@@ -218,13 +218,13 @@ class MetricServer(ThreadingHTTPServer):
         self.state = state
         self.refresh = refresh
         self.snapshot = ""
-        self.updated = 0.0
+        self.updated: float | None = None
         self.snapshot_lock = threading.Lock()
         super().__init__(address, _Handler)
 
     def metrics(self) -> str:
         with self.snapshot_lock:
-            if time.monotonic() - self.updated >= self.refresh:
+            if self.updated is None or time.monotonic() - self.updated >= self.refresh:
                 from .self import SelfCollector
 
                 self_collector = next((c for c in self.collectors if isinstance(c, SelfCollector)), None)

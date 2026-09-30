@@ -12,7 +12,13 @@ from agent_history.metrics.self import SelfCollector
 from agent_history.metrics.server import MetricServer, State
 
 
-def test_failed_collector_keeps_http_scrape_and_throttles(tmp_path):
+def test_failed_collector_keeps_http_scrape_and_throttles(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from agent_history.metrics import server as server_module
+
+    # A newly booted host must still populate the first scrape before refresh expires.
+    monkeypatch.setattr(server_module, "time", SimpleNamespace(monotonic=lambda: 1.0))
+
     class Broken:
         name = "broken"
         calls = 0
@@ -118,14 +124,20 @@ def test_rotating_receipt_and_incoming_file_do_not_abort_collection(tmp_path, mo
     transient = incoming / "one.jsonl"
     transient.write_text("abc")
     original = Path.stat
+    original_is_file = Path.is_file
+
+    def is_file(path, *args, **kwargs):
+        # Both files existed at discovery; disappearance happens at the metadata edge.
+        # Do not depend on whether this Python version implements is_file via stat.
+        return True if path in (receipt, transient) else original_is_file(path, *args, **kwargs)
 
     def stat(path, *args, **kwargs):
-        # is_file/is_symlink may themselves call stat on older Python versions.
-        # Rotate only after those checks, at the explicit metadata read.
+        # Rotate only after successful discovery, at the explicit metadata read.
         if path in (receipt, transient) and not kwargs:
             raise FileNotFoundError("synthetic rotation")
         return original(path, *args, **kwargs)
 
+    monkeypatch.setattr(Path, "is_file", is_file)
     monkeypatch.setattr(Path, "stat", stat)
     families = {f.name: f for f in ArchiveCollector(None, cold, incoming, None).collect()}
     assert families["agent_history_cold_tier_available"].samples[0].value == 0

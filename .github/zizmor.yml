@@ -1,0 +1,6 @@
+# Preserve the shared reusable's hash-pin audit policy.
+rules:
+  unpinned-uses:
+    config:
+      policies:
+        "*": hash-pin

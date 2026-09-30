@@ -16,6 +16,13 @@ CONTRACT.md before changing a parser, the loader, the schema or anything that re
 - `leak-patterns.public.txt` holds generic shapes only. Never add a real name, host or domain to
   any committed file; the private term list lives outside the repository.
 
+## CI security audit
+
+The pinned shared zizmor reusable requires SARIF upload and cannot disable it through an input.
+This package instead uses the same pinned zizmor action with annotations and failing audit exit
+codes, preserving the hash-pin policy without requiring private-repository Code Scanning.
+Do not enable a paid security feature just to make that audit green.
+
 ## Content and tests
 
 - Never add redaction, omission or scrubbing to the parsers or the loader (CONTRACT.md).
