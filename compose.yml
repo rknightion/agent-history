@@ -1,0 +1,65 @@
+# Generic local deployment. Supply passwords, a read-only transcript tree, and a config file.
+name: agent-history
+
+x-worker: &worker
+  build: .
+  user: "10001:10001"
+  read_only: true
+  tmpfs: [/tmp]
+  volumes:
+    - ${TRANSCRIPTS_ROOT:?set TRANSCRIPTS_ROOT}:/transcripts:ro
+    - ${AGENT_HISTORY_CONFIG_FILE:?set AGENT_HISTORY_CONFIG_FILE}:/config/config.toml:ro
+    - state:/state
+    - textfile:/var/lib/alloy/textfile-agent-history
+  environment:
+    AGENT_HISTORY_CONFIG: /config/config.toml
+    AGENT_HISTORY_DSN: ${AGENT_HISTORY_DSN:?set AGENT_HISTORY_DSN}
+    AGENT_HISTORY_READER_DSN: ${AGENT_HISTORY_READER_DSN:?set AGENT_HISTORY_READER_DSN}
+  depends_on:
+    db:
+      condition: service_healthy
+  restart: unless-stopped
+
+services:
+  db:
+    image: paradedb/paradedb:18-v0.25.10@sha256:188591a0bc317beb2c6d6d3f9ef0cb3e859d09ecc15a71dda5e9a027876686cf
+    environment:
+      POSTGRES_DB: agent_history
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      AH_WRITER_PASSWORD: ${AH_WRITER_PASSWORD:?set AH_WRITER_PASSWORD}
+      AH_READER_PASSWORD: ${AH_READER_PASSWORD:?set AH_READER_PASSWORD}
+    volumes:
+      - pgdata:/var/lib/postgresql
+      - ./src/agent_history/sql/roles.sql:/agent-history/roles.sql:ro
+      - ./docker/initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d agent_history"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  exporter:
+    <<: *worker
+    command: ["exporter"]
+    ports:
+      - "127.0.0.1:${EXPORTER_PORT:-9464}:9464"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9464/healthz', timeout=2)"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+  indexer:
+    <<: *worker
+    command: ["index", "--every", "${INDEX_INTERVAL_SECONDS:-60}"]
+
+  embedder:
+    <<: *worker
+    command: ["embed", "--every", "${EMBED_INTERVAL_SECONDS:-60}"]
+
+volumes:
+  pgdata:
+  state:
+  textfile:

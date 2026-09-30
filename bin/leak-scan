@@ -1,0 +1,423 @@
+#!/usr/bin/env python3
+"""Refuse forbidden terms in a tree, the git index, a commit message or the whole git history.
+
+Terms come from, in order: the LEAK_TERMS environment variable (the list itself), the file named by
+LEAK_TERMS_FILE, or ${XDG_CONFIG_HOME:-~/.config}/leak-scan/<repo>.txt, where <repo> is the first
+line of leak-scan.repo. The committed leak-patterns.public.txt is always added. See README-leak-scan
+or the file format section of the repository's AGENTS.md.
+
+Exit 0 clean, 1 on a finding, 2 when the scan cannot be trusted (no term source, an empty or
+malformed list, zero files, a shallow repository, any internal error). A finding prints
+`path:line: label` and never the matched text, the line or the pattern.
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import binascii
+import fnmatch
+import hashlib
+import os
+import re
+import subprocess
+import sys
+import unicodedata
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+PUBLIC_FILE = "leak-patterns.public.txt"
+REPO_FILE = "leak-scan.repo"
+BINARY_ALLOW_FILE = "leak-scan.binary-allow"
+SKIP_DIRS = {".git", "node_modules", ".venv", "__pycache__"}
+MAX_NGRAM = 4
+ZERO_WIDTH = dict.fromkeys(map(ord, "\u00ad\u180e\u200b\u200c\u200d\u200e\u200f\u2060\u2061\u2062\u2063\u2064\ufeff"))
+COARSE = re.compile(r"[^\W_]+")
+FINE = re.compile(r"[^\W\d_]+|\d+")
+BASE64_RUN = re.compile(r"[A-Za-z0-9+/_-]{16,}={0,2}")
+
+
+class ScanError(Exception):
+    """The scan cannot be trusted; exit 2 with this message (never term text)."""
+
+
+# ---------------------------------------------------------------- normalisation and terms
+
+def normalise_text(text: str) -> str:
+    return unicodedata.normalize("NFKC", text).translate(ZERO_WIDTH).lower()
+
+
+def tokens(text: str, pattern: re.Pattern) -> list[str]:
+    return pattern.findall(normalise_text(text))
+
+
+def normalise_literal(literal: str) -> str:
+    """NFKC, zero-width stripped, lowercased, every non-alphanumeric dropped."""
+    return "".join(tokens(literal, COARSE))
+
+
+def literal_findable(literal: str) -> bool:
+    """A literal is found by joining at most MAX_NGRAM consecutive tokens of either tokeniser."""
+    norm = normalise_literal(literal)
+    return bool(norm) and (len(tokens(literal, COARSE)) <= MAX_NGRAM or len(tokens(literal, FINE)) <= MAX_NGRAM)
+
+
+def term_hash(salt: str, norm: str) -> str:
+    return hashlib.sha256(f"{salt}:{norm}".encode("utf-8")).hexdigest()
+
+
+class Terms:
+    def __init__(self) -> None:
+        self.regexes: list[tuple[str, re.Pattern]] = []
+        self.literals: dict[str, str] = {}  # normalised literal -> label
+        self.hashes: dict[str, dict[str, str]] = {}  # salt -> {hexdigest: label}
+
+    def count(self) -> int:
+        return len(self.regexes) + len(self.literals) + sum(len(v) for v in self.hashes.values())
+
+    def add_lines(self, text: str, source: str) -> int:
+        added = 0
+        for number, raw in enumerate(text.splitlines(), 1):
+            line = raw.strip().strip("\r")
+            if not line or line.startswith("#"):
+                continue
+            if "\t" not in line:
+                raise ScanError(f"{source}:{number}: malformed term line (expected label<TAB>pattern)")
+            label, pattern = (part.strip() for part in line.split("\t", 1))
+            if not label or not pattern:
+                raise ScanError(f"{source}:{number}: malformed term line (empty label or pattern)")
+            if pattern.startswith("re:"):
+                body = pattern[3:]
+                if "[[:" in body:
+                    raise ScanError(f"{source}:{number}: POSIX character classes are not Python regex")
+                try:
+                    self.regexes.append((label, re.compile(body, re.IGNORECASE)))
+                except re.error:
+                    raise ScanError(f"{source}:{number}: regex does not compile") from None
+            elif pattern.startswith("lit:"):
+                if not literal_findable(pattern[4:]):
+                    raise ScanError(f"{source}:{number}: literal is empty or longer than {MAX_NGRAM} tokens")
+                self.literals.setdefault(normalise_literal(pattern[4:]), label)
+            elif pattern.startswith("h:"):
+                parts = pattern.split(":")
+                if len(parts) != 3 or not parts[1] or not re.fullmatch(r"[0-9a-f]{64}", parts[2]):
+                    raise ScanError(f"{source}:{number}: hashed term must be h:<salt>:<sha256hex>")
+                self.hashes.setdefault(parts[1], {})[parts[2]] = label
+            else:
+                raise ScanError(f"{source}:{number}: unknown pattern kind (expected re:, lit: or h:)")
+            added += 1
+        return added
+
+
+def repo_name(root: Path) -> str:
+    try:
+        name = (root / REPO_FILE).read_text().strip().splitlines()[0].strip()
+    except (OSError, IndexError):
+        raise ScanError(f"{REPO_FILE} is missing or empty") from None
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", name):
+        raise ScanError(f"{REPO_FILE} does not hold a plain repository name")
+    return name
+
+
+def load_terms(root: Path, public_only: bool) -> Terms:
+    terms = Terms()
+    try:
+        public = (root / PUBLIC_FILE).read_text(encoding="utf-8")
+    except OSError:
+        raise ScanError(f"{PUBLIC_FILE} is missing") from None
+    if terms.add_lines(public, PUBLIC_FILE) == 0:
+        raise ScanError(f"{PUBLIC_FILE} holds no patterns")
+    if public_only:
+        print("leak-scan: WARNING: PUBLIC PATTERNS ONLY; the private term list was not checked", file=sys.stderr)
+        return terms
+    if os.environ.get("LEAK_TERMS") is not None:
+        text, source = os.environ["LEAK_TERMS"], "LEAK_TERMS"
+    else:
+        if os.environ.get("LEAK_TERMS_FILE"):
+            path = Path(os.environ["LEAK_TERMS_FILE"]).expanduser()
+        else:
+            config = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+            path = config / "leak-scan" / f"{repo_name(root)}.txt"
+        try:
+            text, source = path.read_text(encoding="utf-8"), "term file"
+        except OSError:
+            raise ScanError("no private term source: set LEAK_TERMS or LEAK_TERMS_FILE, or create "
+                            f"~/.config/leak-scan/{repo_name(root)}.txt") from None
+    if terms.add_lines(text, source) == 0:
+        raise ScanError("the private term list is empty")
+    return terms
+
+
+def binary_allow(root: Path) -> list[str]:
+    try:
+        text = (root / BINARY_ALLOW_FILE).read_text(encoding="utf-8")
+    except OSError:
+        return []
+    return [line.strip() for line in text.splitlines() if line.strip() and not line.strip().startswith("#")]
+
+
+# ---------------------------------------------------------------- matching
+
+class Scanner:
+    def __init__(self, terms: Terms, allow: list[str]) -> None:
+        self.terms = terms
+        self.allow = allow
+        self.findings: list[str] = []
+
+    def report(self, where: str, label: str) -> None:
+        entry = f"{where}: {label}"
+        if entry not in self.findings:
+            self.findings.append(entry)
+
+    def _token_hits(self, lines: list[str]) -> list[tuple[int, str]]:
+        """(line number, label) for every literal or hashed term formed by <= MAX_NGRAM consecutive tokens.
+        Tokens run across line boundaries, so a term split over two lines is found at its first line."""
+        if not self.terms.literals and not self.terms.hashes:
+            return []
+        candidates: dict[str, set] = {}
+        for pattern in (COARSE, FINE):
+            stream: list[tuple[str, int]] = []
+            for number, line in enumerate(lines, 1):
+                stream.extend((token, number) for token in tokens(line, pattern))
+            for start in range(len(stream)):
+                joined = ""
+                for end in range(start, min(start + MAX_NGRAM, len(stream))):
+                    joined += stream[end][0]
+                    candidates.setdefault(joined, set()).add(stream[start][1])
+        hits: list[tuple[int, str]] = []
+        for candidate, numbers in candidates.items():
+            labels = [self.terms.literals.get(candidate)]
+            labels += [table.get(term_hash(salt, candidate)) for salt, table in self.terms.hashes.items()]
+            hits.extend((number, label) for label in labels if label for number in numbers)
+        return hits
+
+    def _regex_hits(self, lines: list[str]) -> list[tuple[int, str]]:
+        hits = []
+        for number, line in enumerate(lines, 1):
+            variants = {line, unicodedata.normalize("NFKC", line).translate(ZERO_WIDTH)}
+            for label, regex in self.terms.regexes:
+                if any(regex.search(variant) for variant in variants):
+                    hits.append((number, label))
+        return hits
+
+    def text_hits(self, text: str, depth: int = 0) -> list[tuple[int, str]]:
+        lines = text.splitlines() or [""]
+        hits = self._regex_hits(lines) + self._token_hits(lines)
+        if depth < 2:
+            for number, line in enumerate(lines, 1):
+                for run in BASE64_RUN.findall(line):
+                    decoded = decode_base64(run)
+                    if decoded is not None:
+                        hits.extend((number, f"{label} (base64)") for _, label in self.text_hits(decoded, depth + 1))
+        return sorted(set(hits))
+
+    def scan_text(self, where: str, text: str) -> None:
+        for number, label in self.text_hits(text):
+            self.report(f"{where}:{number}", label)
+
+    def scan_name(self, rel: str) -> None:
+        for _, label in self.text_hits(rel):
+            self.report(f"{rel}:name", label)
+
+    def scan_blob(self, rel: str, data: bytes) -> None:
+        self.scan_name(rel)
+        text = as_text(data)
+        if text is None:
+            if not any(fnmatch.fnmatch(rel, glob) for glob in self.allow):
+                self.report(f"{rel}:0", "binary-not-allowed")
+            return
+        self.scan_text(rel, text)
+
+
+def as_text(data: bytes) -> str | None:
+    if b"\x00" in data[:8192]:
+        return None
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def decode_base64(run: str) -> str | None:
+    body = run.rstrip("=")
+    body += "=" * (-len(body) % 4)
+    for altchars, foreign in ((b"+/", "-_"), (b"-_", "+/")):
+        if any(c in body for c in foreign):
+            continue
+        try:
+            raw = base64.b64decode(body, altchars=altchars, validate=True)
+        except (binascii.Error, ValueError):
+            continue
+        text = as_text(raw)
+        if text and sum(ch.isprintable() or ch in "\n\t" for ch in text) >= 0.9 * len(text):
+            return text
+    return None
+
+
+# ---------------------------------------------------------------- modes
+
+def git(args: list[str], cwd: Path, data: bytes | None = None) -> bytes:
+    proc = subprocess.run(["git", *args], cwd=cwd, input=data, capture_output=True)
+    if proc.returncode:
+        raise ScanError(f"git {args[0]} failed")
+    return proc.stdout
+
+
+def git_toplevel(cwd: Path) -> Path:
+    try:
+        return Path(git(["rev-parse", "--show-toplevel"], cwd).decode().strip())
+    except ScanError:
+        raise ScanError("not inside a git repository") from None
+
+
+def read_blobs(top: Path, specs: list[str]) -> list[bytes]:
+    """Contents for object specs via one `git cat-file --batch`, in order."""
+    if not specs:
+        return []
+    out = git(["cat-file", "--batch"], top, ("\n".join(specs) + "\n").encode())
+    blobs, pos = [], 0
+    for _ in specs:
+        end = out.index(b"\n", pos)
+        header = out[pos:end].split()
+        if len(header) < 3 or header[1] == b"missing":
+            raise ScanError("git cat-file could not read an object")
+        size = int(header[2])
+        blobs.append(out[end + 1:end + 1 + size])
+        pos = end + 1 + size + 1
+    return blobs
+
+
+def scan_path(scanner: Scanner, target: Path) -> str:
+    if not target.is_dir():
+        raise ScanError("--path must name a directory")
+    count = 0
+    for dirpath, dirnames, filenames in os.walk(target):
+        dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIRS)
+        for name in sorted(filenames):
+            path = Path(dirpath) / name
+            rel = path.relative_to(target).as_posix()
+            if path.is_symlink():
+                scanner.scan_name(rel)
+                scanner.scan_text(rel, os.readlink(path))
+            else:
+                scanner.scan_blob(rel, path.read_bytes())
+            count += 1
+        for name in dirnames:
+            scanner.scan_name((Path(dirpath) / name).relative_to(target).as_posix())
+    if count == 0:
+        raise ScanError("zero files scanned")
+    return f"{count} files"
+
+
+def scan_staged(scanner: Scanner, cwd: Path) -> str:
+    top = git_toplevel(cwd)
+    names = [n for n in git(["diff", "--cached", "--name-only", "-z", "--diff-filter=ACMRT"], top)
+             .decode("utf-8", "surrogateescape").split("\0") if n]
+    if not names:
+        quiet = subprocess.run(["git", "diff", "--cached", "--quiet"], cwd=top)
+        if quiet.returncode == 0:
+            return "nothing staged"
+        if quiet.returncode != 1:
+            raise ScanError("git diff --cached failed")
+        return "0 added or modified files staged"
+    for name, data in zip(names, read_blobs(top, [f":{n}" for n in names])):
+        scanner.scan_blob(name, data)
+    return f"{len(names)} staged files"
+
+
+def scan_message(scanner: Scanner, path: Path) -> str:
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        raise ScanError("cannot read the commit message file") from None
+    scanner.scan_text("commit message", text)
+    return "commit message"
+
+
+def scan_history(scanner: Scanner, cwd: Path) -> str:
+    top = git_toplevel(cwd)
+    if git(["rev-parse", "--is-shallow-repository"], top).decode().strip() != "false":
+        raise ScanError("shallow repository: history cannot be scanned; fetch with full depth")
+    commits = git(["rev-list", "--all"], top).decode().split()
+    if not commits:
+        raise ScanError("zero commits scanned")
+    for commit in commits:
+        meta = git(["show", "-s", "--format=%an%n%ae%n%cn%n%ce%n%B", commit], top).decode("utf-8", "replace")
+        for _, label in scanner.text_hits(meta):
+            scanner.report(f"{commit[:12]}: commit metadata", label)
+    names: set[str] = set()
+    for commit in commits:
+        listing = git(["ls-tree", "-r", "-z", "--name-only", commit], top).decode("utf-8", "surrogateescape")
+        names.update(n for n in listing.split("\0") if n)
+    for name in sorted(names):
+        scanner.scan_name(name)
+    blobs: dict[str, str] = {}
+    for line in git(["rev-list", "--objects", "--all"], top).decode("utf-8", "surrogateescape").splitlines():
+        sha, _, path = line.partition(" ")
+        blobs.setdefault(sha, path)
+    kinds = git(["cat-file", "--batch-check=%(objectname) %(objecttype)"], top,
+                ("\n".join(blobs) + "\n").encode()).decode().split("\n")
+    blob_shas = [k.split()[0] for k in kinds if k.endswith(" blob")]
+    for sha, data in zip(blob_shas, read_blobs(top, blob_shas)):
+        rel = blobs[sha] or sha[:12]
+        text = as_text(data)
+        if text is None:
+            if not any(fnmatch.fnmatch(rel, glob) for glob in scanner.allow):
+                scanner.report(f"{rel}@{sha[:12]}:0", "binary-not-allowed")
+            continue
+        scanner.scan_text(f"{rel}@{sha[:12]}", text)
+    refs = git(["for-each-ref", "--format=%(objecttype) %(refname)"], top).decode().splitlines()
+    for ref in refs:
+        kind, _, name = ref.partition(" ")
+        short = name.split("/", 2)[-1] if name.startswith("refs/") else name
+        where = f"tag {short}" if name.startswith("refs/tags/") else f"ref {short}"
+        for _, label in scanner.text_hits(name):
+            scanner.report(where, label)
+        if kind == "tag":
+            body = git(["cat-file", "-p", name], top).decode("utf-8", "replace")
+            for _, label in scanner.text_hits(body):
+                scanner.report(where, label)
+    return f"{len(commits)} commits, {len(blob_shas)} blobs"
+
+
+# ---------------------------------------------------------------- entry point
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Refuse forbidden terms (see the module docstring).")
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--path", type=Path, help="scan a directory tree, file names included")
+    mode.add_argument("--staged", action="store_true", help="scan the git index (pre-commit)")
+    mode.add_argument("--message", type=Path, help="scan a commit message file (commit-msg)")
+    mode.add_argument("--history", action="store_true", help="scan every reachable commit, blob, name and tag")
+    parser.add_argument("--root", type=Path, default=ROOT, help="where the committed scanner config lives")
+    parser.add_argument("--public-only", action="store_true",
+                        help="skip the private list (fork pull requests only); says so loudly")
+    args = parser.parse_args(argv)
+    try:
+        terms = load_terms(args.root, args.public_only)
+        scanner = Scanner(terms, binary_allow(args.root))
+        cwd = Path.cwd()
+        if args.path is not None:
+            summary = scan_path(scanner, args.path.resolve())
+        elif args.staged:
+            summary = scan_staged(scanner, cwd)
+        elif args.message is not None:
+            summary = scan_message(scanner, args.message)
+        else:
+            summary = scan_history(scanner, cwd)
+    except ScanError as error:
+        print(f"leak-scan: {error}", file=sys.stderr)
+        return 2
+    except Exception as error:  # never echo content: type name only
+        print(f"leak-scan: internal error ({type(error).__name__}); failing closed", file=sys.stderr)
+        return 2
+    for finding in scanner.findings:
+        print(finding)
+    if scanner.findings:
+        print(f"leak-scan: {len(scanner.findings)} findings ({summary})")
+        return 1
+    print(f"leak-scan: clean ({summary})")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

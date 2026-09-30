@@ -1,0 +1,55 @@
+# agent-history configuration. Copy to ~/.config/agent-history/config.toml (or point
+# $AGENT_HISTORY_CONFIG at it). Every key is optional.
+
+# Writer connection for `agent-history init/index/rebuild/...`. $AGENT_HISTORY_DSN overrides it.
+# Prefer dsn_file (first line of the file) so the password is not in this file.
+# dsn = "postgresql://ah_writer:CHANGE_ME@127.0.0.1:5432/agent_history"
+# dsn_file = "~/.config/agent-history/writer.dsn"
+
+# Reader connection for the MCP server and read-only commands ($AGENT_HISTORY_READER_DSN overrides).
+# It must be a SELECT-only role with default_transaction_read_only = on (sql/roles.sql).
+# reader_dsn_file = "~/.config/agent-history/reader.dsn"
+
+# Namespace -> agent home. The prefix (claude, codex, pi) picks the parser; the rest is your label.
+# Without this table the three defaults below are used.
+[sources]
+claude-local = "~/.claude"
+codex-local = "~/.codex"
+pi-local = "~/.pi/agent"
+# A second Claude Code home (CLAUDE_CONFIG_DIR) is just another namespace:
+# claude-client = "~/.claude-client"
+
+# Named search scopes, not access-control boundaries. Search tools use the selected context's
+# namespaces (the `context` argument, else $AGENT_HISTORY_CONTEXT, else default_context), but the
+# MCP `sql` tool can read every row in the database. Use separate databases for real separation.
+# Without this table there is one context, "default", holding every source.
+# default_context = "local"
+# [contexts]
+# local = ["claude-local", "codex-local", "pi-local"]
+# client = ["claude-client"]
+
+# Who you are, for `agent-history collect-git`: commits whose author email is listed are marked as
+# yours (ah.git_commit.author_is_owner). Emails are compared, never stored. git_owners, when set,
+# limits ingestion to remotes under these host/owner prefixes.
+[identities]
+owner_emails = []
+# git_owners = ["github.com/your-user"]
+
+# Local checkouts whose default-branch history `collect-git` ingests.
+[git]
+repos = []
+days = 180
+
+# Embeddings are off by default. When on, `agent-history embed` sends message chunks, session
+# summaries and tool-error excerpts, including a cwd/project basename header, to an external
+# /v1/embeddings endpoint. Only pattern-matched secret spans become [REDACTED]; other sensitive
+# text is not scrubbed. See CONTRACT.md for the full disclosure, including raw hybrid-search
+# queries sent to that endpoint. The vector column is 1024-dimensional.
+[embedding]
+enabled = false
+base_url = "https://api.openai.com/v1"
+model = "text-embedding-3-large"
+dimensions = 1024
+api_key_env = "OPENAI_API_KEY"
+# api_key_file = "~/.config/agent-history/embedding.key"
+# headers = { "X-Extra-Header" = "value" }

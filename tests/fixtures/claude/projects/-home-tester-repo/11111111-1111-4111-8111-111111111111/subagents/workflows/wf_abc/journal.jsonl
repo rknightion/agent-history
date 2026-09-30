@@ -1,0 +1,2 @@
+{"type": "started", "key": "v2:k1", "agentId": "a0000000000000004"}
+{"type": "result", "key": "v2:k1", "agentId": "a0000000000000004", "result": {"text": "synthetic result"}}

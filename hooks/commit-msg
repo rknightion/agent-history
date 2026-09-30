@@ -1,0 +1,6 @@
+#!/bin/sh
+# Installed by `just setup` from hooks/commit-msg; `just check` fails if it is missing or edited.
+# Never bypass it with --no-verify and never point core.hooksPath elsewhere in this repository.
+set -eu
+top=$(git rev-parse --show-toplevel)
+exec python3 "$top/bin/leak-scan" --message "$1"

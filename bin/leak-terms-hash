@@ -1,0 +1,83 @@
+#!/usr/bin/env python3
+"""Turn a plain term list into the form safe to store as a CI secret.
+
+Reads `label<TAB>lit:<literal>` / `label<TAB>re:<regex>` lines (and `#` comments) from a file or
+stdin. Writes each `lit:` line as `label<TAB>h:<salt>:<sha256(salt ":" normalised)>` and passes
+`re:` and existing `h:` lines through unchanged. Comments and blank lines are dropped. The
+normalisation and the findability rule are imported from bin/leak-scan, so the two never drift.
+
+    bin/leak-terms-hash [--salt S] [FILE] > hashed.txt
+
+Exit 2 on a malformed line or a literal leak-scan could never find; the message names the line
+number only, never its text.
+"""
+from __future__ import annotations
+
+import argparse
+import importlib.machinery
+import importlib.util
+import secrets
+import sys
+from pathlib import Path
+
+
+def _scanner():
+    loader = importlib.machinery.SourceFileLoader("leak_scan", str(Path(__file__).resolve().parent / "leak-scan"))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def convert(text: str, salt: str, scan) -> list[str]:
+    out = []
+    for number, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip().strip("\r")
+        if not line or line.startswith("#"):
+            continue
+        if "\t" not in line:
+            raise ValueError(f"line {number}: expected label<TAB>pattern")
+        label, pattern = (part.strip() for part in line.split("\t", 1))
+        if not label or not pattern:
+            raise ValueError(f"line {number}: empty label or pattern")
+        if pattern.startswith("lit:"):
+            if not scan.literal_findable(pattern[4:]):
+                raise ValueError(f"line {number}: literal is empty or longer than {scan.MAX_NGRAM} tokens; "
+                                 "use a re: line instead")
+            out.append(f"{label}\th:{salt}:{scan.term_hash(salt, scan.normalise_literal(pattern[4:]))}")
+        elif pattern.startswith(("re:", "h:")):
+            out.append(f"{label}\t{pattern}")
+        else:
+            raise ValueError(f"line {number}: unknown pattern kind (expected lit:, re: or h:)")
+    if not out:
+        raise ValueError("no terms")
+    # Check the result parses exactly as leak-scan will parse it.
+    scan.Terms().add_lines("\n".join(out), "output")
+    return out
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument("file", nargs="?", type=Path, help="plain list (default: stdin)")
+    parser.add_argument("--salt", help="salt (default: 16 random hex bytes); [A-Za-z0-9] only")
+    args = parser.parse_args(argv)
+    salt = args.salt or secrets.token_hex(16)
+    if not salt.isalnum() or not salt.isascii():
+        print("leak-terms-hash: salt must be ASCII letters and digits", file=sys.stderr)
+        return 2
+    try:
+        text = args.file.read_text(encoding="utf-8") if args.file else sys.stdin.read()
+        scan = _scanner()
+        lines = convert(text, salt, scan)
+    except (OSError, ValueError) as error:
+        print(f"leak-terms-hash: {error}", file=sys.stderr)
+        return 2
+    except Exception as error:  # the scanner's ScanError, or anything else: never echo input
+        print(f"leak-terms-hash: failed ({type(error).__name__})", file=sys.stderr)
+        return 2
+    sys.stdout.write("\n".join(lines) + "\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

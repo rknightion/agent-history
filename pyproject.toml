@@ -1,0 +1,50 @@
+[project]
+name = "agent-history"
+version = "0.1.0"
+description = "Index Claude Code, Codex and pi agent transcripts into a ParadeDB catalogue, with BM25 search, a wait/poll efficiency classifier and a read-only MCP server."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+dependencies = ["psycopg[binary]>=3.2"]
+
+[project.optional-dependencies]
+mcp = ["mcp>=2.0"]
+
+[project.scripts]
+agent-history = "agent_history.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8", "ruff==0.16.9", "mcp>=2.0"]
+
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agent_history"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Caches live inside .venv, which the leak gate skips, so `just check` never scans them.
+cache_dir = ".venv/pytest-cache"
+pythonpath = ["src", "tests"]
+markers = ["pg: needs AGENT_HISTORY_TEST_DSN (a disposable *_test database)"]
+
+[tool.ruff]
+line-length = 120
+cache-dir = ".venv/ruff-cache"
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
+ignore = ["E731", "E741"]
+
+[tool.ruff.format]
+# The catalogue modules and their tests are shared with an existing deployment and keep its layout;
+# files written for this package are formatted.
+exclude = [
+    "bin/test_leak_scan.py",
+    "src/agent_history/{common,model,memstore,parse_claude,parse_codex,parse_pi,structure,loop_launch,loops,load,embed}.py",
+    "tests/test_{parse_claude,parse_codex,parse_pi,common,embed,loader_pg,loader_pi_pg,structure_pg,embed_pg,analytics_pg}.py",
+]

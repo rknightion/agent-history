@@ -1,0 +1,109 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    name: just ci
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    steps:
+      - name: Harden the runner (audit egress)
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+      - name: Check out (full history for the leak gate)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Set up just
+        uses: rknightion/.github/.github/actions/setup-just@f32275a4a7641f34db5cb005d270db961b54a680 # v1.25.3
+      - name: Set up uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      - name: Install the leak-gate hooks (just check verifies them)
+        run: just hooks
+      - name: just ci
+        env:
+          # Dependency-installing CI jobs never receive private leak terms.
+          LEAK_SCAN_PUBLIC_ONLY: '1'
+        run: just ci
+
+  leak-scan:
+    name: leak-scan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Harden the runner (audit egress)
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+      - name: Check out (full history)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Scan history and tree (private terms)
+        if: ${{ !github.event.pull_request.head.repo.fork }}
+        env:
+          LEAK_TERMS: ${{ secrets.LEAK_TERMS }}
+        run: |
+          python3 bin/leak-scan --history
+          python3 bin/leak-scan --path .
+      - name: Scan history and tree (fork pull request, public patterns only)
+        if: ${{ github.event.pull_request.head.repo.fork }}
+        run: |
+          python3 bin/leak-scan --history --public-only
+          python3 bin/leak-scan --path . --public-only
+
+  trufflehog:
+    name: trufflehog
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Harden the runner (audit egress)
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+      - name: Check out (full history)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Scan every commit for verified or unverifiable secrets
+        env:
+          # renovate: datasource=docker depName=ghcr.io/trufflesecurity/trufflehog
+          TRUFFLEHOG_IMAGE: ghcr.io/trufflesecurity/trufflehog:3.97.9@sha256:52e67fef4d054ecff5c2ce4b4ae376626d1ef54aa0898b53cac19c25e92e14db
+        run: |
+          docker run --rm -v "${GITHUB_WORKSPACE}:/repo" "${TRUFFLEHOG_IMAGE}" \
+            git file:///repo --results=verified,unknown --fail --no-update
+
+  actionlint:
+    name: actionlint
+    permissions:
+      contents: read
+    uses: rknightion/.github/.github/workflows/actionlint.yml@f32275a4a7641f34db5cb005d270db961b54a680 # v1.25.3
+
+  zizmor:
+    name: zizmor
+    permissions:
+      security-events: write
+      contents: read
+      actions: read
+    uses: rknightion/.github/.github/workflows/zizmor.yml@f32275a4a7641f34db5cb005d270db961b54a680 # v1.25.3

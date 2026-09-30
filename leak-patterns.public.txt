@@ -1,0 +1,16 @@
+# Public leak patterns: generic shapes only. Format: label<TAB>re:<python regex> (compiled with re.I).
+# Nothing here may name a real host, domain, person, organisation or tailnet. Private names live in
+# the private term list (see README), never in this file.
+rfc1918-10	re:\b10\.\d{1,3}\.\d{1,3}\.\d{1,3}\b
+rfc1918-172	re:\b172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}\b
+rfc1918-192	re:\b192\.168\.\d{1,3}\.\d{1,3}\b
+cgnat	re:\b100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.\d{1,3}\.\d{1,3}\b
+tailnet-host	re:\.ts\.net\b
+home-path	re:/[U]sers/[^/\s]+/
+home-slug	re:-Users-[a-z]+-
+email	re:\b[a-z0-9._%+-]+@(?!(?:users\.)?noreply\.github\.com\b|github\.com\b|(?:[a-z0-9-]+\.)*example(?:\.(?:com|org|net))?(?![a-z0-9.-]))[a-z0-9-]+(?:\.[a-z0-9-]+)*\.[a-z]{2,}\b
+grafana-tenant-id	re:\b(?:tenant|stack|instance)[_ -]?(?:id)?["']?\s*[:=]\s*["']?\d{5,9}\b
+credential-tree	re:\bcredentials/[a-z0-9._-]+/
+secrets-dir	re:(?:^|[\s"'/])\.secrets/
+secrets-tree	re:\bsecrets-tree/
+token-file	re:\b(?:cap_token|sa_token)_[a-z0-9_]+\b

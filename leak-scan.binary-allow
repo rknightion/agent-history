@@ -1,0 +1,2 @@
+# Paths (fnmatch globs, relative to the repository root) whose binary content is not scanned.
+# File names are still scanned. Keep this list short and specific.

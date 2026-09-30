@@ -1,0 +1,8 @@
+#!/bin/sh
+# Installed by `just setup` from hooks/pre-push; `just check` fails if it is missing or edited.
+# Never bypass it with --no-verify and never point core.hooksPath elsewhere in this repository.
+# Scans every reachable commit, blob, path name, tag and note, so a leak in an unpushed commit
+# stops the push even when the tip is clean.
+set -eu
+top=$(git rev-parse --show-toplevel)
+exec python3 "$top/bin/leak-scan" --history
