@@ -10,11 +10,14 @@ from agent_history.efficiency.parser import EfficiencyParser, EfficiencyRun, eff
 from agent_history.metrics.efficiency import EfficiencyCollector
 
 
-@pytest.mark.parametrize("model", [{"id": "gpt-6.1-sol"}, ["gpt-6.1-sol"]])
-def test_malformed_pi_model_has_no_context_window(model):
-    state = efficiency_file_state("pi-local/sessions/synthetic.jsonl", 0)
+@pytest.mark.parametrize(
+    "agent,model", [("pi", {"id": "gpt-6.1-sol"}), ("pi", ["gpt-6.1-sol"]), ("claude", "<synthetic>")]
+)
+def test_unsupported_model_has_no_context_window(agent, model):
+    relative = f"{agent}-local/sessions/synthetic.jsonl"
+    state = efficiency_file_state(relative, 0)
     state["model"] = model
-    parser = EfficiencyParser(EfficiencyRun({"baseline_ts": 0}), state, "pi-local/sessions/synthetic.jsonl")
+    parser = EfficiencyParser(EfficiencyRun({"baseline_ts": 0}), state, relative)
     assert parser.context_window() is None
 
 
@@ -28,7 +31,15 @@ def test_malformed_pi_model_has_no_context_window(model):
         ("pi", None, None),
         ("codex", "gpt-6.1-sol", 100000),
         ("codex", "gpt-6.1-sol", None),
-        ("claude", "claude-opus-4-6", None),
+        ("claude", "claude-opus-5-5", 1000000),
+        ("claude", "claude-sonnet-5-5", 1000000),
+        ("claude", "claude-fable-4-5-20250929[1m]", 1000000),
+        ("claude", "claude-haiku-4-5-20251001", 200000),
+        ("claude", "claude-haiku-4-5[1m]", 200000),
+        ("claude", "claude-haiku-3-5-20241022", None),
+        ("claude", "claude-haiku-4-50", None),
+        ("claude", "claude-unknown-5-5", None),
+        ("claude", None, None),
     ],
 )
 def test_context_fill_public_collector(tmp_path, agent, model, window):

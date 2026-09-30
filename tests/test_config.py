@@ -75,6 +75,29 @@ def test_invalid_config_is_refused(data, message):
         parse_config(data)
 
 
+@pytest.mark.parametrize("boundary", ["config", "cli"])
+def test_invalid_namespace_diagnostics_do_not_echo_configured_value(tmp_path, capsys, boundary):
+    from agent_history.cli import main
+
+    marker = "private-looking-namespace-marker"
+    namespace = f"invalid/{marker}"
+    config_file = tmp_path / "config.toml"
+    config_file.write_text(f'[sources]\n"{namespace}" = "/tmp"\n')
+
+    if boundary == "config":
+        with pytest.raises(ConfigError) as error:
+            load_config(config_file)
+        diagnostic = str(error.value)
+    else:
+        assert main(["--config", str(config_file), "stats"]) == 2
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        diagnostic = captured.out + captured.err
+    assert marker not in diagnostic
+    assert "sources" in diagnostic and "namespace" in diagnostic
+    assert "must look like claude-<name>, codex-<name> or pi-<name>" in diagnostic
+
+
 def test_unknown_context_is_refused():
     with pytest.raises(ConfigError, match="unknown context"):
         parse_config({}).namespaces("elsewhere")

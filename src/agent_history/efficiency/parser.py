@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
-from .context_windows import PI_CONTEXT_WINDOWS
+from .context_windows import PI_CONTEXT_WINDOWS, claude_context_window
 
 
 def pi_format():
@@ -1200,12 +1200,14 @@ class EfficiencyParser:
             s["last"] = ts
 
     def context_window(self) -> int | None:
-        """Codex uses its recorded window; pi uses explicit configuration; Claude stays unknown."""
+        """Codex uses its recorded window; pi configuration and Claude owner policy are explicit."""
         if self.agent == "codex":
             return efficiency_int(self.s["ctxw"])
         if self.agent == "pi":
             model = self.s["model"]
             return PI_CONTEXT_WINDOWS.get(model) if isinstance(model, str) else None
+        if self.agent == "claude":
+            return claude_context_window(self.s["model"])
         return None
 
     def llm_call(self, ts: float | None, total: int, hit: int, output: int) -> None:

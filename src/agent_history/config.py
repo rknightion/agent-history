@@ -173,7 +173,7 @@ def parse_config(data: dict[str, Any], path: Path | None = None) -> Config:
     sources: dict[str, Path] = {}
     for namespace, directory in sources_raw.items():
         if not NAMESPACE.match(namespace):
-            raise ConfigError(f"source namespace {namespace!r} must look like claude-<name>, codex-<name> or pi-<name>")
+            raise ConfigError("sources namespace key must look like claude-<name>, codex-<name> or pi-<name>")
         if not isinstance(directory, str):
             raise ConfigError(f"source {namespace}: directory must be a string")
         # The configured home itself may be a symlink (resolved here); symlinked transcript files
