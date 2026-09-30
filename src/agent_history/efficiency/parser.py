@@ -14,6 +14,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
+from .context_windows import PI_CONTEXT_WINDOWS
+
 
 def pi_format():
     from agent_history import parse_pi  # loaded only for pi transcript parsing
@@ -1198,8 +1200,13 @@ class EfficiencyParser:
             s["last"] = ts
 
     def context_window(self) -> int | None:
-        """Codex only: Claude transcripts do not record the context window, so Claude has no fill ratio."""
-        return efficiency_int(self.s["ctxw"]) if self.agent == "codex" else None
+        """Codex uses its recorded window; pi uses explicit configuration; Claude stays unknown."""
+        if self.agent == "codex":
+            return efficiency_int(self.s["ctxw"])
+        if self.agent == "pi":
+            model = self.s["model"]
+            return PI_CONTEXT_WINDOWS.get(model) if isinstance(model, str) else None
+        return None
 
     def llm_call(self, ts: float | None, total: int, hit: int, output: int) -> None:
         s = self.s
