@@ -157,7 +157,45 @@ are retained, and temporarily absent sources keep their already-counted contribu
 and source disappearance/reappearance do not reset or double-count the public total.
 Standalone archive namespace values become `<agent>-standalone`, and their machine values become
 `other`; counts and byte totals are summed, and modification-time extrema are retained. Metric
-family names, help, types and label keys do not change.
+family names, help, types and label keys do not change. An optional private `[metrics_labels]`
+table can trust exact `machines` and `models` values for verbatim exposition (see
+`config.example.toml`). Absent, empty or malformed tables grant no extra trust. This section is
+loaded by the shared CLI/MCP loader; it does not relax other config validation. Configured archive
+namespaces emit zero file/byte series for empty hot and cold tiers.
+
+Efficiency counters read Claude session transcripts and their direct subagents, Claude workflow
+agent transcripts (`subagents/workflows/*/agent-*.jsonl`), Codex `sessions/` and pi sessions.
+Workflow journals and Codex `archived_sessions/` copies are never counted. Set
+`[efficiency] workflow_transcripts = false` to leave workflow agents out, for example to compare
+with a collector that never read them; turning it back on adds their calls from that point.
+
+Self-health keeps `storage`, `archive`, `efficiency` and `loops` separate from worker `runs`.
+`loops` times the optional catalogue loop-map fetch: a failed fetch sets its success to zero,
+records duration and retains its last-success timestamp, without failing overall collection.
+
+Before a metrics cutover, compare captures with the public CLI:
+
+```sh
+agent-history metrics parity --legacy legacy.prom --new http://127.0.0.1:9464/metrics \
+  --legacy-at 2026-01-01T12:00:05Z --roster src/agent_history/metrics/parity-roster.json
+```
+
+Files need their actual capture time, from a `# captured_at <timestamp>` comment or
+`--legacy-at`/`--new-at`; file modification times are never capture evidence. HTTP fetches use
+request start time when no capture comment is present. Captures must share a UTC minute bucket
+and be at most 60 seconds apart; an HTTP fetch crossing a minute boundary is also refused.
+Exit 0 means parity, 1 means an unrostered difference, and 2 means invalid or unsynchronised
+input. A `not synchronised` report explicitly says no comparison was performed: zero counts
+are not a pass. Reports are deterministic JSON, with kept-family counts and each rostered
+exception's class and reason. Kept families require identical types and label keys/values;
+new-only families are reported separately. Every kept value, including gauges, allows at most
+0.5% deviation. Repeat `--ended-loop <label>` for every concluded loop to require exact equality
+for its measurements. The roster lists retired SQLite/systemd families and sections as `dropped`,
+only process self counters as `rebase-allowed`, and four legacy activity families confirmed absent
+from the baseline as `not-emitted`. A `not-emitted` family appearing in either capture fails the
+comparison rather than silently waiving it. A `renamed` entry must identify its replacement
+family and still meet the same type, label and numeric checks. `loops` is never a roster exception.
+Use trusted labels matching the legacy capture when proving private deployment parity.
 
 This is not general metadata sanitisation. Other operator-configured namespaces, loop names and
 collector state can be sensitive. Local collector and counter state retain original source

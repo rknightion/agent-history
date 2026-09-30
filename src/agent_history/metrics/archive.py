@@ -8,6 +8,8 @@ import re
 import time
 from pathlib import Path
 
+from agent_history.config import MetricsLabels
+
 from . import Family, Sample
 from .catalogue import gauge
 
@@ -21,12 +23,15 @@ def family(name: str, help_text: str, values: list[tuple[dict[str, str], float]]
     )
 
 
-def namespace_labels(namespace: str) -> dict[str, str]:
+def namespace_labels(namespace: str, trusted: MetricsLabels = MetricsLabels()) -> dict[str, str]:
     agent, profile = namespace.split("-", 1)
     machine = "shared"
     if profile.startswith("standalone-"):
-        profile, machine = "standalone", "other"
-        namespace = agent + "-standalone"  # No host suffix in any public label value.
+        machine = profile.removeprefix("standalone-")
+        profile = "standalone"
+        if machine not in trusted.machines:
+            machine = "other"
+            namespace = agent + "-standalone"  # No untrusted host suffix in a label.
     return {"namespace": namespace, "agent": agent, "profile": profile, "machine": machine}
 
 
@@ -92,11 +97,38 @@ class ArchiveCollector:
         incoming: Path | None,
         conflicts: Path | None,
         retention_days: int = 90,
+        *,
+        namespaces=(),
+        labels: MetricsLabels = MetricsLabels(),
     ):
         self.paths = {"hot": hot, "cold": cold, "incoming": incoming, "conflicts": conflicts}
         self.retention_days = retention_days
+        self.namespaces = tuple(n for n in namespaces if NAMESPACE.fullmatch(n))
+        self.labels = labels
+        self.section_health: dict[str, tuple[float, bool]] = {}
 
     def collect(self):
+        result = []
+        by_tier = {"hot": {}, "cold": {}}
+        self.section_health = {}
+        started = time.monotonic()
+        try:
+            storage, by_tier = self._storage()
+            result.extend(storage)
+            failed = False
+        except Exception:
+            failed = True
+        self.section_health["storage"] = (time.monotonic() - started, failed)
+        started = time.monotonic()
+        try:
+            result.extend(self._archive(by_tier))
+            failed = False
+        except Exception:
+            failed = True
+        self.section_health["archive"] = (time.monotonic() - started, failed)
+        return tuple(result)
+
+    def _storage(self):
         hot, cold = self.paths["hot"], self.paths["cold"]
         roots = {"hot": hot, "cold": cold}
         result = []
@@ -138,7 +170,8 @@ class ArchiveCollector:
         )
         groups = {key: [] for key in ("files", "bytes", "oldest_mtime_seconds", "newest_mtime_seconds")}
         namespaces = sorted(
-            {path.split("/", 1)[0] for files in by_tier.values() for path in files if "/" in path}
+            set(self.namespaces)
+            | {path.split("/", 1)[0] for files in by_tier.values() for path in files if "/" in path}
             | {
                 p.name
                 for root in roots.values()
@@ -150,7 +183,7 @@ class ArchiveCollector:
         for tier, files in by_tier.items():
             for namespace in namespaces:
                 values = [(size, mtime) for path, (size, mtime) in files.items() if path.startswith(namespace + "/")]
-                labels = {"tier": tier, **namespace_labels(namespace)}
+                labels = {"tier": tier, **namespace_labels(namespace, self.labels)}
                 groups["files"].append((labels, len(values)))
                 groups["bytes"].append((labels, sum(size for size, _ in values)))
                 if values:
@@ -215,6 +248,11 @@ class ArchiveCollector:
                 ),
             )
         )
+        return result, by_tier
+
+    def _archive(self, by_tier):
+        cold = self.paths["cold"]
+        result = []
         receipt_root = cold / ".archive-receipts" if cold else None
         receipts = (
             sorted(p for p in receipt_root.glob("*.json") if p.is_file() and not p.is_symlink())

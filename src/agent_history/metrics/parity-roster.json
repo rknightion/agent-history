@@ -1,0 +1,245 @@
+{
+  "version": 1,
+  "entries": [
+    {
+      "scope": "family",
+      "name": "agent_sessions_activity_artifacts",
+      "action": "dropped",
+      "reason": "Computed by the legacy collector from the retired SQLite session index; it appears only while that index holds rows from the last 30 days."
+    },
+    {
+      "scope": "family",
+      "name": "agent_sessions_activity_messages",
+      "action": "dropped",
+      "reason": "Computed by the legacy collector from the retired SQLite session index; it appears only while that index holds rows from the last 30 days."
+    },
+    {
+      "scope": "family",
+      "name": "agent_sessions_activity_tokens",
+      "action": "dropped",
+      "reason": "Computed by the legacy collector from the retired SQLite session index; it appears only while that index holds rows from the last 30 days."
+    },
+    {
+      "scope": "family",
+      "name": "agent_sessions_activity_turns",
+      "action": "dropped",
+      "reason": "Computed by the legacy collector from the retired SQLite session index; it appears only while that index holds rows from the last 30 days."
+    },
+    {
+      "scope": "family",
+      "name": "agent_sessions_index_artifacts",
+      "action": "dropped",
+      "reason": "SQLite index retired; this family was emitted by legacy collect_sqlite."
+    },
+    {
+      "scope": "family",
+      "name": "agent_sessions_index_cold_available_sources",
+      "action": "dropped",
+      "reason": "SQLite index retired; this family was emitted by legacy collect_sqlite."
+    },
+    {
+      "scope": "family",
+      "name": "agent_sessions_index_database_bytes",
+      "action": "dropped",
+      "reason": "SQLite index retired; this family was emitted by legacy collect_sqlite."
+    },
+    {
+      "scope": "family",
+      "name": "agent_sessions_index_first_event_timestamp_seconds",
+      "action": "dropped",
+      "reason": "SQLite index retired; this family was emitted by legacy collect_sqlite."
+    },
+    {
+      "scope": "family",
+      "name": "agent_sessions_index_fts_coverage_ratio",
+      "action": "dropped",
+      "reason": "SQLite index retired; this family was emitted by legacy collect_sqlite."
+    },
+    {
+      "scope": "family",
+      "name": "agent_sessions_index_fts_rows",
+      "action": "dropped",
+      "reason": "SQLite index retired; this family was emitted by legacy collect_sqlite."
+    },
+    {
+      "scope": "family",
+      "name": "agent_sessions_index_hot_available_sources",
+      "action": "dropped",
+      "reason": "SQLite index retired; this family was emitted by legacy collect_sqlite."
+    },
+    {
+      "scope": "family",
+      "name": "agent_sessions_index_indexed_bytes",
+      "action": "dropped",
+      "reason": "SQLite index retired; this family was emitted by legacy collect_sqlite."
+    },
+    {
+      "scope": "family",
+      "name": "agent_sessions_index_last_event_timestamp_seconds",
+      "action": "dropped",
+      "reason": "SQLite index retired; this family was emitted by legacy collect_sqlite."
+    },
+    {
+      "scope": "family",
+      "name": "agent_sessions_index_last_refresh_timestamp_seconds",
+      "action": "dropped",
+      "reason": "SQLite index retired; this family was emitted by legacy collect_sqlite."
+    },
+    {
+      "scope": "family",
+      "name": "agent_sessions_index_message_source_bytes",
+      "action": "dropped",
+      "reason": "SQLite index retired; this family was emitted by legacy collect_sqlite."
+    },
+    {
+      "scope": "family",
+      "name": "agent_sessions_index_messages",
+      "action": "dropped",
+      "reason": "SQLite index retired; this family was emitted by legacy collect_sqlite."
+    },
+    {
+      "scope": "family",
+      "name": "agent_sessions_index_parse_errors",
+      "action": "dropped",
+      "reason": "SQLite index retired; this family was emitted by legacy collect_sqlite."
+    },
+    {
+      "scope": "family",
+      "name": "agent_sessions_index_query_duration_seconds",
+      "action": "dropped",
+      "reason": "SQLite index retired; this family was emitted by legacy collect_sqlite."
+    },
+    {
+      "scope": "family",
+      "name": "agent_sessions_index_rows",
+      "action": "dropped",
+      "reason": "SQLite index retired; this family was emitted by legacy collect_sqlite."
+    },
+    {
+      "scope": "family",
+      "name": "agent_sessions_index_sessions",
+      "action": "dropped",
+      "reason": "SQLite index retired; this family was emitted by legacy collect_sqlite."
+    },
+    {
+      "scope": "family",
+      "name": "agent_sessions_index_sidecar_bytes",
+      "action": "dropped",
+      "reason": "SQLite index retired; this family was emitted by legacy collect_sqlite."
+    },
+    {
+      "scope": "family",
+      "name": "agent_sessions_index_source_bytes",
+      "action": "dropped",
+      "reason": "SQLite index retired; this family was emitted by legacy collect_sqlite."
+    },
+    {
+      "scope": "family",
+      "name": "agent_sessions_index_sources",
+      "action": "dropped",
+      "reason": "SQLite index retired; this family was emitted by legacy collect_sqlite."
+    },
+    {
+      "scope": "family",
+      "name": "agent_sessions_index_sqlite_storage",
+      "action": "dropped",
+      "reason": "SQLite index retired; this family was emitted by legacy collect_sqlite."
+    },
+    {
+      "scope": "family",
+      "name": "agent_sessions_index_turn_average_duration_seconds",
+      "action": "dropped",
+      "reason": "SQLite index retired; this family was emitted by legacy collect_sqlite."
+    },
+    {
+      "scope": "family",
+      "name": "agent_sessions_index_turn_average_time_to_first_token_seconds",
+      "action": "dropped",
+      "reason": "SQLite index retired; this family was emitted by legacy collect_sqlite."
+    },
+    {
+      "scope": "family",
+      "name": "agent_sessions_index_turn_tokens",
+      "action": "dropped",
+      "reason": "SQLite index retired; this family was emitted by legacy collect_sqlite."
+    },
+    {
+      "scope": "family",
+      "name": "agent_sessions_index_turns",
+      "action": "dropped",
+      "reason": "SQLite index retired; this family was emitted by legacy collect_sqlite."
+    },
+    {
+      "scope": "family",
+      "name": "agent_sessions_index_version_info",
+      "action": "dropped",
+      "reason": "SQLite index retired; this family was emitted by legacy collect_sqlite."
+    },
+    {
+      "scope": "family",
+      "name": "agent_sessions_systemd_timer_last_trigger_timestamp_seconds",
+      "action": "dropped",
+      "reason": "Legacy systemd collection moved to the Alloy systemd collector; separate collector ownership."
+    },
+    {
+      "scope": "family",
+      "name": "agent_sessions_systemd_timer_next_trigger_timestamp_seconds",
+      "action": "dropped",
+      "reason": "Legacy systemd collection moved to the Alloy systemd collector; separate collector ownership."
+    },
+    {
+      "scope": "family",
+      "name": "agent_sessions_systemd_unit_last_duration_seconds",
+      "action": "dropped",
+      "reason": "Legacy systemd collection moved to the Alloy systemd collector; separate collector ownership."
+    },
+    {
+      "scope": "family",
+      "name": "agent_sessions_systemd_unit_last_exit_status",
+      "action": "dropped",
+      "reason": "Legacy systemd collection moved to the Alloy systemd collector; separate collector ownership."
+    },
+    {
+      "scope": "family",
+      "name": "agent_sessions_systemd_unit_last_start_timestamp_seconds",
+      "action": "dropped",
+      "reason": "Legacy systemd collection moved to the Alloy systemd collector; separate collector ownership."
+    },
+    {
+      "scope": "family",
+      "name": "agent_sessions_systemd_unit_result",
+      "action": "dropped",
+      "reason": "Legacy systemd collection moved to the Alloy systemd collector; separate collector ownership."
+    },
+    {
+      "scope": "family",
+      "name": "agent_sessions_systemd_unit_state",
+      "action": "dropped",
+      "reason": "Legacy systemd collection moved to the Alloy systemd collector; separate collector ownership."
+    },
+    {
+      "scope": "section",
+      "name": "index",
+      "action": "dropped",
+      "reason": "SQLite index retired."
+    },
+    {
+      "scope": "section",
+      "name": "systemd",
+      "action": "dropped",
+      "reason": "Systemd health is owned by the Alloy systemd collector, not this process."
+    },
+    {
+      "scope": "family",
+      "name": "agent_sessions_metrics_collection_runs_total",
+      "action": "rebase-allowed",
+      "reason": "Process-health counter may restart at zero at cutover; not a session or efficiency counter."
+    },
+    {
+      "scope": "family",
+      "name": "agent_sessions_metrics_collection_failures_total",
+      "action": "rebase-allowed",
+      "reason": "Process-health counter may restart at zero at cutover; not a session or efficiency counter."
+    }
+  ]
+}

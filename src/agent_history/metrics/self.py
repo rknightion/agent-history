@@ -20,6 +20,7 @@ class SelfCollector:
         self.failures = 0
         self.last_run_duration = 0.0
         self.last_complete_success = 0.0
+        self.collection_failed = False
 
     def record(self, collector: str, duration: float, failed: bool):
         self.durations[collector] = duration
@@ -32,6 +33,7 @@ class SelfCollector:
     def complete(self, duration: float, failed: bool):
         self.runs += 1
         self.failures += int(failed)
+        self.collection_failed = failed
         self.last_run_duration = duration
         if not failed:
             self.last_complete_success = time.time()
@@ -61,7 +63,7 @@ class SelfCollector:
             gauge(
                 "agent_sessions_metrics_collection_success",
                 "Whether every agent session metrics section succeeded on the latest run.",
-                int(bool(self.runs and all(self.success.values()))),
+                int(bool(self.runs and not self.collection_failed)),
             ),
             Family(
                 "agent_sessions_metrics_collection_runs_total",

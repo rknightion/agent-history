@@ -138,8 +138,25 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("collect-git", help="ingest commits of the configured [git] repos into ah.git_commit")
     sub.add_parser("mcp", help="run the read-only MCP server on stdio")
     sub.add_parser("exporter", help="serve Prometheus /metrics and /healthz")
+    metrics = sub.add_parser("metrics", help="metrics cutover validation")
+    parity = metrics.add_subparsers(dest="metrics_command", required=True).add_parser("parity")
+    from .metrics.parity import ROSTER
+
+    parity.add_argument("--legacy", required=True, help="legacy exposition file or HTTP URL")
+    parity.add_argument("--new", required=True, help="new exposition file or HTTP URL")
+    parity.add_argument("--roster", type=Path, default=ROSTER)
+    parity.add_argument("--legacy-at", help="actual capture time: Unix seconds or timezone-qualified ISO timestamp")
+    parity.add_argument("--new-at", help="actual capture time: Unix seconds or timezone-qualified ISO timestamp")
+    parity.add_argument(
+        "--ended-loop", action="append", default=[], help="concluded loop label requiring exact equality"
+    )
 
     args = parser.parse_args(argv)
+
+    if args.command == "metrics":
+        from .metrics.parity import run
+
+        return run(args)
 
     # Periodic workers reload config inside the suppressed single-shot iteration.
     if args.command in ("index", "embed") and args.every is not None:
@@ -236,7 +253,14 @@ def main(argv: list[str] | None = None) -> int:
             or config.dsn
         )
         builders = {
-            "archive": lambda: ArchiveCollector(setting.hot, setting.cold, setting.incoming, setting.conflicts),
+            "archive": lambda: ArchiveCollector(
+                setting.hot,
+                setting.cold,
+                setting.incoming,
+                setting.conflicts,
+                namespaces=config.sources,
+                labels=config.metrics_labels,
+            ),
             "catalogue": lambda: CatalogueCollector(dsn) if dsn else parser.error("exporter needs a reader DSN"),
             "runs": lambda: RunCollector(Path("/var/lib/alloy/textfile-agent-history")),
             "self": SelfCollector,
@@ -247,7 +271,9 @@ def main(argv: list[str] | None = None) -> int:
             builders["efficiency"] = lambda: EfficiencyCollector(config, setting.state_dir)
         collectors = [builders[name]() for name in setting.collectors]
         host, port = setting.listen.rsplit(":", 1)
-        with MetricServer((host, int(port)), collectors, State(setting.state_dir), setting.refresh_interval) as server:
+        with MetricServer(
+            (host, int(port)), collectors, State(setting.state_dir, config.metrics_labels), setting.refresh_interval
+        ) as server:
             server.serve_forever()
         return 0
 

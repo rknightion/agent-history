@@ -19,6 +19,18 @@ pi-local = "~/.pi/agent"
 # A second Claude Code home (CLAUDE_CONFIG_DIR) is just another namespace:
 # claude-client = "~/.claude-client"
 
+# Optional private trust list for exporter labels. Without this table (or if empty/malformed),
+# public model identifiers stay allowlisted; other models and standalone machines map to "other".
+# Only explicitly trusted standalone machines retain their namespace suffix. Configured sources
+# get zero file/byte series even when empty. Use neutral placeholders here, never private names.
+# [metrics_labels]
+# machines = ["worker-a"]
+# models = ["example-model"]
+
+# Efficiency collector. Workflow agent transcripts are counted unless disabled.
+# [efficiency]
+# workflow_transcripts = true
+
 # Named search scopes, not access-control boundaries. Search tools use the selected context's
 # namespaces (the `context` argument, else $AGENT_HISTORY_CONTEXT, else default_context), but the
 # MCP `sql` tool can read every row in the database. Use separate databases for real separation.

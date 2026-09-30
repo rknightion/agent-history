@@ -61,6 +61,21 @@ class EfficiencyCollector:
     def __init__(self, config: Config, state_dir: Path) -> None:
         self.config = config
         self.state_dir = Path(state_dir)
+        self.section_health: dict[str, tuple[float, bool]] = {}
+
+    def _claude_transcript(self, parts: tuple[str, ...]) -> bool:
+        """Session transcripts, their direct subagents and, unless disabled, workflow agents."""
+        if len(parts) < 3 or parts[0] != "projects":
+            return False
+        if len(parts) == 3 or (len(parts) == 5 and parts[3] == "subagents"):
+            return True
+        # Workflow journals only record agent state changes; they are not transcripts.
+        return (
+            self.config.efficiency.workflow_transcripts
+            and len(parts) == 7
+            and parts[3:5] == ("subagents", "workflows")
+            and parts[6].startswith("agent-")
+        )
 
     def collect(self) -> tuple[Family, ...]:
         now = time.time()
@@ -80,9 +95,10 @@ class EfficiencyCollector:
                     continue
                 parts = file.relative_to(home).parts
                 agent = namespace.split("-", 1)[0]
-                if agent == "claude" and (len(parts) < 3 or parts[0] != "projects"):
+                if agent == "claude" and not self._claude_transcript(parts):
                     continue
-                if agent == "codex" and parts[0] not in ("sessions", "archived_sessions"):
+                # archived_sessions holds moved copies of rollouts already counted from sessions/.
+                if agent == "codex" and parts[0] != "sessions":
                     continue
                 if agent == "pi" and (
                     parts[0] != "sessions"
@@ -93,6 +109,9 @@ class EfficiencyCollector:
                 sources[rel] = (file, stat.st_size, stat.st_mtime_ns)
         rules.efficiency_prune_loops(state, now)
         fresh_loop_map = None
+        self.section_health = {}
+        loop_started = time.monotonic()
+        loop_failed = True  # Like the legacy optional section, no DSN means no successful fetch.
         if self.config.efficiency.loop_dsn:
             try:
                 import psycopg
@@ -105,9 +124,11 @@ class EfficiencyCollector:
                     roots = db.execute(rules.LOOP_ROOTS_SQL).fetchall()
                     members = db.execute(rules.LOOP_MEMBERS_SQL).fetchall()
                 fresh_loop_map = rules.build_loop_map(roots, members, now)
+                loop_failed = False
             except Exception:
                 # The catalogue is optional: stale mapping is bounded by its recorded age.
                 pass
+        self.section_health["loops"] = (time.monotonic() - loop_started, loop_failed)
         loop_map = rules.efficiency_select_loop_map(state, fresh_loop_map, now)
         run = rules.EfficiencyRun(state, rules.LoopMap(loop_map))
         files = state["files"]

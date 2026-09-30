@@ -80,6 +80,7 @@ class Efficiency:
     baseline_ts: float = 0.0
     loop_dsn: str | None = None
     first_parse_days: int = 3
+    workflow_transcripts: bool = True
 
 
 # Exporter configuration (lane X). All roots are optional; no private paths are defaults.
@@ -95,6 +96,30 @@ class Exporter:
     conflicts: Path | None = None
 
 
+@dataclass(frozen=True)
+class MetricsLabels:
+    """Explicit trust for verbatim labels. Malformed input grants no trust."""
+
+    machines: frozenset[str] = frozenset()
+    models: frozenset[str] = frozenset()
+
+
+def _metrics_labels(value: Any) -> MetricsLabels:
+    if not isinstance(value, dict) or set(value) - {"machines", "models"}:
+        return MetricsLabels()
+    for key, items in value.items():
+        if not isinstance(items, list) or not all(
+            isinstance(item, str)
+            and item
+            and len(item) <= 128
+            and not any(ord(char) < 32 or ord(char) == 127 for char in item)
+            and (key != "machines" or re.fullmatch(r"[a-z0-9][a-z0-9-]{0,47}", item))
+            for item in items
+        ):
+            return MetricsLabels()
+    return MetricsLabels(frozenset(value.get("machines", [])), frozenset(value.get("models", [])))
+
+
 @dataclass
 class Config:
     dsn: str | None = None
@@ -108,6 +133,7 @@ class Config:
     embedding: Embedding = field(default_factory=Embedding)
     efficiency: Efficiency = field(default_factory=Efficiency)
     exporter: Exporter = field(default_factory=Exporter)
+    metrics_labels: MetricsLabels = field(default_factory=MetricsLabels)
     path: Path | None = None
 
     def namespaces(self, context: str | None = None) -> list[str]:
@@ -138,6 +164,7 @@ def parse_config(data: dict[str, Any], path: Path | None = None) -> Config:
         "embedding",
         "efficiency",  # lane C
         "exporter",
+        "metrics_labels",
     }
     unknown = set(data) - known
     if unknown:
@@ -172,14 +199,17 @@ def parse_config(data: dict[str, Any], path: Path | None = None) -> Config:
     emb = _table(data, "embedding")
     # Efficiency collector configuration (lane C).
     eff = _table(data, "efficiency")
-    unexpected = set(eff) - {"baseline_ts", "loop_dsn", "first_parse_days"}
+    unexpected = set(eff) - {"baseline_ts", "loop_dsn", "first_parse_days", "workflow_transcripts"}
     if unexpected:
         raise ConfigError(f"unknown efficiency keys: {', '.join(sorted(unexpected))}")
     efficiency = Efficiency(
         baseline_ts=float(eff.get("baseline_ts", 0.0)),
         loop_dsn=eff.get("loop_dsn"),
         first_parse_days=int(eff.get("first_parse_days", 3)),
+        workflow_transcripts=eff.get("workflow_transcripts", True),
     )
+    if not isinstance(efficiency.workflow_transcripts, bool):
+        raise ConfigError("efficiency workflow_transcripts must be true or false")
     if efficiency.first_parse_days < 0 or efficiency.baseline_ts < 0:
         raise ConfigError("efficiency baseline and first_parse_days must be non-negative")
     embedding = Embedding(
@@ -239,6 +269,7 @@ def parse_config(data: dict[str, Any], path: Path | None = None) -> Config:
         embedding=embedding,
         efficiency=efficiency,
         exporter=exporter,
+        metrics_labels=_metrics_labels(data.get("metrics_labels")),
         path=path,
     )
 

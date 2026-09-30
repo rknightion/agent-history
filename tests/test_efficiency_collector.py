@@ -81,16 +81,20 @@ def test_disappearing_transcript_does_not_block_other_sources(tmp_path: Path, mo
     bad, good = source / "bad.jsonl", source / "good.jsonl"
     bad.write_text(content)
     good.write_text(content)
+    injected = False
     if failure == "stat":
         original = Path.stat
-        calls = 0
+        is_file, is_symlink = Path.is_file, Path.is_symlink
+        # Discovery is not the rotation boundary. Isolate its predicates so this
+        # fault fires at the collector's explicit metadata read on every Python.
+        monkeypatch.setattr(Path, "is_file", lambda self: True if self == bad else is_file(self))
+        monkeypatch.setattr(Path, "is_symlink", lambda self: False if self == bad else is_symlink(self))
 
         def rotating_stat(self, *args, **kwargs):
-            nonlocal calls
+            nonlocal injected
             if self == bad:
-                calls += 1
-                if calls >= 2:
-                    raise FileNotFoundError("synthetic rotation")
+                injected = True
+                raise FileNotFoundError("synthetic rotation")
             return original(self, *args, **kwargs)
 
         monkeypatch.setattr(Path, "stat", rotating_stat)
@@ -98,7 +102,9 @@ def test_disappearing_transcript_does_not_block_other_sources(tmp_path: Path, mo
         original = Path.open
 
         def rotating_open(self, *args, **kwargs):
+            nonlocal injected
             if self == bad:
+                injected = True
                 raise FileNotFoundError("synthetic rotation")
             return original(self, *args, **kwargs)
 
@@ -110,6 +116,7 @@ def test_disappearing_transcript_does_not_block_other_sources(tmp_path: Path, mo
     families = EfficiencyCollector(config, state).collect()
     assert sum(s.value for f in families if f.name == "agent_efficiency_llm_calls_total" for s in f.samples) == 1
     assert (state / "efficiency-state.json").exists()
+    assert injected, "rotation fault must reach the explicit metadata/open boundary"
 
 
 def test_new_file_counts_only_events_inside_first_parse_window(tmp_path: Path, monkeypatch):
@@ -152,3 +159,32 @@ def test_new_file_counts_only_events_inside_first_parse_window(tmp_path: Path, m
     )
     families = EfficiencyCollector(config, tmp_path / "state").collect()
     assert sum(s.value for f in families if f.name == "agent_efficiency_llm_calls_total" for s in f.samples) == 1
+
+
+def test_transcript_sources_match_legacy_plus_opt_in_workflow_agents(tmp_path: Path):
+    """Workflow agent transcripts are opt-out; workflow journals and Codex archives never count."""
+    claude = tmp_path / "claude"
+    session = claude / "projects" / "example-project" / "session-a"
+    files = [
+        claude / "projects" / "example-project" / "session-a.jsonl",
+        session / "subagents" / "agent-direct.jsonl",
+        session / "subagents" / "workflows" / "wf-1" / "agent-workflow.jsonl",
+        session / "subagents" / "workflows" / "wf-1" / "journal.jsonl",
+        tmp_path / "codex" / "sessions" / "2026" / "rollout-a.jsonl",
+        tmp_path / "codex" / "archived_sessions" / "rollout-a.jsonl",
+    ]
+    for file in files:
+        file.parent.mkdir(parents=True, exist_ok=True)
+        file.write_text('{"type":"user"}\n')
+    sources = {"claude-local": str(claude), "codex-local": str(tmp_path / "codex")}
+
+    def tracked(**efficiency):
+        config = parse_config({"sources": sources, "efficiency": {"baseline_ts": 0, **efficiency}})
+        families = EfficiencyCollector(config, tmp_path / f"state-{len(efficiency)}").collect()
+        return value(families, "agent_efficiency_tracked_files")
+
+    # Legacy's set plus the workflow agent transcript: never the journal or the moved Codex copy.
+    assert tracked() == 4
+    assert tracked(workflow_transcripts=False) == 3
+    with pytest.raises(Exception):
+        parse_config({"efficiency": {"workflow_transcripts": "yes"}})

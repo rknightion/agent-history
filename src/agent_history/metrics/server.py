@@ -11,6 +11,8 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from agent_history.config import MetricsLabels
+
 from . import Collector, Family, Sample
 
 NAME = re.compile(r"^[a-zA-Z_:][a-zA-Z0-9_:]*$")
@@ -55,9 +57,20 @@ PUBLIC_MODELS = frozenset(
 )
 
 
-def _public_labels(labels: tuple[tuple[str, str], ...]) -> tuple[tuple[str, str], ...]:
+def _public_labels(
+    labels: tuple[tuple[str, str], ...], trusted: MetricsLabels = MetricsLabels()
+) -> tuple[tuple[str, str], ...]:
     return tuple(
-        (key, (value if value in PUBLIC_MODELS else "unknown" if not value or value == "unknown" else "other"))
+        (
+            key,
+            (
+                value
+                if value in PUBLIC_MODELS or value in trusted.models
+                else "unknown"
+                if not value or value == "unknown"
+                else "other"
+            ),
+        )
         if key == "model"
         else (key, value)
         for key, value in labels
@@ -85,10 +98,10 @@ def _source_samples(family: Family) -> tuple[Sample, ...]:
     return tuple(Sample(labels, value, name) for (name, labels), value in values.items())
 
 
-def _public_samples(samples: tuple[Sample, ...]) -> tuple[Sample, ...]:
+def _public_samples(samples: tuple[Sample, ...], trusted: MetricsLabels = MetricsLabels()) -> tuple[Sample, ...]:
     values: dict[tuple[str, tuple[tuple[str, str], ...]], float] = {}
     for sample in samples:
-        key = (sample.name, _public_labels(sample.labels))
+        key = (sample.name, _public_labels(sample.labels, trusted))
         values[key] = values.get(key, 0.0) + sample.value
     # Each histogram component and bucket bound is aggregated independently.
     return tuple(Sample(labels, value, name) for (name, labels), value in values.items())
@@ -105,7 +118,8 @@ class State:
     without resetting or summing their raw values before independent reset adjustment.
     """
 
-    def __init__(self, directory: Path):
+    def __init__(self, directory: Path, labels: MetricsLabels = MetricsLabels()):
+        self.labels = labels
         self.directory = directory
         self.file = directory / "counters.json"
         self.lock = threading.RLock()
@@ -128,10 +142,10 @@ class State:
                 if name in names:
                     samples.append(Sample(tuple(tuple(pair) for pair in labels), counter["value"], name))
             # Retain already-counted sources even when absent from the current scrape.
-            return _public_samples(tuple(samples))
+            return _public_samples(tuple(samples), self.labels)
 
     def value(self, name: str, labels: tuple[tuple[str, str], ...]) -> float:
-        public = _public_labels(labels)
+        public = _public_labels(labels, self.labels)
         for sample in self.public_samples({name}):
             if sample.labels == public:
                 return sample.value
@@ -183,7 +197,7 @@ def exposition(families: list[Family], state: State) -> str:
 
         sources = _source_samples(family)
         if family.type == "gauge":
-            public = _public_samples(sources)
+            public = _public_samples(sources, state.labels)
         else:
             # Adjust each ORIGINAL source independently before public-label summation.
             for sample in sources:
@@ -206,7 +220,9 @@ def exposition(families: list[Family], state: State) -> str:
                 raise ValueError("invalid sample value")
             value = raw
             labels = "{" + ",".join(f'{key}="{_escape(v)}"' for key, v in sample.labels) + "}" if sample.labels else ""
-            lines.append(f"{name}{labels} {value:g}")
+            # The legacy textfile format: integers exact, everything else to 12 significant digits.
+            rendered = str(int(value)) if value.is_integer() else format(value, ".12g")
+            lines.append(f"{name}{labels} {rendered}")
     return "\n".join(lines) + "\n"
 
 
@@ -246,6 +262,12 @@ class MetricServer(ThreadingHTTPServer):
                         if self_collector:
                             self_collector.record(collector.name, time.monotonic() - start, True)
                         # Isolate unavailable sources while retaining healthy families.
+                    finally:
+                        if self_collector:
+                            for name, (duration, section_failed) in getattr(collector, "section_health", {}).items():
+                                self_collector.record(name, duration, section_failed)
+                                if section_failed and name != "loops":
+                                    failed = True
                 if self_collector:
                     self_collector.complete(time.monotonic() - run_started, failed)
                     families.extend(self_collector.collect())
