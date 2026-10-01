@@ -51,7 +51,9 @@ def _config():
         raise ToolError(f"config: {exc}") from exc
 
 
-def _ns(context: str | None) -> tuple[list[str], str]:
+def _ns(context: str | list[str] | None, namespaces: list[str] | None = None) -> tuple[list[str], str]:
+    if namespaces or isinstance(context, list):
+        return list(namespaces or context), "explicit"
     config = _config()
     name = context or os.environ.get("AGENT_HISTORY_CONTEXT") or config.default_context
     try:
@@ -87,7 +89,9 @@ def _query_vector(text: str) -> str | None:
     """A query embedding from the configured provider within 3 s, else None (BM25-only)."""
     emb = _config().embedding
     if not emb.enabled:
-        return None
+        from .query_embedding import query_vector
+
+        return query_vector(text)
     try:
         body = json.dumps({"model": emb.model, "input": [text[:12000]], "dimensions": emb.dimensions}).encode()
         headers = {"Content-Type": "application/json", "User-Agent": "agent-history-mcp/1", **emb.headers}
@@ -200,7 +204,7 @@ def check_role(conn: psycopg.Connection) -> None:
 
 
 def _dsn() -> str:
-    dsn = os.environ.get("AGENT_HISTORY_READER_DSN") or _config().reader_dsn
+    dsn = os.environ.get("AGENT_HISTORY_READER_DSN") or os.environ.get("AGENT_HISTORY_MCP_DSN") or _config().reader_dsn
     if not dsn:
         raise ToolError("no reader DSN: set AGENT_HISTORY_READER_DSN or reader_dsn in the config")
     return dsn
@@ -282,12 +286,13 @@ def search(
     since: str | None = None,
     limit: int = 20,
     context: str | None = None,
+    namespaces: list[str] | None = None,
 ) -> str:
     """Search prompts, replies, sub-agent briefs/reports and compaction summaries by phrase.
 
     BM25 keyword search, fused with vector similarity when embeddings are configured (otherwise
     BM25 only, noted in the header). `since` takes '7d', '2w', '12h' or an ISO timestamp."""
-    return search_impl(query, mode, since, limit, context)
+    return search_impl(query, mode, since, limit, namespaces or context)
 
 
 def find_sessions_impl(query: str, context: str | None) -> str:
@@ -297,10 +302,10 @@ def find_sessions_impl(query: str, context: str | None) -> str:
 
 
 @mcp.tool()
-def find_sessions(query: str, context: str | None = None) -> str:
+def find_sessions(query: str, context: str | None = None, namespaces: list[str] | None = None) -> str:
     """Find past sessions by phrase. When a hit is a sub-agent, its root_session_uid is the session
     to resume."""
-    return find_sessions_impl(query, context)
+    return find_sessions_impl(query, namespaces or context)
 
 
 def _in_context(rows: list[dict[str, Any]], ns: list[str]) -> list[dict[str, Any]]:
@@ -310,6 +315,9 @@ def _in_context(rows: list[dict[str, Any]], ns: list[str]) -> list[dict[str, Any
 
 def session_impl(session_uid: str, agent_id: str, context: str | None = None) -> str:
     ns, ctx = _ns(context)
+    if context is None:
+        rows = _run("SELECT * FROM ah.session_timeline(%s, %s, %s, %s)", (session_uid, agent_id, 400, 200))
+        return _header(ctx) + "\n" + _json(rows)
     found = _run(
         "SELECT namespace FROM ah.session WHERE session_uid = %s AND agent_id = %s AND NOT is_stub",
         (session_uid, agent_id),
@@ -329,8 +337,10 @@ def session(session_uid: str, agent_id: str = "", context: str | None = None) ->
 
 def why_impl(sha: str, context: str | None = None) -> str:
     ns, ctx = _ns(context)
-    rows = _in_context(_run("SELECT * FROM ah.why(%s)", (sha.strip().lower(),)), ns)
-    return _header(ctx, ns) + "\n" + _json(rows)
+    rows = _run("SELECT * FROM ah.why(%s)", (sha.strip().lower(),))
+    if context is not None:
+        rows = _in_context(rows, ns)
+    return _header(ctx, ns if context is not None else None) + "\n" + _json(rows)
 
 
 @mcp.tool()
@@ -342,8 +352,10 @@ def why(sha: str, context: str | None = None) -> str:
 
 def touched_impl(path: str, context: str | None = None) -> str:
     ns, ctx = _ns(context)
-    rows = _in_context(_run("SELECT * FROM ah.who_touched(%s, %s)", (path, 200)), ns)[:50]
-    return _header(ctx, ns) + "\n" + _json(rows)
+    rows = _run("SELECT * FROM ah.who_touched(%s, %s)", (path, 200 if context is not None else 50))
+    if context is not None:
+        rows = _in_context(rows, ns)[:50]
+    return _header(ctx, ns if context is not None else None) + "\n" + _json(rows)
 
 
 @mcp.tool()
@@ -354,8 +366,11 @@ def touched(path: str, context: str | None = None) -> str:
 
 def loops_impl(limit: int, context: str | None = None) -> str:
     ns, ctx = _ns(context)
-    rows = _in_context(_run("SELECT * FROM ah.recent_loops(%s, %s)", (None, 100)), ns)[: _clamp(limit, 1, 100)]
-    return _header(ctx, ns) + "\n" + _json(rows)
+    lim = _clamp(limit, 1, 100)
+    rows = _run("SELECT * FROM ah.recent_loops(%s, %s)", (None, 100 if context is not None else lim))
+    if context is not None:
+        rows = _in_context(rows, ns)[:lim]
+    return _header(ctx, ns if context is not None else None) + "\n" + _json(rows)
 
 
 @mcp.tool()
@@ -372,9 +387,9 @@ def active_sessions_impl(minutes: int, context: str | None) -> str:
 
 
 @mcp.tool()
-def active_sessions(minutes: int = 15, context: str | None = None) -> str:
+def active_sessions(minutes: int = 15, context: str | None = None, namespaces: list[str] | None = None) -> str:
     """Root sessions with events in the last `minutes` minutes."""
-    return active_sessions_impl(minutes, context)
+    return active_sessions_impl(minutes, namespaces or context)
 
 
 def infra_actions_impl(host: str, around: str | None, window: str, context: str | None) -> str:
@@ -386,9 +401,15 @@ def infra_actions_impl(host: str, around: str | None, window: str, context: str 
 
 
 @mcp.tool()
-def infra_actions(host: str, around: str | None = None, window: str = "2 hours", context: str | None = None) -> str:
+def infra_actions(
+    host: str,
+    around: str | None = None,
+    window: str = "2 hours",
+    context: str | None = None,
+    namespaces: list[str] | None = None,
+) -> str:
     """Agent-driven remote actions (ssh/scp/rsync) against one host within a window around a time."""
-    return infra_actions_impl(host, around, window, context)
+    return infra_actions_impl(host, around, window, namespaces or context)
 
 
 def efficiency_impl(session_uid: str | None, agent_id: str | None, calls: bool, context: str | None) -> str:
@@ -471,6 +492,48 @@ def schema_impl(table: str | None) -> str:
 def schema(table: str | None = None) -> str:
     """Tables, views and columns in schema `ah` (optionally one name), plus function signatures."""
     return schema_impl(table)
+
+
+def search_summaries_impl(
+    query: str, since: str | None, limit: int, namespaces: list[str] | None = None, context: str | None = None
+) -> str:
+    ns, ctx = _ns(context, namespaces)
+    qvec = _query_vector(query)
+    rows = _run(
+        "SELECT summary_id, session_id, namespace, agent, session_uid, agent_id, analysed_at, "
+        "classification, project, title, objective, snippet, round(score::numeric, 3) AS score, "
+        "bm25_rank, vec_rank, cwd FROM ah.hybrid_search_summaries(%s, %s::halfvec, %s, %s, %s::integer, %s::real)",
+        (query, qvec, ns, _parse_when(since), _clamp(limit, 1, 200), _w_vec(query)),
+    )
+    return _header(ctx, ns, "" if qvec else "vector unavailable, BM25-only fallback") + "\n" + _json(rows)
+
+
+@mcp.tool()
+def search_summaries(
+    query: str,
+    since: str | None = None,
+    limit: int = 20,
+    namespaces: list[str] | None = None,
+    context: str | None = None,
+) -> str:
+    """Search journal summary title, objective and narrative, with BM25 fallback."""
+    return search_summaries_impl(query, since, limit, namespaces, context)
+
+
+def task_impl(task_key: str) -> str:
+    rows = _run(
+        "SELECT row_kind, task, task_title, task_status, weight, agent, namespace, session_uid, "
+        "agent_id, session_title, cwd, mentions, in_human, in_brief, first_ts, last_ts, wall_s, "
+        "tokens, output, priced_cost_usd, claude_cost_usd, commits FROM ah.task_effort(%s)",
+        (task_key,),
+    )
+    return _header(_ns(None)[1]) + "\n" + _json(rows)
+
+
+@mcp.tool()
+def task(task_key: str) -> str:
+    """Effort, tokens, priced cost and commits attributed to one backlog task."""
+    return task_impl(task_key)
 
 
 def main() -> int:

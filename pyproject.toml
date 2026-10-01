@@ -13,6 +13,8 @@ mcp = ["mcp>=2.0"]
 
 [project.scripts]
 agent-history = "agent_history.cli:main"
+agent-history-collect = "agent_history.collect_git:main"
+agent-history-mcp = "agent_history.mcp_server:main"
 
 [dependency-groups]
 dev = ["pytest>=8", "ruff==0.16.9", "mcp>=2.0"]

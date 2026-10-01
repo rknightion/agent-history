@@ -121,6 +121,15 @@ def _metrics_labels(value: Any) -> MetricsLabels:
 
 
 @dataclass
+class CollectorConfig:
+    machine: str | None = None
+    homes: dict[str, str] = field(default_factory=dict)
+    repo_contexts: dict[str, str] = field(default_factory=dict)
+    lock_file: Path = field(default_factory=lambda: Path.home() / ".local/state/agent-history/collect.lock")
+    journal_db: Path | None = None
+
+
+@dataclass
 class Config:
     dsn: str | None = None
     reader_dsn: str | None = None
@@ -131,6 +140,7 @@ class Config:
     identities: Identities = field(default_factory=Identities)
     git_repos: list[Path] = field(default_factory=list)
     git_days: int = 180
+    collector: CollectorConfig = field(default_factory=CollectorConfig)
     embedding: Embedding = field(default_factory=Embedding)
     efficiency: Efficiency = field(default_factory=Efficiency)
     exporter: Exporter = field(default_factory=Exporter)
@@ -163,6 +173,7 @@ def parse_config(data: dict[str, Any], path: Path | None = None) -> Config:
         "default_context",
         "identities",
         "git",
+        "collector",
         "embedding",
         "efficiency",  # lane C
         "exporter",
@@ -203,6 +214,27 @@ def parse_config(data: dict[str, Any], path: Path | None = None) -> Config:
         git_owners=frozenset(o.strip().lower().rstrip("/") for o in ident.get("git_owners", [])),
     )
     git = _table(data, "git")
+    col = _table(data, "collector")
+    allowed_collector = {"machine", "homes", "repo_contexts", "lock_file", "journal_db"}
+    if set(col) - allowed_collector:
+        raise ConfigError(f"unknown collector keys: {', '.join(sorted(set(col) - allowed_collector))}")
+    homes = col.get("homes", {})
+    repo_contexts = col.get("repo_contexts", {})
+    if not isinstance(homes, dict) or not all(
+        isinstance(p, str) and isinstance(n, str) and NAMESPACE.match(n) for p, n in homes.items()
+    ):
+        raise ConfigError("collector.homes must map home paths to namespaces")
+    if not isinstance(repo_contexts, dict) or not all(
+        isinstance(p, str) and isinstance(n, str) for p, n in repo_contexts.items()
+    ):
+        raise ConfigError("collector.repo_contexts must map repo slugs to contexts")
+    collector = CollectorConfig(
+        machine=col.get("machine"),
+        homes=homes,
+        repo_contexts={p.lower(): n for p, n in repo_contexts.items()},
+        lock_file=Path(col.get("lock_file", Path.home() / ".local/state/agent-history/collect.lock")).expanduser(),
+        journal_db=Path(col["journal_db"]).expanduser() if col.get("journal_db") else None,
+    )
     emb = _table(data, "embedding")
     # Efficiency collector configuration (lane C).
     eff = _table(data, "efficiency")
@@ -274,6 +306,7 @@ def parse_config(data: dict[str, Any], path: Path | None = None) -> Config:
         identities=identities,
         git_repos=[Path(p).expanduser() for p in git.get("repos", [])],
         git_days=int(git.get("days", 180)),
+        collector=collector,
         embedding=embedding,
         efficiency=efficiency,
         exporter=exporter,

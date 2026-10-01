@@ -82,6 +82,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--config", type=Path, help="config file (default $AGENT_HISTORY_CONFIG or ~/.config/agent-history/config.toml)"
     )
+    parser.add_argument("--format", choices=("aligned", "csv", "json", "expanded"), default="aligned")
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("init", help="apply the baseline schema, migrations and analytics SQL")
@@ -113,7 +114,7 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("postpass", help="run link resolution, rollups and loop tagging for dirty sessions")
     sub.add_parser("stats", help="row counts and meta")
 
-    srch = sub.add_parser("search", help="BM25 search over prompts, replies, briefs, reports and summaries")
+    srch = sub.add_parser("bm25-search", help="BM25 search over prompts, replies, briefs, reports and summaries")
     srch.add_argument("query")
     srch.add_argument("--context", help="named namespace set from the config (default: default_context)")
     srch.add_argument("--since", help="ISO timestamp lower bound")
@@ -152,6 +153,19 @@ def main(argv: list[str] | None = None) -> int:
     parity.add_argument(
         "--ended-loop", action="append", default=[], help="concluded loop label requiring exact equality"
     )
+
+    from . import reader
+
+    reader_parser = reader.build_parser()
+    reader_sub = next(a for a in reader_parser._actions if isinstance(a, argparse._SubParsersAction))
+    reader_commands = set(reader_sub.choices)
+    for name, child in reader_sub.choices.items():
+        sub.add_parser(name, parents=[child], add_help=False, help=child.description or child.prog)
+    col = sub.add_parser("collect", help="collect repository, CI, tracker, feature and permission metadata")
+    col.add_argument("--dry-run", action="store_true")
+    col.add_argument("--rescan-days", type=int)
+    journal = sub.add_parser("journal-sync", help="sync a read-only journal export view")
+    journal.add_argument("--source-db", type=Path)
 
     args = parser.parse_args(argv)
 
@@ -240,6 +254,43 @@ def main(argv: list[str] | None = None) -> int:
         print(f"agent-history: config: {exc}", file=sys.stderr)
         return 2
 
+    if args.command in reader_commands:
+        # Preserve the reader's arguments, SQL and output shape, including search's hybrid modes.
+        previous = {key: os.environ.get(key) for key in ("AGENT_HISTORY_CONFIG", "AGENT_HISTORY_READER_DSN")}
+        try:
+            if args.config:
+                os.environ["AGENT_HISTORY_CONFIG"] = str(args.config)
+            if args.dsn:
+                os.environ["AGENT_HISTORY_READER_DSN"] = args.dsn
+            args.cmd = args.command
+            return reader.execute(args)
+        finally:
+            for key, value in previous.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+    if args.command == "collect":
+        from .collect_git import main as collect_main
+
+        options = ["--config", str(args.config)] if args.config else []
+        if args.dry_run:
+            options.append("--dry-run")
+        if args.rescan_days is not None:
+            options.extend(["--rescan-days", str(args.rescan_days)])
+        return collect_main(options, dsn=args.dsn)
+
+    if args.command == "journal-sync":
+        from .journal_sync import sync
+
+        source = args.source_db or config.collector.journal_db
+        if source is None:
+            parser.error("journal-sync needs --source-db or collector.journal_db")
+        with load.connect(args.dsn or os.environ.get("AGENT_HISTORY_DSN") or config.dsn) as conn:
+            print(json.dumps(sync(conn, source), default=str))
+        return 0
+
     if args.command == "exporter":
         from .metrics.archive import ArchiveCollector
         from .metrics.catalogue import CatalogueCollector, RunCollector
@@ -292,11 +343,11 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(report, sort_keys=True))
             return 1 if any(r["refused"] for r in report.values()) else 0
 
-    if args.command in ("search", "efficiency"):
+    if args.command in ("bm25-search", "efficiency"):
         conn = _reader(args, config)
         try:
             namespaces = config.namespaces(args.context)
-            if args.command == "search":
+            if args.command == "bm25-search":
                 cur = conn.execute(
                     "SELECT ts, namespace, session_uid, agent_id, message_class, round(score::numeric, 3), snippet "
                     "FROM ah.search(%s, %s, %s::timestamptz, %s, %s)",

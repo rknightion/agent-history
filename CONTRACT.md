@@ -35,6 +35,9 @@ stored tool inputs/outputs and secrets captured in transcripts. Its connected mo
 receive that content when the agent includes returned tool results in its context. Contexts do not
 limit the `sql` tool. If embeddings are enabled, hybrid MCP `search` sends the raw query (up to 12,000
 characters, without redaction) to the configured embeddings endpoint; BM25-only search does not.
+Setting `AGENT_HISTORY_EMBED_ENV` also enables the legacy query-embedding provider, even when
+`[embedding]` is disabled. Hybrid/vector reader searches and hybrid MCP `search`/`search_summaries`
+then send up to 12,000 unredacted query characters to that environment file's provider endpoint.
 
 ## Derived data
 
@@ -145,3 +148,43 @@ and Claude raw-record origin to order events where recorded timestamps tie or di
 physical position. Existing catalogue rows do not acquire these fields merely by applying the
 migrations: rebuild from retained transcripts before relying on exact per-call parity. A rebuild
 cannot recover transcripts already deleted from their source homes.
+
+## Collector metadata
+
+The collector writes `task_prefix`, `backlog_task`, `git_commit`, `git_commit_file`, `ci_run`,
+`installed_feature` and `permission_log`. Git subjects, tracker titles, labels and project values,
+file paths, repository slugs, workflow names and installed-feature names are stored verbatim.
+Author emails are compared to configured identities but only `author_is_owner` is stored.
+Permission logs contribute timestamps, line hashes, tool names, command verbs, classifier reasons
+and sub-agent flags, never command arguments or target text. These metadata fields may themselves
+be sensitive. Protect collector homes, configuration and the catalogue accordingly.
+
+Repositories and homes are explicitly configured. A failed CI query is an attributable collection
+error, not a failed or successful CI run. Other repositories continue independently. Feature
+snapshots reconcile removed features; task removal and off-default git flags require a successful
+remote fetch. The collector changes remote-tracking git refs, never the working tree or tracker.
+The hourly collector validates the server's session and current role as dedicated `ah_ingest`,
+rejecting administrative privileges and catalogue-owning role membership before collection.
+The guard completes its transaction before writes so each metadata write can commit normally.
+The pre-existing writer/indexer `collect-git` path accepts the indexer's connection separately.
+
+## MCP compatibility
+
+The package supplies one MCP server, including `search_summaries`, `task` and `efficiency`.
+Explicit namespace overrides and configured contexts select search scopes, not permissions.
+Legacy provenance tools (`session`, `why`, `touched`, `loops`, `task`) default to unscoped output;
+the first four support explicit context filtering. Plain-reader role validation and the extended-protocol single-statement SQL guard remain required.
+Registering it can disclose unredacted catalogue content to the connected model provider, as
+stated above.
+
+## Journal summary source
+
+`journal-sync` reads only `ah_export_session_summary` in an operator-selected SQLite database,
+opened read-only with query-only mode. It stores title, objective, narrative, outcomes, unfinished
+items, classification, project, model and topics without redaction. Session identity joins use
+`(agent, session_uid, agent_id)`; unmatched summaries are retained. Watermarks make ordinary runs
+incremental. A daily full pass reconciles deletions, and a changed source instance identifier
+resets summary/topic rows before resync. Every selected record's required timestamp must parse
+with a timezone before any reset, batch write, deletion or metadata update. Invalid timestamps
+produce a visible skipped reason and preserve the entire previous journal catalogue state.
+It never drops or rewrites catalogue schema.

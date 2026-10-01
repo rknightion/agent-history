@@ -225,3 +225,73 @@ Test fixtures are synthetic. Never add a real transcript to `tests/fixtures`.
 
 MIT, see [LICENSE](LICENSE). ParadeDB is AGPL-3.0; this project talks to it over the network as a
 separate service and neither includes nor links its code.
+
+## Collector
+
+`agent-history collect` and `agent-history-collect` run the metadata collector once. Use
+`--dry-run` without a database, or `--rescan-days N` for an explicit wider git rescan. Configure
+`[git].repos` as explicit checkout paths and `[identities].git_owners` as allowed `host/owner`
+strings. Unlisted owners, forks and unknown fork status are skipped. The collector fetches the
+remote default branch before reading git objects; it never edits the checkout or its tracker.
+GitHub CI requires an authenticated `gh` CLI. A failed Actions request is reported against its
+repository and does not create a CI observation or prevent collection of other repositories.
+
+`[collector].homes` maps feature/permission-log home paths to namespace names. Feature locations
+are the homes' skills, plugins and MCP configuration; permission logs are `logs/permission-denied.jsonl`
+below each configured home. Optional keys are `machine`, `repo_contexts` (slug to context),
+`lock_file` and `journal_db`. Machine defaults to the local machine name, with
+`AGENT_HISTORY_MACHINE` as an override. There are no implicit repository or home scan roots.
+The collector DSN comes from `--dsn` on `collect`, then `AGENT_HISTORY_INGEST_DSN`,
+`AGENT_HISTORY_DSN` or the configured `dsn`. The legacy `AGENT_HISTORY_INGEST_ENV` PG-variable
+file is also supported when no DSN is configured. Both hourly entry points require session and
+current identity `ah_ingest`, without administrative privileges, schema/table ownership or
+membership in owning roles. Provision it separately with only the metadata-table privileges
+needed by the collector. This check does not apply to the separate writer/indexer `collect-git`
+command, which uses the indexer's existing connection.
+
+## Reader and MCP
+
+The reader commands retain their arguments and aligned/CSV/JSON/expanded output via
+`agent-history --format csv search QUERY --mode bm25 --since 7d`. `search` keeps the reader's
+hybrid/BM25/vector meanings; the former indexer BM25 command is now `bm25-search`. Reader commands
+use `AGENT_HISTORY_READER_DSN` or configured `reader_dsn`; a legacy PG-variable file may be
+selected with `AGENT_HISTORY_ENV`. Install `psql` for reader commands. Context and repository
+lookup come from the package configuration, with `AGENT_HISTORY_CONTEXT` and
+`AGENT_HISTORY_NATIVE_CONTEXT` available to select search and native resume-home contexts.
+
+Run `agent-history mcp` or `agent-history-mcp` after installing the `mcp` extra. The tool set
+includes `search_summaries` and `task`, retains explicit `namespaces` overrides, and includes
+`efficiency`. The existing plain-reader role checks and single-statement SQL guard remain in force.
+Contexts are search scopes, not access-control boundaries. For compatibility, `session`, `why`,
+`touched`, `loops` and `task` keep the reader's unscoped defaults; an explicit `context` on the
+first four opts into context filtering. The optional legacy embedding adapters
+read `AGENT_HISTORY_EMBED_ENV`; OpenAI/Cohere gateway routes require `EMBED_BASE_URL` alongside
+`EMBED_PROVIDER`, `EMBED_MODEL` and `CF_AIG_TOKEN`. Workers AI also reads `CF_ACCOUNT_ID` and optional
+`CF_AIG_GATEWAY_ID`. Otherwise query embedding uses `[embedding]` from the public config.
+
+Private command add-ons can import `agent_history.reader.main(argv, register, dispatch)`.
+`register(subparsers)` adds parsers; `dispatch(args)` returns an integer status when handled or
+`None` for public dispatch. The public reader exposes `run`, `query`, `since_sql`, `namespaces`
+and `context` for those add-ons.
+
+## Journal sync
+
+`agent-history journal-sync --source-db /opt/journal/app.db` reads only the
+`ah_export_session_summary` SQLite view, using a read-only connection. `collector.journal_db`
+can supply the source path instead. The destination uses `--dsn`, `AGENT_HISTORY_DSN` or `dsn`
+and needs write access to `ah.session_summary`, `ah.session_topic` and `ah.meta`.
+Mount the source database directory read-only, including SQLite WAL/SHM sidecars when present;
+mounting only the database file may hide recent WAL-backed rows. The catalogue DSN is supplied
+at runtime, never baked into the image. Run periodically if journal summaries are wanted:
+transcript indexing alone does not populate these tables. Instance changes cause a full resync;
+daily reconciliation removes summaries and topics no longer present in the source view. An invalid
+required source timestamp stops the selected sync before reset, reconciliation or watermark writes;
+existing summaries and topics remain unchanged and the result reports a skipped reason.
+
+## Synthetic fixture provenance
+
+All parser fixtures are toy records, not captures of real sessions or private prompt content.
+The pi records are generated by `tests/fixtures/pi/generate.py` (`just gen-fixtures`); the existing
+Claude and Codex fixtures were assembled synthetically for parser contracts. Collector and journal
+integration tests construct their own toy git repositories, SQLite records and disposable catalogue
+rows at runtime. Keep this provenance: do not replace them with actual transcripts or credentials.
