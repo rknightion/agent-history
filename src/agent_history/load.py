@@ -160,7 +160,7 @@ def inventory(hot: Path | None, cold: Path | None, namespaces: Iterable[str] | N
     return result
 
 
-def inventory_map(sources: dict[str, Path]) -> dict[str, SourceEntry]:
+def inventory_map(sources: dict[str, Path], *, strict: bool = False) -> dict[str, SourceEntry]:
     """Inventory from a namespace -> agent home map (config.py), e.g. claude-local -> ~/.claude.
 
     Only the subtrees a parser reads are walked: Claude projects/, Codex sessions/ and
@@ -168,6 +168,9 @@ def inventory_map(sources: dict[str, Path]) -> dict[str, SourceEntry]:
     """
     result: dict[str, SourceEntry] = {}
     for namespace, base in sorted(sources.items()):
+        if strict:
+            with os.scandir(base):
+                pass
         if not base.is_dir():
             continue
         agent, profile, machine = namespace_details(namespace)
@@ -175,9 +178,20 @@ def inventory_map(sources: dict[str, Path]) -> dict[str, SourceEntry]:
                 "pi": ("sessions",)}[agent]
         for top in tops:
             start = base / top
-            if not start.is_dir() or start.is_symlink():
+            if strict:
+                import stat
+                try:
+                    is_directory = stat.S_ISDIR(start.stat().st_mode)
+                except FileNotFoundError:
+                    continue
+            else:
+                is_directory = start.is_dir()
+            if not is_directory or start.is_symlink():
                 continue
-            for dirpath, dirnames, filenames in os.walk(start):
+            def walk_error(exc):
+                if strict:
+                    raise exc
+            for dirpath, dirnames, filenames in os.walk(start, onerror=walk_error):
                 dirnames[:] = sorted(d for d in dirnames if not d.startswith(".") and d != "_history")
                 for name in sorted(filenames):
                     if not name.endswith(".jsonl"):
@@ -189,10 +203,52 @@ def inventory_map(sources: dict[str, Path]) -> dict[str, SourceEntry]:
                     role = file_role(agent, parts)
                     if role is None:
                         continue
+                    if strict:
+                        with path.open('rb'):
+                            pass
                     rel = f"{namespace}/{'/'.join(parts)}"
                     result[rel] = SourceEntry(rel, namespace, agent, profile, machine, role,
                                               logical_uid(agent, role, parts), hot=path)
     return result
+
+
+def check_rebuild_sources(conn: psycopg.Connection, sources: dict[str, Path],
+                          cold_sources: dict[str, Path] | None = None
+                          ) -> tuple[dict[str, SourceEntry], dict[str, dict[str, int | bool]]]:
+    """Read-only preflight: no lock or mutation; diagnostics contain counts, never paths."""
+    cold_sources = cold_sources or {}
+    if set(cold_sources) - set(sources):
+        raise ValueError("cold_sources namespaces must have a hot source")
+    entries = inventory_map(sources)
+    report: dict[str, dict[str, int | bool]] = {}
+    catalogued: dict[str, set[str]] = {n: set() for n in cold_sources}
+    if cold_sources:
+        for namespace, rel in conn.execute("SELECT namespace, rel_path FROM ah.source_file"):
+            if namespace in catalogued:
+                catalogued[namespace].add(rel)
+    for namespace in sorted(sources):
+        hot_keys = {rel for rel, e in entries.items() if e.namespace == namespace}
+        cold_entries: dict[str, SourceEntry] = {}
+        unreadable = 0
+        if namespace in cold_sources:
+            try:
+                cold_entries = inventory_map({namespace: cold_sources[namespace]}, strict=True)
+            except OSError:
+                unreadable = 1
+        cold_keys = set(cold_entries)
+        missing = len(catalogued.get(namespace, set()) - hot_keys - cold_keys)
+        # An unreadable tree has unknown coverage; do not double-count its missing files.
+        count = unreadable or missing
+        report[namespace] = {"hot": len(hot_keys), "cold": len(cold_keys),
+                             "cold_only": len(cold_keys - hot_keys), "missing": missing,
+                             "unreadable": unreadable, "count": count, "refused": bool(count)}
+        for rel, cold_entry in cold_entries.items():
+            if rel in entries:
+                entries[rel].cold = cold_entry.path
+            else:
+                cold_entry.cold, cold_entry.hot = cold_entry.path, None
+                entries[rel] = cold_entry
+    return entries, report
 
 
 def cold_tier_ok(cold: Path | None, max_age_s: int = 48 * 3600) -> bool:
@@ -1180,7 +1236,8 @@ def create_post_load_indexes(conn: psycopg.Connection) -> None:
 def refresh(conn: psycopg.Connection, hot: Path | None = HOT_ROOT, cold: Path | None = COLD_ROOT,
             namespaces: Iterable[str] | None = None, limit_files: int | None = None,
             textfile: Path | None = TEXTFILE, log=print, kind: str = "refresh",
-            sources: dict[str, Path] | None = None) -> RunStats:
+            sources: dict[str, Path] | None = None,
+            source_entries: dict[str, SourceEntry] | None = None) -> RunStats:
     """Index new transcript bytes from `sources` (namespace -> agent home) or the hot/cold archive."""
     stats = RunStats()
     previous = previous_success_timestamp(textfile) if textfile else None
@@ -1199,8 +1256,9 @@ def refresh(conn: psycopg.Connection, hot: Path | None = HOT_ROOT, cold: Path | 
         apply_schema(conn)
         refresh_id = new_refresh(conn, kind)
         conn.commit()
-        entries = (inventory_map(sources) if sources is not None
-                   else inventory(hot, cold if cold_ok else None, namespaces))
+        entries = (source_entries if source_entries is not None else
+                   inventory_map(sources) if sources is not None else
+                   inventory(hot, cold if cold_ok else None, namespaces))
         existing = {r[1]: dict(zip(("id", "rel_path", "indexed_offset", "line_count", "checkpoint_start",
                                      "checkpoint_sha256", "head_sha256", "parser_version", "parser_state",
                                      "status", "mtime_ns", "tier"), r))
@@ -1351,19 +1409,36 @@ def unlock(conn: psycopg.Connection) -> None:
 
 
 def rebuild(conn: psycopg.Connection, hot: Path | None = HOT_ROOT, cold: Path | None = COLD_ROOT,
-            textfile: Path | None = TEXTFILE, log=print, sources: dict[str, Path] | None = None) -> RunStats:
+            textfile: Path | None = TEXTFILE, log=print, sources: dict[str, Path] | None = None,
+            cold_sources: dict[str, Path] | None = None) -> RunStats:
     """Empty every derived table and re-index from JSONL (parser upgrades, breaking fixes).
 
     Readers see a partial catalogue until it finishes. With the archive layout it refuses unless
     the cold archive is mounted with fresh receipts, so a rebuild can never silently drop cold-only
-    history. With a source map it re-indexes whatever the mapped homes still hold: transcripts
-    an agent has already deleted are gone from the catalogue after a rebuild.
+    history. Source maps optionally union cold directories, preferring hot copies, and refuse
+    before mutation if protected namespaces have unreadable cold trees or missing transcripts.
     """
+    source_entries = None
+    if sources is not None and cold_sources:
+        source_entries, report = check_rebuild_sources(conn, sources, cold_sources)
+        failures = [f'{n} count={r["count"]}' for n, r in report.items() if r['refused']]
+        if failures:
+            raise SystemExit('rebuild refused: ' + '; '.join(failures))
+        conn.commit()
     if sources is None and not cold_tier_ok(cold):
         raise SystemExit("rebuild refused: cold archive missing or receipts older than 48 h")
     if not try_lock(conn):
         raise SystemExit("rebuild refused: another index run holds the lock")
     try:
+        # A writer may have added protected paths after the read-only preflight.
+        # Re-inventory and validate the current catalogue while holding its lock,
+        # before dropping indexes, updating rows, or truncating any table.
+        if sources is not None and cold_sources:
+            source_entries, report = check_rebuild_sources(conn, sources, cold_sources)
+            failures = [f'{n} count={r["count"]}' for n, r in report.items() if r['refused']]
+            if failures:
+                raise SystemExit('rebuild refused: ' + '; '.join(failures))
+            conn.commit()
         with conn.transaction():
             for index in POST_LOAD_INDEXES:
                 conn.execute(f"DROP INDEX IF EXISTS ah.{index}")
@@ -1392,7 +1467,8 @@ def rebuild(conn: psycopg.Connection, hot: Path | None = HOT_ROOT, cold: Path | 
     finally:
         unlock(conn)
     try:
-        stats = refresh(conn, hot, cold, None, None, textfile, log, kind="rebuild", sources=sources)
+        stats = refresh(conn, hot, cold, None, None, textfile, log, kind="rebuild",
+                        sources=sources, source_entries=source_entries)
         with conn.transaction():
             for table, agent_col, agent_id_col in (("session_summary", "agent", "agent_id"),
                                                     ("session_topic", "session_agent", "session_agent_id")):

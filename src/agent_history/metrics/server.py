@@ -157,21 +157,47 @@ class State:
             prev = self.counters.get(key)
             if prev is None:
                 value = raw
+            elif raw >= prev["raw"]:
+                value = prev["value"] + raw - prev["raw"]
+            elif not float(prev["raw"]).is_integer() and prev["raw"] == float(format(raw, ".12g")):
+                # Only the exact legacy non-integer rendering is a rounding alias.
+                value = prev["value"]
             else:
-                value = prev["value"] + (raw if raw < prev["raw"] else raw - prev["raw"])
+                value = prev["value"] + raw
             if prev is None or prev["raw"] != raw:
                 self.counters[key] = {"raw": raw, "value": value}
-                self.directory.mkdir(parents=True, exist_ok=True)
-                temporary = self.file.with_suffix(".tmp")
-                with temporary.open("w") as out:
-                    json.dump(self.counters, out, sort_keys=True)
-                    out.flush()
-                    os.fsync(out.fileno())
-                os.replace(temporary, self.file)
+                self._save()
             return value
 
+    def forget_ended_loops(self, names: set[str], loops: set[str]) -> None:
+        """Drop only loops positively retired by the collector's retention policy."""
+        with self.lock:
+            ended = [
+                key
+                for key in self.counters
+                if (parsed := json.loads(key))[0] in names
+                and (loop := dict(tuple(pair) for pair in parsed[1]).get("loop")) is not None
+                and loop in loops
+            ]
+            for key in ended:
+                del self.counters[key]
+            if ended:
+                self._save()
 
-def exposition(families: list[Family], state: State) -> str:
+    def _save(self) -> None:
+        self.directory.mkdir(parents=True, exist_ok=True)
+        temporary = self.file.with_suffix(".tmp")
+        with temporary.open("w") as out:
+            json.dump(self.counters, out, sort_keys=True)
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(temporary, self.file)
+
+
+def exposition(families: list[Family], state: State, *, retired_loops: dict[str, set[str]] | None = None) -> str:
+    # Retirement is independent of family presence: the last loop may retire too.
+    for name, loops in (retired_loops or {}).items():
+        state.forget_ended_loops({name}, loops)
     lines: list[str] = []
     seen: set[str] = set()
     for family in families:
@@ -245,6 +271,8 @@ class MetricServer(ThreadingHTTPServer):
 
                 self_collector = next((c for c in self.collectors if isinstance(c, SelfCollector)), None)
                 families = []
+                retired_loops: dict[str, set[str]] = {}
+                retirement_collectors = []
                 run_started = time.monotonic()
                 failed = False
                 for collector in self.collectors:
@@ -255,6 +283,10 @@ class MetricServer(ThreadingHTTPServer):
                         # Materialize before adding: a generator may fail after yielding.
                         collected = list(collector.collect())
                         families.extend(collected)
+                        for name, loops in getattr(collector, "retired_loops", {}).items():
+                            retired_loops.setdefault(name, set()).update(loops)
+                        if getattr(collector, "retired_loops", {}) and hasattr(collector, "acknowledge_retired_loops"):
+                            retirement_collectors.append(collector)
                         if self_collector:
                             self_collector.record(collector.name, time.monotonic() - start, False)
                     except Exception:
@@ -271,7 +303,13 @@ class MetricServer(ThreadingHTTPServer):
                 if self_collector:
                     self_collector.complete(time.monotonic() - run_started, failed)
                     families.extend(self_collector.collect())
-                rendered = exposition(families, self.state)
+                rendered = exposition(families, self.state, retired_loops=retired_loops)
+                for collector in retirement_collectors:
+                    try:
+                        collector.acknowledge_retired_loops()
+                    except OSError:
+                        # Replay is safe: the collector keeps its durable pending signal.
+                        pass
                 self.snapshot = rendered
                 self.updated = time.monotonic()
             return self.snapshot

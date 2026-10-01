@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import threading
+
+import pytest
 from types import SimpleNamespace
 from urllib.request import urlopen
 
@@ -191,6 +193,47 @@ def test_efficiency_histogram_keeps_family_metadata_and_samples(tmp_path):
     assert exposition(list(families), State(tmp_path)) == output
 
 
+def test_rounded_restored_raw_is_not_a_reset(tmp_path):
+    # A raw recorded at 12 significant digits can exceed the lossless source by a rounding step;
+    # counting that as a reset doubled every such counter at the loop6 cutover.
+    key = State.key("agent_example_seconds_total", (("loop", "a"),))
+    (tmp_path / "counters.json").write_text(json.dumps({key: {"raw": 6462.96199942, "value": 6462.96199942}}))
+
+    def render(raw):
+        family = Family("agent_example_seconds_total", "counter", "Example.", (Sample((("loop", "a"),), raw),))
+        return exposition([family], State(tmp_path))
+
+    assert 'agent_example_seconds_total{loop="a"} 6462.96199942' in render(6462.961999416351)
+    assert 'agent_example_seconds_total{loop="a"} 6472.96199942' in render(6472.961999416351)
+    assert 'agent_example_seconds_total{loop="a"} 6475.96199942' in render(3)  # A real reset still counts.
+
+
+def test_pruned_loop_leaves_exposition_and_state(tmp_path):
+    # The efficiency collector drops a loop's series after its retention window, as the legacy
+    # textfile did; retained counter state must not keep carrying that loop forever.
+    def family(*samples):
+        return Family("agent_example_total", "counter", "Example.", tuple(samples))
+
+    both = family(
+        Sample((("loop", "a"), ("model", "m")), 4),
+        Sample((("loop", "b"), ("model", "m")), 5),
+        Sample((("loop", "b"), ("model", "n")), 6),
+    )
+    output = exposition([both], State(tmp_path))
+    assert 'loop="a"' in output
+    pruned = exposition([family(Sample((("loop", "b"), ("model", "m")), 5))], State(tmp_path))
+    assert 'loop="a"' in pruned  # Absence alone is not retirement.
+    pruned = exposition([], State(tmp_path), retired_loops={"agent_example_total": {"a"}})
+    assert 'loop="a"' not in pruned
+    assert "a" not in {
+        dict(json.loads(key)[1]).get("loop") for key in json.loads((tmp_path / "counters.json").read_text())
+    }
+    # A source that disappears while its loop is still emitted keeps its counted value.
+    assert 'agent_example_total{loop="b",model="other"} 11' in exposition([family()], State(tmp_path))
+    # An empty family is not proof that every loop ended.
+    assert 'agent_example_total{loop="b",model="other"} 11' in exposition([family()], State(tmp_path))
+
+
 def test_counter_never_falls_after_source_resets(tmp_path):
     state = State(tmp_path)
     assert "agent_example_total 9" in exposition(
@@ -203,3 +246,120 @@ def test_counter_never_falls_after_source_resets(tmp_path):
     assert "agent_example_total 14" in exposition(
         [Family("agent_example_total", "counter", "Example.", (Sample((), 5),))], restarted
     )
+
+
+def test_omitted_loop_preserves_offset(tmp_path):
+    def render(**raws):
+        return exposition(
+            [
+                Family(
+                    "agent_example_total",
+                    "counter",
+                    "Example.",
+                    tuple(Sample((("loop", loop),), raw) for loop, raw in raws.items()),
+                )
+            ],
+            State(tmp_path),
+        )
+
+    render(a=100, b=5)
+    render(b=5)
+    assert 'agent_example_total{loop="a"} 102' in render(a=2, b=5)
+
+
+@pytest.mark.parametrize(
+    "raw,lower",
+    [(1000000000, 999999999), (1000000000000000, 999999999999999), (6462.961999416351, 6462.961999416)],
+)
+def test_near_value_resets_and_current_state_compatibility(tmp_path, raw, lower):
+    # Existing live state needs no retirement metadata or migration.
+    key = State.key("agent_example_total", ())
+    (tmp_path / "counters.json").write_text(json.dumps({key: {"raw": raw, "value": raw + 10}}))
+    state = State(tmp_path)
+    assert state.observe("agent_example_total", (), raw) == raw + 10
+    # Each drop is a reset, not a generic relative-tolerance rounding allowance.
+    assert state.observe("agent_example_total", (), lower) == raw + 10 + lower
+
+
+def test_actual_collector_partial_cache_and_retirement(tmp_path, monkeypatch):
+    from agent_history.efficiency import parser as rules
+    from agent_history.metrics.efficiency import EfficiencyCollector
+
+    clock = [2000000000.0]
+    monkeypatch.setattr("agent_history.metrics.efficiency.time.time", lambda: clock[0])
+    directory = tmp_path / "collector"
+    directory.mkdir()
+    path = directory / "efficiency-state.json"
+    metric = "agent_efficiency_llm_calls_total"
+
+    def cache(**raws):
+        state = rules.read_efficiency_state(path, clock[0])
+        state["loops"] = {loop: clock[0] for loop in raws}
+        state["totals"] = {metric: {"pi\tpi-local\tsolo\tuser\t" + loop: raw for loop, raw in raws.items()}}
+        path.write_text(json.dumps(state))
+
+    collector = EfficiencyCollector(parse_config({}), directory)
+    offsets = State(tmp_path / "exporter")
+    server = MetricServer(("127.0.0.1", 0), [collector], offsets, refresh=0)
+    try:
+        cache(a=100, b=5)
+        server.metrics()
+        clock[0] += 10
+        cache(b=5)
+        assert 'loop="a"' in server.metrics()
+        cache(a=2, b=5)
+        assert 'loop="a",namespace="pi-local",role="solo",trigger="user"} 102' in server.metrics()
+        # A partial cache may also omit whole families previously emitted for this loop.
+        offsets.observe("agent_efficiency_first_spawn_seconds_sum", (("loop", "a"),), 10)
+        # The actual collector's retention decision removes persisted exporter offsets too.
+        clock[0] += rules.EFFICIENCY_LOOP_RETAIN_SECONDS + 1
+        assert 'loop="a"' not in server.metrics()
+        assert not offsets.counters
+    finally:
+        server.server_close()
+
+
+def test_failed_collector_does_not_apply_stale_retirement(tmp_path):
+    class Failed:
+        name = "efficiency"
+        retired_loops = {"agent_example_total": {"a"}}
+
+        def collect(self):
+            raise OSError("unavailable")
+
+    state = State(tmp_path)
+    state.observe("agent_example_total", (("loop", "a"),), 100)
+    server = MetricServer(("127.0.0.1", 0), [Failed()], state)
+    try:
+        server.metrics()
+        assert state.value("agent_example_total", (("loop", "a"),)) == 100
+    finally:
+        server.server_close()
+
+
+def test_retirement_replays_after_collector_restart(tmp_path, monkeypatch):
+    from agent_history.efficiency import parser as rules
+    from agent_history.metrics.efficiency import EfficiencyCollector
+
+    now = 2000000000.0
+    monkeypatch.setattr("agent_history.metrics.efficiency.time.time", lambda: now)
+    directory = tmp_path / "collector"
+    directory.mkdir()
+    path = directory / "efficiency-state.json"
+    state = rules.read_efficiency_state(path, now)
+    metric = "agent_efficiency_llm_calls_total"
+    state["loops"] = {"a": now - rules.EFFICIENCY_LOOP_RETAIN_SECONDS - 1}
+    state["totals"] = {metric: {"pi\tpi-local\tsolo\tuser\ta": 100}}
+    path.write_text(json.dumps(state))
+    offsets = State(tmp_path / "exporter")
+    offsets.observe(metric, (("loop", "a"),), 100)
+    config = parse_config({})
+    # Simulate the process dying after collector persistence, before exporter persistence.
+    EfficiencyCollector(config, directory).collect()
+    server = MetricServer(("127.0.0.1", 0), [EfficiencyCollector(config, directory)], offsets)
+    try:
+        server.metrics()
+        assert offsets.counters == {}
+        assert json.loads(path.read_text())["retired_loops"] == {}
+    finally:
+        server.server_close()

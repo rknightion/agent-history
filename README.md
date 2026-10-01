@@ -84,6 +84,7 @@ Optional, in `~/.config/agent-history/config.toml` (or `$AGENT_HISTORY_CONFIG`);
   isolate rows without row-level security, which this package does not implement.
 - **identities** and **git**: your email addresses and the local checkouts whose history
   `agent-history collect-git` ingests, so `why <sha>` can join a commit to the session that made it.
+  Migration 021 removes the legacy owner alias; move all catalogue readers and writers to `author_is_owner` before deploying it.
 - **embedding**: off by default. When enabled, the indexer sends chunks of `human_prompt`,
   `queued_prompt`, `assistant_text`, `subagent_brief`, `subagent_report` and `compaction_summary`
   messages, session-summary title/objective/narrative text, and failed tool-call/tool-op error
@@ -124,7 +125,7 @@ model call to the event that last changed the agent's state before it: `user`, `
 polling instead of waiting on events. It classifies Claude Code, Codex and pi. Exact per-call
 ordering needs result offsets and Claude record origins populated by a rebuild; older catalogue rows
 without them cannot establish the same-millisecond ordering. A rebuild cannot recover transcripts
-that have already been deleted (see CONTRACT.md).
+that have already been deleted (see CONTRACT.md). Optional `[cold_sources]` preserves cold-only history on rebuild; run `agent-history rebuild-check` for read-only tier counts and refusal decisions before rebuilding.
 
 The package ships the catalogue, search, classifier, application container and native `/metrics`
 exporter. The Compose template is for local deployment; no live metrics cutover is implied.
@@ -148,6 +149,7 @@ metadata and receipts, and catalogue collection reads database aggregates; those
 do not read transcript content. Archive roots (`hot`, `cold`, `incoming`, `conflicts`) are optional
 and must be mounted read-only if set.
 
+Non-string pi model values are treated as missing: the model remains unknown unless a valid string was previously recorded.
 At the public exposition boundary, `model` label values are restricted to an explicit literal
 allowlist of public model identifiers. Unlisted values become `other`, and empty values become
 `unknown`; persisted historical collector series pass through the same boundary. Counters are
@@ -155,6 +157,7 @@ reset-adjusted durably by original source identity before privacy-mapped labelse
 Histogram buckets, sums and counts follow the same policy. Original pre-privacy counter offsets
 are retained, and temporarily absent sources keep their already-counted contribution, so restarts
 and source disappearance/reappearance do not reset or double-count the public total.
+Loop offsets are removed only on an explicit successful collector retirement after the retention window; a falling raw is a reset except when the previous non-integer raw exactly equals the current raw rendered to 12 significant digits (the legacy rounding alias, which cannot distinguish a genuine reset to that same alias).
 Standalone archive namespace values become `<agent>-standalone`, and their machine values become
 `other`; counts and byte totals are summed, and modification-time extrema are retained. Metric
 family names, help, types and label keys do not change. An optional private `[metrics_labels]`

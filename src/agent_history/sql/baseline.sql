@@ -8,25 +8,6 @@ DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_extension WHERE extname =
 
 DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_namespace WHERE nspname = 'ah') THEN CREATE SCHEMA ah; END IF; END $$;
 
-CREATE FUNCTION ah.sync_git_commit_owner() RETURNS trigger
-    LANGUAGE plpgsql
-    AS $$
-BEGIN
-    IF TG_OP = 'INSERT' THEN
-        IF NEW.author_is_owner IS NOT NULL AND NEW.author_is_rob IS NOT NULL
-           AND NEW.author_is_owner IS DISTINCT FROM NEW.author_is_rob THEN
-            RAISE EXCEPTION 'conflicting owner flags';
-        END IF;
-        NEW.author_is_owner := COALESCE(NEW.author_is_owner, NEW.author_is_rob);
-        NEW.author_is_rob := NEW.author_is_owner;
-    ELSIF NEW.author_is_owner IS DISTINCT FROM OLD.author_is_owner THEN
-        NEW.author_is_rob := NEW.author_is_owner;
-    ELSIF NEW.author_is_rob IS DISTINCT FROM OLD.author_is_rob THEN
-        NEW.author_is_owner := NEW.author_is_rob;
-    END IF;
-    RETURN NEW;
-END $$;
-
 CREATE TABLE ah.artifact (
     id bigint NOT NULL,
     agent text NOT NULL,
@@ -281,7 +262,6 @@ CREATE TABLE ah.git_commit (
     sha text NOT NULL,
     context text NOT NULL,
     committed_at timestamp with time zone NOT NULL,
-    author_is_rob boolean,
     subject text,
     parent_count smallint,
     files_changed integer,
@@ -1497,8 +1477,6 @@ CREATE INDEX tool_op_seq_idx ON ah.tool_op USING btree (session_id, seq);
 CREATE INDEX tool_op_session_idx ON ah.tool_op USING btree (session_id, started_at);
 
 CREATE INDEX turn_started_idx ON ah.turn USING btree (started_at);
-
-CREATE TRIGGER git_commit_owner_sync BEFORE INSERT OR UPDATE ON ah.git_commit FOR EACH ROW EXECUTE FUNCTION ah.sync_git_commit_owner();
 
 ALTER TABLE ONLY ah.artifact
     ADD CONSTRAINT artifact_session_id_fkey FOREIGN KEY (session_id) REFERENCES ah.session(id) ON DELETE CASCADE;

@@ -19,6 +19,16 @@ pi-local = "~/.pi/agent"
 # A second Claude Code home (CLAUDE_CONFIG_DIR) is just another namespace:
 # claude-client = "~/.claude-client"
 
+# Optional namespace -> cold agent home (same projects/sessions layout as the hot home).
+# Rebuild unions these with [sources], preferring hot copies. An unreadable cold tree or a
+# catalogued transcript missing from both tiers refuses before truncate. Incremental index is unchanged.
+# Mount the archive read-only at /archive in containerised indexers, then configure each namespace.
+# [cold_sources]
+# claude-local = "/archive/claude-local"
+# codex-local = "/archive/codex-local"
+# pi-local = "/archive/pi-local"
+# `agent-history rebuild-check` reports per-namespace hot/cold/cold_only counts and refusal (exit 1).
+
 # Optional private trust list for exporter labels. Without this table (or if empty/malformed),
 # public model identifiers stay allowlisted; other models and standalone machines map to "other".
 # Only explicitly trusted standalone machines retain their namespace suffix. Configured sources

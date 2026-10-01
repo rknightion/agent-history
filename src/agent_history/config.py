@@ -125,6 +125,7 @@ class Config:
     dsn: str | None = None
     reader_dsn: str | None = None
     sources: dict[str, Path] = field(default_factory=dict)
+    cold_sources: dict[str, Path] = field(default_factory=dict)
     contexts: dict[str, list[str]] = field(default_factory=dict)
     default_context: str = "default"
     identities: Identities = field(default_factory=Identities)
@@ -157,6 +158,7 @@ def parse_config(data: dict[str, Any], path: Path | None = None) -> Config:
         "reader_dsn",
         "reader_dsn_file",
         "sources",
+        "cold_sources",
         "contexts",
         "default_context",
         "identities",
@@ -179,6 +181,11 @@ def parse_config(data: dict[str, Any], path: Path | None = None) -> Config:
         # The configured home itself may be a symlink (resolved here); symlinked transcript files
         # inside it are still skipped by the loader.
         sources[namespace] = Path(directory).expanduser().resolve()
+    cold_sources: dict[str, Path] = {}
+    for namespace, directory in _table(data, "cold_sources").items():
+        if namespace not in sources or not isinstance(directory, str) or not directory:
+            raise ConfigError("cold_sources must map configured source namespaces to directory strings")
+        cold_sources[namespace] = Path(directory).expanduser().resolve()
     contexts_raw = _table(data, "contexts")
     contexts: dict[str, list[str]] = {}
     for name, namespaces in contexts_raw.items():
@@ -261,6 +268,7 @@ def parse_config(data: dict[str, Any], path: Path | None = None) -> Config:
         dsn=_secret(data.get("dsn"), data.get("dsn_file"), None, "dsn"),
         reader_dsn=_secret(data.get("reader_dsn"), data.get("reader_dsn_file"), None, "reader_dsn"),
         sources=sources,
+        cold_sources=cold_sources,
         contexts=contexts,
         default_context=default_context,
         identities=identities,

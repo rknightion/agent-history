@@ -1810,7 +1810,9 @@ class EfficiencyParser:
         ):
             s["role"] = "root"
         if kind == "model_change":
-            s["model"] = record.get("modelId") or s["model"]
+            model = record.get("modelId")
+            if isinstance(model, str) and model:
+                s["model"] = model
         elif kind == "compaction":
             self.compaction(event_ts)
         elif kind == "custom_message":
@@ -1843,8 +1845,9 @@ class EfficiencyParser:
 
     def pi_assistant(self, ts: float | None, message: dict[str, Any]) -> None:
         s = self.s
-        if message.get("model"):
-            s["model"] = message["model"]
+        model = message.get("model")
+        if isinstance(model, str) and model:
+            s["model"] = model
         usage = message.get("usage")
         if isinstance(usage, dict) and usage:
             cache = int(usage.get("cacheRead") or 0)
@@ -2318,20 +2321,28 @@ def read_efficiency_state(path: Path, now: float) -> dict[str, Any]:
     return state
 
 
-def efficiency_prune_loops(state: dict[str, Any], now: float) -> None:
+def efficiency_prune_loops(state: dict[str, Any], now: float) -> dict[str, set[str]]:
     """Drop a loop's persisted series once it has had no counted event for the retention window.
 
     Grafana keeps the history; this only stops the textfile carrying finished loops forever.
     """
     expired = {label for label, seen in state["loops"].items() if now - float(seen) > EFFICIENCY_LOOP_RETAIN_SECONDS}
-    if not expired:
-        return
+    # Retirement is a loop decision, not a list of series present in a partial cache.
+    names = set(EFFICIENCY_COUNTERS)
+    names.update(family + suffix for family in EFFICIENCY_HISTOGRAMS for suffix in ("_bucket", "_sum", "_count"))
+    retired: dict[str, set[str]] = {metric: set(expired) for metric in names} if expired else {}
     for metric, series in state["totals"].items():
         index = efficiency_key_loop_index(metric)
         for key in [key for key in series if key.split("\t")[index] in expired]:
+            retired.setdefault(metric, set()).add(key.split("\t")[index])
             del series[key]
     for label in expired:
         del state["loops"][label]
+    # Keep the signal until the exporter durably consumes it, including across restarts.
+    pending = state.setdefault("retired_loops", {})
+    for metric, loops in retired.items():
+        pending[metric] = sorted(set(pending.get(metric, ())) | loops)
+    return {metric: set(loops) for metric, loops in pending.items()}
 
 
 def efficiency_select_loop_map(

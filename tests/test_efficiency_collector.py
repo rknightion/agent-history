@@ -58,6 +58,78 @@ def test_incremental_restart_and_partial_line(tmp_path: Path):
     assert value(fourth, "agent_efficiency_llm_calls_total", **labels) == 2
 
 
+@pytest.mark.parametrize("model", [{"unexpected": "model"}, ["unexpected"], 17])
+@pytest.mark.parametrize("record_kind", ["assistant", "model_change"])
+def test_malformed_pi_model_does_not_poison_cache_resume(tmp_path: Path, monkeypatch, model, record_kind):
+    fixed = datetime(2026, 9, 29, 20, tzinfo=timezone.utc)
+    monkeypatch.setattr("agent_history.metrics.efficiency.time.time", lambda: fixed.timestamp())
+    source = tmp_path / "pi" / "sessions" / "synthetic"
+    source.mkdir(parents=True)
+    transcript = source / "model.jsonl"
+
+    def line(record):
+        return json.dumps(record, separators=(",", ":")) + "\n"
+
+    def call(model_value, seconds=2):
+        return line(
+            {
+                "type": "message",
+                "timestamp": (fixed + timedelta(seconds=seconds)).isoformat(),
+                "message": {
+                    "role": "assistant",
+                    "model": model_value,
+                    "usage": {"input": 10, "output": 3},
+                    "content": [],
+                },
+            }
+        )
+
+    prompt = line({"type": "message", "timestamp": fixed.isoformat(), "message": {"role": "user", "content": "hello"}})
+    malformed = (
+        call(model)
+        if record_kind == "assistant"
+        else line({"type": "model_change", "timestamp": fixed.isoformat(), "modelId": model}) + call(None)
+    )
+    transcript.write_text(
+        line({"type": "session", "id": "synthetic", "timestamp": fixed.isoformat()}) + prompt + malformed
+    )
+    config = parse_config(
+        {"sources": {"pi-local": str(tmp_path / "pi")}, "efficiency": {"baseline_ts": 0, "first_parse_days": 1000}}
+    )
+    state = tmp_path / "state"
+    first = EfficiencyCollector(config, state).collect()
+    restarted = EfficiencyCollector(config, state)
+    second = restarted.collect()
+    with transcript.open("a") as output:
+        output.write(call("unsupported-model", seconds=3))
+    third = restarted.collect()
+
+    def calls(families):
+        return sum(s.value for f in families if f.name == "agent_efficiency_llm_calls_total" for s in f.samples)
+
+    counts = [calls(families) for families in (first, second, third)]
+    assert counts == [1, 1, 2], f"cold/restart/append-valid counts: {counts}"
+    for families in (first, second, third):
+        assert (
+            value(
+                families,
+                "agent_efficiency_model_calls_total",
+                agent="pi",
+                namespace="pi-local",
+                role="solo",
+                model="unknown",
+                loop="none",
+            )
+            == 1
+        )
+        assert not any(f.name == "agent_efficiency_context_fill_ratio" and f.samples for f in families)
+    saved = json.loads((state / "efficiency-state.json").read_text())
+    assert all(isinstance(item, str) for item in saved["models"])
+    assert all(entry["model"] is None or isinstance(entry["model"], str) for entry in saved["files"].values())
+    fourth = EfficiencyCollector(config, state).collect()
+    assert calls(fourth) == 2
+
+
 @pytest.mark.parametrize("failure", ["stat", "open"])
 def test_disappearing_transcript_does_not_block_other_sources(tmp_path: Path, monkeypatch, failure):
     source = tmp_path / "pi" / "sessions" / "synthetic"

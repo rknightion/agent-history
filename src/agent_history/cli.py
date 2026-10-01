@@ -106,6 +106,8 @@ def main(argv: list[str] | None = None) -> int:
 
     reb = sub.add_parser("rebuild", help="empty every derived table and re-index from the sources")
     reb.add_argument("--source", action="append", metavar="NAMESPACE=DIR")
+    check = sub.add_parser("rebuild-check", help="read-only source-tier counts and rebuild refusal decision")
+    check.add_argument("--source", action="append", metavar="NAMESPACE=DIR")
 
     sub.add_parser("create-indexes", help="create the BM25 indexes (done automatically after the first index)")
     sub.add_parser("postpass", help="run link resolution, rollups and loop tagging for dirty sessions")
@@ -284,6 +286,12 @@ def main(argv: list[str] | None = None) -> int:
 
         return mcp_main()
 
+    if args.command == "rebuild-check":
+        with _reader(args, config) as conn:
+            _, report = load.check_rebuild_sources(conn, _sources(config, args.source), config.cold_sources)
+            print(json.dumps(report, sort_keys=True))
+            return 1 if any(r["refused"] for r in report.values()) else 0
+
     if args.command in ("search", "efficiency"):
         conn = _reader(args, config)
         try:
@@ -327,7 +335,9 @@ def main(argv: list[str] | None = None) -> int:
                 _ensure_search_indexes(conn)
             return 1 if stats.errors else 0
         if args.command == "rebuild":
-            stats = load.rebuild(conn, None, None, None, sources=_sources(config, args.source))
+            stats = load.rebuild(
+                conn, None, None, None, sources=_sources(config, args.source), cold_sources=config.cold_sources
+            )
             return 1 if stats.errors else 0
         if args.command == "stats":
             print(json.dumps(load.stats_report(conn), indent=2, default=str))

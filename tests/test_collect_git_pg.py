@@ -72,16 +72,6 @@ def test_commits_are_ingested_with_owner_flag_and_no_email(clean, repo):  # noqa
         "WHERE repo_slug = 'github.com/example-org/widget' ORDER BY committed_at, subject"
     ).fetchall()
     assert sorted(rows) == [("add a", True, 1, 1), ("extend a", False, 1, 1)]
-    assert (
-        clean.execute(
-            "SELECT count(*) FROM ah.git_commit WHERE author_is_owner IS DISTINCT FROM author_is_rob"
-        ).fetchone()[0]
-        == 0
-    )
-    clean.execute("UPDATE ah.git_commit SET author_is_rob = false WHERE subject = 'add a'")
-    assert clean.execute("SELECT author_is_owner FROM ah.git_commit WHERE subject = 'add a'").fetchone() == (False,)
-    clean.execute("UPDATE ah.git_commit SET author_is_owner = true WHERE subject = 'add a'")
-    assert clean.execute("SELECT author_is_rob FROM ah.git_commit WHERE subject = 'add a'").fetchone() == (True,)
     dump = " ".join(str(v) for row in clean.execute("SELECT * FROM ah.git_commit").fetchall() for v in row)
     assert "@" not in dump
     assert clean.execute("SELECT count(*) FROM ah.git_commit_file").fetchone()[0] == 2

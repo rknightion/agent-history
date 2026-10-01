@@ -62,6 +62,7 @@ class EfficiencyCollector:
         self.config = config
         self.state_dir = Path(state_dir)
         self.section_health: dict[str, tuple[float, bool]] = {}
+        self.retired_loops: dict[str, set[str]] = {}
 
     def _claude_transcript(self, parts: tuple[str, ...]) -> bool:
         """Session transcripts, their direct subagents and, unless disabled, workflow agents."""
@@ -107,7 +108,7 @@ class EfficiencyCollector:
                     continue
                 rel = namespace + "/" + file.relative_to(home).as_posix()
                 sources[rel] = (file, stat.st_size, stat.st_mtime_ns)
-        rules.efficiency_prune_loops(state, now)
+        retired = rules.efficiency_prune_loops(state, now)
         fresh_loop_map = None
         self.section_health = {}
         loop_started = time.monotonic()
@@ -177,6 +178,12 @@ class EfficiencyCollector:
         run.commit()
         state["recent_calls"] = [x for x in state["recent_calls"] if x[0] >= now - rules.EFFICIENCY_ACTIVE_SECONDS]
         state["recent_calls"] = state["recent_calls"][-rules.EFFICIENCY_MAX_RECENT_CALLS :]
+        # A loop revived in this collection must not carry a pending retirement.
+        state["retired_loops"] = {
+            metric: sorted(loops - state["loops"].keys())
+            for metric, loops in retired.items()
+            if loops - state["loops"].keys()
+        }
         _save(path, state)
         rendered = _Series()
         rules.efficiency_emit(rendered, state, now, run)
@@ -198,4 +205,23 @@ class EfficiencyCollector:
             len(state["loops"]),
             help_text="Loop label values currently carried by the efficiency series (bounded; excludes none).",
         )
-        return rendered.families()
+        families = rendered.families()
+        # Publish only on success, and never retire a loop revived by this collection.
+        self.retired_loops = {metric: set(loops) for metric, loops in state["retired_loops"].items()}
+        return families
+
+    def acknowledge_retired_loops(self) -> None:
+        """Clear the pending signal only after exporter offsets are durably removed."""
+        if not self.retired_loops:
+            return
+        path = self.state_dir / "efficiency-state.json"
+        state = rules.read_efficiency_state(path, self.config.efficiency.baseline_ts)
+        pending = state.get("retired_loops", {})
+        for metric, loops in self.retired_loops.items():
+            remaining = set(pending.get(metric, ())) - loops
+            if remaining:
+                pending[metric] = sorted(remaining)
+            else:
+                pending.pop(metric, None)
+        _save(path, state)
+        self.retired_loops = {}

@@ -6,8 +6,7 @@ For each checkout it resolves the repo slug (host/owner/name) from the `origin` 
 default branch's commits from the last [git] days: subject, stats, parents, the reverted sha and
 whether the author email is one of [identities] owner_emails. Emails themselves are never stored.
 
-The owner match is ah.git_commit.author_is_owner; the legacy author_is_rob column stays in sync
-for existing catalogue readers and writers. Both mean "the author email is an owner identity".
+The owner match is ah.git_commit.author_is_owner: "the author email is an owner identity".
 """
 
 from __future__ import annotations
