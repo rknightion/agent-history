@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.2.0](https://github.com/rknightion/agent-history/compare/v0.1.0...v0.2.0) (2026-10-02)
+
+
+### Features
+
+* expose refresh-derived live loop lifecycle ([69cccf3](https://github.com/rknightion/agent-history/commit/69cccf313276bf74d43762d224569cb3f04c8147))
+
+
+### Bug Fixes
+
+* **collector:** decide remote ownership from the parsed host and owner ([1e349cd](https://github.com/rknightion/agent-history/commit/1e349cdc29469d566a7b2e750b7b288d23c08cb6))
+* **collector:** limit remote userinfo to what each transport cannot misread ([5daa7c2](https://github.com/rknightion/agent-history/commit/5daa7c23ba89a32139078d8ae7f35d671bd7e277))
+* generate the fresh catalogue ledger without optional pricing ([a9d78c5](https://github.com/rknightion/agent-history/commit/a9d78c5890a8ddbd01cecc5b0c21ef3bedb9a5ca))
+* **reader:** bound service resolution without overriding connection policy ([a250b11](https://github.com/rknightion/agent-history/commit/a250b112a1ce9224498609fe83c3ccd603b5d56a))
+* **reader:** honour service deadlines through blocking libpq ([a6abb8b](https://github.com/rknightion/agent-history/commit/a6abb8b312b3b251c8ebb3269e6649bdf3b79ede))
+* **reader:** resolve remote slugs with the collector grammar ([7c7dcd2](https://github.com/rknightion/agent-history/commit/7c7dcd293be2e08c3b912a3a2ca9cde6b69e84d0))
+* **release:** update project version in uv lockfile ([1ecdb36](https://github.com/rknightion/agent-history/commit/1ecdb365e9b4de8b5244333559d2e32217342e1d))
+* restore gpt-6.1-sol in the optional price seed ([094b5c9](https://github.com/rknightion/agent-history/commit/094b5c9e199d17cf12184711e529a364dab7c949))
+* transfer reader service credentials over private descriptor ([8fb1936](https://github.com/rknightion/agent-history/commit/8fb1936bb5cc41bc7cf92fea6835a574a350ada2))
+
+
+### Documentation
+
+* align contributor guidance with public security gates ([75579b6](https://github.com/rknightion/agent-history/commit/75579b6e415972502e4a24d35360976fc12725a3))
+
 ## 0.1.0 (2026-10-01)
 
 

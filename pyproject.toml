@@ -1,6 +1,6 @@
 [project]
 name = "agent-history"
-version = "0.1.0"
+version = "0.2.0"
 description = "Index Claude Code, Codex and pi agent transcripts into a ParadeDB catalogue, with BM25 search, a wait/poll efficiency classifier and a read-only MCP server."
 readme = "README.md"
 license = "MIT"
