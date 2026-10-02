@@ -1,13 +1,15 @@
--- Optional seed for ah.model_pricing (USD per million tokens): list prices as published on
--- 2026-09-25, applied to all history (effective_from 2000-01-01). Add a newer effective_from row
--- when a price changes. Long-context surcharges and fast modes are not modelled. Load with
--- `agent-history seed-pricing`; nothing else reads prices unless you seed them.
+-- Optional seed for ah.model_pricing (USD per million tokens): list prices as published on the
+-- date in each row's source, applied to all history (effective_from 2000-01-01). Add a newer
+-- effective_from row when a price changes. Long-context surcharges and fast modes are not modelled.
+-- Load with `agent-history seed-pricing`. A row that already exists is left as it is, so an
+-- operator's own price for a model is never replaced.
 
 SET search_path = ah, public;
 
 INSERT INTO model_pricing (model, effective_from, input_per_mtok, cached_input_per_mtok, cache_write_per_mtok,
                            cache_write_1h_per_mtok, output_per_mtok, source) VALUES
     ('gpt-6-astra',              '2000-01-01', 10.00, 1.00,  12.50, NULL, 50.00, 'openai pricing 2026-09-25'),
+    ('gpt-6.1-sol',              '2000-01-01',  2.00, 0.10,   2.50, NULL, 10.00, 'openai pricing 2026-09-29'),
     ('gpt-6-sol',                '2000-01-01',  2.00, 0.20,   2.50, NULL, 10.00, 'openai pricing 2026-09-25'),
     ('gpt-6-luna',               '2000-01-01',  0.10, 0.01,  0.125, NULL,  0.50, 'openai pricing 2026-09-25'),
     ('gpt-5.6-sol',              '2000-01-01',  4.00, 0.40,   5.00, NULL, 20.00, 'openai pricing 2026-09-25'),
