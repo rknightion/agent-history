@@ -295,22 +295,15 @@ def _normalise_host(value: str) -> str:
 
 
 def _repo_slug_from_remote(remote: str) -> str | None:
-    """host/owner/name from a git remote URL -- mirrors bin/agent-history-collect's repo_slug()."""
-    if not remote:
-        return None
-    url = remote.strip()
-    m = re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://(?:[^@/]+@)?([^/:]+)(?::\d+)?/(.+)$", url)
-    if not m:
-        m = re.match(r"^(?:[^@/]+@)?([^/:]+):(?!/)(.+)$", url)  # git@host:owner/name
-    if not m:
-        return None
-    host, path = m.group(1).lower(), m.group(2).strip("/")
-    if path.endswith(".git"):
-        path = path[:-4]
-    parts = [p for p in path.split("/") if p]
-    if len(parts) != 2:
-        return None
-    return f"{host}/{parts[0]}/{parts[1]}".lower()
+    """host/owner/name from a git remote URL, decided by the collector's own grammar.
+
+    The reader and the collector must agree on which remotes are a repository, so this calls
+    `collect_git.repo_slug` rather than carrying a second parser. The import is deferred: it needs
+    only the standard library and `.common`, and the other reader commands never pay for it.
+    """
+    from .collect_git import repo_slug
+
+    return repo_slug(remote)
 
 
 def find_local_checkout(repo_slug: str) -> Path | None:
