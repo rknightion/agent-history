@@ -13,15 +13,21 @@ CONTRACT.md before changing a parser, the loader, the schema or anything that re
   and in CI. Never commit with `--no-verify` and never set `core.hooksPath` in this repository.
 - `bin/leak-scan`, `bin/leak-terms-hash`, `bin/test_leak_scan.py` and `hooks/` are shared verbatim
   with another repository: change them there first, then copy them here unchanged.
-- `leak-patterns.public.txt` holds generic shapes only. Never add a real name, host or domain to
-  any committed file; the private term list lives outside the repository.
+- `leak-patterns.public.txt` holds generic shapes only; the private term list lives outside the
+  repository. Public code may name `camden` and system paths under `/opt`, `/etc`, `/usr/local`,
+  `/var/lib` and `/nasmount`. Never commit credentials or credential paths, real transcripts or
+  session files, personal emails or home paths, IP addresses, tailnet or private domains, Grafana
+  tenant or stack identifiers, customer, employer or work-organisation names, or private repository
+  names. Synthetic example identities remain subject to the public patterns and private-term gate.
 
 ## CI security audit
 
-The pinned shared zizmor reusable requires SARIF upload and cannot disable it through an input.
-This package instead uses the same pinned zizmor action with annotations and failing audit exit
-codes, preserving the hash-pin policy without requiring private-repository Code Scanning.
-Do not enable a paid security feature just to make that audit green.
+`.github/workflows/ci.yml` calls the shared `rknightion/.github/.github/workflows/zizmor.yml`
+reusable, pinned to `f32275a4a7641f34db5cb005d270db961b54a680` (v1.25.3). The caller grants
+`security-events: write`, `contents: read` and `actions: read` for its SARIF upload. Code Scanning
+and SARIF upload are available for this public repository without enabling a paid private-repository
+security feature. Keep the pinned reusable and the failing audit gate; do not bypass the audit or
+weaken the leak gate to make CI green.
 
 ## Content and tests
 
