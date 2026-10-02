@@ -2,7 +2,7 @@
 
 Pure, stdlib-only module. No imports from other project scripts, and no I/O beyond the explicit `read_file`
 injection point and the filesystem existence checks it documents below. Its public surface is
-`parse_launch` and `report_target`; do not import anything else from outside.
+`parse_launch`, `report_target` and `identity_fields`; do not import anything else from outside.
 
 A message is a launch when its operator text either:
 
@@ -17,6 +17,7 @@ The launch format is the fan-out loop protocol's: a root prompt naming one repor
 
 import datetime
 import hashlib
+import json
 import os
 import re
 from pathlib import Path
@@ -112,7 +113,7 @@ def _single_target(tokens, base, legacy):
         targets.setdefault(_resolve_token(token, base), token)
     if len(targets) != 1:
         return None
-    (report, token), = targets.items()
+    ((report, token),) = targets.items()
     return {"report": report, "loop": _extract_loop(token, legacy)}
 
 
@@ -173,6 +174,117 @@ def _finalize(legacy, target, text, launch_ts, hash_bytes):
         # (the launch file's contents for a bare-path launch), in seconds, or None.
         "budget": _budget_seconds(text),
     }
+
+
+def identity_fields(text, loop, goal_path=None, *, report=False):
+    """Extract exact identity metadata, never a basename or launch-file hash as a substitute.
+
+    A launch may carry an explicit canonical report header and/or a same-line goal manifest.
+    A recorded report must start with its header at byte zero. If Data exists its identity must
+    agree with that header. No file reads, remote lookups or command interpretation occur here.
+    """
+    result = {"repo": None, "loop": f"loop{loop}" if loop is not None else None, "goal_sha256": None}
+    header_pattern = r"# Loop: ([A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)?) (loop[0-9]+) · Goal: ([0-9a-f]{64})"
+    headers = set(re.findall(r"(?m)^" + header_pattern + r"\r?$", text))
+    if report:
+        first = re.fullmatch(header_pattern, re.split(r"\r\n|\r|\n", text, maxsplit=1)[0])
+        headers = {first.groups()} if first else set()
+    hashes = set()
+    if len(headers) == 1:
+        repo, label, digest = next(iter(headers))
+        if result["loop"] is None or label == result["loop"]:
+            valid = True
+            if report:
+                # Restrict the section to one JSON fence; unrelated fenced examples are not Data.
+                # Invalid/ambiguous Data cannot establish an exact report identity.
+                data = _identity_data(text)
+                valid = data is False or (
+                    data is not None
+                    and all(
+                        data.get(key) == value
+                        for key, value in (("repo", repo), ("loop", label), ("goal_sha256", digest))
+                    )
+                )
+            if valid:
+                result["loop"] = label
+                result["repo"] = repo if "/" in repo else None
+                hashes.add(digest)
+    if not report and goal_path:
+        # Only the exact goal path on the same physical line qualifies. In particular \s would
+        # consume a newline and accidentally attach the next packet's digest to this goal.
+        path = re.escape(goal_path)
+        for line in re.split(r"\r\n|\r|\n", text):
+            for pattern in (
+                r"^[ \t]*([0-9a-f]{64})[ \t]+" + path + r"[ \t]*$",
+                r"^[ \t]*(?:-[ \t]+)?(?:goal[ \t]+)?" + path + r"[ \t]+([0-9a-f]{64})[ \t]*$",
+            ):
+                match = re.fullmatch(pattern, line)
+                if match:
+                    hashes.add(match.group(1))
+    if len(hashes) == 1:
+        result["goal_sha256"] = next(iter(hashes))
+    return result
+
+
+def _identity_data(text):
+    """Return a Data object, False when absent, or None when invalid/ambiguous."""
+    sections, body, marker, in_data = [], [], None, False
+    for line in re.split(r"\r\n|\r|\n", text):
+        fence = re.fullmatch(r" {0,3}(`{3,}|~{3,})([^\r\n]*)", line)
+        if marker:
+            if in_data:
+                body.append(line)
+            if (
+                fence
+                and fence.group(1)[0] == marker[0]
+                and len(fence.group(1)) >= len(marker)
+                and not fence.group(2).strip()
+            ):
+                marker = None
+            continue
+        if re.match(r"^#{1,2} ", line):
+            if in_data:
+                sections.append(body)
+                body = []
+            in_data = line == "## Data"
+        elif in_data:
+            body.append(line)
+        if fence:
+            marker = fence.group(1)
+    if in_data:
+        sections.append(body)
+    if not sections:
+        return False
+    if len(sections) != 1:
+        return None
+    lines = sections[0]
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    while lines and not lines[-1].strip():
+        lines.pop()
+    section = "\n".join(lines)
+    match = re.fullmatch(r" {0,3}(`{3,}|~{3,})[ \t]*json[ \t]*\n(.*?)\n {0,3}([`~]{3,})[ \t]*", section, re.S)
+    if (
+        not match
+        or len(set(match.group(3))) != 1
+        or match.group(3)[0] != match.group(1)[0]
+        or len(match.group(3)) < len(match.group(1))
+    ):
+        return None
+
+    def unique(pairs):
+        obj = {}
+        for key, value in pairs:
+            if key in obj:
+                raise ValueError("duplicate Data member")
+            obj[key] = value
+        return obj
+
+    try:
+        value = json.loads(match.group(2), object_pairs_hook=unique)
+    except (ValueError, RecursionError):
+        return None
+    return value if isinstance(value, dict) else None
 
 
 def report_target(text, cwd, mode):

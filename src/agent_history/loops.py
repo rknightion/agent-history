@@ -19,7 +19,7 @@ from typing import Any
 import psycopg
 from psycopg.types.json import Jsonb
 
-from .loop_launch import parse_launch
+from .loop_launch import identity_fields, parse_launch
 
 ACTIVATED_AT = "1970-01-01T00:00:00Z"   # launches before this instant are ignored
 BARE_LAUNCH = re.compile(r"^`?\s*(\S*launch-[^\s`/]*\.(?:txt|md))\s*`?$")
@@ -105,7 +105,61 @@ def refresh_live(conn: psycopg.Connection) -> dict[str, int]:
             launch_ts = EXCLUDED.launch_ts, end_ts = EXCLUDED.end_ts,
             observed_at = EXCLUDED.observed_at
     """)
-    return {"live_loops": result.rowcount}
+    count = result.rowcount
+    _refresh_identity(conn)
+    return {"live_loops": count}
+
+
+def _refresh_identity(conn: psycopg.Connection) -> None:
+    """Re-project exact identity on every pass, including previously indexed launches.
+
+    Only recorded metadata is authoritative: never read the current checkout or goal/report files.
+    Report contents come from completed successful structured writes of the exact report path.
+    Shell command strings are not interpreted. Keep this independent of terminal-evidence tagging.
+    """
+    rows = conn.execute("""
+        SELECT l.launch_uid, l.root_session_id,
+               CASE WHEN l.naming = 'loop' THEN l.loop_number END, l.goal_path, l.report_path,
+               l.launch_ts, m.text,
+               (SELECT min(n.launch_ts) FROM ah.loop_run n
+                WHERE n.root_session_id = l.root_session_id AND n.launch_ts > l.launch_ts)
+        FROM ah.loop_run l JOIN ah.session s ON s.id = l.root_session_id
+        LEFT JOIN ah.message m ON m.session_id = s.id
+            AND l.launch_uid = s.agent || '/' || s.session_uid || '/' || s.agent_id || ':' || m.event_uid
+        WHERE l.launch_ts IS NOT NULL
+    """).fetchall()
+    for uid, root, number, goal_path, report_path, started, launch_text, following in rows:
+        fields = identity_fields(launch_text or "", number, goal_path)
+        if report_path:
+            for tool, raw in conn.execute("""
+                SELECT i.tool_name, i.input_text FROM ah.tool_io i
+                JOIN ah.tool_call t ON t.agent = i.agent AND t.call_uid = i.call_uid
+                JOIN ah.session s ON s.id = i.session_id
+                WHERE (s.id = %s OR s.root_session_id = %s) AND i.ts >= %s
+                  AND (%s::timestamptz IS NULL OR i.ts < %s)
+                  AND t.outcome = 'ok' AND t.ended_at IS NOT NULL
+                  AND lower(i.tool_name) ~ '(^|[.])write$'
+                  AND NOT COALESCE(i.input_truncated, false)
+                ORDER BY i.ts, i.id
+            """, (root, root, started, following, following)):
+                if (tool or "").rsplit(".", 1)[-1].lower() != "write":
+                    continue
+                try:
+                    args = json.loads(raw or "")
+                except (ValueError, RecursionError):
+                    continue
+                if not isinstance(args, dict):
+                    continue
+                path = args.get("file_path", args.get("path"))
+                content = args.get("content")
+                if path == report_path and isinstance(content, str) and content.startswith("# Loop: "):
+                    # Latest observed report identity supersedes launch metadata, including null
+                    # for a conflicting Data block or a legacy basename without an owner.
+                    fields = identity_fields(content, number, report=True)
+        conn.execute(
+            "UPDATE ah.loops SET repo = %s, loop = %s, goal_sha256 = %s WHERE launch_uid = %s",
+            (fields["repo"], fields["loop"], fields["goal_sha256"], uid),
+        )
 
 
 def _tag_root(conn: psycopg.Connection, root_id: int) -> int:

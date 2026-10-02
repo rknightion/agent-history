@@ -145,7 +145,31 @@ migration `022_live_loops.sql` on its first schema pass and fills the table duri
 refresh post-pass, including refreshes with no dirty sessions. Rebuild re-reads retained transcripts
 and refills it; rows whose source transcripts are gone cannot be recovered.
 
-The receiver seam is `status text`, `launch_ts timestamptz`, `end_ts timestamptz`:
+Migration `023_loop_identity.sql` adds the nullable receiver join fields `repo text`, `loop text`
+and `goal_sha256 text`. `repo` is an explicitly recorded `owner/repo`, never a directory or report
+basename. `loop` is the recognised launch's `loop<N>` label. `goal_sha256` is 64 lowercase hex for
+the goal, never the launch file's hash. Each unknown field is independently NULL, not guessed.
+
+A running launch can supply identity through an explicit canonical `# Loop: <owner/repo> loop<N> ·
+Goal: <sha256>` line, and its goal hash through a same-line manifest entry naming the exact goal
+path. Conflicting goal hashes leave only that hash unknown. There is no lookup of current files,
+Git remotes or directory names. Bare-path launches whose contents were not collected retain unknown
+identity fields. Legacy `wave<N>` launches are not asserted to have a `loop<N>` identity.
+
+Recorded report identity supersedes launch identity when a completed successful structured `Write`
+or `write` call records the exact report path and complete contents beginning with the header at
+byte zero. Its `## Data` identity, if present, must match line 1; invalid or ambiguous Data leaves
+repo and goal hash unknown. A legacy basename-only header leaves repo NULL while preserving its
+exact loop and goal hash. Shell commands and partial edits are not interpreted to reconstruct
+reports; absent captured report contents cannot establish report identity. These columns describe
+observed identity, independently of terminal-status evidence or report outcome.
+
+Every refresh, including a scheduled pass without dirty sessions, projects identity for existing
+launches. A dirty-session refresh also fills them; no rebuild is needed after migration. Rebuild
+recreates values from retained transcript evidence and preserves consumer table-level SELECT grants.
+The migration changes no grants or roles, and imposes no constraint or default on existing rows.
+
+The receiver seam also includes `status text`, `launch_ts timestamptz`, `end_ts timestamptz`:
 
 - `running`: no report-write or replacement-launch evidence, and the root's last recorded activity
   (or launch, if later) is within 24 hours of refresh. `end_ts` is NULL.
