@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -65,7 +65,7 @@ def identity(conn):
     return conn.execute("SELECT repo, loop, goal_sha256 FROM ah.loops").fetchone()
 
 
-def record_report(conn, text, *, success=True):
+def record_report(conn, text, *, success=True, report_ts=None):
     root = conn.execute("SELECT id FROM ah.session").fetchone()[0]
     conn.execute(
         "INSERT INTO ah.tool_call (agent, call_uid, session_id, tool_name, started_at, ended_at, "
@@ -75,8 +75,9 @@ def record_report(conn, text, *, success=True):
     conn.execute(
         "INSERT INTO ah.tool_io (agent, io_uid, session_id, namespace, profile, kind, tool_name, call_uid, ts, "
         "input_text, source_id, byte_offset) "
-        "VALUES ('claude','identity-report',%s,'claude-test','test','call','Write','identity-report',now(),%s,0,0)",
-        (root, json.dumps({"file_path": REPORT, "content": text})),
+        "VALUES ('claude','identity-report',%s,'claude-test','test','call','Write','identity-report',"
+        "COALESCE(%s::timestamptz, now()),%s,0,0)",
+        (root, report_ts, json.dumps({"file_path": REPORT, "content": text})),
     )
     conn.execute(
         "INSERT INTO ah.artifact (agent,event_uid,session_id,ts,kind,action,path,evidence_type,source_id,byte_offset) "
@@ -87,6 +88,63 @@ def record_report(conn, text, *, success=True):
     conn.commit()
     load.post_passes(conn)
     conn.commit()
+
+
+@pytest.mark.parametrize("case", ["distinct", "tied", "missing_launch", "ambiguous_report"])
+def test_superseding_launch_report_window(clean, tmp_path, case):
+    """A later same-path report must not supply an earlier launch's identity."""
+    source = tmp_path / "sessions"
+    project = source / "projects" / "synthetic-project"
+    project.mkdir(parents=True)
+    started = datetime.now(timezone.utc) - timedelta(seconds=10)
+    rows = []
+    for index, goal in enumerate((GOAL, "b" * 64)):
+        stamp = started + timedelta(seconds=index) if case == "distinct" else started
+        header = f"# Loop: example/project loop1 · Goal: {goal}"
+        if case == "ambiguous_report" and index == 1:
+            header = ""
+        rows.append(
+            {
+                "type": "user",
+                # Lexical UUID order intentionally opposes recorded message order.
+                "uuid": "launch-z" if index == 0 else "launch-a",
+                "sessionId": "synthetic-identity-root",
+                "timestamp": stamp.isoformat(),
+                "cwd": "/tmp/synthetic-project",
+                "message": {
+                    "role": "user",
+                    "content": f"You are the root. Write codex/report-synthetic-loop1.md.\n{header}",
+                },
+            }
+        )
+    (project / "11111111-1111-4111-8111-111111111111.jsonl").write_text(
+        "\n".join(json.dumps(row, separators=(",", ":")) for row in rows) + "\n"
+    )
+    assert load.refresh(clean, sources={"claude-test": source}, textfile=None, log=lambda *_: None).errors == 0
+    if case == "missing_launch":
+        clean.execute("DELETE FROM ah.message WHERE id = (SELECT min(id) FROM ah.message)")
+        clean.commit()
+    report_goal = GOAL if case == "ambiguous_report" else "b" * 64
+    record_report(
+        clean,
+        f"# Loop: example/project loop1 · Goal: {report_goal}\n",
+        report_ts=started if case == "ambiguous_report" else None,
+    )
+    expected = [("example/project", "loop1", GOAL), ("example/project", "loop1", "b" * 64)]
+    if case == "missing_launch":
+        expected[0] = (None, "loop1", None)
+    if case == "ambiguous_report":
+        # A report at the shared timestamp could precede the final launch. With no
+        # comparable cross-table event order, it cannot establish that launch's identity.
+        expected[1] = (None, "loop1", None)
+    query = (
+        "SELECT live.repo, live.loop, live.goal_sha256 FROM ah.loops live "
+        "JOIN ah.loop_run l USING (launch_uid) ORDER BY l.id"
+    )
+    assert clean.execute(query).fetchall() == expected
+    # Scheduled refresh must not undo the dirty-session projection.
+    assert load.post_passes(clean)["dirty_sessions"] == 0
+    assert clean.execute(query).fetchall() == expected
 
 
 def test_running_exact_launch_identity(clean, tmp_path):

@@ -121,36 +121,49 @@ def _refresh_identity(conn: psycopg.Connection) -> None:
         "SELECT NOT EXISTS (SELECT 1 FROM ah.meta WHERE key = 'loops_identity_projection_v1')"
     ).fetchone()[0]
     rows = conn.execute("""
-        SELECT l.launch_uid, l.root_session_id,
-               CASE WHEN l.naming = 'loop' THEN l.loop_number END, l.goal_path, l.report_path,
-               l.launch_ts, m.text,
-               (SELECT min(n.launch_ts) FROM ah.loop_run n
-                WHERE n.root_session_id = l.root_session_id AND n.launch_ts > l.launch_ts)
-        FROM ah.loop_run l JOIN ah.session s ON s.id = l.root_session_id
-        JOIN ah.loops live ON live.launch_uid = l.launch_uid
-        LEFT JOIN ah.message m ON m.session_id = s.id
-            AND l.launch_uid = s.agent || '/' || s.session_uid || '/' || s.agent_id || ':' || m.event_uid
-        WHERE l.launch_ts IS NOT NULL AND (
-            %s OR live.status = 'running' OR EXISTS (
-                SELECT 1 FROM dirty_now d JOIN ah.session changed ON changed.id = d.session_id
-                WHERE COALESCE(changed.root_session_id, changed.id) = l.root_session_id
-            )
+        WITH ordered_launches AS (
+            SELECT l.launch_uid, l.root_session_id,
+                   CASE WHEN l.naming = 'loop' THEN l.loop_number END AS number,
+                   l.goal_path, l.report_path, l.launch_ts, m.text,
+                   lead(l.launch_ts) OVER (
+                       PARTITION BY l.root_session_id ORDER BY l.launch_ts, m.id
+                   ) AS following,
+                   bool_and(COALESCE(m.ts = l.launch_ts, false)) OVER (
+                       PARTITION BY l.root_session_id
+                   ) AS window_known,
+                   count(*) OVER (PARTITION BY l.root_session_id, l.launch_ts) > 1 AS tied_start
+            FROM ah.loop_run l JOIN ah.session s ON s.id = l.root_session_id
+            LEFT JOIN ah.message m ON m.session_id = s.id
+                AND l.launch_uid = s.agent || '/' || s.session_uid || '/' || s.agent_id || ':' || m.event_uid
+            WHERE l.launch_ts IS NOT NULL
+        )
+        SELECT l.launch_uid, l.root_session_id, l.number, l.goal_path, l.report_path,
+               l.launch_ts, l.text, l.following, l.window_known, l.tied_start
+        FROM ordered_launches l JOIN ah.loops live ON live.launch_uid = l.launch_uid
+        WHERE %s OR live.status = 'running' OR EXISTS (
+            SELECT 1 FROM dirty_now d JOIN ah.session changed ON changed.id = d.session_id
+            WHERE COALESCE(changed.root_session_id, changed.id) = l.root_session_id
         )
     """, (initial,)).fetchall()
-    for uid, root, number, goal_path, report_path, started, launch_text, following in rows:
+    for uid, root, number, goal_path, report_path, started, launch_text, following, window_known, tied_start in rows:
         fields = identity_fields(launch_text or "", number, goal_path)
-        if report_path:
+        # Match _tag_root's (ts, id) order before filtering refresh candidates. Missing
+        # launch messages make report ownership uncertain, not permission to guess it.
+        if report_path and window_known:
             for tool, raw in conn.execute("""
                 SELECT i.tool_name, i.input_text FROM ah.tool_io i
                 JOIN ah.tool_call t ON t.agent = i.agent AND t.call_uid = i.call_uid
                 JOIN ah.session s ON s.id = i.session_id
                 WHERE (s.id = %s OR s.root_session_id = %s) AND i.ts >= %s
+                  AND (NOT %s OR i.ts > %s)
                   AND (%s::timestamptz IS NULL OR i.ts < %s)
                   AND t.outcome = 'ok' AND t.ended_at IS NOT NULL
                   AND lower(i.tool_name) ~ '(^|[.])write$'
                   AND NOT COALESCE(i.input_truncated, false)
                 ORDER BY i.ts, i.id
-            """, (root, root, started, following, following)):
+            """, (root, root, started, tied_start, started, following, following)):
+                # Tool IO ids and message ids have no shared ordering. A write at a
+                # tied launch timestamp may precede the final launch; ignore it.
                 if (tool or "").rsplit(".", 1)[-1].lower() != "write":
                     continue
                 try:
