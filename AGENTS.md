@@ -42,8 +42,12 @@ weaken the leak gate to make CI green.
 
 ## Schema
 
-`src/agent_history/sql/baseline.sql` is generated; never edit it. A schema change is a new numbered
-file in `src/agent_history/sql/migrations/`, additive in schema_version 1.
+`src/agent_history/sql/baseline.sql` is generated; never edit it. Its schema body is a schema-only
+`pg_dump`; `just gen-baseline-ledger` regenerates its seed-data trailer using
+`bin/baseline-ledger.py`, and `just check` verifies it. Classify new migrations there explicitly as
+recorded or replayed on fresh init. Migration 020 is pre-recorded without its optional pricing data;
+existing catalogues keep their own ledger. A schema change is a new numbered file in
+`src/agent_history/sql/migrations/`, additive in schema_version 1.
 
 ## Writing
 

@@ -1605,3 +1605,4 @@ INSERT INTO ah.meta (key, value) VALUES ('migration:016_tool_output_offset.sql',
 INSERT INTO ah.meta (key, value) VALUES ('migration:017_pi_artifact_evidence.sql', now()::text) ON CONFLICT (key) DO NOTHING;
 INSERT INTO ah.meta (key, value) VALUES ('migration:018_git_owner_alias.sql', now()::text) ON CONFLICT (key) DO NOTHING;
 INSERT INTO ah.meta (key, value) VALUES ('migration:019_message_record_origin.sql', now()::text) ON CONFLICT (key) DO NOTHING;
+INSERT INTO ah.meta (key, value) VALUES ('migration:020_gpt_6_1_sol_pricing.sql', now()::text) ON CONFLICT (key) DO NOTHING;

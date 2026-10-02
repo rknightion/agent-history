@@ -37,7 +37,7 @@ test:
 
 # The pre-commit gate: format, lint, tests and the leak gate
 [group('check')]
-check: fmt-check lint test leak
+check: fmt-check lint baseline-ledger-check test leak
 
 # check plus the legs that need a Docker daemon
 [group('check')]
@@ -69,6 +69,16 @@ pg-test:
     AGENT_HISTORY_TEST_ADMIN_DSN="postgresql://postgres:${admin}@${base}" \
     AGENT_HISTORY_CONFIG=/dev/null/absent \
         uv run --locked --group dev python -m pytest -q -rs tests
+
+# Verify the generated fresh-init migration ledger against the classified migrations
+[group('check')]
+baseline-ledger-check:
+    python3 bin/baseline-ledger.py
+
+# Regenerate the baseline's seed-data trailer, retaining the schema-only dump
+[group('gen')]
+gen-baseline-ledger:
+    python3 bin/baseline-ledger.py --write
 
 # Regenerate the synthetic pi session fixtures
 [group('gen')]
