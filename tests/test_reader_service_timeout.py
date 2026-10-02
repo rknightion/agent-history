@@ -8,7 +8,7 @@ import threading
 import time
 
 import pytest
-from psycopg.conninfo import make_conninfo
+from psycopg.conninfo import conninfo_to_dict, make_conninfo
 
 from agent_history import reader
 
@@ -128,3 +128,41 @@ def test_reader_service_default_timeout_is_transferred_to_psql(monkeypatch, tmp_
     monkeypatch.setenv("AGENT_HISTORY_READER_DSN", make_conninfo(dsn, service="synthetic"))
     assert reader.load_env()["PGCONNECT_TIMEOUT"] == "5"
     assert "PGCONNECT_TIMEOUT" not in os.environ
+
+
+@pytest.mark.parametrize(
+    "source, through_service",
+    [("dsn", False), ("dsn", True), ("service", True), ("environment", False), ("environment", True)],
+)
+def test_rejected_password_from_any_source_is_in_no_error_text(tmp_path, source, through_service):
+    dsn = os.environ.get("AGENT_HISTORY_TEST_READER_DSN", "")
+    if "agent_history_test" not in dsn:
+        pytest.skip("AGENT_HISTORY_TEST_READER_DSN (a *_test database) not set")
+    target = conninfo_to_dict(dsn)
+    target.pop("password", None)
+    # The server rejects this password, so the failure is a real authentication error
+    # from the real connection path, not a simulated one.
+    password = "synthetic-" + "rejected-" + source
+    env = service_environment(tmp_path)
+    (tmp_path / "service.conf").write_text("[synthetic]\n" + (f"password={password}\n" if source == "service" else ""))
+    if source == "environment":
+        env["PGPASSWORD"] = password
+    if through_service:
+        target["service"] = "synthetic"
+    if source == "dsn":
+        target["password"] = password
+    env["AGENT_HISTORY_READER_DSN"] = make_conninfo("", **target)
+    result = subprocess.run(
+        [sys.executable, "-c", "from agent_history.reader import query; query('SELECT 1', {})"],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode != 0
+    assert result.stderr.startswith("agent-history: ")
+    assert password not in result.stdout + result.stderr
+    if not through_service:
+        # psql's own report: where it connected and why that failed.
+        assert str(target["port"]) in result.stderr
+        assert "password authentication failed" in result.stderr
