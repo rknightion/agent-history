@@ -7,6 +7,12 @@ CONTRACT.md before changing a parser, the loader, the schema or anything that re
 
 `just check` is the gate before every commit. `just ci` adds the database tests and needs Docker.
 
+## Task tracking
+
+This repository has no task board and does not use GitHub Issues for planned work: the maintainer
+tracks it on a private board. Never initialise a Backlog board here, and never write a private task
+id into a file, commit message or pull request.
+
 ## Leak gate
 
 - `bin/leak-scan` runs from the git hooks in `hooks/` (installed by `just setup`), in `just check`
