@@ -136,6 +136,34 @@ them; after a `kind = 'rebuild'` row in `ah.change_log`, re-page any cursor from
 - `ah.session_timeline`, `ah.find_sessions`, `ah.why`, `ah.who_touched`, `ah.recent_loops`,
   `ah.active_sessions`, `ah.infra_actions` back the MCP tools.
 
+## Live loop lifecycle (`ah.loops`)
+
+`ah.loops` is a migration-owned table, not an analytics alias. Consumers may grant SELECT on it;
+analytics re-application and rebuild preserve that grant. Each recognised, timestamped launch has
+one row keyed by `launch_uid` (the same stable natural key as `ah.loop_run`). The indexer applies
+migration `022_live_loops.sql` on its first schema pass and fills the table during the following
+refresh post-pass, including refreshes with no dirty sessions. Rebuild re-reads retained transcripts
+and refills it; rows whose source transcripts are gone cannot be recovered.
+
+The receiver seam is `status text`, `launch_ts timestamptz`, `end_ts timestamptz`:
+
+- `running`: no report-write or replacement-launch evidence, and the root's last recorded activity
+  (or launch, if later) is within 24 hours of refresh. `end_ts` is NULL.
+- `finished`: the transcript records a write/edit/create/update/add of the launch's report path,
+  or the next recognised launch in the same root replaces it. `end_ts` is that evidence timestamp.
+  This is an observed end, not a claim of success or a parsed report outcome.
+- `stale`: no terminal evidence and no root activity within 24 hours. `end_ts` is the last recorded
+  root activity (at least `launch_ts`), not an inferred death time. A loop that died without a
+  report becomes stale, never finished; new root activity can make it running again.
+
+`launch_ts` is the operator launch message timestamp. `observed_at timestamptz` is the last refresh's
+transaction timestamp. Running means running **as of that refresh**, not verified process liveness.
+A silent live root may be stale after 24 hours; a dead root may appear running for up to 24 hours,
+plus the delay until the next successful refresh. No refresh schedule or maximum indexing lag is
+guaranteed by this package. Consumers should check `observed_at` when freshness matters. Child-only
+activity is not root activity. Neither report-path parsing quality (`loop_run.status`) nor its
+fallback `root_last_event` end timestamp is terminal evidence. No heartbeat or phase feed is used.
+
 ## Efficiency classifier
 
 `ah.efficiency_calls(namespaces, session_uid, agent_id)` returns one row per model call with its

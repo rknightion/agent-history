@@ -5,7 +5,9 @@ Skipped unless AGENT_HISTORY_TEST_DSN points at a scratch database the tests may
 
 from __future__ import annotations
 
+import json
 import os
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -32,7 +34,99 @@ def conn():
 def clean(conn):
     conn.execute("TRUNCATE " + ", ".join(f"ah.{table}" for table in load.DATA_TABLES) + " RESTART IDENTITY CASCADE")
     conn.commit()
-    return conn
+    yield conn
+    conn.rollback()
+
+
+@pytest.fixture
+def launched(clean, tmp_path):
+    """A real indexed launch, old enough to exercise silence without sleeping."""
+    at = (datetime.now(timezone.utc) - timedelta(hours=25)).isoformat()
+    source = tmp_path / "sessions"
+    project = source / "projects" / "synthetic-project"
+    project.mkdir(parents=True)
+    path = project / "11111111-1111-4111-8111-111111111111.jsonl"
+    path.write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "uuid": "synthetic-launch",
+                "sessionId": "synthetic-live-root",
+                "timestamp": at,
+                "cwd": "/tmp/synthetic-project",
+                "message": {"role": "user", "content": "You are the root. Write codex/report-synthetic-loop1.md."},
+            },
+            separators=(",", ":"),
+        )
+        + "\n"
+    )
+    sources = {"claude-test": source}
+    stats = load.refresh(clean, sources=sources, textfile=None, log=lambda *_: None)
+    assert stats.errors == 0 and stats.files_parsed == 1
+    clean.execute("UPDATE ah.session SET last_event_at = now()")
+    clean.commit()
+    load.post_passes(clean)
+    clean.commit()
+    return sources
+
+
+def test_live_loop_report_and_next_launch(clean, launched):
+    assert clean.execute("SELECT status, end_ts FROM ah.loops").fetchone() == ("running", None)
+    root_id = clean.execute("SELECT id FROM ah.session").fetchone()[0]
+    clean.execute(
+        "INSERT INTO ah.artifact (agent, event_uid, session_id, ts, kind, action, path, "
+        "evidence_type, source_id, byte_offset) VALUES ('claude', 'synthetic-report', %s, now(), "
+        "'file', 'write', '/tmp/synthetic-project/codex/report-synthetic-loop1.md', 'tool', 0, 0)",
+        (root_id,),
+    )
+    clean.execute("INSERT INTO ah.dirty_session (session_id) VALUES (%s) ON CONFLICT DO NOTHING", (root_id,))
+    clean.commit()
+    load.post_passes(clean)
+    row = clean.execute("SELECT status, end_ts FROM ah.loops").fetchone()
+    assert row[0] == "finished" and row[1] is not None
+    # Supersession is terminal evidence too, not an inferred stale failure.
+    clean.execute("UPDATE ah.loop_run SET end_evidence = 'next_launch'")
+    clean.commit()
+    load.post_passes(clean)
+    assert clean.execute("SELECT status FROM ah.loops").fetchone() == ("finished",)
+
+
+def test_silent_loop_expires_without_dirty_sessions_and_can_resume(clean, launched):
+    assert clean.execute("SELECT status, end_ts FROM ah.loops").fetchone() == ("running", None)
+    clean.execute("UPDATE ah.session SET last_event_at = now() - interval '25 hours'")
+    clean.commit()
+    assert load.post_passes(clean)["dirty_sessions"] == 0
+    row = clean.execute("SELECT status, end_ts FROM ah.loops").fetchone()
+    assert row[0] == "stale" and row[1] is not None
+    clean.execute("UPDATE ah.session SET last_event_at = now()")
+    clean.commit()
+    load.post_passes(clean)
+    assert clean.execute("SELECT status, end_ts FROM ah.loops").fetchone() == ("running", None)
+
+
+def test_analytics_reapply_and_rebuild_preserve_live_relation_and_grant(clean, launched):
+    # Grant as the owner, to an absent-by-default consumer role in the disposable database.
+    with psycopg.connect(os.environ["AGENT_HISTORY_TEST_ADMIN_DSN"]) as admin:
+        admin.execute("CREATE ROLE synthetic_loop_reader")
+    try:
+        clean.execute("GRANT SELECT ON ah.loops TO synthetic_loop_reader")
+        clean.commit()
+        before = clean.execute("SELECT launch_uid FROM ah.loops").fetchall()
+        clean.commit()
+        load.apply_schema(clean, force=True)
+        clean.commit()
+        assert clean.execute("SELECT launch_uid FROM ah.loops").fetchall() == before
+        clean.commit()
+        assert load.rebuild(clean, sources=launched, textfile=None, log=lambda *_: None).errors == 0
+        assert clean.execute("SELECT launch_uid, status FROM ah.loops").fetchall() == [(before[0][0], "stale")]
+        assert clean.execute(
+            "SELECT has_table_privilege('synthetic_loop_reader', 'ah.loops', 'SELECT')"
+        ).fetchone() == (True,)
+    finally:
+        clean.rollback()
+        with psycopg.connect(os.environ["AGENT_HISTORY_TEST_ADMIN_DSN"]) as admin:
+            admin.execute("DROP OWNED BY synthetic_loop_reader")
+            admin.execute("DROP ROLE synthetic_loop_reader")
 
 
 def test_xreview_does_not_link_a_codex_exec_session_to_a_loop(clean):

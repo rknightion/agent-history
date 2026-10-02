@@ -1034,6 +1034,7 @@ def post_passes(conn: psycopg.Connection, refresh_id: int | None = None) -> dict
         dirty = conn.execute("SELECT count(*) FROM dirty_now").fetchone()[0]
         result["dirty_sessions"] = dirty
         if not dirty:
+            result.update(loops.refresh_live(conn))
             result["task_refs"] = task_refs(conn)  # type: ignore[assignment]  (prefix changes rescan)
             result.update(structure.session_embeddings(conn))
             if standalone:
@@ -1044,6 +1045,7 @@ def post_passes(conn: psycopg.Connection, refresh_id: int | None = None) -> dict
         conn.execute(ROLLUP_SQL.replace("ah.dirty_now", "dirty_now"))
         result["task_refs"] = task_refs(conn)  # type: ignore[assignment]
         result.update(loops.run(conn))
+        result.update(loops.refresh_live(conn))
         result.update(structure.run(conn, refresh_id))
         conn.execute("DELETE FROM ah.dirty_session d USING dirty_now n WHERE d.session_id = n.session_id")
         if standalone:
@@ -1386,7 +1388,7 @@ def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
-DATA_TABLES = ("lane", "loop_run", "session_rollup", "dirty_session", "parse_issue", "record_type_seen", "cost_state",
+DATA_TABLES = ("loops", "lane", "loop_run", "session_rollup", "dirty_session", "parse_issue", "record_type_seen", "cost_state",
                "pi_run_response", "rate_limit_sample", "session_event", "artifact", "git_event", "compaction", "hook_event",
                "subagent_spawn", "tool_op", "tool_call", "llm_call", "message", "turn", "tool_io", "attachment",
                "file_touch", "session_continuation", "session_embedding", "session", "repo", "source_file")

@@ -79,6 +79,35 @@ def run(conn: psycopg.Connection) -> dict[str, int]:
     return {"loop_roots": len(roots), "launches": found}
 
 
+def refresh_live(conn: psycopg.Connection) -> dict[str, int]:
+    """Refresh lifecycle state even without dirty transcripts (silence ages on every pass).
+
+    A report write or replacement launch is terminal evidence. Otherwise, root activity within
+    24 hours is evidence of running, not proof of a live process. A silent root is stale and may
+    resume. Do not reuse loop_run's fallback end timestamp as evidence of completion.
+    """
+    result = conn.execute("""
+        INSERT INTO ah.loops (launch_uid, status, launch_ts, end_ts, observed_at)
+        SELECT l.launch_uid,
+               CASE WHEN l.end_evidence IN ('report_write', 'next_launch') AND l.end_ts IS NOT NULL
+                    THEN 'finished'
+                    WHEN greatest(s.last_event_at, l.launch_ts) >= now() - interval '24 hours'
+                    THEN 'running' ELSE 'stale' END,
+               l.launch_ts,
+               CASE WHEN l.end_evidence IN ('report_write', 'next_launch') AND l.end_ts IS NOT NULL
+                    THEN l.end_ts
+                    WHEN greatest(s.last_event_at, l.launch_ts) >= now() - interval '24 hours'
+                    THEN NULL ELSE greatest(s.last_event_at, l.launch_ts) END,
+               now()
+        FROM ah.loop_run l LEFT JOIN ah.session s ON s.id = l.root_session_id
+        WHERE l.launch_ts IS NOT NULL
+        ON CONFLICT (launch_uid) DO UPDATE SET status = EXCLUDED.status,
+            launch_ts = EXCLUDED.launch_ts, end_ts = EXCLUDED.end_ts,
+            observed_at = EXCLUDED.observed_at
+    """)
+    return {"live_loops": result.rowcount}
+
+
 def _tag_root(conn: psycopg.Connection, root_id: int) -> int:
     root = conn.execute("SELECT cwd, last_event_at, agent, session_uid, agent_id FROM ah.session WHERE id = %s",
                         (root_id,)).fetchone()
