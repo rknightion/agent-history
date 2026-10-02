@@ -159,6 +159,21 @@ def test_report_data_mismatch_with_cr_lines_is_unknown(clean, tmp_path):
     assert identity(clean) == (None, "loop1", None)
 
 
+def test_basename_launch_header_is_not_a_complete_identity(clean, tmp_path):
+    index_launch(clean, tmp_path, f"# Loop: project loop1 · Goal: {GOAL}\n")
+    assert identity(clean) == (None, "loop1", None)
+
+
+def test_first_scheduled_identity_backfill_needs_no_dirty_sessions(clean, tmp_path):
+    index_launch(clean, tmp_path, "")
+    record_report(clean, f"# Loop: example/project loop1 · Goal: {GOAL}\n")
+    clean.execute("UPDATE ah.loops SET repo = NULL, loop = NULL, goal_sha256 = NULL")
+    clean.execute("DELETE FROM ah.meta WHERE key = 'loops_identity_projection_v1'")
+    clean.commit()
+    assert load.post_passes(clean)["dirty_sessions"] == 0
+    assert identity(clean) == ("example/project", "loop1", GOAL)
+
+
 def test_identity_rows_and_foreign_grant_survive_reapply_and_rebuild(clean, tmp_path):
     sources = index_launch(clean, tmp_path, f"# Loop: example/project loop1 · Goal: {GOAL}")
     with psycopg.connect(os.environ["AGENT_HISTORY_TEST_ADMIN_DSN"]) as admin:

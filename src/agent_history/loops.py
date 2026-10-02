@@ -117,6 +117,9 @@ def _refresh_identity(conn: psycopg.Connection) -> None:
     Report contents come from completed successful structured writes of the exact report path.
     Shell command strings are not interpreted. Keep this independent of terminal-evidence tagging.
     """
+    initial = conn.execute(
+        "SELECT NOT EXISTS (SELECT 1 FROM ah.meta WHERE key = 'loops_identity_projection_v1')"
+    ).fetchone()[0]
     rows = conn.execute("""
         SELECT l.launch_uid, l.root_session_id,
                CASE WHEN l.naming = 'loop' THEN l.loop_number END, l.goal_path, l.report_path,
@@ -124,10 +127,16 @@ def _refresh_identity(conn: psycopg.Connection) -> None:
                (SELECT min(n.launch_ts) FROM ah.loop_run n
                 WHERE n.root_session_id = l.root_session_id AND n.launch_ts > l.launch_ts)
         FROM ah.loop_run l JOIN ah.session s ON s.id = l.root_session_id
+        JOIN ah.loops live ON live.launch_uid = l.launch_uid
         LEFT JOIN ah.message m ON m.session_id = s.id
             AND l.launch_uid = s.agent || '/' || s.session_uid || '/' || s.agent_id || ':' || m.event_uid
-        WHERE l.launch_ts IS NOT NULL
-    """).fetchall()
+        WHERE l.launch_ts IS NOT NULL AND (
+            %s OR live.status = 'running' OR EXISTS (
+                SELECT 1 FROM dirty_now d JOIN ah.session changed ON changed.id = d.session_id
+                WHERE COALESCE(changed.root_session_id, changed.id) = l.root_session_id
+            )
+        )
+    """, (initial,)).fetchall()
     for uid, root, number, goal_path, report_path, started, launch_text, following in rows:
         fields = identity_fields(launch_text or "", number, goal_path)
         if report_path:
@@ -157,8 +166,15 @@ def _refresh_identity(conn: psycopg.Connection) -> None:
                     # for a conflicting Data block or a legacy basename without an owner.
                     fields = identity_fields(content, number, report=True)
         conn.execute(
-            "UPDATE ah.loops SET repo = %s, loop = %s, goal_sha256 = %s WHERE launch_uid = %s",
-            (fields["repo"], fields["loop"], fields["goal_sha256"], uid),
+            "UPDATE ah.loops SET repo = %s, loop = %s, goal_sha256 = %s WHERE launch_uid = %s "
+            "AND (repo, loop, goal_sha256) IS DISTINCT FROM (%s, %s, %s)",
+            (fields["repo"], fields["loop"], fields["goal_sha256"], uid,
+             fields["repo"], fields["loop"], fields["goal_sha256"]),
+        )
+    if initial:
+        conn.execute(
+            "INSERT INTO ah.meta (key, value) VALUES ('loops_identity_projection_v1', '1') "
+            "ON CONFLICT (key) DO NOTHING"
         )
 
 

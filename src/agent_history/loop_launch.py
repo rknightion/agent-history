@@ -192,7 +192,7 @@ def identity_fields(text, loop, goal_path=None, *, report=False):
     hashes = set()
     if len(headers) == 1:
         repo, label, digest = next(iter(headers))
-        if result["loop"] is None or label == result["loop"]:
+        if (result["loop"] is None or label == result["loop"]) and (report or "/" in repo):
             valid = True
             if report:
                 # Restrict the section to one JSON fence; unrelated fenced examples are not Data.

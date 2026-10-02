@@ -164,9 +164,11 @@ exact loop and goal hash. Shell commands and partial edits are not interpreted t
 reports; absent captured report contents cannot establish report identity. These columns describe
 observed identity, independently of terminal-status evidence or report outcome.
 
-Every refresh, including a scheduled pass without dirty sessions, projects identity for existing
-launches. A dirty-session refresh also fills them; no rebuild is needed after migration. Rebuild
-recreates values from retained transcript evidence and preserves consumer table-level SELECT grants.
+The first refresh after migration projects identity for every existing launch, even without dirty
+sessions; no rebuild is needed. A transactional `ah.meta` projection-version marker avoids repeated
+historical report scans. Subsequent refreshes project running loops and the roots of dirty root or
+child sessions, updating identity only when a value changes. Rebuild recreates values from retained
+transcript evidence and preserves consumer table-level SELECT grants.
 The migration changes no grants or roles, and imposes no constraint or default on existing rows.
 
 The receiver seam also includes `status text`, `launch_ts timestamptz`, `end_ts timestamptz`:
