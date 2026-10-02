@@ -166,3 +166,71 @@ def test_rejected_password_from_any_source_is_in_no_error_text(tmp_path, source,
         # psql's own report: where it connected and why that failed.
         assert str(target["port"]) in result.stderr
         assert "password authentication failed" in result.stderr
+
+
+def test_service_credentials_use_private_channel_and_parent_connects(monkeypatch, tmp_path):
+    import psycopg
+
+    dsn = os.environ.get("AGENT_HISTORY_TEST_READER_DSN", "")
+    if "agent_history_test" not in dsn:
+        pytest.skip("AGENT_HISTORY_TEST_READER_DSN (a *_test database) not set")
+    password = conninfo_to_dict(dsn)["password"]
+    env = service_environment(tmp_path)
+    (tmp_path / "service.conf").write_text("[synthetic]\n")
+    for key in list(os.environ):
+        if key.startswith(("PG", "AGENT_HISTORY_")):
+            monkeypatch.delenv(key)
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("AGENT_HISTORY_READER_DSN", make_conninfo(dsn, service="synthetic"))
+    original_run = subprocess.run
+    captured = []
+
+    def capture_child(*args, **kwargs):
+        result = original_run(*args, **kwargs)
+        captured.append(result.stdout + result.stderr)
+        return result
+
+    monkeypatch.setattr(reader.subprocess, "run", capture_child)
+    effective = reader.load_env()
+    assert captured and all(password not in output for output in captured)
+    assert effective["PGPASSWORD"] == password
+    with psycopg.connect(
+        make_conninfo(
+            "",
+            **{
+                key: effective[name]
+                for key, name in (
+                    ("host", "PGHOST"),
+                    ("port", "PGPORT"),
+                    ("dbname", "PGDATABASE"),
+                    ("user", "PGUSER"),
+                    ("password", "PGPASSWORD"),
+                )
+            },
+        )
+    ) as connection:
+        assert connection.execute("SELECT 1").fetchone() == (1,)
+
+
+@pytest.mark.parametrize("message", [b"", b'{"password":', b"not json", b"[]", b'{"password": 42}'])
+def test_invalid_service_handoff_is_bounded_and_generic(monkeypatch, message):
+    original_run = subprocess.run
+
+    def broken_child(args, **kwargs):
+        # A real process exercises EOF, descriptor inheritance and captured errors.
+        args = [
+            sys.executable,
+            "-c",
+            "import os, sys; "
+            "os.write(int(sys.argv[1]), " + repr(message) + ") if len(sys.argv) > 1 "
+            "else print(" + repr(message.decode()) + ")",
+            *args[3:],
+        ]
+        return original_run(args, **kwargs, timeout=3)
+
+    monkeypatch.setattr(reader.subprocess, "run", broken_child)
+    start = time.monotonic()
+    with pytest.raises(SystemExit, match="^agent-history: cannot resolve reader service connection$"):
+        reader._service_connection_settings("service=synthetic")
+    assert time.monotonic() - start < 3

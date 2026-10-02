@@ -17,6 +17,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 ENV_FILE = Path(os.environ["AGENT_HISTORY_ENV"]) if os.environ.get("AGENT_HISTORY_ENV") else None
@@ -85,23 +86,72 @@ def _service_connection_settings(dsn: str) -> dict[str, str]:
     # a connect_timeout keyword, which would override service-file policy.
     if not env.get("PGCONNECT_TIMEOUT"):
         env["PGCONNECT_TIMEOUT"] = "5"
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            "from agent_history.reader import _service_connection_child; _service_connection_child()",
-        ],
-        input=dsn,
-        text=True,
-        capture_output=True,
-        env=env,
-    )
-    if result.returncode:
+    # Drain concurrently: effective settings can exceed a pipe's buffer. The
+    # connection deadline remains libpq's, including an explicit unlimited zero.
+    # Once the child exits, even an inherited open descriptor cannot stall us.
+    payload = bytearray()
+    finished = threading.Event()
+    incoming, outgoing = socket.socketpair()
+    with incoming, outgoing:
+        incoming.settimeout(0.2)
+
+        def receive() -> None:
+            try:
+                while True:
+                    try:
+                        chunk = incoming.recv(8192)
+                    except TimeoutError:
+                        if finished.is_set():
+                            return
+                        continue
+                    if not chunk:
+                        return
+                    payload.extend(chunk)
+                    if len(payload) > 1024 * 1024:
+                        incoming.shutdown(socket.SHUT_RD)
+                        return
+            except OSError:
+                return
+
+        receiver = threading.Thread(target=receive)
+        receiver.start()
+        try:
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    "import sys; from agent_history.reader import _service_connection_child; "
+                    "_service_connection_child(int(sys.argv[1]))",
+                    str(outgoing.fileno()),
+                ],
+                input=dsn,
+                text=True,
+                capture_output=True,
+                env=env,
+                pass_fds=(outgoing.fileno(),),
+            )
+        except (OSError, ValueError):
+            sys.exit("agent-history: cannot resolve reader service connection")
+        finally:
+            outgoing.close()
+            finished.set()
+            receiver.join()
+    try:
+        if result.returncode or len(payload) > 1024 * 1024:
+            raise ValueError
+        effective = json.loads(payload)
+        if (
+            not isinstance(effective, dict)
+            or "password" not in effective
+            or not all(isinstance(key, str) and isinstance(value, str) for key, value in effective.items())
+        ):
+            raise ValueError
+    except (ValueError, UnicodeError, RecursionError):
         sys.exit("agent-history: cannot resolve reader service connection")
-    return json.loads(result.stdout)
+    return effective
 
 
-def _service_connection_child() -> None:
+def _service_connection_child(settings_fd: int) -> None:
     """Keep the DSN and effective credentials off argv and error output."""
     from psycopg import pq
 
@@ -119,7 +169,18 @@ def _service_connection_child() -> None:
         effective["password"] = connection.password.decode()
     finally:
         connection.finish()
-    print(json.dumps(effective))
+    # This descriptor is private IPC, never stdout/stderr or a logging sink.
+    payload = memoryview(json.dumps(effective).encode())
+    try:
+        while payload:
+            written = os.write(settings_fd, payload)
+            if written == 0:
+                sys.exit(1)
+            payload = payload[written:]
+    except OSError:
+        sys.exit(1)
+    finally:
+        os.close(settings_fd)
 
 
 def load_env() -> dict[str, str]:

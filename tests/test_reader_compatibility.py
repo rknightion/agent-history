@@ -168,13 +168,13 @@ def test_reader_service_keeps_explicit_default_port_over_inherited_port(monkeypa
     import io
 
     monkeypatch.setattr(sys, "stdin", io.StringIO(os.environ["AGENT_HISTORY_READER_DSN"]))
-    reader._service_connection_child()
-    resolved = capsys.readouterr().out
     captured = []
 
     def process(argv, **kwargs):
         if argv[0] == sys.executable:
-            return subprocess.CompletedProcess(argv, 0, stdout=resolved)
+            # Model subprocess descriptor inheritance without closing the parent's FD.
+            reader._service_connection_child(os.dup(kwargs["pass_fds"][0]))
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
         captured.append(kwargs["env"])
         return subprocess.CompletedProcess(argv, 0)
 
