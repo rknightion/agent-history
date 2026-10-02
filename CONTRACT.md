@@ -26,6 +26,15 @@ printed one in a command's output, the secret is in the catalogue.
   `error_excerpt` text. Each chunk includes a class/type header and a cwd basename (or namespace when
   absent; session summaries use the project basename). Regex-matched secret-shaped spans are replaced
   with `[REDACTED]`; other sensitive text is not scrubbed. The stored text remains unredacted.
+- Embed run failures expose `agent_history_embed_last_failure_reason{reason="..."} 1` alongside
+  `agent_history_embed_run_success 0`. The only reason labels are `auth` (401/403),
+  `billing_quota` (402 or a 429 with a fixed structured quota/billing code), `rate_limit` (other 429),
+  `route` (404), `provider_error` (5xx), `network` (status 0/408), and `other`. The recognised 429
+  `error.code` or `error.type` strings are `insufficient_quota`, `billing_hard_limit_reached`,
+  `billing_not_active` and `quota_exceeded`. Free-text messages never determine quota. The bounded
+  reason is retained in catalogue metadata across failed runs and omitted from the snapshot after
+  success. Labels never contain response bodies, status text, URLs or input text. Existing embed
+  metric names, labels and help text are unchanged.
 
 Treat the database like the transcript directories it was built from: local, access-controlled,
 and never exposed to a network you do not trust. There is no row-level security.

@@ -305,3 +305,113 @@ def test_embed_run_survives_a_failing_gc_and_retries_next_day(gc_db, monkeypatch
     stats = embed.run(conn, FakeProvider(), cap_tokens=0, daily_cap=0, log=lambda *_: None, gc_interval_hours=24)
     assert stats.gc and stats.gc["skipped"] == "error" and _present(conn, "old-orphan")
     assert conn.execute("SELECT 1 FROM ah.meta WHERE key = 'embed_gc_at'").fetchone()
+
+
+@pytest.fixture
+def upstream():
+    """Local HTTP process-edge fixture; no credentials or external provider."""
+    import json
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    response = {"status": 402, "body": {"error": {"code": "insufficient_quota"}}}
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            if response["status"] == 0:
+                self.connection.close()
+                return
+            self.send_response(response["status"])
+            if response["body"] == "broken-chunk":
+                self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            if response["body"] == "broken-chunk":
+                self.wfile.write(b"invalid-chunk-size\r\n")
+                self.close_connection = True
+                return
+            data = response["body"]
+            if response["status"] == 200 and response["body"] == "malformed":
+                self.wfile.write(b"not JSON")
+                return
+            if response["status"] == 200:
+                data = {"data": [{"index": i, "embedding": [1.0] + [0.0] * 1023}
+                                 for i in range(len(body["input"]))]}
+            self.wfile.write(json.dumps(data).encode())
+
+        def log_message(self, *_args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    provider = embed.Provider("fake-http", MODEL, "", f"http://127.0.0.1:{server.server_port}")
+    try:
+        yield provider, response
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
+
+
+def scrape_embed(directory):
+    from agent_history.metrics.catalogue import RunCollector
+    from agent_history.metrics.server import State, exposition
+
+    return exposition(list(RunCollector(directory).collect()), State(directory / "exporter-state"))
+
+
+@pytest.mark.parametrize(("status", "body", "reason"), [
+    (401, {}, "auth"), (403, {}, "auth"), (402, {}, "billing_quota"),
+    (429, {"error": {"code": "insufficient_quota"}}, "billing_quota"),
+    (429, {"error": {"type": "billing_hard_limit_reached"}}, "billing_quota"),
+    (429, {"error": {"message": "quota billing echoed input"}}, "rate_limit"),
+    (429, {"error": {"code": ["insufficient_quota"]}}, "rate_limit"),
+    (429, "broken-chunk", "rate_limit"),
+    (404, {}, "route"), (500, {}, "provider_error"), (503, {}, "provider_error"),
+    (408, {}, "network"), (0, {}, "network"), (200, "malformed", "other"),
+])
+def test_http_run_failure_reason_and_success_clear(db, upstream, tmp_path, monkeypatch, status, body, reason):
+    conn, _ids = db
+    provider, response = upstream
+    response.update(status=status, body=body)
+    # Only retry backoff is replaced; HTTP, run orchestration and DB are real.
+    monkeypatch.setattr(embed.time, "sleep", lambda _delay: None)
+    path = tmp_path / "agent-history-embed.prom"
+    import json
+    with pytest.raises(json.JSONDecodeError if status == 200 else embed.ProviderError):
+        run(conn, provider)
+    # The CLI makes a fresh stats object when run raises: preserve that real boundary.
+    embed.write_metrics(conn, embed.EmbedStats(), False, path)
+    output = scrape_embed(tmp_path)
+    assert f'agent_history_embed_last_failure_reason{{reason="{reason}"}} 1' in output
+    assert "agent_history_embed_run_success 0" in output
+    assert "echoed input" not in output
+    response.update(status=200, body={})
+    stats = run(conn, provider)
+    embed.write_metrics(conn, stats, True, path)
+    output = scrape_embed(tmp_path)
+    assert "agent_history_embed_last_failure_reason" not in output
+    assert "agent_history_embed_run_success 1" in output
+
+
+def test_embed_existing_family_exposition_matches_main(tmp_path):
+    from pathlib import Path
+    from agent_history.metrics.catalogue import RUN_METRICS
+
+    lines = [name + ('{' + labels[0] + '="none"}' if labels else '') + ' 1'
+             for name, labels in RUN_METRICS.items() if name.startswith("agent_history_embed_")
+             and name != "agent_history_embed_last_failure_reason"]
+    lines.append('agent_history_embed_last_failure_reason{reason="auth"} 1')
+    (tmp_path / "agent-history-embed.prom").write_text("\n".join(lines) + "\n")
+    output = scrape_embed(tmp_path)
+    existing = "\n".join(line for line in output.splitlines()
+                         if "agent_history_embed_last_failure_reason" not in line) + "\n"
+    assert existing == (Path(__file__).parent / "fixtures/embed_metrics_main.prom").read_text()
+    assert 'agent_history_embed_last_failure_reason{reason="auth"} 1' in output
+    # The new family's vocabulary is isolated from all existing skip-reason families.
+    (tmp_path / "agent-history-embed.prom").write_text(
+        'agent_history_embed_last_failure_reason{reason="daily_cap"} 1\n'
+        'agent_history_embed_run_skipped{reason="auth"} 1\n'
+    )
+    assert scrape_embed(tmp_path) == "\n"

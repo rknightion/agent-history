@@ -38,6 +38,7 @@ RUN_METRICS = {
     "agent_history_run_files": ("result",),
     "agent_history_run_lines": (),
     "agent_history_run_rows": (),
+    "agent_history_embed_last_failure_reason": ("reason",),
     "agent_history_embed_run_success": (),
     "agent_history_embed_run_duration_seconds": (),
     "agent_history_embed_run_items": (),
@@ -53,6 +54,9 @@ RUN_METRICS = {
     "agent_history_embed_gc_deleted": (),
     "agent_history_embed_gc_skipped": ("reason",),
 }
+EMBED_FAILURE_REASONS = frozenset(
+    {"auth", "billing_quota", "rate_limit", "route", "provider_error", "network", "other"}
+)
 RUN_RESULTS = frozenset({"parsed", "rewritten", "tier_only", "load_error"})
 # These are the complete skip vocabularies in the producers, not input-derived values.
 RUN_REASONS = frozenset(
@@ -103,7 +107,10 @@ class RunCollector:
                     continue
                 if label == "result" and value not in RUN_RESULTS:
                     continue
-                if label == "reason" and value not in RUN_REASONS:
+                if name == "agent_history_embed_last_failure_reason":
+                    if value not in EMBED_FAILURE_REASONS:
+                        continue
+                elif label == "reason" and value not in RUN_REASONS:
                     continue
                 values.setdefault(name, []).append(Sample(((label, value),) if label else (), float(raw)))
         return tuple(

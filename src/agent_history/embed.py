@@ -16,6 +16,7 @@ Off unless configured ([embedding] in the config file, see config.example.toml).
 from __future__ import annotations
 
 import hashlib
+import http.client
 import json
 import math
 import os
@@ -222,10 +223,40 @@ def halfvec_literal(vec: list[float]) -> str:
 # --- providers ------------------------------------------------------------------------------------
 
 
+FAILURE_REASONS = frozenset({"auth", "billing_quota", "rate_limit", "route", "provider_error", "network", "other"})
+QUOTA_CODES = frozenset({"insufficient_quota", "billing_hard_limit_reached", "billing_not_active", "quota_exceeded"})
+
+
+def failure_reason(status: int, detail: str = "") -> str:
+    """Only fixed structured provider codes distinguish quota from ordinary throttling."""
+    if status in (401, 403):
+        return "auth"
+    if status == 402:
+        return "billing_quota"
+    if status == 429:
+        try:
+            body = json.loads(detail)
+            error = body.get("error") if isinstance(body, dict) else None
+            if isinstance(error, dict) and any(isinstance(error.get(key), str) and error[key] in QUOTA_CODES
+                                               for key in ("code", "type")):
+                return "billing_quota"
+        except (ValueError, TypeError):
+            pass
+        return "rate_limit"
+    if status == 404:
+        return "route"
+    if status >= 500:
+        return "provider_error"
+    if status in (0, 408):
+        return "network"
+    return "other"
+
+
 class ProviderError(Exception):
-    def __init__(self, status: int, message: str):
+    def __init__(self, status: int, message: str, reason: str | None = None):
         super().__init__(f"{status}: {message}")
         self.status = status
+        self.reason = reason if reason in FAILURE_REASONS else failure_reason(status, message)
 
 
 @dataclass
@@ -256,15 +287,19 @@ class Provider:
                     self.usage["requests"] += 1
                     return json.loads(resp.read())
             except urllib.error.HTTPError as exc:
-                detail = exc.read()[:300].decode("utf-8", "replace")
+                try:
+                    detail = exc.read(65536).decode("utf-8", "replace")
+                except (OSError, http.client.HTTPException):
+                    # A broken error body must not hide the received status or bypass retries.
+                    detail = ""
                 if exc.code in (408, 429) or exc.code >= 500:
                     if attempt == 5:
-                        raise ProviderError(exc.code, detail) from None
+                        raise ProviderError(exc.code, detail[:300], failure_reason(exc.code, detail)) from None
                     time.sleep(delay)
                     delay = min(delay * 2, 60)
                     continue
-                raise ProviderError(exc.code, detail) from None
-            except (urllib.error.URLError, TimeoutError) as exc:
+                raise ProviderError(exc.code, detail[:300], failure_reason(exc.code, detail)) from None
+            except (urllib.error.URLError, TimeoutError, http.client.HTTPException) as exc:
                 if attempt == 5:
                     raise ProviderError(0, str(exc)) from None
                 time.sleep(delay)
@@ -591,6 +626,19 @@ def run(conn: psycopg.Connection, provider: Provider, cap_tokens: int = 3_000_00
                     conn.commit()
                     result = GcStats(skipped="error")
                 stats.gc = gc_stats_dict(result)
+        conn.execute("DELETE FROM ah.meta WHERE key = 'embed_last_failure_reason'")
+        conn.commit()
+    except Exception as exc:
+        # The CLI creates fresh stats on failure, so retain only the bounded reason in the catalogue.
+        failure = exc.reason if isinstance(exc, ProviderError) else "other"
+        try:
+            conn.rollback()
+            conn.execute("INSERT INTO ah.meta VALUES ('embed_last_failure_reason', %s) "
+                         "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value", (failure,))
+            conn.commit()
+        except psycopg.Error:
+            conn.rollback()
+        raise
     finally:
         try:
             conn.rollback()
@@ -623,6 +671,10 @@ def write_metrics(conn: psycopg.Connection, stats: EmbedStats, success: bool, pa
     # GC runs once a day; the ten-minute runs in between carry its last result forward.
     lines += gc_metric_lines(stats.gc) if stats.gc else _previous_gc_lines(path)
     try:
+        if not success:
+            failure = conn.execute("SELECT value FROM ah.meta WHERE key = 'embed_last_failure_reason'").fetchone()
+            reason = failure[0] if failure and failure[0] in FAILURE_REASONS else "other"
+            lines.append(f'agent_history_embed_last_failure_reason{{reason="{reason}"}} 1')
         model = conn.execute("SELECT value FROM ah.meta WHERE key = 'embedding_model'").fetchone()
         if model:
             pending = conn.execute(

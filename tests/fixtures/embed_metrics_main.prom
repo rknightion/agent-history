@@ -1,0 +1,42 @@
+# HELP agent_history_embed_gc_deleted Last worker run: embed gc deleted.
+# TYPE agent_history_embed_gc_deleted gauge
+agent_history_embed_gc_deleted 1
+# HELP agent_history_embed_gc_dry_run Last worker run: embed gc dry run.
+# TYPE agent_history_embed_gc_dry_run gauge
+agent_history_embed_gc_dry_run 1
+# HELP agent_history_embed_gc_eligible Last worker run: embed gc eligible.
+# TYPE agent_history_embed_gc_eligible gauge
+agent_history_embed_gc_eligible 1
+# HELP agent_history_embed_gc_last_run_timestamp_seconds Last worker run: embed gc last run timestamp seconds.
+# TYPE agent_history_embed_gc_last_run_timestamp_seconds gauge
+agent_history_embed_gc_last_run_timestamp_seconds 1
+# HELP agent_history_embed_gc_skipped Last worker run: embed gc skipped.
+# TYPE agent_history_embed_gc_skipped gauge
+agent_history_embed_gc_skipped{reason="none"} 1
+# HELP agent_history_embed_last_success_timestamp_seconds Last worker run: embed last success timestamp seconds.
+# TYPE agent_history_embed_last_success_timestamp_seconds gauge
+agent_history_embed_last_success_timestamp_seconds 1
+# HELP agent_history_embed_run_api_inputs Last worker run: embed run api inputs.
+# TYPE agent_history_embed_run_api_inputs gauge
+agent_history_embed_run_api_inputs 1
+# HELP agent_history_embed_run_cached_inputs Last worker run: embed run cached inputs.
+# TYPE agent_history_embed_run_cached_inputs gauge
+agent_history_embed_run_cached_inputs 1
+# HELP agent_history_embed_run_chunks Last worker run: embed run chunks.
+# TYPE agent_history_embed_run_chunks gauge
+agent_history_embed_run_chunks 1
+# HELP agent_history_embed_run_duration_seconds Last worker run: embed run duration seconds.
+# TYPE agent_history_embed_run_duration_seconds gauge
+agent_history_embed_run_duration_seconds 1
+# HELP agent_history_embed_run_items Last worker run: embed run items.
+# TYPE agent_history_embed_run_items gauge
+agent_history_embed_run_items 1
+# HELP agent_history_embed_run_skipped Last worker run: embed run skipped.
+# TYPE agent_history_embed_run_skipped gauge
+agent_history_embed_run_skipped{reason="none"} 1
+# HELP agent_history_embed_run_success Last worker run: embed run success.
+# TYPE agent_history_embed_run_success gauge
+agent_history_embed_run_success 1
+# HELP agent_history_embed_run_tokens Last worker run: embed run tokens.
+# TYPE agent_history_embed_run_tokens gauge
+agent_history_embed_run_tokens 1
