@@ -65,39 +65,45 @@ class Deadline(Exception):
 
 
 GITHUB_HOST = "github.com"
-# Transports with a network authority. file:// and anything else names no remote host to own.
-REMOTE_SCHEMES = frozenset({"https", "http", "ssh", "git", "git+ssh", "ssh+git"})
 _HOST = r"(?P<host>[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*)"
 _PATH = r"(?P<owner>[a-z0-9._-]+)/(?P<name>[a-z0-9._-]+)/?"
-# The authority is matched whole: at most one userinfo, which cannot hold a character at which a
-# URL client would end the authority ('/', '?', '#', a backslash), so the host is what git dials.
-# ASCII matching: without it IGNORECASE folds U+212A KELVIN SIGN onto k.
-_URL_REMOTE = re.compile(
-    r"(?P<scheme>[a-z][a-z0-9+.-]*)://(?:[^@/?#\\\s\x00-\x1f\x7f]+@)?" + _HOST + r"(?::[0-9]{1,5})?/" + _PATH,
-    re.ASCII | re.IGNORECASE,
+# Transports with a network authority, each with the userinfo its client can carry without moving
+# the host. file:// and anything else names no remote host to own.
+# - ssh family: git percent-decodes the whole URL before it splits host from path, and takes a
+#   leading [...] as the host, so the user is a plain name: no '%', '[', ']' or ':'.
+# - http(s): curl splits the URL, so userinfo is user[:password] in RFC 3986 userinfo characters
+#   (percent-encoding included); it cannot hold '@', '/', '?', '#', a backslash, '[' or ']'.
+# - git://: the protocol has no userinfo; git would resolve 'user@host' whole as a host name.
+_USER = r"[a-z0-9._-]+"
+_AUTHORITY = (
+    r"(?:(?:ssh|git\+ssh|ssh\+git)://(?:" + _USER + r"@)?"
+    r"|https?://(?:[a-z0-9._~!$&'()*+,;=:%-]+@)?"
+    r"|git://)"
 )
+# Matched whole, with at most one userinfo. Checked against the host git 2.54 and 2.56 dial, with
+# stubbed ssh, git:// and http(s) transports: an accepted URL reaches the parsed host or no host.
+# One exception is left alone: curl reads an all-numeric or hex host as an IPv4 address, so such a
+# host is reported as written, not as the address dialled. The port is ignored.
+# ASCII matching: without it IGNORECASE folds U+212A KELVIN SIGN onto k.
+_URL_REMOTE = re.compile(_AUTHORITY + _HOST + r"(?::[0-9]{1,5})?/" + _PATH, re.ASCII | re.IGNORECASE)
 _SCP_REMOTE = re.compile(
-    r"(?:[a-z0-9._-]+@)?" + _HOST + ":" + _PATH, re.ASCII | re.IGNORECASE
+    r"(?:" + _USER + r"@)?" + _HOST + ":" + _PATH, re.ASCII | re.IGNORECASE
 )  # [user@]host:owner/name
 
 
 def parse_remote(remote: str | None) -> tuple[str, str, str] | None:
     """(host, owner, name), lower-cased, from a git remote URL; None unless it is exactly that shape.
 
-    Accepts scheme://[userinfo@]host[:port]/owner/name and scp-style [user@]host:owner/name, each
-    with an optional .git suffix and trailing slash. Every character is accounted for: a query, a
-    fragment, an encoded or empty path segment, a dot segment or a deeper path is not a repository
-    this collector can attribute to an owner.
+    Accepts ssh://, git+ssh:// and ssh+git:// as [user@]host[:port]/owner/name, http:// and
+    https:// as [user[:password]@]host[:port]/owner/name, git:// as host[:port]/owner/name, and
+    scp-style [user@]host:owner/name, each with an optional .git suffix and trailing slash. Every
+    character is accounted for: a query, a fragment, an encoded or empty path segment, a dot
+    segment or a deeper path is not a repository this collector can attribute to an owner.
     """
     if not remote:
         return None
     url = remote.strip()
-    m = _URL_REMOTE.fullmatch(url)
-    if m:
-        if m.group("scheme").lower() not in REMOTE_SCHEMES:
-            return None
-    else:
-        m = _SCP_REMOTE.fullmatch(url)
+    m = _URL_REMOTE.fullmatch(url) or _SCP_REMOTE.fullmatch(url)
     if not m:
         return None
     host, owner, name = (m.group(part).lower() for part in ("host", "owner", "name"))

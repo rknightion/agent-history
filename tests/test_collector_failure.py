@@ -18,6 +18,11 @@ def test_malformed_slugs_are_not_allowlisted(slug, monkeypatch):
 OWNERS = {("github.com", "example-org"), ("git.example.net", "team")}
 # Userinfo with a password is assembled at run time so no scanner sees a credential-shaped literal.
 WITH_PASSWORD = "https://" + "user" + ":" + "synthetic" + "@github.com/example-org/widget.git"
+ENCODED_PASSWORD = "https://" + "user" + ":" + "synth%40etic" + "@github.com/example-org/widget.git"
+SSH_FAMILY = ("ssh", "git+ssh", "ssh+git")
+# git percent-decodes an ssh-family or git:// URL before it splits host from path, and takes a
+# leading [...] as the host: each of these userinfo values makes git dial example.net.
+DECODED_ELSEWHERE = ("git%40example.net%2fx", "example.net%2fx", "[example.net]", "[example.net]:22")
 
 
 @pytest.mark.parametrize(
@@ -34,6 +39,13 @@ WITH_PASSWORD = "https://" + "user" + ":" + "synthetic" + "@github.com/example-o
         ("git@github.com:example-org/widget.git", "github.com/example-org/widget"),
         ("github.com:example-org/widget", "github.com/example-org/widget"),
         ("git@github.com:example-org/widget.git\n", "github.com/example-org/widget"),
+        (ENCODED_PASSWORD, "github.com/example-org/widget"),
+        *(
+            (f"{scheme}://git@github.com/example-org/widget.git", "github.com/example-org/widget")
+            for scheme in SSH_FAMILY
+        ),
+        ("git://git.example.net/team/tools.git", "git.example.net/team/tools"),
+        ("git://git.example.net:9418/team/tools", "git.example.net/team/tools"),
     ],
 )
 def test_owner_remote_of_each_url_form_is_accepted(remote, slug, monkeypatch):
@@ -68,6 +80,19 @@ def test_owner_remote_of_each_url_form_is_accepted(remote, slug, monkeypatch):
         "https://example.net/@github.com/example-org/widget",
         "https://a@example.net@github.com/example-org/widget",
         "a@example.net@github.com:example-org/widget",
+        # transport confusion: git dials the host inside the userinfo, not the one after the '@'
+        *(
+            f"{scheme}://{userinfo}@github.com/example-org/widget{suffix}"
+            for scheme in (*SSH_FAMILY, "git")
+            for userinfo in DECODED_ELSEWHERE
+            for suffix in ("", ".git")
+        ),
+        *(f"{scheme}://user:word@github.com/example-org/widget" for scheme in SSH_FAMILY),
+        # git:// carries no userinfo: git would look up the whole 'x@github.com' as a host name
+        "git://" + "x" + "@github.com/example-org/widget",
+        # http(s) userinfo is user[:password] in URL characters, never a bracketed host
+        "https://[example.net]@github.com/example-org/widget",
+        "http://[example.net]@github.com/example-org/widget",
         # not a network remote, or not exactly host/owner/name
         "file://github.com/example-org/widget",
         "ftp://github.com/example-org/widget",
@@ -148,6 +173,8 @@ def test_repository_with_owner_remote_is_collected(tmp_path, offline, remote):
         ("https://example.net/github.com/example-org/widget", "no_origin"),
         ("https://example.net#@github.com/example-org/widget", "no_origin"),
         ("file://github.com/example-org/widget", "no_origin"),
+        ("ssh://git%40example.net%2fx@github.com/example-org/widget", "no_origin"),
+        ("ssh://[example.net]@github.com/example-org/widget.git", "no_origin"),
     ],
 )
 def test_repository_with_lookalike_remote_is_skipped(tmp_path, offline, remote, reason):
