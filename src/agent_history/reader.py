@@ -103,20 +103,22 @@ def _service_connection_settings(dsn: str) -> dict[str, str]:
 
 def _service_connection_child() -> None:
     """Keep the DSN and effective credentials off argv and error output."""
-    import psycopg
+    from psycopg import pq
 
+    # psycopg's polling connect computes its deadline before service-file values
+    # are resolved. Blocking libpq connect honours the effective service policy.
+    connection = pq.PGconn.connect(sys.stdin.read().encode())
     try:
-        with psycopg.connect(sys.stdin.read()) as connection:
-            # Keep compiled defaults too: omitting port 5432, for example, would
-            # revive an inherited wrong PGPORT when settings are passed to psql.
-            effective = {
-                option.keyword.decode(): option.val.decode()
-                for option in connection.pgconn.info
-                if option.val is not None
-            }
-            effective["password"] = connection.info.password
-    except psycopg.Error:
-        sys.exit(1)
+        if connection.status != pq.ConnStatus.OK:
+            sys.exit(1)
+        # Keep compiled defaults too: omitting port 5432, for example, would
+        # revive an inherited wrong PGPORT when settings are passed to psql.
+        effective = {
+            option.keyword.decode(): option.val.decode() for option in connection.info if option.val is not None
+        }
+        effective["password"] = connection.password.decode()
+    finally:
+        connection.finish()
     print(json.dumps(effective))
 
 

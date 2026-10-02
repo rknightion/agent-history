@@ -149,9 +149,7 @@ def test_reader_explicit_dsn_overrides_service_defaults_in_real_psql(monkeypatch
 
 
 def test_reader_service_keeps_explicit_default_port_over_inherited_port(monkeypatch, capsys):
-    from contextlib import nullcontext
     from types import SimpleNamespace
-    import psycopg
     from psycopg import pq
     from agent_history import reader
 
@@ -161,10 +159,12 @@ def test_reader_service_keeps_explicit_default_port_over_inherited_port(monkeypa
     # Model the database connection edge: get_parameters omits the compiled default
     # port, whereas pgconn.info retains the effective value chosen by libpq.
     connection = SimpleNamespace(
-        info=SimpleNamespace(get_parameters=lambda: {"dbname": "synthetic", "user": "reader"}, password="synthetic"),
-        pgconn=SimpleNamespace(info=pq.Conninfo.parse(b"port=5432 dbname=synthetic user=reader password=synthetic")),
+        status=pq.ConnStatus.OK,
+        info=pq.Conninfo.parse(b"port=5432 dbname=synthetic user=reader password=synthetic"),
+        password=b"synthetic",
+        finish=lambda: None,
     )
-    monkeypatch.setattr(psycopg, "connect", lambda *args, **kwargs: nullcontext(connection))
+    monkeypatch.setattr(pq, "PGconn", SimpleNamespace(connect=lambda *args: connection))
     import io
 
     monkeypatch.setattr(sys, "stdin", io.StringIO(os.environ["AGENT_HISTORY_READER_DSN"]))

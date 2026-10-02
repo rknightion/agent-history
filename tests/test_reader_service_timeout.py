@@ -4,6 +4,7 @@ import os
 import socket
 import subprocess
 import sys
+import threading
 import time
 
 import pytest
@@ -45,6 +46,49 @@ def test_unresponsive_service_resolution_is_bounded_and_does_not_disclose_passwo
         assert result.returncode != 0
         assert result.stderr.strip() == "agent-history: cannot resolve reader service connection"
         assert password not in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("service_timeout,environment_timeout", [("2", "37"), ("37", "2"), ("0", "2")])
+def test_service_file_timeout_controls_delayed_handshake(tmp_path, service_timeout, environment_timeout):
+    with socket.socket() as endpoint:
+        endpoint.bind(("127.0.0.1", 0))
+        endpoint.listen()
+        endpoint.settimeout(6)
+        env = service_environment(tmp_path)
+        (tmp_path / "service.conf").write_text(
+            f"[synthetic]\nhost=127.0.0.1\nport={endpoint.getsockname()[1]}\n"
+            f"dbname=synthetic\nuser=reader\nsslmode=disable\nconnect_timeout={service_timeout}\n"
+        )
+        env.update(AGENT_HISTORY_READER_DSN="service=synthetic", PGCONNECT_TIMEOUT=environment_timeout)
+
+        def delay_response():
+            with endpoint.accept()[0] as client:
+                time.sleep(3.5)
+                # Reject the handshake after the environment timeout, but before
+                # the deliberately long (or unlimited) service-file deadline.
+                client.sendall(b"invalid")
+
+        server = threading.Thread(target=delay_response)
+        server.start()
+        try:
+            start = time.monotonic()
+            result = subprocess.run(
+                [sys.executable, "-c", "from agent_history.reader import load_env; load_env()"],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=6,
+            )
+            elapsed = time.monotonic() - start
+        finally:
+            server.join(timeout=7)
+        assert not server.is_alive()
+        assert result.returncode != 0
+        assert result.stderr.strip() == "agent-history: cannot resolve reader service connection"
+        if service_timeout == "2":
+            assert elapsed < 3.5
+        else:
+            assert elapsed >= 3.5
 
 
 @pytest.mark.parametrize("source", ["dsn", "service", "environment"])
