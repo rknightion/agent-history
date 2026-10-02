@@ -77,6 +77,49 @@ def resolve_vector(q: str, mode: str | None) -> tuple[str | None, str]:
     return qvec, mode or "hybrid"
 
 
+def _service_connection_settings(dsn: str) -> dict[str, str]:
+    """Resolve libpq policy in a child with an isolated environment fallback."""
+    env = dict(os.environ)
+    # libpq itself preserves DSN > service file > environment precedence, including
+    # an explicit zero (unlimited). Do not mutate this process's environment or pass
+    # a connect_timeout keyword, which would override service-file policy.
+    if not env.get("PGCONNECT_TIMEOUT"):
+        env["PGCONNECT_TIMEOUT"] = "5"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from agent_history.reader import _service_connection_child; _service_connection_child()",
+        ],
+        input=dsn,
+        text=True,
+        capture_output=True,
+        env=env,
+    )
+    if result.returncode:
+        sys.exit("agent-history: cannot resolve reader service connection")
+    return json.loads(result.stdout)
+
+
+def _service_connection_child() -> None:
+    """Keep the DSN and effective credentials off argv and error output."""
+    import psycopg
+
+    try:
+        with psycopg.connect(sys.stdin.read()) as connection:
+            # Keep compiled defaults too: omitting port 5432, for example, would
+            # revive an inherited wrong PGPORT when settings are passed to psql.
+            effective = {
+                option.keyword.decode(): option.val.decode()
+                for option in connection.pgconn.info
+                if option.val is not None
+            }
+            effective["password"] = connection.info.password
+    except psycopg.Error:
+        sys.exit(1)
+    print(json.dumps(effective))
+
+
 def load_env() -> dict[str, str]:
     env = dict(os.environ)
     from .config import load_config
@@ -94,23 +137,9 @@ def load_env() -> dict[str, str]:
             sys.exit("agent-history: invalid reader DSN")
         service = os.environ.get("PGSERVICE") or any(option.keyword == b"service" and option.val for option in options)
         if service:
-            import psycopg
-
-            # Service-file values beat PG environment defaults. Resolve explicit
-            # DSN overrides through libpq before transferring the effective
-            # settings to psql. This connection runs no SQL; secrets stay in memory.
-            try:
-                with psycopg.connect(dsn) as connection:
-                    # Keep values equal to compiled defaults too: omitting port
-                    # 5432, for example, would revive an inherited wrong PGPORT.
-                    effective = {
-                        option.keyword.decode(): option.val.decode()
-                        for option in connection.pgconn.info
-                        if option.val is not None
-                    }
-                    effective["password"] = connection.info.password
-            except psycopg.Error:
-                sys.exit("agent-history: cannot resolve reader service connection")
+            # Resolve effective settings through libpq without overriding service
+            # policy. The child runs no SQL; credentials travel only through pipes.
+            effective = _service_connection_settings(dsn)
             environment_names = {option.keyword.decode(): option.envvar for option in pq.Conninfo.get_defaults()}
             for key, value in effective.items():
                 name = environment_names.get(key)

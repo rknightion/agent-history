@@ -258,6 +258,12 @@ use `AGENT_HISTORY_READER_DSN` or configured `reader_dsn`; a legacy PG-variable 
 selected with `AGENT_HISTORY_ENV`. Install `psql` for reader commands. Context and repository
 lookup come from the package configuration, with `AGENT_HISTORY_CONTEXT` and
 `AGENT_HISTORY_NATIVE_CONTEXT` available to select search and native resume-home contexts.
+When resolving a reader connection service, `connect_timeout` takes precedence from the explicit
+DSN, then the service file, then `PGCONNECT_TIMEOUT`, then a five-second default. Explicit long
+values and zero (unlimited) are preserved. The default bounds libpq's connection handshake per
+host/address, not DNS resolution or the total time across multiple hosts. Resolution runs in a
+child with an isolated environment; credentials use pipes, never command arguments, and failures
+report a generic error without connection details.
 
 Run `agent-history mcp` or `agent-history-mcp` after installing the `mcp` extra. The tool set
 includes `search_summaries` and `task`, retains explicit `namespaces` overrides, and includes

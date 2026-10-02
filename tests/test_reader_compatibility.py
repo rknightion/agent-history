@@ -148,7 +148,7 @@ def test_reader_explicit_dsn_overrides_service_defaults_in_real_psql(monkeypatch
             assert reader.query("SHOW work_mem", {}) == [{"work_mem": work_mem}]
 
 
-def test_reader_service_keeps_explicit_default_port_over_inherited_port(monkeypatch):
+def test_reader_service_keeps_explicit_default_port_over_inherited_port(monkeypatch, capsys):
     from contextlib import nullcontext
     from types import SimpleNamespace
     import psycopg
@@ -165,9 +165,16 @@ def test_reader_service_keeps_explicit_default_port_over_inherited_port(monkeypa
         pgconn=SimpleNamespace(info=pq.Conninfo.parse(b"port=5432 dbname=synthetic user=reader password=synthetic")),
     )
     monkeypatch.setattr(psycopg, "connect", lambda *args, **kwargs: nullcontext(connection))
+    import io
+
+    monkeypatch.setattr(sys, "stdin", io.StringIO(os.environ["AGENT_HISTORY_READER_DSN"]))
+    reader._service_connection_child()
+    resolved = capsys.readouterr().out
     captured = []
 
     def process(argv, **kwargs):
+        if argv[0] == sys.executable:
+            return subprocess.CompletedProcess(argv, 0, stdout=resolved)
         captured.append(kwargs["env"])
         return subprocess.CompletedProcess(argv, 0)
 
