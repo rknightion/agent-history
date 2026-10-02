@@ -64,23 +64,59 @@ class Deadline(Exception):
 # --------------------------------------------------------------------------------------------
 
 
-def repo_slug(remote: str | None) -> str | None:
-    """host/owner/name from a git remote URL (scp-like, ssh://, https://), lower-cased; None if unparseable."""
+GITHUB_HOST = "github.com"
+# Transports with a network authority. file:// and anything else names no remote host to own.
+REMOTE_SCHEMES = frozenset({"https", "http", "ssh", "git", "git+ssh", "ssh+git"})
+_HOST = r"(?P<host>[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*)"
+_PATH = r"(?P<owner>[a-z0-9._-]+)/(?P<name>[a-z0-9._-]+)/?"
+# The authority is matched whole: at most one userinfo, which cannot hold a character at which a
+# URL client would end the authority ('/', '?', '#', a backslash), so the host is what git dials.
+# ASCII matching: without it IGNORECASE folds U+212A KELVIN SIGN onto k.
+_URL_REMOTE = re.compile(
+    r"(?P<scheme>[a-z][a-z0-9+.-]*)://(?:[^@/?#\\\s\x00-\x1f\x7f]+@)?" + _HOST + r"(?::[0-9]{1,5})?/" + _PATH,
+    re.ASCII | re.IGNORECASE,
+)
+_SCP_REMOTE = re.compile(
+    r"(?:[a-z0-9._-]+@)?" + _HOST + ":" + _PATH, re.ASCII | re.IGNORECASE
+)  # [user@]host:owner/name
+
+
+def parse_remote(remote: str | None) -> tuple[str, str, str] | None:
+    """(host, owner, name), lower-cased, from a git remote URL; None unless it is exactly that shape.
+
+    Accepts scheme://[userinfo@]host[:port]/owner/name and scp-style [user@]host:owner/name, each
+    with an optional .git suffix and trailing slash. Every character is accounted for: a query, a
+    fragment, an encoded or empty path segment, a dot segment or a deeper path is not a repository
+    this collector can attribute to an owner.
+    """
     if not remote:
         return None
     url = remote.strip()
-    m = re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://(?:[^@/]+@)?([^/:]+)(?::\d+)?/(.+)$", url)
-    if not m:
-        m = re.match(r"^(?:[^@/]+@)?([^/:]+):(?!/)(.+)$", url)  # git@host:owner/name
+    m = _URL_REMOTE.fullmatch(url)
+    if m:
+        if m.group("scheme").lower() not in REMOTE_SCHEMES:
+            return None
+    else:
+        m = _SCP_REMOTE.fullmatch(url)
     if not m:
         return None
-    host, path = m.group(1).lower(), m.group(2).strip("/")
-    if path.endswith(".git"):
-        path = path[:-4]
-    parts = [p for p in path.split("/") if p]
-    if len(parts) != 2:
+    host, owner, name = (m.group(part).lower() for part in ("host", "owner", "name"))
+    if name.endswith(".git"):
+        name = name[:-4]
+    if not name or {owner, name} & {".", ".."}:
         return None
-    return f"{host}/{parts[0]}/{parts[1]}".lower()
+    return host, owner, name
+
+
+def repo_slug(remote: str | None) -> str | None:
+    """host/owner/name from a git remote URL (scp-like, ssh://, https://), lower-cased; None if unparseable."""
+    parsed = parse_remote(remote)
+    return "/".join(parsed) if parsed else None
+
+
+def slug_host(slug: str | None) -> str | None:
+    """The host component of a host/owner/name slug."""
+    return slug.split("/", 1)[0] if slug else None
 
 
 def allowlisted(slug: str | None) -> bool:
@@ -425,7 +461,7 @@ def classify_repo(repo: Path, forks: set[str] | None) -> tuple[dict[str, Any] | 
         return None, "no_origin"
     if not allowlisted(slug):
         return None, "not_allowlisted"
-    if slug.startswith("github.com/"):
+    if slug_host(slug) == GITHUB_HOST:
         if forks is None:
             return None, "fork_status_unknown"
         if slug in forks:
@@ -498,7 +534,7 @@ def github_forks() -> set[str] | None:
             return None
         for r in json.loads(out.stdout or "[]"):
             if r.get("isFork"):
-                forks.add(f"github.com/{r['nameWithOwner']}".lower())
+                forks.add(f"{GITHUB_HOST}/{r['nameWithOwner']}".lower())
     return forks
 
 
@@ -1102,7 +1138,7 @@ class Collector:
             self.rollback()
             self.errors.append({"repo": slug, "step": "git_commit_file", "error": type(error).__name__})
         self.check_time()
-        if slug.startswith("github.com/"):
+        if slug_host(slug) == GITHUB_HOST:
             try:
                 self.write("ci_run", CI_COLS, ["run_id"], ci_runs(slug))
             except Exception as error:
@@ -1211,7 +1247,7 @@ def configure(config) -> None:
     global CONTEXT, REPO_CONTEXTS, HOMES, HOME_NAMESPACES, MACHINE, LOCK_FILE
     REPOSITORIES = config.git_repos
     ALLOWED_OWNERS = {tuple(owner.split("/", 1)) for owner in config.identities.git_owners}
-    GITHUB_OWNERS = sorted(owner for host, owner in ALLOWED_OWNERS if host == "github.com")
+    GITHUB_OWNERS = sorted(owner for host, owner in ALLOWED_OWNERS if host == GITHUB_HOST)
     OWNER_IDENTITIES = set(config.identities.owner_emails)
     setting = config.collector
     CONTEXT = config.default_context
