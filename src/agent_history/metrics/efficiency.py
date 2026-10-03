@@ -9,6 +9,7 @@ import time
 from collections import defaultdict
 from pathlib import Path
 
+from agent_history import telemetry
 from agent_history.config import Config
 from agent_history.efficiency import parser as rules
 from agent_history.metrics import Family, Sample
@@ -115,9 +116,7 @@ class EfficiencyCollector:
         loop_failed = True  # Like the legacy optional section, no DSN means no successful fetch.
         if self.config.efficiency.loop_dsn:
             try:
-                import psycopg
-
-                with psycopg.connect(
+                with telemetry.db_connect(
                     self.config.efficiency.loop_dsn,
                     connect_timeout=5,
                     options="-c statement_timeout=10000 -c default_transaction_read_only=on",

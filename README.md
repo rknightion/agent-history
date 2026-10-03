@@ -149,6 +149,17 @@ metadata and receipts, and catalogue collection reads database aggregates; those
 do not read transcript content. Archive roots (`hot`, `cold`, `incoming`, `conflicts`) are optional
 and must be mounted read-only if set.
 
+With the optional `otel` extra installed and `OTEL_EXPORTER_OTLP_ENDPOINT` (or the metrics-specific
+endpoint) set, the exporter also publishes every `agent_history_*`, `agent_sessions_*` and
+`agent_efficiency_*` family through the OpenTelemetry meter, as the mapping in `docs/otel-design.md`
+describes, and refreshes it at the exporter's refresh interval even when nothing scrapes `/metrics`.
+Both outputs come from one collection, so the Prometheus exposition is byte for byte what it was
+without OTLP. Use `OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE=CUMULATIVE` or leave it unset;
+any other value switches the bridge off. A label value outside its producer's vocabulary is refused
+by OTLP only, never rewritten, and the Prometheus text keeps it. `just otlp-parity` runs one synthetic
+collection through both outputs, decodes the real OTLP request and compares every mapped family; rerun
+it before retiring the Prometheus route.
+
 Non-string pi model values are treated as missing: the model remains unknown unless a valid string was previously recorded.
 At the public exposition boundary, `model` label values are restricted to an explicit literal
 allowlist of public model identifiers. Unlisted values become `other`, and empty values become

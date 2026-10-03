@@ -33,7 +33,16 @@ _NOOP = _Noop()
 _active = None
 _lock = threading.RLock()
 _passes = contextvars.ContextVar("agent_history_passes", default={})
-_EVENTS = frozenset({"worker.pass.completed", "worker.pass.skipped", "worker.pass.failed", "outbound.call.failed"})
+_EVENTS = frozenset(
+    {
+        "worker.pass.completed",
+        "worker.pass.skipped",
+        "worker.pass.failed",
+        "outbound.call.failed",
+        "telemetry.configuration.invalid",
+        "telemetry.export.failed",
+    }
+)
 _COUNTS = frozenset(
     {
         "files",
@@ -89,6 +98,7 @@ _ENUMS = {
         "daily_cap",
     },
     "error.type": {"config", "io", "lookup", "error", "status"},
+    "agent_history.collector": {"archive", "catalogue", "runs", "efficiency", "self"},
     "db.system.name": {"postgresql", "sqlite"},
     "db.operation.name": {"connect", "query", "copy", "commit", "rollback"},
 }
@@ -268,6 +278,21 @@ def shutdown():
     if _active is not None:
         _active.shutdown()
     _active = None
+
+
+def metrics_enabled():
+    """True only when a real meter provider exists, so callers can skip work that feeds only OTLP metrics."""
+    return _active is not None and not _active.closed and not isinstance(_active.metric, _Noop)
+
+
+def fail(span, category="error"):
+    """Mark a span failed without a description, for a failure that was handled rather than raised."""
+    span.set_attributes(
+        {"agent_history.outcome": "error", "error.type": category if category in _ENUMS["error.type"] else "error"}
+    )
+    if _active is not None and _active.enabled:
+        api = importlib.import_module("opentelemetry.trace")
+        span.set_status(api.Status(api.StatusCode.ERROR))
 
 
 def tracer():

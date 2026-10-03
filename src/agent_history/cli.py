@@ -318,6 +318,7 @@ def _dispatch(args, parser, argv, reader_commands):
     if args.command == "exporter":
         from .metrics.archive import ArchiveCollector
         from .metrics.catalogue import CatalogueCollector, RunCollector
+        from .metrics.otlp import Bridge, Refresher
         from .metrics.self import SelfCollector
         from .metrics.server import MetricServer, State
 
@@ -348,10 +349,25 @@ def _dispatch(args, parser, argv, reader_commands):
             builders["efficiency"] = lambda: EfficiencyCollector(config, setting.state_dir)
         collectors = [builders[name]() for name in setting.collectors]
         host, port = setting.listen.rsplit(":", 1)
+        # None unless OTLP metric export is explicitly enabled: then /metrics is unchanged and the same
+        # collection also feeds the OTel meter, refreshed on schedule even with no scraper.
+        bridge = Bridge.create()
         with MetricServer(
-            (host, int(port)), collectors, State(setting.state_dir, config.metrics_labels), setting.refresh_interval
+            (host, int(port)),
+            collectors,
+            State(setting.state_dir, config.metrics_labels),
+            setting.refresh_interval,
+            bridge=bridge,
         ) as server:
-            server.serve_forever()
+            refresher = Refresher(server) if bridge is not None else None
+            if refresher is not None:
+                refresher.start()
+            try:
+                server.serve_forever()
+            finally:
+                if refresher is not None:
+                    refresher.stop()
+                server.quiesce()
         return 0
 
     if args.command == "mcp":

@@ -11,6 +11,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from agent_history import telemetry
 from agent_history.config import MetricsLabels
 
 from . import Collector, Family, Sample
@@ -195,10 +196,22 @@ class State:
 
 
 def exposition(families: list[Family], state: State, *, retired_loops: dict[str, set[str]] | None = None) -> str:
+    return render(families, state, retired_loops=retired_loops)[0]
+
+
+def render(
+    families: list[Family], state: State, *, retired_loops: dict[str, set[str]] | None = None
+) -> tuple[str, tuple[Family, ...]]:
+    """The Prometheus text and the immutable public snapshot of the very same samples.
+
+    Counters pass through `State.observe` exactly once here; the snapshot is what the text renders, so
+    any other consumer (the OTLP bridge) sees the same adjusted, label-mapped, aggregated values.
+    """
     # Retirement is independent of family presence: the last loop may retire too.
     for name, loops in (retired_loops or {}).items():
         state.forget_ended_loops({name}, loops)
     lines: list[str] = []
+    snapshot: list[Family] = []
     seen: set[str] = set()
     for family in families:
         if not NAME.fullmatch(family.name) or family.type not in ("counter", "gauge", "histogram"):
@@ -234,7 +247,16 @@ def exposition(families: list[Family], state: State, *, retired_loops: dict[str,
                 else {family.name}
             )
             public = state.public_samples(names)
-        for sample in sorted(public, key=sample_order):
+        ordered = sorted(public, key=sample_order)
+        snapshot.append(
+            Family(
+                family.name,
+                family.type,
+                family.help,
+                tuple(Sample(sample.labels, float(sample.value), sample.name or family.name) for sample in ordered),
+            )
+        )
+        for sample in ordered:
             name = sample.name or family.name
             if family.type == "histogram":
                 if name not in (family.name + "_bucket", family.name + "_sum", family.name + "_count"):
@@ -249,70 +271,101 @@ def exposition(families: list[Family], state: State, *, retired_loops: dict[str,
             # The legacy textfile format: integers exact, everything else to 12 significant digits.
             rendered = str(int(value)) if value.is_integer() else format(value, ".12g")
             lines.append(f"{name}{labels} {rendered}")
-    return "\n".join(lines) + "\n"
+    return "\n".join(lines) + "\n", tuple(snapshot)
 
 
 class MetricServer(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, address: tuple[str, int], collectors: list[Collector], state: State, refresh: float = 15):
+    def __init__(
+        self,
+        address: tuple[str, int],
+        collectors: list[Collector],
+        state: State,
+        refresh: float = 15,
+        bridge=None,
+    ):
         self.collectors = collectors
         self.state = state
         self.refresh = refresh
+        self.bridge = bridge  # optional OTLP bridge fed from the same collection; None changes nothing
         self.snapshot = ""
         self.updated: float | None = None
         self.snapshot_lock = threading.Lock()
         super().__init__(address, _Handler)
 
+    def seconds_until_refresh(self) -> float:
+        """Time left before the cached collection is stale; zero or less means collect now."""
+        updated = self.updated
+        return 0.0 if updated is None else self.refresh - (time.monotonic() - updated)
+
+    def quiesce(self) -> None:
+        """Wait for any collection in flight; call after the server stopped accepting requests."""
+        with self.snapshot_lock:
+            pass
+
     def metrics(self) -> str:
         with self.snapshot_lock:
             if self.updated is None or time.monotonic() - self.updated >= self.refresh:
-                from .self import SelfCollector
-
-                self_collector = next((c for c in self.collectors if isinstance(c, SelfCollector)), None)
-                families = []
-                retired_loops: dict[str, set[str]] = {}
-                retirement_collectors = []
-                run_started = time.monotonic()
-                failed = False
-                for collector in self.collectors:
-                    if collector is self_collector:
-                        continue
-                    start = time.monotonic()
-                    try:
-                        # Materialize before adding: a generator may fail after yielding.
-                        collected = list(collector.collect())
-                        families.extend(collected)
-                        for name, loops in getattr(collector, "retired_loops", {}).items():
-                            retired_loops.setdefault(name, set()).update(loops)
-                        if getattr(collector, "retired_loops", {}) and hasattr(collector, "acknowledge_retired_loops"):
-                            retirement_collectors.append(collector)
-                        if self_collector:
-                            self_collector.record(collector.name, time.monotonic() - start, False)
-                    except Exception:
-                        failed = True
-                        if self_collector:
-                            self_collector.record(collector.name, time.monotonic() - start, True)
-                        # Isolate unavailable sources while retaining healthy families.
-                    finally:
-                        if self_collector:
-                            for name, (duration, section_failed) in getattr(collector, "section_health", {}).items():
-                                self_collector.record(name, duration, section_failed)
-                                if section_failed and name != "loops":
-                                    failed = True
-                if self_collector:
-                    self_collector.complete(time.monotonic() - run_started, failed)
-                    families.extend(self_collector.collect())
-                rendered = exposition(families, self.state, retired_loops=retired_loops)
-                for collector in retirement_collectors:
-                    try:
-                        collector.acknowledge_retired_loops()
-                    except OSError:
-                        # Replay is safe: the collector keeps its durable pending signal.
-                        pass
-                self.snapshot = rendered
-                self.updated = time.monotonic()
+                # One span per real refresh, never per cache hit or HTTP scrape.
+                with telemetry.operation("exporter.collect") as span:
+                    self._refresh(span)
             return self.snapshot
+
+    def _refresh(self, span) -> None:
+        from .self import SelfCollector
+
+        self_collector = next((c for c in self.collectors if isinstance(c, SelfCollector)), None)
+        families = []
+        retired_loops: dict[str, set[str]] = {}
+        retirement_collectors = []
+        run_started = time.monotonic()
+        failed = False
+        for collector in self.collectors:
+            if collector is self_collector:
+                continue
+            start = time.monotonic()
+            try:
+                # Materialize before adding: a generator may fail after yielding.
+                with telemetry.operation("exporter.collector", {"agent_history.collector": collector.name}):
+                    collected = list(collector.collect())
+                families.extend(collected)
+                for name, loops in getattr(collector, "retired_loops", {}).items():
+                    retired_loops.setdefault(name, set()).update(loops)
+                if getattr(collector, "retired_loops", {}) and hasattr(collector, "acknowledge_retired_loops"):
+                    retirement_collectors.append(collector)
+                if self_collector:
+                    self_collector.record(collector.name, time.monotonic() - start, False)
+            except Exception:
+                failed = True
+                if self_collector:
+                    self_collector.record(collector.name, time.monotonic() - start, True)
+                # Isolate unavailable sources while retaining healthy families.
+            finally:
+                if self_collector:
+                    for name, (duration, section_failed) in getattr(collector, "section_health", {}).items():
+                        self_collector.record(name, duration, section_failed)
+                        if section_failed and name != "loops":
+                            failed = True
+        if self_collector:
+            self_collector.complete(time.monotonic() - run_started, failed)
+            families.extend(self_collector.collect())
+        rendered, public = render(families, self.state, retired_loops=retired_loops)
+        if self.bridge is not None:
+            # The same completed samples, published atomically; the bridge never collects or observes.
+            self.bridge.publish(public)
+        for collector in retirement_collectors:
+            try:
+                collector.acknowledge_retired_loops()
+            except OSError:
+                # Replay is safe: the collector keeps its durable pending signal.
+                pass
+        if failed:
+            telemetry.fail(span)
+        else:
+            span.set_attributes({"agent_history.outcome": "success"})
+        self.snapshot = rendered
+        self.updated = time.monotonic()
 
 
 class _Handler(BaseHTTPRequestHandler):

@@ -5,6 +5,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from agent_history import telemetry
+
 from . import Family, Sample
 
 TABLES = (
@@ -131,9 +133,8 @@ class CatalogueCollector:
         self.dsn = dsn
 
     def collect(self):
-        import psycopg
-
-        with psycopg.connect(self.dsn, application_name="agent-history-exporter", autocommit=True) as conn:
+        # The shared factory is psycopg.connect unchanged unless telemetry is enabled.
+        with telemetry.db_connect(self.dsn, application_name="agent-history-exporter", autocommit=True) as conn:
             conn.read_only = True
             result = []
             success = conn.execute(

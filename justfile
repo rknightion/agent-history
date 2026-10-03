@@ -38,6 +38,11 @@ test:
     uv run --locked --group dev python -m pytest -q
     python3 -m unittest discover -s bin -p 'test_leak_scan.py'
 
+# One synthetic collection rendered as Prometheus text and decoded OTLP, every mapped family compared
+[group('check')]
+otlp-parity:
+    uv run --locked --group dev python -m pytest -q -rs tests/test_otlp_bridge.py tests/test_metrics_exposition_golden.py
+
 # The pre-commit gate: format, lint, tests and the leak gate
 [group('check')]
 check: fmt-check lint baseline-ledger-check alerts-check test leak
