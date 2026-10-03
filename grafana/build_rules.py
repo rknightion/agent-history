@@ -56,7 +56,7 @@ RULES = [
         "severity": "warning",
     },
     {
-        "name": "agent-history-embed-stale",
+        "name": "agent-history-embed-stale-pending",
         "title": "agent-history embeddings stalled with messages pending",
         "summary": "agent-history embeddings have not succeeded for over an hour with messages pending",
         "description": (

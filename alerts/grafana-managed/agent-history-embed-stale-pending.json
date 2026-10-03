@@ -8,7 +8,7 @@
     "labels": {
       "grafana.app/folder": "REPLACE_WITH_FOLDER_UID"
     },
-    "name": "agent-history-embed-stale"
+    "name": "agent-history-embed-stale-pending"
   },
   "spec": {
     "annotations": {
