@@ -28,6 +28,9 @@ otel = [
 [package.dev-dependencies]
 dev = [
     { name = "mcp" },
+    { name = "opentelemetry-api" },
+    { name = "opentelemetry-exporter-otlp-proto-http" },
+    { name = "opentelemetry-sdk" },
     { name = "pytest" },
     { name = "ruff" },
 ]
@@ -45,6 +48,9 @@ provides-extras = ["mcp", "otel"]
 [package.metadata.requires-dev]
 dev = [
     { name = "mcp", specifier = ">=2.0" },
+    { name = "opentelemetry-api", specifier = ">=1.39,<2" },
+    { name = "opentelemetry-exporter-otlp-proto-http", specifier = ">=1.39,<2" },
+    { name = "opentelemetry-sdk", specifier = ">=1.39,<2" },
     { name = "pytest", specifier = ">=8" },
     { name = "ruff", specifier = "==0.16.10" },
 ]
