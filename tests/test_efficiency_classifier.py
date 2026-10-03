@@ -23,3 +23,10 @@ def test_tool_result_across_harnesses():
     assert classify_tool_result("claude", "TaskOutput", {}, {"task": {"status": "running"}}) == "wait"
     assert classify_tool_result("claude", "TaskOutput", {}, {"task": {"status": "completed"}}) == "event"
     assert classify_tool_result("claude", "Agent", {}, {}) == "orchestrate"
+
+
+def test_markerless_process_poll_output_counts_as_timed_out():
+    from agent_history.efficiency.parser import efficiency_codex_result
+
+    assert efficiency_codex_result("process", "Script completed\nOutput: building...") == "timed_out"
+    assert efficiency_codex_result("process", "Process exited with code 0") == "event"

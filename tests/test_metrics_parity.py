@@ -1,6 +1,7 @@
 """Public loader, metric collection and parity CLI contracts at their used boundaries."""
 
 import json
+import re
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -77,19 +78,37 @@ def test_allowlisted_archive_machine_and_configured_zero_namespaces(tmp_path):
     assert "storage_newest_mtime_seconds{" not in text
 
 
-def test_loop_map_failure_is_visible_but_optional_over_http(tmp_path, monkeypatch):
+def test_loop_map_failure_is_visible_but_optional_over_http(tmp_path, monkeypatch, capsys):
     import psycopg
+    import time
 
     def unavailable(*args, **kwargs):
         raise psycopg.OperationalError("synthetic unavailability")
 
     monkeypatch.setattr(psycopg, "connect", unavailable)
-    config = parse_config({"sources": {}, "efficiency": {"loop_dsn": "synthetic"}})
+    rollouts = tmp_path / "codex" / "sessions" / "2026"
+    rollouts.mkdir(parents=True)
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(time.time() - 60))
+    (rollouts / "rollout-a.jsonl").write_text(
+        json.dumps({"timestamp": stamp, "type": "session_meta", "payload": {"id": "thread-a"}})
+        + "\n"
+        + json.dumps({"timestamp": stamp, "type": "token_usage_record", "payload": {"usage": {"input_tokens": 5}}})
+        + "\n"
+    )
+    dsn = "postgresql://reader-dsn-secret@127.0.0.1:1/synthetic"
+    config = parse_config({"sources": {"codex-local": str(tmp_path / "codex")}, "efficiency": {"loop_dsn": dsn}})
     health = SelfCollector()
     health.record("loops", 0.01, False)
     last = health.last_success["loops"]
     collectors = [EfficiencyCollector(config, tmp_path / "efficiency"), health]
     text = Collection(collectors, State(tmp_path / "collection")).metrics()
+    # The efficiency section still succeeds and attributes everything to loop="none", with no map age.
+    assert 'agent_sessions_metrics_section_success{section="efficiency"} 1' in text
+    assert 'agent_efficiency_llm_calls_total{agent="codex",loop="none"' in text
+    assert {label for label in re.findall(r'loop="([^"]*)"', text)} == {"none"}
+    assert "agent_efficiency_loop_map_age_seconds" not in text
+    streams = capsys.readouterr()
+    assert all("reader-dsn-secret" not in surface for surface in (text, streams.out, streams.err))
     assert 'agent_sessions_metrics_section_success{section="loops"} 0' in text
     assert 'agent_sessions_metrics_section_duration_seconds{section="loops"}' in text
     assert health.last_success["loops"] == last

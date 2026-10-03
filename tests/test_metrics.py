@@ -84,6 +84,43 @@ def test_archive_private_family_contract(tmp_path):
     assert all("one.jsonl" not in str(f.samples) for f in families.values())
 
 
+def test_archive_pending_bytes_retention_and_newest_archive_receipt(tmp_path):
+    import os
+    import time
+
+    hot, cold = tmp_path / "hot", tmp_path / "cold"
+    hot_file = hot / "codex-local" / "sessions" / "one.jsonl"
+    cold_file = cold / "codex-local" / "sessions" / "one.jsonl"
+    for path, text in ((hot_file, "longer\n"), (cold_file, "old\n")):
+        path.parent.mkdir(parents=True)
+        path.write_text(text)
+    old = time.time() - 91 * 86400
+    os.utime(hot_file, (old, old))
+    receipts = cold / ".archive-receipts"
+    receipts.mkdir()
+    (receipts / "20260919T230510.000000001Z.json").write_text('{"jsonl_files":3,"jsonl_bytes":30}\n')
+    archive = receipts / "20260920T230510.071133649Z.json"
+    archive.write_text('{"jsonl_files":7,"jsonl_bytes":70}\n')
+    # A one-off audit receipt sorts after the stamp-named archive receipts and is newer, but is not an archive run.
+    other = receipts / "retired-20260921T092249.974091678Z.json"
+    other.write_text('{"archived_at":"x"}\n')
+    os.utime(archive, (2000, 2000))
+    os.utime(other, (3000, 3000))
+    families = {f.name: f for f in ArchiveCollector(hot, cold, None, None, retention_days=90).collect()}
+    gauge = lambda name: families[name].samples[0].value
+    assert gauge("agent_sessions_archive_pending_files") == 1
+    assert gauge("agent_sessions_archive_pending_bytes") == 3  # only the bytes beyond the cold copy
+    assert gauge("agent_sessions_hot_retention_eligible_files") == 1
+    assert gauge("agent_sessions_archive_receipts") == 3
+    assert gauge("agent_sessions_archive_last_success_timestamp_seconds") == 2000
+    assert gauge("agent_sessions_archive_receipt_jsonl_files") == 7
+
+
+def test_exposition_escapes_label_values(tmp_path):
+    families = [Family("example_metric", "gauge", "Example.", (Sample((("value", 'a"b\\c\nd'),), 1),))]
+    assert 'example_metric{value="a\\"b\\\\c\\nd"} 1' in exposition(families, State(tmp_path / "state"))
+
+
 def test_archive_namespace_cardinality_is_bounded(tmp_path):
     hot = tmp_path / "hot"
     hot.mkdir()
