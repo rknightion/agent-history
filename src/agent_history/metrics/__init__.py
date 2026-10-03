@@ -1,4 +1,4 @@
-"""Frozen collector seam shared by the exporter and every collector."""
+"""Frozen collector seam shared by the metric collection and every collector."""
 
 from __future__ import annotations
 

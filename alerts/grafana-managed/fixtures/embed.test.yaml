@@ -5,19 +5,19 @@
     {
       "input_series": [
         {
-          "series": "agent_history_embed_run_success{job=\"agent-history\"}",
+          "series": "agent_history_embed_run_success_ratio{job=\"agent-history-index\"}",
           "values": "0x150"
         },
         {
-          "series": "agent_history_embed_last_success_timestamp_seconds{job=\"agent-history\"}",
+          "series": "agent_history_embed_last_success_timestamp_seconds{job=\"agent-history-index\"}",
           "values": "0x150"
         },
         {
-          "series": "agent_history_embed_last_failure_reason{reason=\"billing_quota\",job=\"agent-history\"}",
+          "series": "agent_history_embed_last_failure_reason_ratio{reason=\"billing_quota\",job=\"agent-history-index\"}",
           "values": "1x150"
         },
         {
-          "series": "agent_history_embed_pending_messages{job=\"agent-history\"}",
+          "series": "agent_history_embed_pending_messages{job=\"agent-history-index\"}",
           "values": "5x150"
         }
       ],
@@ -32,31 +32,31 @@
               "value": 1
             }
           ],
-          "expr": "max by (reason) ((agent_history_embed_last_failure_reason{job=\"agent-history\"} == 1) and on() (agent_history_embed_run_success{job=\"agent-history\"} == 0)) or on() label_replace(1 - min(agent_history_embed_run_success{job=\"agent-history\"}) == 1, \"reason\", \"unreported\", \"\", \"\")"
+          "expr": "max by (reason) ((agent_history_embed_last_failure_reason_ratio{job=\"agent-history-index\"} == 1) and on() (agent_history_embed_run_success_ratio{job=\"agent-history-index\"} == 0)) or on() label_replace(1 - min(agent_history_embed_run_success_ratio{job=\"agent-history-index\"}) == 1, \"reason\", \"unreported\", \"\", \"\")"
         },
         {
           "eval_time": "10m",
           "exp_samples": [],
-          "expr": "(time() - max(agent_history_embed_last_success_timestamp_seconds{job=\"agent-history\"}) > 3600) and on() (max(agent_history_embed_pending_messages{job=\"agent-history\"}) > 0)"
+          "expr": "(time() - max(agent_history_embed_last_success_timestamp_seconds{job=\"agent-history-index\"}) > 3600) and on() (max(agent_history_embed_pending_messages{job=\"agent-history-index\"}) > 0)"
         }
       ]
     },
     {
       "input_series": [
         {
-          "series": "agent_history_embed_run_success{job=\"agent-history\"}",
+          "series": "agent_history_embed_run_success_ratio{job=\"agent-history-index\"}",
           "values": "0x150"
         },
         {
-          "series": "agent_history_embed_last_success_timestamp_seconds{job=\"agent-history\"}",
+          "series": "agent_history_embed_last_success_timestamp_seconds{job=\"agent-history-index\"}",
           "values": "0x150"
         },
         {
-          "series": "agent_history_embed_last_failure_reason{reason=\"rate_limit\",job=\"agent-history\"}",
+          "series": "agent_history_embed_last_failure_reason_ratio{reason=\"rate_limit\",job=\"agent-history-index\"}",
           "values": "1x150"
         },
         {
-          "series": "agent_history_embed_pending_messages{job=\"agent-history\"}",
+          "series": "agent_history_embed_pending_messages{job=\"agent-history-index\"}",
           "values": "5x150"
         }
       ],
@@ -71,27 +71,27 @@
               "value": 1
             }
           ],
-          "expr": "max by (reason) ((agent_history_embed_last_failure_reason{job=\"agent-history\"} == 1) and on() (agent_history_embed_run_success{job=\"agent-history\"} == 0)) or on() label_replace(1 - min(agent_history_embed_run_success{job=\"agent-history\"}) == 1, \"reason\", \"unreported\", \"\", \"\")"
+          "expr": "max by (reason) ((agent_history_embed_last_failure_reason_ratio{job=\"agent-history-index\"} == 1) and on() (agent_history_embed_run_success_ratio{job=\"agent-history-index\"} == 0)) or on() label_replace(1 - min(agent_history_embed_run_success_ratio{job=\"agent-history-index\"}) == 1, \"reason\", \"unreported\", \"\", \"\")"
         },
         {
           "eval_time": "10m",
           "exp_samples": [],
-          "expr": "(time() - max(agent_history_embed_last_success_timestamp_seconds{job=\"agent-history\"}) > 3600) and on() (max(agent_history_embed_pending_messages{job=\"agent-history\"}) > 0)"
+          "expr": "(time() - max(agent_history_embed_last_success_timestamp_seconds{job=\"agent-history-index\"}) > 3600) and on() (max(agent_history_embed_pending_messages{job=\"agent-history-index\"}) > 0)"
         }
       ]
     },
     {
       "input_series": [
         {
-          "series": "agent_history_embed_run_success{job=\"agent-history\"}",
+          "series": "agent_history_embed_run_success_ratio{job=\"agent-history-index\"}",
           "values": "0x150"
         },
         {
-          "series": "agent_history_embed_last_success_timestamp_seconds{job=\"agent-history\"}",
+          "series": "agent_history_embed_last_success_timestamp_seconds{job=\"agent-history-index\"}",
           "values": "0x150"
         },
         {
-          "series": "agent_history_embed_pending_messages{job=\"agent-history\"}",
+          "series": "agent_history_embed_pending_messages{job=\"agent-history-index\"}",
           "values": "5x150"
         }
       ],
@@ -106,27 +106,27 @@
               "value": 1
             }
           ],
-          "expr": "max by (reason) ((agent_history_embed_last_failure_reason{job=\"agent-history\"} == 1) and on() (agent_history_embed_run_success{job=\"agent-history\"} == 0)) or on() label_replace(1 - min(agent_history_embed_run_success{job=\"agent-history\"}) == 1, \"reason\", \"unreported\", \"\", \"\")"
+          "expr": "max by (reason) ((agent_history_embed_last_failure_reason_ratio{job=\"agent-history-index\"} == 1) and on() (agent_history_embed_run_success_ratio{job=\"agent-history-index\"} == 0)) or on() label_replace(1 - min(agent_history_embed_run_success_ratio{job=\"agent-history-index\"}) == 1, \"reason\", \"unreported\", \"\", \"\")"
         },
         {
           "eval_time": "10m",
           "exp_samples": [],
-          "expr": "(time() - max(agent_history_embed_last_success_timestamp_seconds{job=\"agent-history\"}) > 3600) and on() (max(agent_history_embed_pending_messages{job=\"agent-history\"}) > 0)"
+          "expr": "(time() - max(agent_history_embed_last_success_timestamp_seconds{job=\"agent-history-index\"}) > 3600) and on() (max(agent_history_embed_pending_messages{job=\"agent-history-index\"}) > 0)"
         }
       ]
     },
     {
       "input_series": [
         {
-          "series": "agent_history_embed_run_success{job=\"agent-history\"}",
+          "series": "agent_history_embed_run_success_ratio{job=\"agent-history-index\"}",
           "values": "1x150"
         },
         {
-          "series": "agent_history_embed_last_success_timestamp_seconds{job=\"agent-history\"}",
+          "series": "agent_history_embed_last_success_timestamp_seconds{job=\"agent-history-index\"}",
           "values": "0x150"
         },
         {
-          "series": "agent_history_embed_pending_messages{job=\"agent-history\"}",
+          "series": "agent_history_embed_pending_messages{job=\"agent-history-index\"}",
           "values": "5x150"
         }
       ],
@@ -136,19 +136,19 @@
         {
           "eval_time": "10m",
           "exp_samples": [],
-          "expr": "max by (reason) ((agent_history_embed_last_failure_reason{job=\"agent-history\"} == 1) and on() (agent_history_embed_run_success{job=\"agent-history\"} == 0)) or on() label_replace(1 - min(agent_history_embed_run_success{job=\"agent-history\"}) == 1, \"reason\", \"unreported\", \"\", \"\")"
+          "expr": "max by (reason) ((agent_history_embed_last_failure_reason_ratio{job=\"agent-history-index\"} == 1) and on() (agent_history_embed_run_success_ratio{job=\"agent-history-index\"} == 0)) or on() label_replace(1 - min(agent_history_embed_run_success_ratio{job=\"agent-history-index\"}) == 1, \"reason\", \"unreported\", \"\", \"\")"
         },
         {
           "eval_time": "10m",
           "exp_samples": [],
-          "expr": "(time() - max(agent_history_embed_last_success_timestamp_seconds{job=\"agent-history\"}) > 3600) and on() (max(agent_history_embed_pending_messages{job=\"agent-history\"}) > 0)"
+          "expr": "(time() - max(agent_history_embed_last_success_timestamp_seconds{job=\"agent-history-index\"}) > 3600) and on() (max(agent_history_embed_pending_messages{job=\"agent-history-index\"}) > 0)"
         }
       ]
     },
     {
       "input_series": [
         {
-          "series": "agent_history_embed_pending_messages{job=\"agent-history\"}",
+          "series": "agent_history_embed_pending_messages{job=\"agent-history-index\"}",
           "values": "5x150"
         }
       ],
@@ -158,31 +158,31 @@
         {
           "eval_time": "2h",
           "exp_samples": [],
-          "expr": "max by (reason) ((agent_history_embed_last_failure_reason{job=\"agent-history\"} == 1) and on() (agent_history_embed_run_success{job=\"agent-history\"} == 0)) or on() label_replace(1 - min(agent_history_embed_run_success{job=\"agent-history\"}) == 1, \"reason\", \"unreported\", \"\", \"\")"
+          "expr": "max by (reason) ((agent_history_embed_last_failure_reason_ratio{job=\"agent-history-index\"} == 1) and on() (agent_history_embed_run_success_ratio{job=\"agent-history-index\"} == 0)) or on() label_replace(1 - min(agent_history_embed_run_success_ratio{job=\"agent-history-index\"}) == 1, \"reason\", \"unreported\", \"\", \"\")"
         },
         {
           "eval_time": "2h",
           "exp_samples": [],
-          "expr": "(time() - max(agent_history_embed_last_success_timestamp_seconds{job=\"agent-history\"}) > 3600) and on() (max(agent_history_embed_pending_messages{job=\"agent-history\"}) > 0)"
+          "expr": "(time() - max(agent_history_embed_last_success_timestamp_seconds{job=\"agent-history-index\"}) > 3600) and on() (max(agent_history_embed_pending_messages{job=\"agent-history-index\"}) > 0)"
         }
       ]
     },
     {
       "input_series": [
         {
-          "series": "agent_history_embed_run_success{job=\"agent-history\"}",
+          "series": "agent_history_embed_run_success_ratio{job=\"agent-history-index\"}",
           "values": "0x150"
         },
         {
-          "series": "agent_history_embed_last_success_timestamp_seconds{job=\"agent-history\"}",
+          "series": "agent_history_embed_last_success_timestamp_seconds{job=\"agent-history-index\"}",
           "values": "0x150"
         },
         {
-          "series": "agent_history_embed_last_failure_reason{reason=\"billing_quota\",job=\"agent-history\"}",
+          "series": "agent_history_embed_last_failure_reason_ratio{reason=\"billing_quota\",job=\"agent-history-index\"}",
           "values": "1x150"
         },
         {
-          "series": "agent_history_embed_pending_messages{job=\"agent-history\"}",
+          "series": "agent_history_embed_pending_messages{job=\"agent-history-index\"}",
           "values": "5x150"
         }
       ],
@@ -197,7 +197,7 @@
               "value": 1
             }
           ],
-          "expr": "max by (reason) ((agent_history_embed_last_failure_reason{job=\"agent-history\"} == 1) and on() (agent_history_embed_run_success{job=\"agent-history\"} == 0)) or on() label_replace(1 - min(agent_history_embed_run_success{job=\"agent-history\"}) == 1, \"reason\", \"unreported\", \"\", \"\")"
+          "expr": "max by (reason) ((agent_history_embed_last_failure_reason_ratio{job=\"agent-history-index\"} == 1) and on() (agent_history_embed_run_success_ratio{job=\"agent-history-index\"} == 0)) or on() label_replace(1 - min(agent_history_embed_run_success_ratio{job=\"agent-history-index\"}) == 1, \"reason\", \"unreported\", \"\", \"\")"
         },
         {
           "eval_time": "3660s",
@@ -207,22 +207,22 @@
               "value": 3660
             }
           ],
-          "expr": "(time() - max(agent_history_embed_last_success_timestamp_seconds{job=\"agent-history\"}) > 3600) and on() (max(agent_history_embed_pending_messages{job=\"agent-history\"}) > 0)"
+          "expr": "(time() - max(agent_history_embed_last_success_timestamp_seconds{job=\"agent-history-index\"}) > 3600) and on() (max(agent_history_embed_pending_messages{job=\"agent-history-index\"}) > 0)"
         }
       ]
     },
     {
       "input_series": [
         {
-          "series": "agent_history_embed_run_success{job=\"agent-history\"}",
+          "series": "agent_history_embed_run_success_ratio{job=\"agent-history-index\"}",
           "values": "1x150"
         },
         {
-          "series": "agent_history_embed_last_success_timestamp_seconds{job=\"agent-history\"}",
+          "series": "agent_history_embed_last_success_timestamp_seconds{job=\"agent-history-index\"}",
           "values": "0x150"
         },
         {
-          "series": "agent_history_embed_pending_messages{job=\"agent-history\"}",
+          "series": "agent_history_embed_pending_messages{job=\"agent-history-index\"}",
           "values": "5x150"
         }
       ],
@@ -232,27 +232,27 @@
         {
           "eval_time": "3600s",
           "exp_samples": [],
-          "expr": "max by (reason) ((agent_history_embed_last_failure_reason{job=\"agent-history\"} == 1) and on() (agent_history_embed_run_success{job=\"agent-history\"} == 0)) or on() label_replace(1 - min(agent_history_embed_run_success{job=\"agent-history\"}) == 1, \"reason\", \"unreported\", \"\", \"\")"
+          "expr": "max by (reason) ((agent_history_embed_last_failure_reason_ratio{job=\"agent-history-index\"} == 1) and on() (agent_history_embed_run_success_ratio{job=\"agent-history-index\"} == 0)) or on() label_replace(1 - min(agent_history_embed_run_success_ratio{job=\"agent-history-index\"}) == 1, \"reason\", \"unreported\", \"\", \"\")"
         },
         {
           "eval_time": "3600s",
           "exp_samples": [],
-          "expr": "(time() - max(agent_history_embed_last_success_timestamp_seconds{job=\"agent-history\"}) > 3600) and on() (max(agent_history_embed_pending_messages{job=\"agent-history\"}) > 0)"
+          "expr": "(time() - max(agent_history_embed_last_success_timestamp_seconds{job=\"agent-history-index\"}) > 3600) and on() (max(agent_history_embed_pending_messages{job=\"agent-history-index\"}) > 0)"
         }
       ]
     },
     {
       "input_series": [
         {
-          "series": "agent_history_embed_run_success{job=\"agent-history\"}",
+          "series": "agent_history_embed_run_success_ratio{job=\"agent-history-index\"}",
           "values": "1x150"
         },
         {
-          "series": "agent_history_embed_last_success_timestamp_seconds{job=\"agent-history\"}",
+          "series": "agent_history_embed_last_success_timestamp_seconds{job=\"agent-history-index\"}",
           "values": "0x150"
         },
         {
-          "series": "agent_history_embed_pending_messages{job=\"agent-history\"}",
+          "series": "agent_history_embed_pending_messages{job=\"agent-history-index\"}",
           "values": "0x150"
         }
       ],
@@ -262,23 +262,23 @@
         {
           "eval_time": "2h",
           "exp_samples": [],
-          "expr": "max by (reason) ((agent_history_embed_last_failure_reason{job=\"agent-history\"} == 1) and on() (agent_history_embed_run_success{job=\"agent-history\"} == 0)) or on() label_replace(1 - min(agent_history_embed_run_success{job=\"agent-history\"}) == 1, \"reason\", \"unreported\", \"\", \"\")"
+          "expr": "max by (reason) ((agent_history_embed_last_failure_reason_ratio{job=\"agent-history-index\"} == 1) and on() (agent_history_embed_run_success_ratio{job=\"agent-history-index\"} == 0)) or on() label_replace(1 - min(agent_history_embed_run_success_ratio{job=\"agent-history-index\"}) == 1, \"reason\", \"unreported\", \"\", \"\")"
         },
         {
           "eval_time": "2h",
           "exp_samples": [],
-          "expr": "(time() - max(agent_history_embed_last_success_timestamp_seconds{job=\"agent-history\"}) > 3600) and on() (max(agent_history_embed_pending_messages{job=\"agent-history\"}) > 0)"
+          "expr": "(time() - max(agent_history_embed_last_success_timestamp_seconds{job=\"agent-history-index\"}) > 3600) and on() (max(agent_history_embed_pending_messages{job=\"agent-history-index\"}) > 0)"
         }
       ]
     },
     {
       "input_series": [
         {
-          "series": "agent_history_embed_run_success{job=\"agent-history\"}",
+          "series": "agent_history_embed_run_success_ratio{job=\"agent-history-index\"}",
           "values": "1x150"
         },
         {
-          "series": "agent_history_embed_last_success_timestamp_seconds{job=\"agent-history\"}",
+          "series": "agent_history_embed_last_success_timestamp_seconds{job=\"agent-history-index\"}",
           "values": "0x150"
         }
       ],
@@ -288,12 +288,68 @@
         {
           "eval_time": "2h",
           "exp_samples": [],
-          "expr": "max by (reason) ((agent_history_embed_last_failure_reason{job=\"agent-history\"} == 1) and on() (agent_history_embed_run_success{job=\"agent-history\"} == 0)) or on() label_replace(1 - min(agent_history_embed_run_success{job=\"agent-history\"}) == 1, \"reason\", \"unreported\", \"\", \"\")"
+          "expr": "max by (reason) ((agent_history_embed_last_failure_reason_ratio{job=\"agent-history-index\"} == 1) and on() (agent_history_embed_run_success_ratio{job=\"agent-history-index\"} == 0)) or on() label_replace(1 - min(agent_history_embed_run_success_ratio{job=\"agent-history-index\"}) == 1, \"reason\", \"unreported\", \"\", \"\")"
         },
         {
           "eval_time": "2h",
           "exp_samples": [],
-          "expr": "(time() - max(agent_history_embed_last_success_timestamp_seconds{job=\"agent-history\"}) > 3600) and on() (max(agent_history_embed_pending_messages{job=\"agent-history\"}) > 0)"
+          "expr": "(time() - max(agent_history_embed_last_success_timestamp_seconds{job=\"agent-history-index\"}) > 3600) and on() (max(agent_history_embed_pending_messages{job=\"agent-history-index\"}) > 0)"
+        }
+      ]
+    },
+    {
+      "input_series": [
+        {
+          "series": "agent_sessions_metrics_collection_runs_total{job=\"agent-history-index\"}",
+          "values": "0+4x40"
+        }
+      ],
+      "interval": "1m",
+      "name": "collection running",
+      "promql_expr_test": [
+        {
+          "eval_time": "30m",
+          "exp_samples": [],
+          "expr": "((sum(increase(agent_sessions_metrics_collection_runs_total{job=\"agent-history-index\"}[15m])) < bool 1) == 1) or on() absent_over_time(agent_sessions_metrics_collection_runs_total{job=\"agent-history-index\"}[15m])"
+        }
+      ]
+    },
+    {
+      "input_series": [
+        {
+          "series": "agent_sessions_metrics_collection_runs_total{job=\"agent-history-index\"}",
+          "values": "0+4x10 40x30"
+        }
+      ],
+      "interval": "1m",
+      "name": "collection stalled",
+      "promql_expr_test": [
+        {
+          "eval_time": "30m",
+          "exp_samples": [
+            {
+              "labels": "{}",
+              "value": 1
+            }
+          ],
+          "expr": "((sum(increase(agent_sessions_metrics_collection_runs_total{job=\"agent-history-index\"}[15m])) < bool 1) == 1) or on() absent_over_time(agent_sessions_metrics_collection_runs_total{job=\"agent-history-index\"}[15m])"
+        }
+      ]
+    },
+    {
+      "input_series": [],
+      "interval": "1m",
+      "name": "collection absent",
+      "promql_expr_test": [
+        {
+          "eval_time": "30m",
+          "exp_samples": [
+            {
+              "labels": "{job=\"agent-history-index\"}",
+              "value": 1
+            }
+          ],
+          "expr": "((sum(increase(agent_sessions_metrics_collection_runs_total{job=\"agent-history-index\"}[15m])) < bool 1) == 1) or on() absent_over_time(agent_sessions_metrics_collection_runs_total{job=\"agent-history-index\"}[15m])"
         }
       ]
     }

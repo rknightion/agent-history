@@ -40,17 +40,7 @@ services:
       retries: 20
     restart: unless-stopped
 
-  exporter:
-    <<: *worker
-    command: ["exporter"]
-    ports:
-      - "127.0.0.1:${EXPORTER_PORT:-9464}:9464"
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9464/healthz', timeout=2)"]
-      interval: 15s
-      timeout: 5s
-      retries: 3
-
+  # Also hosts the metric collectors; with OTEL_* set it publishes every metric family over OTLP.
   indexer:
     <<: *worker
     command: ["index", "--every", "${INDEX_INTERVAL_SECONDS:-60}"]

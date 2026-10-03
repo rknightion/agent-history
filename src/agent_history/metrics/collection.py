@@ -1,4 +1,10 @@
-"""Prometheus text 0.0.4 endpoint with durable monotonic counters."""
+"""One metric collection with durable monotonic counters, published over OTLP.
+
+`Collection` runs every configured collector, adjusts counters through `State`, applies the public
+label policy and renders one immutable public snapshot. The snapshot feeds the OTLP bridge; the same
+samples also render as Prometheus text 0.0.4, which is kept as an in-process proof format for tests
+and parity checks. Nothing here serves HTTP.
+"""
 
 from __future__ import annotations
 
@@ -8,7 +14,6 @@ import os
 import re
 import threading
 import time
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from agent_history import telemetry
@@ -273,12 +278,11 @@ def render(
     return "\n".join(lines) + "\n", tuple(snapshot)
 
 
-class MetricServer(ThreadingHTTPServer):
-    daemon_threads = True
+class Collection:
+    """Cached collection over a set of collectors, refreshed at most once per `refresh` seconds."""
 
     def __init__(
         self,
-        address: tuple[str, int],
         collectors: list[Collector],
         state: State,
         refresh: float = 15,
@@ -291,7 +295,6 @@ class MetricServer(ThreadingHTTPServer):
         self.snapshot = ""
         self.updated: float | None = None
         self.snapshot_lock = threading.Lock()
-        super().__init__(address, _Handler)
 
     def seconds_until_refresh(self) -> float:
         """Time left before the cached collection is stale; zero or less means collect now."""
@@ -299,15 +302,15 @@ class MetricServer(ThreadingHTTPServer):
         return 0.0 if updated is None else self.refresh - (time.monotonic() - updated)
 
     def quiesce(self) -> None:
-        """Wait for any collection in flight; call after the server stopped accepting requests."""
+        """Wait for any collection in flight."""
         with self.snapshot_lock:
             pass
 
     def metrics(self) -> str:
         with self.snapshot_lock:
             if self.updated is None or time.monotonic() - self.updated >= self.refresh:
-                # One span per real refresh, never per cache hit or HTTP scrape.
-                with telemetry.operation("exporter.collect") as span:
+                # One span per real refresh, never per cache hit.
+                with telemetry.operation("metrics.collect") as span:
                     self._refresh(span)
             return self.snapshot
 
@@ -326,7 +329,7 @@ class MetricServer(ThreadingHTTPServer):
             start = time.monotonic()
             try:
                 # Materialize before adding: a generator may fail after yielding.
-                with telemetry.operation("exporter.collector", {"agent_history.collector": collector.name}):
+                with telemetry.operation("metrics.collector", {"agent_history.collector": collector.name}):
                     collected = list(collector.collect())
                 families.extend(collected)
                 for name, loops in getattr(collector, "retired_loops", {}).items():
@@ -365,27 +368,3 @@ class MetricServer(ThreadingHTTPServer):
             span.set_attributes({"agent_history.outcome": "success"})
         self.snapshot = rendered
         self.updated = time.monotonic()
-
-
-class _Handler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        if self.path == "/healthz":
-            body, status = b"ok\n", 200
-        elif self.path == "/metrics":
-            try:
-                body, status = self.server.metrics().encode(), 200
-            except Exception:
-                body, status = b"collection failed\n", 503
-        else:
-            body, status = b"not found\n", 404
-        self.send_response(status)
-        self.send_header(
-            "Content-Type",
-            "text/plain; version=0.0.4; charset=utf-8" if self.path == "/metrics" else "text/plain; charset=utf-8",
-        )
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def log_message(self, format, *args):
-        pass

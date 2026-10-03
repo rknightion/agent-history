@@ -1,8 +1,7 @@
-"""Legacy metric bridge: the exporter's one collection, also published through the OTel meter.
+"""Metric bridge: the indexer's one metric collection, published through the OTel meter.
 
-The bridge consumes the immutable public snapshot that `server.render` builds while rendering the
-Prometheus text, so there is exactly one collection, one pass over `State.observe` and one set of
-public labels. Callbacks only read that snapshot; they never query, parse, mutate state or collect.
+The bridge consumes the immutable public snapshot that `collection.render` builds, so there is exactly
+one collection, one pass over `State.observe` and one set of public labels. Callbacks only read that snapshot; they never query, parse, mutate state or collect.
 Nothing here imports OpenTelemetry unless metric export is explicitly enabled.
 """
 
@@ -243,7 +242,7 @@ ENUMS: dict[tuple[str, str], frozenset[str]] = {
     ("agent_efficiency_coderabbit_findings_total", "severity"): SEVERITIES,
 }
 LABEL_ENUMS: dict[str, frozenset[str]] = {
-    "collector": SECTIONS,  # the exporter's per-collector series also carry each collector's sub-sections
+    "collector": SECTIONS,  # the per-collector series also carry each collector's sub-sections
     "section": SECTIONS,
     "tier": TIERS,
     "window": frozenset({"primary", "secondary"}),
@@ -416,20 +415,23 @@ class Bridge:
 
 
 class Refresher(threading.Thread):
-    """Drives the exporter's cached collection at its refresh cadence, with or without a scraper."""
+    """Drives the cached collection at its refresh cadence on its own thread.
 
-    def __init__(self, server):
-        super().__init__(name="agent-history-otlp-refresh", daemon=True)
-        self.server = server
+    Any collection failure is contained here: it never reaches the thread that started the refresher.
+    """
+
+    def __init__(self, collection):
+        super().__init__(name="agent-history-metrics-refresh", daemon=True)
+        self.collection = collection
         self._halt = threading.Event()
 
     def run(self) -> None:
         while not self._halt.is_set():
             try:
-                self.server.metrics()
-                delay = self.server.seconds_until_refresh()
+                self.collection.metrics()
+                delay = self.collection.seconds_until_refresh()
             except Exception:
-                delay = self.server.refresh
+                delay = self.collection.refresh
             self._halt.wait(max(delay, 0.01))
 
     def stop(self, timeout: float = 60) -> None:

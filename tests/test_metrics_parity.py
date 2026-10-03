@@ -1,8 +1,8 @@
-"""Public loader, HTTP exporter and parity CLI contracts at their used boundaries."""
+"""Public loader, metric collection and parity CLI contracts at their used boundaries."""
 
 import json
 import threading
-from urllib.request import urlopen
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
@@ -11,7 +11,7 @@ from agent_history.metrics import Family, Sample
 from agent_history.metrics.archive import ArchiveCollector
 from agent_history.metrics.efficiency import EfficiencyCollector
 from agent_history.metrics.self import SelfCollector
-from agent_history.metrics.server import MetricServer, State, exposition
+from agent_history.metrics.collection import Collection, State, exposition
 
 
 def test_trusted_labels_through_shared_and_mcp_loader(tmp_path, monkeypatch):
@@ -89,14 +89,7 @@ def test_loop_map_failure_is_visible_but_optional_over_http(tmp_path, monkeypatc
     health.record("loops", 0.01, False)
     last = health.last_success["loops"]
     collectors = [EfficiencyCollector(config, tmp_path / "efficiency"), health]
-    with MetricServer(("127.0.0.1", 0), collectors, State(tmp_path / "server")) as server:
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        try:
-            text = urlopen(f"http://127.0.0.1:{server.server_address[1]}/metrics", timeout=5).read().decode()
-        finally:
-            server.shutdown()
-            thread.join(timeout=5)
+    text = Collection(collectors, State(tmp_path / "collection")).metrics()
     assert 'agent_sessions_metrics_section_success{section="loops"} 0' in text
     assert 'agent_sessions_metrics_section_duration_seconds{section="loops"}' in text
     assert health.last_success["loops"] == last
@@ -106,10 +99,7 @@ def test_loop_map_failure_is_visible_but_optional_over_http(tmp_path, monkeypatc
 
 
 def test_storage_and_archive_are_distinct_kept_health_sections(tmp_path):
-    with MetricServer(
-        ("127.0.0.1", 0), [ArchiveCollector(None, None, None, None), SelfCollector()], State(tmp_path)
-    ) as server:
-        text = server.metrics()
+    text = Collection([ArchiveCollector(None, None, None, None), SelfCollector()], State(tmp_path)).metrics()
     for name in ("storage", "archive"):
         assert f'agent_sessions_metrics_section_success{{section="{name}"}} 1' in text
 
@@ -263,14 +253,26 @@ def test_parity_url_fetch_crossing_minute_is_refused(tmp_path, capsys, monkeypat
     from agent_history.metrics import parity
 
     old = _capture(tmp_path, "old.prom", 1000, 179)
+    body = Collection([SelfCollector()], State(tmp_path / "state")).metrics().encode()
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
     # Exercise the real HTTP fetch; only the clock is controlled at the process edge.
-    with MetricServer(("127.0.0.1", 0), [SelfCollector()], State(tmp_path / "state")) as server:
+    with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         stamps = iter([179, 180])
         monkeypatch.setattr(parity, "time", SimpleNamespace(time=lambda: next(stamps)))
         try:
-            assert _parity(old, f"http://127.0.0.1:{server.server_address[1]}/metrics") == 2
+            assert _parity(old, f"http://127.0.0.1:{server.server_port}/metrics") == 2
         finally:
             server.shutdown()
             thread.join(timeout=5)

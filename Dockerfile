@@ -21,4 +21,4 @@ USER 10001:10001
 ENV PATH="/opt/venv/bin:${PATH}" \
     PYTHONDONTWRITEBYTECODE=1
 ENTRYPOINT ["agent-history"]
-CMD ["exporter"]
+CMD ["--help"]

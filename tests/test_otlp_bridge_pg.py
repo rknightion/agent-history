@@ -10,7 +10,7 @@ from agent_history import load, telemetry
 from agent_history.metrics import otlp, otlp_parity
 from agent_history.metrics.catalogue import CatalogueCollector
 from agent_history.metrics.self import SelfCollector
-from agent_history.metrics.server import MetricServer, State
+from agent_history.metrics.collection import Collection, State
 from test_otlp_bridge import receiver  # noqa: F401  (the fixture)
 
 DSN = os.environ.get("AGENT_HISTORY_TEST_DSN", "")
@@ -21,16 +21,11 @@ def test_real_catalogue_collection_agrees_and_its_database_calls_are_spans(tmp_p
     with load.connect(DSN) as conn:
         load.apply_schema(conn, force=True)
         conn.commit()
-    telemetry.setup("agent-history-exporter")
+    telemetry.setup("agent-history-index")
     bridge = otlp.Bridge.create()
-    server = MetricServer(
-        ("127.0.0.1", 0), [CatalogueCollector(DSN), SelfCollector()], State(tmp_path), 0, bridge=bridge
-    )
-    try:
-        text = server.metrics()
-        decoded = receiver.flush()
-    finally:
-        server.server_close()
+    collection = Collection([CatalogueCollector(DSN), SelfCollector()], State(tmp_path), 0, bridge=bridge)
+    text = collection.metrics()
+    decoded = receiver.flush()
     report = otlp_parity.compare(text, decoded, rejected=bridge.rejected)
     assert report["ok"], {k: v for k, v in report.items() if v}
     assert {"agent_history_sources", "agent_history_rows", "agent_history_dirty_sessions"} <= set(decoded)
@@ -38,7 +33,7 @@ def test_real_catalogue_collection_agrees_and_its_database_calls_are_spans(tmp_p
     collector = next(
         s
         for s in spans
-        if s.name == "exporter.collector"
+        if s.name == "metrics.collector"
         and any(a.key == "agent_history.collector" and a.value.string_value == "catalogue" for a in s.attributes)
     )
     database = [s for s in spans if s.name.startswith("db.")]

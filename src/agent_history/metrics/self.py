@@ -1,4 +1,4 @@
-"""Exporter collection health, including the private collector's run/section families."""
+"""Metric collection health, including the private collector's run/section families."""
 
 from __future__ import annotations
 

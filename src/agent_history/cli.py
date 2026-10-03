@@ -140,7 +140,6 @@ def main(argv: list[str] | None = None) -> int:
 
     sub.add_parser("collect-git", help="ingest commits of the configured [git] repos into ah.git_commit")
     sub.add_parser("mcp", help="run the read-only MCP server on stdio")
-    sub.add_parser("exporter", help="serve Prometheus /metrics and /healthz")
     metrics = sub.add_parser("metrics", help="metrics cutover validation")
     parity = metrics.add_subparsers(dest="metrics_command", required=True).add_parser("parity")
     from .metrics.parity import ROSTER
@@ -176,16 +175,81 @@ def main(argv: list[str] | None = None) -> int:
         "collect-git": "collect_git.pass",
         "collect": "collect.pass",
     }
-    if args.command not in workers and args.command != "exporter":
+    if args.command not in workers:
         return _dispatch(args, parser, argv, reader_commands)
     with telemetry.lifecycle("agent-history-" + args.command):
-        if args.command == "exporter" or (args.command in ("index", "embed") and args.every is not None):
+        if args.command in ("index", "embed") and args.every is not None:
             return _dispatch(args, parser, argv, reader_commands)
         with telemetry.pass_span(workers[args.command]) as span:
             result = _dispatch(args, parser, argv, reader_commands)
             if result:
                 span.counts({"errors": 1})
             return result
+
+
+def _start_collection(args, runs_directory: Path):
+    """Start the metric collectors beside the periodic indexer, or return None.
+
+    Collection exists only to feed OTLP metrics: with metric export disabled nothing is collected and
+    no collector state is touched. Any setup failure leaves the indexer running without metrics; the
+    staleness alert on the collection runs counter makes that visible. Collector settings are read
+    once, at startup: a change to them needs a restart.
+    """
+    from .metrics.otlp import Bridge, Refresher
+
+    bridge = Bridge.create()
+    if bridge is None:
+        return None
+    try:
+        from .metrics.archive import ArchiveCollector
+        from .metrics.catalogue import CatalogueCollector, RunCollector
+        from .metrics.collection import Collection, State
+        from .metrics.self import SelfCollector
+
+        config = load_config(args.config)
+        setting = config.exporter
+        dsn = (
+            args.dsn
+            or os.environ.get("AGENT_HISTORY_READER_DSN")
+            or config.reader_dsn
+            or os.environ.get("AGENT_HISTORY_DSN")
+            or config.dsn
+        )
+        builders = {
+            "archive": lambda: ArchiveCollector(
+                setting.hot,
+                setting.cold,
+                setting.incoming,
+                setting.conflicts,
+                namespaces=config.sources,
+                labels=config.metrics_labels,
+            ),
+            "catalogue": lambda: CatalogueCollector(dsn),
+            "runs": lambda: RunCollector(runs_directory),
+            "self": SelfCollector,
+        }
+        if "efficiency" in setting.collectors:
+            from .metrics.efficiency import EfficiencyCollector
+
+            builders["efficiency"] = lambda: EfficiencyCollector(config, setting.state_dir)
+        if not dsn:
+            # No database to read: collect everything else rather than nothing.
+            builders.pop("catalogue")
+        collectors = [builders[name]() for name in setting.collectors if name in builders]
+        collection = Collection(
+            collectors,
+            State(setting.state_dir, config.metrics_labels),
+            setting.refresh_interval,
+            bridge=bridge,
+        )
+    except Exception:
+        # Fixed event and line: never the exception text, which could carry a path or DSN.
+        telemetry.emit("telemetry.configuration.invalid", {})
+        print("agent-history: metric collection disabled (config)", file=sys.stderr)
+        return None
+    refresher = Refresher(collection)
+    refresher.start()
+    return refresher
 
 
 def _dispatch(args, parser, argv, reader_commands):
@@ -212,6 +276,7 @@ def _dispatch(args, parser, argv, reader_commands):
         # textfiles. Periodic container workers supply a shared-volume destination
         # to the existing producer emitters without changing their catalogue logic.
         output = Path("/var/lib/alloy/textfile-agent-history")
+        refresher = None
         if args.command == "index":
             original_refresh = load.refresh
 
@@ -240,6 +305,10 @@ def _dispatch(args, parser, argv, reader_commands):
 
             embed.run = observed_embed_run
         try:
+            if args.command == "index":
+                # The periodic indexer also hosts the metric collectors, on their own thread and cadence,
+                # so a slow or failing index pass never stops metrics and a collector never fails a pass.
+                refresher = _start_collection(args, output)
             while True:
                 category = None
                 try:
@@ -269,6 +338,9 @@ def _dispatch(args, parser, argv, reader_commands):
         finally:
             if args.command == "index":
                 load.refresh = original_refresh
+                if refresher is not None:
+                    refresher.stop()
+                    refresher.collection.quiesce()
             else:
                 embed.run = original_embed_run
 
@@ -313,61 +385,6 @@ def _dispatch(args, parser, argv, reader_commands):
             parser.error("journal-sync needs --source-db or collector.journal_db")
         with load.connect(args.dsn or os.environ.get("AGENT_HISTORY_DSN") or config.dsn) as conn:
             print(json.dumps(sync(conn, source), default=str))
-        return 0
-
-    if args.command == "exporter":
-        from .metrics.archive import ArchiveCollector
-        from .metrics.catalogue import CatalogueCollector, RunCollector
-        from .metrics.otlp import Bridge, Refresher
-        from .metrics.self import SelfCollector
-        from .metrics.server import MetricServer, State
-
-        setting = config.exporter
-        dsn = (
-            args.dsn
-            or os.environ.get("AGENT_HISTORY_READER_DSN")
-            or config.reader_dsn
-            or os.environ.get("AGENT_HISTORY_DSN")
-            or config.dsn
-        )
-        builders = {
-            "archive": lambda: ArchiveCollector(
-                setting.hot,
-                setting.cold,
-                setting.incoming,
-                setting.conflicts,
-                namespaces=config.sources,
-                labels=config.metrics_labels,
-            ),
-            "catalogue": lambda: CatalogueCollector(dsn) if dsn else parser.error("exporter needs a reader DSN"),
-            "runs": lambda: RunCollector(Path("/var/lib/alloy/textfile-agent-history")),
-            "self": SelfCollector,
-        }
-        if "efficiency" in setting.collectors:
-            from .metrics.efficiency import EfficiencyCollector
-
-            builders["efficiency"] = lambda: EfficiencyCollector(config, setting.state_dir)
-        collectors = [builders[name]() for name in setting.collectors]
-        host, port = setting.listen.rsplit(":", 1)
-        # None unless OTLP metric export is explicitly enabled: then /metrics is unchanged and the same
-        # collection also feeds the OTel meter, refreshed on schedule even with no scraper.
-        bridge = Bridge.create()
-        with MetricServer(
-            (host, int(port)),
-            collectors,
-            State(setting.state_dir, config.metrics_labels),
-            setting.refresh_interval,
-            bridge=bridge,
-        ) as server:
-            refresher = Refresher(server) if bridge is not None else None
-            if refresher is not None:
-                refresher.start()
-            try:
-                server.serve_forever()
-            finally:
-                if refresher is not None:
-                    refresher.stop()
-                server.quiesce()
         return 0
 
     if args.command == "mcp":

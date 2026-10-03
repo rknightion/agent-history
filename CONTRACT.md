@@ -35,6 +35,10 @@ printed one in a command's output, the secret is in the catalogue.
   reason is retained in catalogue metadata across failed runs and omitted from the snapshot after
   success. Labels never contain response bodies, status text, URLs or input text. Existing embed
   metric names, labels and help text are unchanged.
+- Metric families are published only over OTLP, by the periodic indexer's metric collection
+  (service `agent-history-index`). The package serves no metrics endpoint and writes no Prometheus
+  textfile for a scraper; the worker run snapshots under `/var/lib/alloy/textfile-agent-history` are
+  an internal hand-off read by that collection.
 
 Treat the database like the transcript directories it was built from: local, access-controlled,
 and never exposed to a network you do not trust. There is no row-level security.

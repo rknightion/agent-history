@@ -16,7 +16,7 @@ from synthetic_metrics import PARSE_KINDS, Stub
 
 from agent_history import telemetry
 from agent_history.metrics import Family, Sample, otlp, otlp_parity
-from agent_history.metrics.server import MetricServer, State
+from agent_history.metrics.collection import Collection, State
 
 
 class Receiver:
@@ -75,8 +75,8 @@ def receiver(monkeypatch):
         capture.close()
 
 
-def make_server(tmp_path, collectors, bridge, refresh=0):
-    return MetricServer(("127.0.0.1", 0), collectors, State(tmp_path), refresh, bridge=bridge)
+def make_collection(tmp_path, collectors, bridge, refresh=0):
+    return Collection(collectors, State(tmp_path), refresh, bridge=bridge)
 
 
 def test_mapping_matches_the_design_tables():
@@ -118,69 +118,57 @@ def test_every_family_a_producer_can_emit_is_mapped(tmp_path):
 
 
 def test_one_collection_feeds_both_outputs_for_every_mapped_family(tmp_path, receiver):
-    telemetry.setup("agent-history-exporter")
+    telemetry.setup("agent-history-index")
     bridge = otlp.Bridge.create()
     assert bridge is not None
     collector = Stub()
-    server = make_server(tmp_path, [collector], bridge)
-    try:
-        for step in (0, 1, 2):
-            collector.step = step
-            text = server.metrics()
-            decoded = receiver.flush()
-            report = otlp_parity.compare(text, decoded, rejected=bridge.rejected)
-            assert report["ok"], {k: v for k, v in report.items() if v}
-            # Every design family, with each histogram compared through its three components.
-            assert report["families"] == len(otlp.SPECS) + len(otlp.HISTOGRAMS) - (step == 2)
-            assert report["unvalidated"] == report["missing"] == report["extra"] == report["rejected"] == []
-        # Neither the flushes nor the callbacks collected again.
-        assert collector.collections == 3
-        by_loop = {dict(p)["loop"] for p in decoded["agent_efficiency_tool_calls_total"]["points"]}
-        assert len(by_loop) > 40  # loop labels are deliberately uncapped
-        assert "loop2" not in {dict(p)["loop"] for p in decoded["agent_efficiency_llm_calls_total"]["points"]}
-        assert "agent_history_lag_bytes" not in decoded  # an absent gauge stays absent
-    finally:
-        server.server_close()
+    collection = make_collection(tmp_path, [collector], bridge)
+    for step in (0, 1, 2):
+        collector.step = step
+        text = collection.metrics()
+        decoded = receiver.flush()
+        report = otlp_parity.compare(text, decoded, rejected=bridge.rejected)
+        assert report["ok"], {k: v for k, v in report.items() if v}
+        # Every design family, with each histogram compared through its three components.
+        assert report["families"] == len(otlp.SPECS) + len(otlp.HISTOGRAMS) - (step == 2)
+        assert report["unvalidated"] == report["missing"] == report["extra"] == report["rejected"] == []
+    # Neither the flushes nor the callbacks collected again.
+    assert collector.collections == 3
+    by_loop = {dict(p)["loop"] for p in decoded["agent_efficiency_tool_calls_total"]["points"]}
+    assert len(by_loop) > 40  # loop labels are deliberately uncapped
+    assert "loop2" not in {dict(p)["loop"] for p in decoded["agent_efficiency_llm_calls_total"]["points"]}
+    assert "agent_history_lag_bytes" not in decoded  # an absent gauge stays absent
 
 
 def test_prometheus_bytes_are_unchanged_while_the_bridge_is_publishing(tmp_path, receiver):
     from test_metrics_exposition_golden import GOLDEN, render
 
-    telemetry.setup("agent-history-exporter")
+    telemetry.setup("agent-history-index")
     assert render(tmp_path, bridge=otlp.Bridge.create()).encode() == GOLDEN.read_bytes()
 
 
 def test_retained_counter_state_survives_a_restart(tmp_path, receiver):
-    telemetry.setup("agent-history-exporter")
+    telemetry.setup("agent-history-index")
     first = Stub()
-    server = make_server(tmp_path, [first], otlp.Bridge.create())
-    try:
-        server.metrics()
-    finally:
-        server.server_close()
+    collection = make_collection(tmp_path, [first], otlp.Bridge.create())
+    collection.metrics()
     telemetry.shutdown()  # a process restart: new providers, and counters.json retained on disk
-    telemetry.setup("agent-history-exporter")
+    telemetry.setup("agent-history-index")
     second = Stub()
     second.step = 2  # every counter reset against the persisted raw values
-    server = make_server(tmp_path, [second], otlp.Bridge.create())
-    try:
-        text = server.metrics()
-        report = otlp_parity.compare(text, receiver.flush(), rejected=[])
-        assert report["ok"], {k: v for k, v in report.items() if v}
-    finally:
-        server.server_close()
+    collection = make_collection(tmp_path, [second], otlp.Bridge.create())
+    text = collection.metrics()
+    report = otlp_parity.compare(text, receiver.flush(), rejected=[])
+    assert report["ok"], {k: v for k, v in report.items() if v}
 
 
 def test_comparator_distinguishes_every_kind_of_difference(tmp_path, receiver):
-    telemetry.setup("agent-history-exporter")
+    telemetry.setup("agent-history-index")
     bridge = otlp.Bridge.create()
     collector = Stub()
-    server = make_server(tmp_path, [collector], bridge)
-    try:
-        text = server.metrics()
-        decoded = receiver.flush()
-    finally:
-        server.server_close()
+    collection = make_collection(tmp_path, [collector], bridge)
+    text = collection.metrics()
+    decoded = receiver.flush()
     assert otlp_parity.compare(text, decoded, rejected=[])["ok"]
 
     def mutated(change):
@@ -218,7 +206,7 @@ def test_comparator_distinguishes_every_kind_of_difference(tmp_path, receiver):
 
 
 def test_out_of_contract_labels_are_refused_and_visible(tmp_path, receiver):
-    telemetry.setup("agent-history-exporter")
+    telemetry.setup("agent-history-index")
     bridge = otlp.Bridge.create()
     marker = "synthetic_private_" + "payload"
     secret = "gh" + "p_" + "Q" * 36
@@ -246,18 +234,15 @@ def test_out_of_contract_labels_are_refused_and_visible(tmp_path, receiver):
                 Family("agent_history_not_in_design", "gauge", "Unmapped.", (Sample((), 5),)),
             ]
 
-    server = make_server(tmp_path, [Odd()], bridge)
-    try:
-        text = server.metrics()
-        # The Prometheus exposition is not changed to hide the discrepancy.
-        assert f'agent_history_parse_issues_total{{kind="{marker}"}} 2' in text
-        receiver.requests.clear()
-        assert telemetry.force_flush()
-        bodies = b"".join(body for path, body in receiver.requests)
-        assert marker.encode() not in bodies and secret.encode() not in bodies
-        decoded = otlp_parity.decode([body for path, body in receiver.requests if path == "/v1/metrics"][-1])
-    finally:
-        server.server_close()
+    collection = make_collection(tmp_path, [Odd()], bridge)
+    text = collection.metrics()
+    # The Prometheus exposition is not changed to hide the discrepancy.
+    assert f'agent_history_parse_issues_total{{kind="{marker}"}} 2' in text
+    receiver.requests.clear()
+    assert telemetry.force_flush()
+    bodies = b"".join(body for path, body in receiver.requests)
+    assert marker.encode() not in bodies and secret.encode() not in bodies
+    decoded = otlp_parity.decode([body for path, body in receiver.requests if path == "/v1/metrics"][-1])
     assert set(bridge.rejected) == {
         ("agent_history_parse_issues_total", "label_value"),
         ("agent_history_rows", "label_set"),
@@ -278,11 +263,11 @@ def test_bridge_is_absent_unless_metrics_export_is_explicitly_enabled(monkeypatc
     for key in list(__import__("os").environ):
         if key.startswith("OTEL_"):
             monkeypatch.delenv(key)
-    telemetry.setup("agent-history-exporter")
+    telemetry.setup("agent-history-index")
     assert otlp.Bridge.create() is None
     telemetry.shutdown()
     monkeypatch.setenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "http://localhost:1/v1/traces")
-    telemetry.setup("agent-history-exporter")
+    telemetry.setup("agent-history-index")
     assert otlp.Bridge.create() is None  # traces alone do not enable the metric bridge
     telemetry.shutdown()
 
@@ -300,29 +285,28 @@ def test_missing_extra_leaves_the_exporter_as_before(monkeypatch, tmp_path):
         return original(name, *args, **kwargs)
 
     monkeypatch.setattr(importlib, "import_module", absent)
-    telemetry.setup("agent-history-exporter")
+    telemetry.setup("agent-history-index")
     assert otlp.Bridge.create() is None
-    server = make_server(tmp_path, [Stub()], None)
+    collection = make_collection(tmp_path, [Stub()], None)
     try:
-        assert server.metrics().startswith("# HELP agent_efficiency_")
+        assert collection.metrics().startswith("# HELP agent_efficiency_")
     finally:
-        server.server_close()
         telemetry.shutdown()
 
 
 @pytest.mark.parametrize("preference", ["DELTA", "LOWMEMORY", "bogus"])
 def test_non_cumulative_temporality_disables_the_bridge(tmp_path, receiver, monkeypatch, preference):
     monkeypatch.setenv("OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE", preference)
-    telemetry.setup("agent-history-exporter")
+    telemetry.setup("agent-history-index")
     assert otlp.Bridge.create() is None
 
 
 def test_scheduler_publishes_without_a_prometheus_scrape_and_stops_cleanly(tmp_path, receiver):
-    telemetry.setup("agent-history-exporter")
+    telemetry.setup("agent-history-index")
     bridge = otlp.Bridge.create()
     collector = Stub()
-    server = make_server(tmp_path, [collector], bridge, refresh=0.05)
-    refresher = otlp.Refresher(server)
+    collection = make_collection(tmp_path, [collector], bridge, refresh=0.05)
+    refresher = otlp.Refresher(collection)
     refresher.start()
     try:
         deadline = time.monotonic() + 10
@@ -336,11 +320,10 @@ def test_scheduler_publishes_without_a_prometheus_scrape_and_stops_cleanly(tmp_p
     decoded = receiver.flush()
     assert decoded["agent_history_sources"]["points"]  # the retained final snapshot is flushed
     assert collector.collections == settled  # flushing and a stopped scheduler never collect
-    server.server_close()
 
 
 def test_scheduler_survives_a_failing_refresh(tmp_path, receiver):
-    telemetry.setup("agent-history-exporter")
+    telemetry.setup("agent-history-index")
 
     class Broken:
         name = "efficiency"
@@ -350,8 +333,8 @@ def test_scheduler_survives_a_failing_refresh(tmp_path, receiver):
             Broken.calls += 1
             return [Family("agent_history_lag_bytes", "gauge", "Lag.", (Sample((), float("nan")),))]
 
-    server = make_server(tmp_path, [Broken()], otlp.Bridge.create(), refresh=0.02)
-    refresher = otlp.Refresher(server)
+    collection = make_collection(tmp_path, [Broken()], otlp.Bridge.create(), refresh=0.02)
+    refresher = otlp.Refresher(collection)
     refresher.start()
     try:
         deadline = time.monotonic() + 10
@@ -360,11 +343,10 @@ def test_scheduler_survives_a_failing_refresh(tmp_path, receiver):
         assert Broken.calls >= 3  # an invalid sample fails the refresh, never the scheduler
     finally:
         refresher.stop()
-        server.server_close()
 
 
-def test_exporter_spans_are_one_per_real_refresh_and_content_free(tmp_path, receiver):
-    telemetry.setup("agent-history-exporter")
+def test_collection_spans_are_one_per_real_refresh_and_content_free(tmp_path, receiver):
+    telemetry.setup("agent-history-index")
     marker = "synthetic-private-" + "payload"
 
     class Failing:
@@ -373,17 +355,14 @@ def test_exporter_spans_are_one_per_real_refresh_and_content_free(tmp_path, rece
         def collect(self):
             raise OSError(marker)
 
-    server = make_server(tmp_path, [Stub(), Failing()], otlp.Bridge.create(), refresh=3600)
-    try:
-        for _ in range(3):  # one real refresh and two cache hits
-            server.metrics()
-    finally:
-        server.server_close()
+    collection = make_collection(tmp_path, [Stub(), Failing()], otlp.Bridge.create(), refresh=3600)
+    for _ in range(3):  # one real refresh and two cache hits
+        collection.metrics()
     receiver.requests.clear()
     assert telemetry.force_flush()
     spans = receiver.spans()
-    parents = [s for s in spans if s.name == "exporter.collect"]
-    children = [s for s in spans if s.name == "exporter.collector"]
+    parents = [s for s in spans if s.name == "metrics.collect"]
+    children = [s for s in spans if s.name == "metrics.collector"]
     assert len(parents) == 1 and len(children) == 2
     assert all(c.parent_span_id == parents[0].span_id for c in children)
 
@@ -435,7 +414,7 @@ def test_real_collectors_agree_including_a_failed_collector(tmp_path, receiver, 
         def collect(self):
             raise OSError("unavailable")
 
-    telemetry.setup("agent-history-exporter")
+    telemetry.setup("agent-history-index")
     bridge = otlp.Bridge.create()
     collectors = [
         ArchiveCollector(hot, cold, None, None),
@@ -444,65 +423,87 @@ def test_real_collectors_agree_including_a_failed_collector(tmp_path, receiver, 
         Failed(),
         SelfCollector(),
     ]
-    server = make_server(tmp_path / "offsets", collectors, bridge)
-    try:
-        for _ in range(2):  # the second collection adds self-health counter movement
-            text = server.metrics()
-            report = otlp_parity.compare(text, receiver.flush(), rejected=bridge.rejected)
-            assert report["ok"], {k: v for k, v in report.items() if v}
-        assert 'agent_history_exporter_collection_errors_total{collector="catalogue"} 2' in text
-        assert report["families"] > 30
-    finally:
-        server.server_close()
+    collection = make_collection(tmp_path / "offsets", collectors, bridge)
+    for _ in range(2):  # the second collection adds self-health counter movement
+        text = collection.metrics()
+        report = otlp_parity.compare(text, receiver.flush(), rejected=bridge.rejected)
+        assert report["ok"], {k: v for k, v in report.items() if v}
+    assert 'agent_history_exporter_collection_errors_total{collector="catalogue"} 2' in text
+    assert report["families"] > 30
 
 
-def test_exporter_process_publishes_unscraped_from_the_scrape_collection_and_exits_on_term(tmp_path, receiver):
-    """The CLI path end to end: no scraper needed, one collection, and SIGTERM flushes then exits."""
-    import json
+def test_periodic_indexer_publishes_metrics_while_its_index_pass_fails_and_exits_on_term(tmp_path, receiver):
+    """The CLI path end to end: `index --every` hosts the collection on its own thread.
+
+    The index pass cannot reach its database and fails on every iteration; metrics still publish,
+    exactly one collection happens per refresh interval, and SIGTERM flushes then exits.
+    """
     import os
     import signal
     import socket
     import subprocess
     import sys
-    from urllib.request import urlopen
 
     hot = tmp_path / "hot"
     (hot / "claude-personal").mkdir(parents=True)
     (hot / "claude-personal" / "one.jsonl").write_bytes(b"abc")
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
-        port = probe.getsockname()[1]
+        closed = probe.getsockname()[1]  # nothing listens here once the probe closes
     config = tmp_path / "config.toml"
     config.write_text(
         "[exporter]\n"
-        f'listen = "127.0.0.1:{port}"\n'
+        'listen = "127.0.0.1:9464"\n'  # retired key: still accepted, ignored
         "refresh_interval = 3600\n"
         f'state_dir = "{tmp_path / "state"}"\n'
         f'hot = "{hot}"\n'
         'collectors = ["archive", "self"]\n'
     )
     env = {k: v for k, v in os.environ.items() if not k.startswith(("OTEL_", "AGENT_HISTORY_"))}
+    env["AGENT_HISTORY_DSN"] = f"postgresql://synthetic@127.0.0.1:{closed}/absent?connect_timeout=1"
     env["OTEL_EXPORTER_OTLP_ENDPOINT"] = f"http://localhost:{receiver.server.server_port}"
     env["OTEL_METRIC_EXPORT_INTERVAL"] = "300"
     env["OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE"] = "CUMULATIVE"
-    code = f"from agent_history.cli import main; raise SystemExit(main(['--config', {str(config)!r}, 'exporter']))"
+    argv = ["--config", str(config), "index", "--every", "3600"]
+    code = f"from agent_history.cli import main; raise SystemExit(main({argv!r}))"
     process = subprocess.Popen([sys.executable, "-c", code], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     try:
         deadline = time.monotonic() + 30
-        while time.monotonic() < deadline and not any(p == "/v1/metrics" for p, _ in receiver.requests):
+        decoded = {}
+        while time.monotonic() < deadline and "agent_sessions_storage_files" not in decoded:
             assert process.poll() is None, process.stderr.read()
+            bodies = [b for p, b in receiver.requests if p == "/v1/metrics"]
+            decoded = otlp_parity.decode(bodies[-1]) if bodies else {}
             time.sleep(0.05)
-        assert any(p == "/v1/metrics" for p, _ in receiver.requests), "nothing exported without a scrape"
-        text = urlopen(f"http://127.0.0.1:{port}/metrics").read().decode()  # a cache hit, not a new collection
-        decoded = otlp_parity.decode([b for p, b in receiver.requests if p == "/v1/metrics"][-1])
-        report = otlp_parity.compare(text, decoded, rejected=[])
-        assert report["ok"], json.dumps({k: v for k, v in report.items() if v}, default=str)
-        assert "agent_sessions_metrics_collection_runs_total 1\n" in text  # exactly one collection happened
+        assert "agent_sessions_storage_files" in decoded, "the collection published nothing"
+        runs = decoded["agent_sessions_metrics_collection_runs_total"]["points"]
+        assert list(runs.values()) == [1.0], repr(runs)  # exactly one collection in the refresh interval
         process.send_signal(signal.SIGTERM)
         assert process.wait(timeout=30) == 143
+        stderr = process.stderr.read().decode()
+        assert "index failed" in stderr  # the pass really failed while metrics published
+        assert "metric collection disabled" not in stderr
     finally:
         if process.poll() is None:
             process.kill()
         process.wait()
         process.stdout.close()
         process.stderr.close()
+
+
+def test_periodic_indexer_collects_nothing_without_metric_export(tmp_path, monkeypatch):
+    """With OTLP metric export off, collection never starts and its state directory is never touched."""
+    from types import SimpleNamespace
+
+    from agent_history import cli
+
+    telemetry.shutdown()
+    for key in list(__import__("os").environ):
+        if key.startswith("OTEL_"):
+            monkeypatch.delenv(key)
+    telemetry.setup("agent-history-index")
+    try:
+        assert cli._start_collection(SimpleNamespace(config=tmp_path / "absent.toml", dsn=None), tmp_path) is None
+    finally:
+        telemetry.shutdown()
+    assert list(tmp_path.iterdir()) == []

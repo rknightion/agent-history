@@ -8,12 +8,12 @@
     "labels": {
       "grafana.app/folder": "REPLACE_WITH_FOLDER_UID"
     },
-    "name": "agent-history-embed-run-failed"
+    "name": "agent-history-metrics-stale"
   },
   "spec": {
     "annotations": {
-      "description": "The last embedding run failed with reason {{ $labels.reason }} (auth, billing_quota, rate_limit, route, provider_error, network, other, or unreported when the run reported no reason) for at least 15 minutes. billing_quota means the provider refused for credit or quota. Absent series do not fire (noDataState OK): this rule cannot tell a healthy embedder from a metric collection that does not see the worker snapshot. agent-history-metrics-stale covers a stopped collection.",
-      "summary": "agent-history embedding run failed: {{ $labels.reason }}"
+      "description": "agent_sessions_metrics_collection_runs_total from the agent-history-index service has not increased in 15m, or is absent. The periodic indexer runs the metric collectors on its own thread; check that the indexer container is running with OTLP metric export configured, and look for telemetry.configuration.invalid in its OTLP logs. A failing collector section does not fire this rule: read agent_sessions_metrics_section_success_ratio.",
+      "summary": "agent-history metric collection has not completed a run for 15 minutes"
     },
     "execErrState": "Error",
     "expressions": {
@@ -24,7 +24,7 @@
             "type": "prometheus",
             "uid": "grafanacloud-prom"
           },
-          "expr": "max by (reason) ((agent_history_embed_last_failure_reason_ratio{job=\"agent-history-index\"} == 1) and on() (agent_history_embed_run_success_ratio{job=\"agent-history-index\"} == 0)) or on() label_replace(1 - min(agent_history_embed_run_success_ratio{job=\"agent-history-index\"}) == 1, \"reason\", \"unreported\", \"\", \"\")",
+          "expr": "((sum(increase(agent_sessions_metrics_collection_runs_total{job=\"agent-history-index\"}[15m])) < bool 1) == 1) or on() absent_over_time(agent_sessions_metrics_collection_runs_total{job=\"agent-history-index\"}[15m])",
           "instant": true,
           "range": false,
           "refId": "A"
@@ -72,7 +72,7 @@
         "source": true
       }
     },
-    "for": "15m",
+    "for": "5m",
     "labels": {
       "domain": "observability",
       "service": "agent-history",
@@ -81,7 +81,7 @@
     },
     "noDataState": "Ok",
     "paused": false,
-    "title": "agent-history embedding run failed",
+    "title": "agent-history metric collection stopped",
     "trigger": {
       "interval": "1m"
     }

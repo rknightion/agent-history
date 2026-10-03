@@ -111,7 +111,7 @@ def families(step: int = 0) -> tuple[list[Family], dict[str, set[str]]]:
 
 
 class Stub:
-    """A collector replaying the scenario, so a MetricServer drives the whole public path."""
+    """A collector replaying the scenario, so a Collection drives the whole public path."""
 
     name = "efficiency"
 

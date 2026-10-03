@@ -83,10 +83,10 @@ class Efficiency:
     workflow_transcripts: bool = True
 
 
-# Exporter configuration (lane X). All roots are optional; no private paths are defaults.
+# Metric collection settings, run by the periodic indexer. The table keeps its historical name
+# `[exporter]`. All roots are optional; no private paths are defaults.
 @dataclass
 class Exporter:
-    listen: str = "127.0.0.1:9464"
     refresh_interval: float = 15.0
     state_dir: Path = field(default_factory=lambda: Path.home() / ".local/state/agent-history")
     collectors: tuple[str, ...] = ("archive", "catalogue", "runs", "efficiency", "self")
@@ -261,7 +261,8 @@ def parse_config(data: dict[str, Any], path: Path | None = None) -> Config:
         api_key_file=emb.get("api_key_file"),
         headers={str(k): str(v) for k, v in (emb.get("headers") or {}).items()},
     )
-    # Exporter configuration (lane X): reject misspellings and unsafe collector selectors.
+    # Metric collection: reject misspellings and unsafe collector selectors. `listen` is accepted and
+    # ignored so a config written for the retired HTTP exporter still loads.
     exp = _table(data, "exporter")
     allowed = {"listen", "refresh_interval", "state_dir", "collectors", "hot", "cold", "incoming", "conflicts"}
     if set(exp) - allowed:
@@ -273,9 +274,6 @@ def parse_config(data: dict[str, Any], path: Path | None = None) -> Config:
         or not set(selected) <= {"archive", "catalogue", "runs", "self", "efficiency"}
     ):
         raise ConfigError("exporter.collectors must be unique names: archive, catalogue, runs, self, efficiency")
-    listen = exp.get("listen", "127.0.0.1:9464")
-    if not isinstance(listen, str) or not re.fullmatch(r"[^:]+:[0-9]{1,5}", listen):
-        raise ConfigError("exporter.listen must be HOST:PORT")
     import math
 
     try:
@@ -285,7 +283,6 @@ def parse_config(data: dict[str, Any], path: Path | None = None) -> Config:
     if not math.isfinite(interval) or interval <= 0:
         raise ConfigError("exporter.refresh_interval must be finite and positive")
     exporter = Exporter(
-        listen=listen,
         refresh_interval=interval,
         state_dir=Path(exp.get("state_dir", Path.home() / ".local/state/agent-history")).expanduser(),
         collectors=tuple(selected),

@@ -81,8 +81,7 @@ _COUNTS = frozenset(
     }
 )
 _SERVICES = frozenset(
-    "agent-history-" + name
-    for name in ("index", "postpass", "embed", "journal-sync", "collect-git", "collect", "exporter")
+    "agent-history-" + name for name in ("index", "postpass", "embed", "journal-sync", "collect-git", "collect")
 )
 _ENUMS = {
     "agent_history.outcome": {"success", "skipped", "error"},

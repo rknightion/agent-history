@@ -31,8 +31,8 @@ def gauge(name: str, help_text: str, value: float) -> Family:
     return Family(name, "gauge", help_text, (Sample((), value),))
 
 
-# Producer-written run snapshots in the shared state volume. This is not an Alloy
-# textfile endpoint: the HTTP exporter owns exposition, validation and escaping.
+# Producer-written run snapshots in the shared state volume, read by the indexer's metric
+# collection. Nothing scrapes these files: the collection owns validation and OTLP publication.
 RUN_METRICS = {
     "agent_history_run_success": (),
     "agent_history_run_duration_seconds": (),
@@ -134,7 +134,7 @@ class CatalogueCollector:
 
     def collect(self):
         # The shared factory is psycopg.connect unchanged unless telemetry is enabled.
-        with telemetry.db_connect(self.dsn, application_name="agent-history-exporter", autocommit=True) as conn:
+        with telemetry.db_connect(self.dsn, application_name="agent-history-metrics", autocommit=True) as conn:
             conn.read_only = True
             result = []
             success = conn.execute(

@@ -1,23 +1,21 @@
-"""Regression proofs for exporter isolation and periodic worker resilience."""
+"""Regression proofs for collector isolation and periodic worker resilience."""
 
-import threading
 from pathlib import Path
-from urllib.request import urlopen
 
 import pytest
 
 from agent_history.metrics import Family, Sample
 from agent_history.metrics.archive import ArchiveCollector
 from agent_history.metrics.self import SelfCollector
-from agent_history.metrics.server import MetricServer, State
+from agent_history.metrics.collection import Collection, State
 
 
-def test_failed_collector_keeps_http_scrape_and_throttles(tmp_path, monkeypatch):
+def test_failed_collector_keeps_the_collection_and_throttles(tmp_path, monkeypatch):
     from types import SimpleNamespace
-    from agent_history.metrics import server as server_module
+    from agent_history.metrics import collection as collection_module
 
-    # A newly booted host must still populate the first scrape before refresh expires.
-    monkeypatch.setattr(server_module, "time", SimpleNamespace(monotonic=lambda: 1.0))
+    # A newly booted host must still populate the first collection before refresh expires.
+    monkeypatch.setattr(collection_module, "time", SimpleNamespace(monotonic=lambda: 1.0))
 
     class Broken:
         name = "broken"
@@ -35,24 +33,15 @@ def test_failed_collector_keeps_http_scrape_and_throttles(tmp_path, monkeypatch)
             return [Family("agent_healthy", "gauge", "Healthy.", (Sample((), 7),))]
 
     broken = Broken()
-    with MetricServer(("127.0.0.1", 0), [broken, Healthy(), SelfCollector()], State(tmp_path), 60) as server:
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        try:
-            address = f"http://127.0.0.1:{server.server_address[1]}/metrics"
-            with urlopen(address) as response:
-                assert response.status == 200
-                text = response.read().decode()
-            assert "agent_healthy 7" in text
-            assert "agent_partial" not in text
-            assert 'collector="broken"' in text
-            assert server.updated > 0
-            assert urlopen(address).read().decode() == text
-            assert broken.calls == 1
-            assert any("broken" in key and value["value"] == 1 for key, value in server.state.counters.items())
-        finally:
-            server.shutdown()
-            thread.join(timeout=3)
+    collection = Collection([broken, Healthy(), SelfCollector()], State(tmp_path), 60)
+    text = collection.metrics()
+    assert "agent_healthy 7" in text
+    assert "agent_partial" not in text
+    assert 'collector="broken"' in text
+    assert collection.updated > 0
+    assert collection.metrics() == text
+    assert broken.calls == 1
+    assert any("broken" in key and value["value"] == 1 for key, value in collection.state.counters.items())
 
 
 def test_worker_textfiles_have_dedicated_writable_volume():

@@ -2330,7 +2330,7 @@ def efficiency_prune_loops(state: dict[str, Any], now: float) -> dict[str, set[s
             del series[key]
     for label in expired:
         del state["loops"][label]
-    # Keep the signal until the exporter durably consumes it, including across restarts.
+    # Keep the signal until the metric collection durably consumes it, including across restarts.
     pending = state.setdefault("retired_loops", {})
     for metric, loops in retired.items():
         pending[metric] = sorted(set(pending.get(metric, ())) | loops)

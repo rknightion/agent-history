@@ -210,7 +210,7 @@ class EfficiencyCollector:
         return families
 
     def acknowledge_retired_loops(self) -> None:
-        """Clear the pending signal only after exporter offsets are durably removed."""
+        """Clear the pending signal only after collection offsets are durably removed."""
         if not self.retired_loops:
             return
         path = self.state_dir / "efficiency-state.json"

@@ -4,8 +4,6 @@ import json
 import os
 import subprocess
 import sys
-import threading
-from urllib.request import urlopen
 
 import pytest
 
@@ -13,20 +11,11 @@ from agent_history.config import parse_config
 from agent_history.metrics import Family, Sample
 from agent_history.metrics.archive import ArchiveCollector
 from agent_history.metrics.efficiency import EfficiencyCollector
-from agent_history.metrics.server import MetricServer, State
+from agent_history.metrics.collection import Collection, State
 
 
 def scrape(collectors, directory):
-    with MetricServer(("127.0.0.1", 0), collectors, State(directory), 0) as server:
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        try:
-            with urlopen(f"http://127.0.0.1:{server.server_address[1]}/metrics", timeout=3) as response:
-                assert response.status == 200
-                return response.read().decode()
-        finally:
-            server.shutdown()
-            thread.join(timeout=3)
+    return Collection(collectors, State(directory), 0).metrics()
 
 
 def samples(text, name):

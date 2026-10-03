@@ -356,9 +356,9 @@ def upstream():
 
 def scrape_embed(directory):
     from agent_history.metrics.catalogue import RunCollector
-    from agent_history.metrics.server import State, exposition
+    from agent_history.metrics.collection import State, exposition
 
-    return exposition(list(RunCollector(directory).collect()), State(directory / "exporter-state"))
+    return exposition(list(RunCollector(directory).collect()), State(directory / "collection-state"))
 
 
 @pytest.mark.parametrize(("status", "body", "reason"), [

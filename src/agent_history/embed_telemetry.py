@@ -16,7 +16,7 @@ import urllib.error
 from contextlib import contextmanager
 
 from . import telemetry
-from .metrics.server import public_model
+from .metrics.collection import public_model
 
 OPERATION = "embeddings"
 # An OpenAI-compatible endpoint says nothing certain about the real provider, so the identifier is fixed.

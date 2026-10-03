@@ -24,8 +24,8 @@ Anything an agent read or printed, including secrets, ends up in the database.
 ## Quick start
 
 Needs Docker with Compose. The template builds the application image and keeps ParadeDB on the
-internal Compose network, with **no host database port**. Only the exporter is published, on host
-loopback by default.
+internal Compose network, with **no host database port** and no other published port. Metrics,
+traces and logs leave only over OTLP, when you configure an endpoint (see [Metrics](#metrics)).
 
 Copy `.env.example` to `.env` and fill every required value: `POSTGRES_PASSWORD`,
 `AH_WRITER_PASSWORD`, `AH_READER_PASSWORD`, `AGENT_HISTORY_DSN`, `AGENT_HISTORY_READER_DSN`,
@@ -49,7 +49,6 @@ pi-local = "/transcripts/pi"
 enabled = false
 
 [exporter]
-listen = "0.0.0.0:9464"
 state_dir = "/state"
 ```
 
@@ -62,7 +61,7 @@ docker compose run --build --rm indexer init
 docker compose run --rm indexer index      # configured read-only /transcripts sources
 docker compose run --rm indexer search "flaky test"
 docker compose run --rm indexer efficiency
-docker compose up -d exporter indexer
+docker compose up -d indexer
 ```
 
 `index` is incremental: it remembers how far it read each file and only parses new bytes. The
@@ -127,21 +126,30 @@ ordering needs result offsets and Claude record origins populated by a rebuild; 
 without them cannot establish the same-millisecond ordering. A rebuild cannot recover transcripts
 that have already been deleted (see CONTRACT.md). Optional `[cold_sources]` preserves cold-only history on rebuild; run `agent-history rebuild-check` for read-only tier counts and refusal decisions before rebuilding.
 
-The package ships the catalogue, search, classifier, application container and native `/metrics`
-exporter. The Compose template is for local deployment; no live metrics cutover is implied.
+The package ships the catalogue, search, classifier and application container. The Compose
+template is for local deployment.
 
-## Running the exporter
+## Metrics
 
-The container image runs three separate processes from the same image: `exporter` serves
-`/metrics` and `/healthz`, `index --every 60` indexes the configured sources, and
-`embed --every 60` processes pending chunks. Set the three database passwords, writer and reader
-DSNs, `TRANSCRIPTS_ROOT` and `AGENT_HISTORY_CONFIG_FILE` in your environment before running
-`docker compose -f compose.yml up --build`. Never store passwords in the compose file.
+The container image runs two periodic processes from the same image: `index --every 60` indexes the
+configured sources and `embed --every 60` processes pending chunks. Set the three database
+passwords, writer and reader DSNs, `TRANSCRIPTS_ROOT` and `AGENT_HISTORY_CONFIG_FILE` in your
+environment before running `docker compose -f compose.yml up --build`. Never store passwords in the
+compose file.
 
-The config file should set `[sources]` to namespace-to-directory entries under `/transcripts`,
-`[embedding]` to your chosen provider, and `[exporter]` with `listen = "0.0.0.0:9464"` and
-`state_dir = "/state"`. Bind only the host loopback port in compose; expose another port only
-behind an authenticated scrape path. The state volume preserves counters through restarts. Set
+Metrics are OTLP only; nothing serves `/metrics`. The periodic indexer also hosts the metric
+collectors, on their own thread and at their own cadence (`[exporter] refresh_interval`, 15 seconds
+by default): a slow or failing index pass never stops metrics, and a failing collector never fails an
+index pass. Collection runs only when the optional `otel` extra is installed and
+`OTEL_EXPORTER_OTLP_ENDPOINT` (or the metrics-specific endpoint) is set; otherwise nothing is
+collected and no collector state is written. A one-shot `index` never collects. If collection cannot
+start, the indexer keeps indexing, prints `metric collection disabled (config)` and emits a
+`telemetry.configuration.invalid` OTLP log; the `agent-history-metrics-stale` alert rule catches a
+collection that is absent or no longer completes runs.
+
+The `[exporter]` table keeps its historical name and configures this collection; its `listen` key
+is accepted and ignored. Set `state_dir = "/state"`: the state volume preserves the collectors'
+counter offsets and efficiency state through restarts, and must be writable by the indexer. Set
 `[exporter] collectors = ["archive", "catalogue", "self"]` explicitly when using only these
 three collectors. The default collector set also includes `efficiency`, which **reads transcript
 contents** from the configured sources to classify model calls. Archive collection reads file
@@ -149,16 +157,19 @@ metadata and receipts, and catalogue collection reads database aggregates; those
 do not read transcript content. Archive roots (`hot`, `cold`, `incoming`, `conflicts`) are optional
 and must be mounted read-only if set.
 
-With the optional `otel` extra installed and `OTEL_EXPORTER_OTLP_ENDPOINT` (or the metrics-specific
-endpoint) set, the exporter also publishes every `agent_history_*`, `agent_sessions_*` and
-`agent_efficiency_*` family through the OpenTelemetry meter, as the mapping in `docs/otel-design.md`
-describes, and refreshes it at the exporter's refresh interval even when nothing scrapes `/metrics`.
-Both outputs come from one collection, so the Prometheus exposition is byte for byte what it was
-without OTLP. Use `OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE=CUMULATIVE` or leave it unset;
-any other value switches the bridge off. A label value outside its producer's vocabulary is refused
-by OTLP only, never rewritten, and the Prometheus text keeps it. `just otlp-parity` runs one synthetic
-collection through both outputs, decodes the real OTLP request and compares every mapped family; rerun
-it before retiring the Prometheus route.
+The indexer publishes every `agent_history_*`, `agent_sessions_*` and `agent_efficiency_*` family
+through the OpenTelemetry meter as service `agent-history-index`, as the mapping in
+`docs/otel-design.md` describes. Use `OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE=CUMULATIVE` or
+leave it unset; any other value switches metric publication off. A label value outside its producer's
+vocabulary is refused, never rewritten. Each collection also renders the same samples as Prometheus
+text in process, which the tests use as the proof format: `just otlp-parity` runs one synthetic
+collection, decodes the real OTLP request and compares every mapped family against that text.
+
+A backend may translate names. Grafana Cloud maps `service.name` to the `job` label and appends a
+unit suffix to some names: a gauge with unit `1` gains `_ratio` (`agent_history_run_success_ratio`),
+`agent_efficiency_wait_timeout_ms_total` becomes `agent_efficiency_wait_timeout_ms_milliseconds_total`,
+and the legacy histogram components gain `_total` (`agent_efficiency_lane_seconds_bucket_total`).
+The alert rules in `alerts/grafana-managed/` select those stored names.
 
 Non-string pi model values are treated as missing: the model remains unknown unless a valid string was previously recorded.
 At the public exposition boundary, `model` label values are restricted to an explicit literal
@@ -187,10 +198,10 @@ Self-health keeps `storage`, `archive`, `efficiency` and `loops` separate from w
 `loops` times the optional catalogue loop-map fetch: a failed fetch sets its success to zero,
 records duration and retains its last-success timestamp, without failing overall collection.
 
-Before a metrics cutover, compare captures with the public CLI:
+To compare two Prometheus captures from an older exporter, use the public CLI:
 
 ```sh
-agent-history metrics parity --legacy legacy.prom --new http://127.0.0.1:9464/metrics \
+agent-history metrics parity --legacy legacy.prom --new new.prom \
   --legacy-at 2026-01-01T12:00:05Z --roster src/agent_history/metrics/parity-roster.json
 ```
 
@@ -214,8 +225,7 @@ Use trusted labels matching the legacy capture when proving private deployment p
 This is not general metadata sanitisation. Other operator-configured namespaces, loop names and
 collector state can be sensitive. Local collector and counter state retain original source
 identities, including transcript-derived model identifiers and paths; protect the trusted state
-volume as well as the transcript mounts and database. Do not expose
-an unauthenticated metrics endpoint beyond a trusted local scrape path. Periodic index/embed logs
+volume as well as the transcript mounts and database. Periodic index/embed logs
 discard nested command stdout/stderr and use only fixed status/error categories, without raw
 exception messages. `SystemExit` still exits rather than retrying, but its payload is replaced
 with a numeric status; interrupts and other `BaseException` types still escape. Interactive

@@ -1,18 +1,16 @@
-"""Exporter public HTTP contract with synthetic collectors, no transcript content."""
+"""Metric collection contract with synthetic collectors, no transcript content."""
 
 from __future__ import annotations
 
 import json
-import threading
 
 import pytest
 from types import SimpleNamespace
-from urllib.request import urlopen
 
 from agent_history.config import ConfigError, parse_config
 from agent_history.metrics import Family, Sample
 from agent_history.metrics.archive import ArchiveCollector
-from agent_history.metrics.server import MetricServer, State, exposition
+from agent_history.metrics.collection import Collection, State, exposition
 from agent_history.metrics.catalogue import RunCollector
 
 
@@ -23,23 +21,12 @@ class StubEfficiency:
         return [Family("agent_efficiency_llm_calls_total", "counter", "LLM calls.", (Sample((("agent", "pi"),), 7),))]
 
 
-def test_stub_efficiency_http_restart(tmp_path):
+def test_stub_efficiency_collection_restart(tmp_path):
     state = State(tmp_path)
-    server = MetricServer(("127.0.0.1", 0), [StubEfficiency()], state)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    try:
-        address = f"http://127.0.0.1:{server.server_address[1]}"
-        assert urlopen(address + "/healthz").read() == b"ok\n"
-        output = urlopen(address + "/metrics").read().decode()
-        assert "# TYPE agent_efficiency_llm_calls_total counter" in output
-        assert 'agent_efficiency_llm_calls_total{agent="pi"} 7' in output
-        assert urlopen(address + "/metrics").headers["Content-Type"].startswith("text/plain; version=0.0.4")
-        assert state.value("agent_efficiency_llm_calls_total", (("agent", "pi"),)) == 7
-    finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=3)
+    output = Collection([StubEfficiency()], state).metrics()
+    assert "# TYPE agent_efficiency_llm_calls_total counter" in output
+    assert 'agent_efficiency_llm_calls_total{agent="pi"} 7' in output
+    assert state.value("agent_efficiency_llm_calls_total", (("agent", "pi"),)) == 7
     assert State(tmp_path).value("agent_efficiency_llm_calls_total", (("agent", "pi"),)) == 7
 
 
@@ -300,23 +287,20 @@ def test_actual_collector_partial_cache_and_retirement(tmp_path, monkeypatch):
 
     collector = EfficiencyCollector(parse_config({}), directory)
     offsets = State(tmp_path / "exporter")
-    server = MetricServer(("127.0.0.1", 0), [collector], offsets, refresh=0)
-    try:
-        cache(a=100, b=5)
-        server.metrics()
-        clock[0] += 10
-        cache(b=5)
-        assert 'loop="a"' in server.metrics()
-        cache(a=2, b=5)
-        assert 'loop="a",namespace="pi-local",role="solo",trigger="user"} 102' in server.metrics()
-        # A partial cache may also omit whole families previously emitted for this loop.
-        offsets.observe("agent_efficiency_first_spawn_seconds_sum", (("loop", "a"),), 10)
-        # The actual collector's retention decision removes persisted exporter offsets too.
-        clock[0] += rules.EFFICIENCY_LOOP_RETAIN_SECONDS + 1
-        assert 'loop="a"' not in server.metrics()
-        assert not offsets.counters
-    finally:
-        server.server_close()
+    collection = Collection([collector], offsets, refresh=0)
+    cache(a=100, b=5)
+    collection.metrics()
+    clock[0] += 10
+    cache(b=5)
+    assert 'loop="a"' in collection.metrics()
+    cache(a=2, b=5)
+    assert 'loop="a",namespace="pi-local",role="solo",trigger="user"} 102' in collection.metrics()
+    # A partial cache may also omit whole families previously emitted for this loop.
+    offsets.observe("agent_efficiency_first_spawn_seconds_sum", (("loop", "a"),), 10)
+    # The actual collector's retention decision removes persisted exporter offsets too.
+    clock[0] += rules.EFFICIENCY_LOOP_RETAIN_SECONDS + 1
+    assert 'loop="a"' not in collection.metrics()
+    assert not offsets.counters
 
 
 def test_failed_collector_does_not_apply_stale_retirement(tmp_path):
@@ -329,12 +313,9 @@ def test_failed_collector_does_not_apply_stale_retirement(tmp_path):
 
     state = State(tmp_path)
     state.observe("agent_example_total", (("loop", "a"),), 100)
-    server = MetricServer(("127.0.0.1", 0), [Failed()], state)
-    try:
-        server.metrics()
-        assert state.value("agent_example_total", (("loop", "a"),)) == 100
-    finally:
-        server.server_close()
+    collection = Collection([Failed()], state)
+    collection.metrics()
+    assert state.value("agent_example_total", (("loop", "a"),)) == 100
 
 
 def test_retirement_replays_after_collector_restart(tmp_path, monkeypatch):
@@ -356,10 +337,7 @@ def test_retirement_replays_after_collector_restart(tmp_path, monkeypatch):
     config = parse_config({})
     # Simulate the process dying after collector persistence, before exporter persistence.
     EfficiencyCollector(config, directory).collect()
-    server = MetricServer(("127.0.0.1", 0), [EfficiencyCollector(config, directory)], offsets)
-    try:
-        server.metrics()
-        assert offsets.counters == {}
-        assert json.loads(path.read_text())["retired_loops"] == {}
-    finally:
-        server.server_close()
+    collection = Collection([EfficiencyCollector(config, directory)], offsets)
+    collection.metrics()
+    assert offsets.counters == {}
+    assert json.loads(path.read_text())["retired_loops"] == {}

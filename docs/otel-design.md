@@ -1,5 +1,6 @@
 # OpenTelemetry design
-Status: proposed frozen seam, subject to independent design review before implementation.
+Status: implemented. Section 14 supersedes the coexistence rules below: the exporter is folded into
+the periodic indexer and OTLP is the only metric route.
 Repository baseline: `292bf2d7b3d113979e85d32f1482893e01226b06`.
 ## 1. Scope and invariants
 Add optional OpenTelemetry traces, metrics and content-free operational logs. Do not replace the catalogue, its unredacted content policy, or the existing Prometheus collection path.
@@ -84,7 +85,7 @@ Each worker's `service.name` is a fixed literal chosen by the package, on every 
 | standalone `journal-sync` | `agent-history-journal-sync` |
 | `collect-git` | `agent-history-collect-git` |
 | `collect` / `agent-history-collect` | `agent-history-collect` |
-| `exporter` | `agent-history-exporter` |
+| `exporter` (retired, section 14) | was `agent-history-exporter`; collection now reports as `agent-history-index` |
 A nested postpass inherits `agent-history-index`. Do not identify a service from a hostname, working directory, database DSN or transcript namespace.
 ### Provider construction
 Use:
@@ -115,7 +116,7 @@ Successful, skipped and failed outcomes are distinct. A lock-held or disabled pa
 | `journal_sync.pass` | `journal_sync.sync`, `journal_sync.py:152-225`; command dispatch at `cli.py:282-292` | Include read-only SQLite open/read/close, source validation, destination transaction, batches, pruning and watermark updates. Export `journal_rows`, matched/unmatched/deleted/bad-json counts and reset/full-pass flags where known. Do not export `journal_skipped_reason` text. |
 | `collect_git.pass` | `collect_git.collect`, `collect_git.py:1267-1291`; `cli.py:416-420` | Include configured-repository iteration, local git reads and database upserts. Export repository/commit/file counts and number skipped. Never export the returned `skipped` list. |
 | `collect.pass` | `collect_git.main`, `collect_git.py:1305-1368` | Cover lock/deadline handling, connection, repository/CI/home collection and cleanup. Export aggregate table counts, repository count, dry-run flag and bounded outcome. Do not export the full summary dict. |
-| `exporter.collect` | `MetricServer.metrics`, `metrics/server.py:295-351` | One span for a real refresh, not each cache hit or HTTP scrape. Child spans `exporter.collector` carry the fixed collector name and success/failure. |
+| `metrics.collect` | `Collection.metrics`, `metrics/collection.py` (was `exporter.collect` in `MetricServer.metrics`) | One span for a real refresh, not each cache hit. Child spans `metrics.collector` carry the fixed collector name and success/failure. Root spans on the collection thread, never children of `index.pass`. |
 Application functions invoked within an already-open command/pass span must not create a duplicate same-name pass span. A small shared pass wrapper may provide the function boundary for direct module invocation and reuse the active pass when entered from the CLI. Nested postpass is a separate genuine pass, not a duplicate index pass.
 For index/embed, a pass finishes before `time.sleep(args.every)`. Do not create a process-lifetime span covering idle intervals.
 Known result fields must be selected explicitly. For example, `task_refs` may have a structured result: export its numeric fields individually, never stringify it.
@@ -539,3 +540,39 @@ Remaining implementation/review obligations:
 - run final all-outbound-call proof after embedding request instrumentation is integrated;
 - verify backend metric translation and coexistence attribution before removing any existing route.
 Legacy stdout error details are outside the new OTLP log route. If those existing messages require a separate content-policy change, handle that separately rather than silently changing established command output here.
+
+## 14. Exporter fold and OTLP-only cutover
+
+This section supersedes the coexistence rules in sections 1, 6, 7 and 10 wherever they conflict.
+
+- The `exporter` command, its HTTP server, `/metrics` and `/healthz` are removed. Metric families are
+  published only through the OTel meter.
+- The periodic indexer (`index --every`) hosts the collection. The outer `--every` process builds the
+  configured collectors once, from the `[exporter]` table (name kept for configuration compatibility;
+  `listen` is accepted and ignored), and starts the existing `Refresher` thread over a `Collection`
+  (`metrics/collection.py`, the former `MetricServer` without HTTP) at `refresh_interval`.
+- Collection starts only when `Bridge.create()` returns a bridge, that is when OTLP metric export is
+  enabled and cumulative. Otherwise nothing is collected and `counters.json` and efficiency state are
+  never touched. A one-shot `index` never collects.
+- Isolation: index passes run on the main thread and collection on its own daemon thread. Collection
+  exceptions are contained by `Refresher`; an index pass never calls a collector, so a collector
+  failure cannot fail a pass, and a slow or failing pass cannot stop collection. A setup failure leaves
+  the indexer running, prints the fixed line `metric collection disabled (config)` and emits
+  `telemetry.configuration.invalid`. On exit the refresher is stopped and joined, then the telemetry
+  lifecycle flushes and shuts down.
+- Staleness is alertable: `agent_sessions_metrics_collection_runs_total` stops increasing when the
+  refresher hangs (the bridge keeps exporting the last snapshot) and disappears when the indexer or
+  its collection is absent. `grafana/build_rules.py` generates `agent-history-metrics-stale` over it.
+- `render` still produces the Prometheus text from the same snapshot. It is an in-process proof
+  format for the golden and one-snapshot parity tests, not an exposed surface.
+- Counter state moves with the collection: the indexer needs a writable `state_dir`. Continuity of a
+  previous exporter's `counters.json` is not required; a reset at the switch is accepted, and the
+  backend sees a counter reset.
+- The worker run snapshots stay files on the shared volume, written by the index and embed workers
+  and read by the `runs` collector. Nothing else reads them.
+- Backend identity, observed on Grafana Cloud: `service.name` becomes `job` (no `service.namespace` is
+  set) and is also kept as `service_name`; series carry only `job`, `service_name`, `service_version`
+  and their own attributes. Gauges with unit `1` gain `_ratio`, `agent_efficiency_wait_timeout_ms_total`
+  becomes `agent_efficiency_wait_timeout_ms_milliseconds_total`, and the histogram component Sums gain
+  `_total`. Dashboards and alert rules select those stored names under `job="agent-history-index"`.
+
