@@ -52,6 +52,8 @@ OVERRIDES = {
     ("agent_history_rows", "table"): list(TABLES),
     ("agent_sessions_filesystem_bytes", "kind"): ["total", "free"],
     ("agent_sessions_filesystem_inodes", "kind"): ["total", "free"],
+    ("agent_efficiency_coderabbit_findings_total", "severity"): ["critical", "info"],
+    ("agent_efficiency_spawns_by_route_total", "effort"): ["high", "inherit"],
 }
 CAP = 16
 
