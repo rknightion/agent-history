@@ -271,6 +271,8 @@ class Provider:
     batch: int = 96
     dimensions: int = DIMS
     headers: dict = field(default_factory=dict)
+    # Operator-trusted model identifiers ([metrics_labels] models); others export as `other`.
+    trusted_models: frozenset = frozenset()
     usage: dict = field(default_factory=lambda: {"tokens": 0, "requests": 0})
 
     def _post(self, url: str, body: dict, headers: dict) -> dict:
@@ -311,7 +313,7 @@ class Provider:
         raise ProviderError(0, "unreachable")
 
     def embed(self, texts: list[str], kind: str = "document") -> list[list[float]]:
-        with embed_telemetry.request(self.model, self.dimensions) as tel:
+        with embed_telemetry.request(self.model, self.dimensions, self.trusted_models) as tel:
             body: dict = {"model": self.model, "input": texts}
             if self.dimensions:
                 body["dimensions"] = self.dimensions
@@ -327,11 +329,12 @@ class Provider:
 def provider_from_config(config=None) -> Provider:
     """The configured embedding provider; raises LookupError when embeddings are off."""
     from .config import load_config
-    cfg = (config or load_config()).embedding
+    config = config or load_config()
+    cfg = config.embedding
     if not cfg.enabled:
         raise LookupError("embeddings are off ([embedding] enabled = false)")
     return Provider("openai-compatible", cfg.model, cfg.token(), cfg.base_url, cfg.batch, cfg.dimensions,
-                    dict(cfg.headers))
+                    dict(cfg.headers), frozenset(config.metrics_labels.models))
 
 
 def embed_resilient(call: Callable[[list[str]], list[list[float]]], texts: list[str]

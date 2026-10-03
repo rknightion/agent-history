@@ -10,28 +10,28 @@ from __future__ import annotations
 
 import contextvars
 import importlib
-import re
 import time
 import http.client
 import urllib.error
 from contextlib import contextmanager
 
 from . import telemetry
+from .metrics.server import public_model
 
 OPERATION = "embeddings"
 # An OpenAI-compatible endpoint says nothing certain about the real provider, so the identifier is fixed.
 PROVIDER = "openai-compatible"
 DURATION_BOUNDARIES = [0.01, 0.02, 0.04, 0.08, 0.16, 0.32, 0.64, 1.28, 2.56, 5.12, 10.24, 20.48, 40.96, 81.92]
 TOKEN_BOUNDARIES = [1, 4, 16, 64, 256, 1024, 4096, 16384, 65536, 262144, 1048576, 4194304, 16777216, 67108864]
-# Model identifiers are configuration or a short identifier field, never prose: anything else is omitted.
-_MODEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,63}")
 # embed.FAILURE_REASONS plus the semantic-conventions fallback.
 _REASONS = frozenset({"auth", "billing_quota", "rate_limit", "route", "provider_error", "network", "other", "_OTHER"})
 _current = contextvars.ContextVar("agent_history_embedding_request", default=None)
 
 
-def _model(value):
-    return value if isinstance(value, str) and _MODEL.fullmatch(value) else None
+def _model(value, trusted=frozenset()):
+    """The public model allowlist the metrics exposition uses (never a copy), else None."""
+    public = public_model(value, trusted) if isinstance(value, str) else "other"
+    return None if public in ("other", "unknown") else public
 
 
 def _error_type(exc):
@@ -64,8 +64,9 @@ class _Null:
 
 
 class _Request:
-    def __init__(self, base):
+    def __init__(self, base, trusted):
         self.base = base
+        self.trusted = trusted
         self.span = None
         self.attempts = 0
         self.response_model = None
@@ -76,7 +77,7 @@ class _Request:
         if not isinstance(out, dict):
             return
         values = {}
-        model = _model(out.get("model"))
+        model = _model(out.get("model"), self.trusted)
         if model:
             self.response_model = model
             values["gen_ai.response.model"] = model
@@ -122,26 +123,25 @@ def _record(request, elapsed, error):
 
 
 @contextmanager
-def request(model, dimensions=0):
+def request(model, dimensions=0, trusted=frozenset()):
     """One logical embeddings request: a CLIENT span plus the duration and usage histograms."""
     if not telemetry.enabled():
         yield _Null()
         return
     api = importlib.import_module("opentelemetry.trace")
-    request_model = _model(model)
+    request_model = _model(model, trusted) or "other"
     base = {"gen_ai.operation.name": OPERATION, "gen_ai.provider.name": PROVIDER}
-    if request_model:
-        base["gen_ai.request.model"] = request_model
+    base["gen_ai.request.model"] = request_model
     attributes = dict(base)
     if type(dimensions) is int and dimensions > 0:
         attributes["gen_ai.embeddings.dimension.count"] = dimensions
-    state = _Request(base)
+    state = _Request(base, trusted)
     token = _current.set(state)
     started = time.monotonic()
     error = None
     try:
         with telemetry.tracer().start_as_current_span(
-            f"{OPERATION} {request_model}" if request_model else OPERATION,
+            f"{OPERATION} {request_model}",
             kind=api.SpanKind.CLIENT,
             attributes=attributes,
             record_exception=False,

@@ -74,7 +74,10 @@ def script(monkeypatch, *outcomes):
 
 
 def provider(token=""):
-    return embed.Provider("fake-http", MODEL, token, "http://provider.invalid/v1", dimensions=2)
+    # The embedding model is not in the public list: the operator trusts it via [metrics_labels] models.
+    return embed.Provider(
+        "fake-http", MODEL, token, "http://provider.invalid/v1", dimensions=2, trusted_models=frozenset({MODEL})
+    )
 
 
 def value(any_value):
@@ -335,19 +338,37 @@ def test_duration_and_token_histograms_follow_released_metrics(monkeypatch, otlp
     ]
 
 
-def test_unapproved_model_names_are_omitted_not_exported(monkeypatch, otlp):
-    odd = "a model name with spaces and a long tail " * 3
-    script(monkeypatch, good(["alpha"], model=odd))
-    embed.Provider("fake-http", odd, "", "http://provider.invalid/v1").embed(["alpha"])
+def test_echoed_secret_shaped_model_never_reaches_any_signal(monkeypatch, otlp):
+    """Provider-supplied and configured model names pass the public model allowlist or are not exported."""
+    secret = "gh" + "p_" + "R" * 36
+    # The gateway echoes a secret-shaped value as the response model; a misconfigured request model is one too.
+    script(monkeypatch, good(["alpha"], model=secret), good(["alpha"], model=secret), http_error(401))
+    embed.Provider("fake-http", MODEL, "", "http://provider.invalid/v1", dimensions=2).embed(["alpha"])
+    embed.Provider("fake-http", secret, "", "http://provider.invalid/v1", dimensions=2).embed(["alpha"])
+    with pytest.raises(embed.ProviderError):
+        embed.Provider("fake-http", secret, "", "http://provider.invalid/v1").embed(["alpha"])
+    capture = otlp.finish()
+    assert secret not in capture.every_text()
+    assert capture.spans() and capture.metrics() and capture.logs()
+    for span in capture.spans():
+        assert not {"gen_ai.response.model"} & set(attrs(span.attributes))
+        assert attrs(span.attributes).get("gen_ai.request.model", "other") == "other"
+    assert {s.name for s in capture.spans() if s.name != "embedding.http_attempt"} == {"embeddings other"}
+
+
+def test_model_names_outside_the_allowlist_export_as_other(monkeypatch, otlp):
+    # Untrusted configured model: `other`. An allowlisted response model is still exported.
+    script(monkeypatch, good(["alpha"], model="claude-haiku-4-5"))
+    embed.Provider("fake-http", MODEL, "", "http://provider.invalid/v1").embed(["alpha"])
     capture = otlp.finish()
     span = logical(capture)
-    assert span.name == "embeddings"
+    assert span.name == "embeddings other"
     values = attrs(span.attributes)
-    assert not {"gen_ai.request.model", "gen_ai.response.model"} & set(values)
-    for metric in capture.metrics().values():
-        for point in metric.histogram.data_points:
-            assert not {"gen_ai.request.model", "gen_ai.response.model"} & set(attrs(point.attributes))
-    assert odd not in capture.every_text()
+    assert values["gen_ai.request.model"] == "other"
+    assert values["gen_ai.response.model"] == "claude-haiku-4-5"
+    for point in capture.metrics()[OPERATION_HISTOGRAM].histogram.data_points:
+        assert attrs(point.attributes)["gen_ai.request.model"] == "other"
+    assert MODEL not in capture.every_text()
 
 
 def test_no_input_text_vector_or_body_reaches_any_signal(monkeypatch, otlp):

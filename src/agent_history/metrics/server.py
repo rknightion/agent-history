@@ -58,23 +58,22 @@ PUBLIC_MODELS = frozenset(
 )
 
 
+def public_model(value: str, trusted: frozenset[str] = frozenset()) -> str:
+    """The one model-label policy: an explicit public or operator-trusted identifier, else `other`."""
+    return (
+        value
+        if value in PUBLIC_MODELS or value in trusted
+        else "unknown"
+        if not value or value == "unknown"
+        else "other"
+    )
+
+
 def _public_labels(
     labels: tuple[tuple[str, str], ...], trusted: MetricsLabels = MetricsLabels()
 ) -> tuple[tuple[str, str], ...]:
     return tuple(
-        (
-            key,
-            (
-                value
-                if value in PUBLIC_MODELS or value in trusted.models
-                else "unknown"
-                if not value or value == "unknown"
-                else "other"
-            ),
-        )
-        if key == "model"
-        else (key, value)
-        for key, value in labels
+        (key, public_model(value, trusted.models)) if key == "model" else (key, value) for key, value in labels
     )
 
 
