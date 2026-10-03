@@ -85,7 +85,7 @@ def resource(rule: dict) -> dict:
             "trigger": {"interval": "1m"},
             "for": rule["for"],
             "paused": False,
-            "noDataState": "OK",
+            "noDataState": "Ok",
             "execErrState": "Error",
             "labels": {
                 "domain": "observability",

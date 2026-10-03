@@ -79,7 +79,7 @@
       "severity": "critical",
       "source": "agent-history"
     },
-    "noDataState": "OK",
+    "noDataState": "Ok",
     "paused": false,
     "title": "agent-history embeddings stalled with messages pending",
     "trigger": {

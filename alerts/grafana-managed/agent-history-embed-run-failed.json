@@ -79,7 +79,7 @@
       "severity": "warning",
       "source": "agent-history"
     },
-    "noDataState": "OK",
+    "noDataState": "Ok",
     "paused": false,
     "title": "agent-history embedding run failed",
     "trigger": {
