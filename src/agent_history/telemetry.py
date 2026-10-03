@@ -295,6 +295,10 @@ def fail(span, category="error"):
         span.set_status(api.Status(api.StatusCode.ERROR))
 
 
+def enabled():
+    return _active is not None and _active.enabled and not _active.closed
+
+
 def tracer():
     return _active.trace if _active is not None and not _active.closed else _NOOP
 

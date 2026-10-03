@@ -31,7 +31,7 @@ from typing import Callable
 
 import psycopg
 
-from . import telemetry
+from . import embed_telemetry, telemetry
 
 from .load import ADVISORY_LOCK
 
@@ -285,9 +285,11 @@ class Provider:
         for attempt in range(6):
             req = urllib.request.Request(url, data=data, headers=base, method="POST")
             try:
-                with urllib.request.urlopen(req, timeout=120) as resp:
-                    self.usage["requests"] += 1
-                    return json.loads(resp.read())
+                with embed_telemetry.attempt() as tel:
+                    with urllib.request.urlopen(req, timeout=120) as resp:
+                        tel.status(getattr(resp, "status", None))
+                        self.usage["requests"] += 1
+                        return json.loads(resp.read())
             except urllib.error.HTTPError as exc:
                 try:
                     detail = exc.read(65536).decode("utf-8", "replace")
@@ -309,15 +311,17 @@ class Provider:
         raise ProviderError(0, "unreachable")
 
     def embed(self, texts: list[str], kind: str = "document") -> list[list[float]]:
-        body: dict = {"model": self.model, "input": texts}
-        if self.dimensions:
-            body["dimensions"] = self.dimensions
-        out = self._post(self.base_url.rstrip("/") + "/embeddings", body, {})
-        vectors = [d["embedding"] for d in sorted(out.get("data") or [], key=lambda d: d["index"])]
-        self.usage["tokens"] += int((out.get("usage") or {}).get("prompt_tokens") or 0)
-        if len(vectors) != len(texts):
-            raise ProviderError(502, f"expected {len(texts)} vectors, got {len(vectors)}")
-        return [normalise(v) for v in vectors]
+        with embed_telemetry.request(self.model, self.dimensions) as tel:
+            body: dict = {"model": self.model, "input": texts}
+            if self.dimensions:
+                body["dimensions"] = self.dimensions
+            out = self._post(self.base_url.rstrip("/") + "/embeddings", body, {})
+            tel.response(out)
+            vectors = [d["embedding"] for d in sorted(out.get("data") or [], key=lambda d: d["index"])]
+            self.usage["tokens"] += int((out.get("usage") or {}).get("prompt_tokens") or 0)
+            if len(vectors) != len(texts):
+                raise ProviderError(502, f"expected {len(texts)} vectors, got {len(vectors)}")
+            return [normalise(v) for v in vectors]
 
 
 def provider_from_config(config=None) -> Provider:

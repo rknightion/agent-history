@@ -170,6 +170,14 @@ New native instruments:
 - `gen_ai.client.token.usage`: Histogram, unit `{token}`, one observation for known input usage, with `gen_ai.token.type="input"`; do not invent output tokens or a zero measurement when usage is unknown.
 Metric attributes are the released operation/provider/model fields and bounded error category where applicable. Retry count belongs on spans, not a high-cardinality metric attribute.
 The embedding-request owner owns this code. Do not add a second generic URL wrapper or globally monkey-patch urllib to circumvent that ownership. Final proof of “every outbound call” includes these requests after request-level instrumentation is integrated.
+Implemented in `src/agent_history/embed_telemetry.py`, called from `Provider.embed` and `Provider._post` (semantic-conventions `v1.41.0`):
+
+- Logical span `embeddings <model>` (`embeddings` when the model identifier is not a short identifier), `CLIENT`: `gen_ai.operation.name`, `gen_ai.provider.name` (always `openai-compatible`), `gen_ai.request.model`, `gen_ai.embeddings.dimension.count` (when configured), `gen_ai.response.model` and `gen_ai.usage.input_tokens` (only when the response states them in a well-formed field), `agent_history.retry_count`, `agent_history.outcome`, and on failure `error.type` (the bounded `embed.FAILURE_REASONS` value, else `_OTHER`) with `ERROR` status and no description.
+- Attempt span `embedding.http_attempt`, `CLIENT`, child of the logical span: the same identifying attributes, `http.response.status_code` when known, `agent_history.outcome` and, on failure, `error.type` (the numeric status, `timeout`, `network` or `_OTHER`).
+- Model identifiers must match `[A-Za-z0-9][A-Za-z0-9._:/-]{0,63}`; anything else is omitted rather than exported. `server.address` and `server.port` are deliberately not recorded.
+- Histograms `gen_ai.client.operation.duration` (`s`, one observation per logical request including failures, with `error.type` on failures) and `gen_ai.client.token.usage` (`{token}`, `gen_ai.token.type="input"`, only when usage is known), with the released recommended bucket boundaries.
+- A failed logical request also emits the `outbound.call.failed` log with the bounded category, numeric status and retry count.
+
 ### Git and GitHub subprocess edges
 Instrument logical outbound subprocess operations, without claiming visibility into a subprocess's internal HTTP pagination:
 | Span | Actual callsite |
