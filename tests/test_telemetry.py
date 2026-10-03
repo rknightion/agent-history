@@ -121,3 +121,51 @@ def test_real_otlp_correlated_safe_success_and_failure(monkeypatch):
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
+
+
+@pytest.mark.parametrize("command", ["index", "embed", "journal-sync", "collect-git", "postpass"])
+def test_operator_environment_never_reaches_resource_on_cli_config_failure(monkeypatch, tmp_path, command):
+    """OTEL_SERVICE_NAME and OTEL_RESOURCE_ATTRIBUTES are operator input, never exported."""
+    pytest.importorskip("opentelemetry.sdk")
+    from opentelemetry.proto.collector.logs.v1.logs_service_pb2 import ExportLogsServiceRequest
+    from opentelemetry.proto.collector.metrics.v1.metrics_service_pb2 import ExportMetricsServiceRequest
+    from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import ExportTraceServiceRequest
+
+    from agent_history import cli
+
+    received = []
+
+    class Receiver(BaseHTTPRequestHandler):
+        def do_POST(self):
+            received.append((self.path, self.rfile.read(int(self.headers["Content-Length"]))))
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, *_):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Receiver)
+    thread = threading.Thread(target=server.serve_forever)
+    thread.start()
+    secret = "gh" + "p_" + "Z" * 36
+    config = tmp_path / "invalid-config.toml"
+    config.write_text('unknown = "synthetic"\n')
+    try:
+        monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", f"http://127.0.0.1:{server.server_port}")
+        monkeypatch.setenv("OTEL_SERVICE_NAME", secret)
+        monkeypatch.setenv("OTEL_RESOURCE_ATTRIBUTES", f"service.name={secret},credential={secret}")
+        assert cli.main(["--config", str(config), command]) == 2
+        types = {
+            "/v1/traces": ExportTraceServiceRequest,
+            "/v1/logs": ExportLogsServiceRequest,
+            "/v1/metrics": ExportMetricsServiceRequest,
+        }
+        decoded = "".join(str(types[path].FromString(body)) for path, body in received)
+        assert received
+        assert secret not in decoded
+        assert f'string_value: "agent-history-{command}"' in decoded
+    finally:
+        telemetry.shutdown()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)

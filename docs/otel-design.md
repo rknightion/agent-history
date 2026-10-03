@@ -68,15 +68,15 @@ Supported endpoint and authentication configuration:
 | `OTEL_EXPORTER_OTLP_LOGS_HEADERS` | Standard logs-specific override. |
 | `OTEL_EXPORTER_OTLP_PROTOCOL` | `http/protobuf`; this extra does not support gRPC or HTTP JSON. |
 | `OTEL_EXPORTER_OTLP_{TRACES,METRICS,LOGS}_PROTOCOL` | If set, must also be `http/protobuf`. |
-| `OTEL_SERVICE_NAME` | Overrides the command's default service name. |
 | `OTEL_EXPORTER_OTLP_TIMEOUT` and signal-specific timeout variables | SDK export timeouts, with the SDK's documented units. |
 | `OTEL_METRIC_EXPORT_INTERVAL` / `OTEL_METRIC_EXPORT_TIMEOUT` | Standard metric reader controls, in milliseconds. |
 | `OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE` | Legacy snapshot instruments require `CUMULATIVE`. |
 Treat an unset or empty endpoint as absent. A signal is enabled only when its effective endpoint is explicitly present; the SDK's localhost default must not activate export accidentally. A generic endpoint enables all three signals. A signal-specific endpoint alone enables only that signal.
 For HTTP/protobuf, the generic base URL gains `v1/traces`, `v1/metrics` or `v1/logs`. Signal-specific URLs are used as supplied. Delegate these rules and header decoding to the SDK, rather than maintaining a second parser.
 If the configured temporality preference is incompatible with the cumulative legacy bridge, disable that bridge with a fixed diagnostic; do not silently publish deltas under a cumulative parity claim. Production configuration uses `CUMULATIVE`.
-### Default service names
-| Command/process | Default `service.name` |
+### Service names
+Each worker's `service.name` is a fixed literal chosen by the package, on every path including configuration failure. `OTEL_SERVICE_NAME` and `OTEL_RESOURCE_ATTRIBUTES` are ignored.
+| Command/process | `service.name` |
 |---|---|
 | `index`, including `--every` | `agent-history-index` |
 | standalone `postpass` | `agent-history-postpass` |
@@ -97,7 +97,7 @@ The resource is an explicit allowlist:
 - package `service.version`;
 - SDK name, language and version.
 Do not export arbitrary `OTEL_RESOURCE_ATTRIBUTES`, automatically detected host/process/container data, process arguments, environment variables or baggage. In particular, do not pass an unfiltered `Resource.create()` result to a provider. Construct or filter the resource so only the allowlisted fields survive.
-Support `OTEL_SERVICE_NAME` explicitly; unsupported resource fields must never weaken the content rule. Endpoint/header values are configuration for transport, not resource attributes.
+`OTEL_SERVICE_NAME` and `OTEL_RESOURCE_ATTRIBUTES` are deliberately unsupported: operator-supplied environment must never reach an exported resource. Endpoint/header values are configuration for transport, not resource attributes.
 SDK and HTTP-exporter diagnostics must not escape as raw URLs, headers, response bodies or exception messages. Do not attach their loggers to the operational OTLP logger. Use a narrowly scoped diagnostic filter/handler, without changing unrelated application logging.
 ## 4. Worker spans and exact callsites
 All pass spans are `INTERNAL` spans. Use fixed names.

@@ -71,6 +71,10 @@ _COUNTS = frozenset(
         "journal_bad_json",
     }
 )
+_SERVICES = frozenset(
+    "agent-history-" + name
+    for name in ("index", "postpass", "embed", "journal-sync", "collect-git", "collect", "exporter")
+)
 _ENUMS = {
     "agent_history.outcome": {"success", "skipped", "error"},
     "agent_history.skip_reason": {
@@ -162,7 +166,8 @@ def setup(service_name: str) -> Telemetry:
     with _lock:
         if _active is not None and not _active.closed:
             return _active
-        service = os.environ.get("OTEL_SERVICE_NAME") or service_name
+        # The package chooses service.name from a fixed set; operator environment never reaches it.
+        service = service_name if service_name in _SERVICES else "agent-history"
         signals = [
             s
             for s in ("TRACES", "METRICS", "LOGS")
