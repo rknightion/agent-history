@@ -160,11 +160,15 @@ def sync(conn: psycopg.Connection, db_path: Path = APP_DB) -> dict[str, Any]:
         "journal_deleted": 0,
         "journal_bad_json": 0,
     }
-    try:
-        with telemetry.operation("journal.read", {"db.system.name": "sqlite"}):
+    skip: _Skip | None = None
+    with telemetry.operation("journal.read", {"db.system.name": "sqlite"}):
+        try:
             view = _open_view(db_path)
-    except _Skip as exc:
-        result["journal_skipped_reason"] = exc.reason
+        except _Skip as exc:
+            # An expected skip is not a failed read: leave the span successful.
+            skip = exc
+    if skip is not None:
+        result["journal_skipped_reason"] = skip.reason
         return result
 
     try:
