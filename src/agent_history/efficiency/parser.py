@@ -1883,14 +1883,17 @@ class EfficiencyParser:
         if stop in ("stop", "length", "error", "aborted") and not s["pending"]:
             s["in_task"] = False
 
-    def pi_count_spawn(self, ts: float | None, key: str, agent_type: str | None = None) -> None:
+    def pi_count_spawn(
+        self, ts: float | None, key: str, agent_type: str | None = None, alias: str | None = None
+    ) -> None:
+        """Count one child once. `alias` is another key the same child is known by (a single run's run id)."""
         seen: list[str] = self.s["pi_spawns"]
-        digest = hashlib.sha256(key.encode()).hexdigest()[:16]
-        if digest in seen:
+        digests = [hashlib.sha256(k.encode()).hexdigest()[:16] for k in (key, alias) if k]
+        if any(d in seen for d in digests):
             return
         if self.s["spawn_ts"] is None:
             self.pi_spawn_started(self.s.get("pi_launch_ts") or ts)
-        seen.append(digest)
+        seen.extend(digests)
         del seen[:-EFFICIENCY_MAX_IDS]
         if self.countable(ts):
             self.add("agent_efficiency_spawns_total", 1)
@@ -1924,10 +1927,11 @@ class EfficiencyParser:
             match = fmt.CHILD_RUNS_RE.search(text)
             for child in fmt.CHILD_RUN_ITEM_RE.finditer(match.group(1) if match else ""):
                 self.pi_count_spawn(ts, child.group(2), child.group(1))
-            # a single async run: the header opens the text, the directory line is the trailer
+            # a single async run: the header opens the text, the directory line is the trailer. A
+            # workflow's notice has the same frame around its children, which are counted above.
             done = fmt.ASYNC_DONE_RE.match(text)
             dirs = list(fmt.ASYNC_DIR_RE.finditer(text))
-            if done and dirs:
+            if done and dirs and not match and not fmt.WORKFLOW_RUN_RE.search(text):
                 self.pi_count_spawn(ts, dirs[-1].group(1), done.group(2).strip())
 
     def pi_result(self, ts: float | None, message: dict[str, Any]) -> None:
@@ -1944,14 +1948,20 @@ class EfficiencyParser:
             if entry[6] == ["pi-spawn"] and self.countable(ts):
                 self.add("agent_efficiency_spawn_errors_total", 1, "other")
         if entry[6] == ["pi-spawn"]:
-            launched = bool(details.get("runId") or details.get("asyncId"))
+            run_id = details.get("runId") or details.get("asyncId")
+            launched = bool(run_id)
+            results = [r for r in details.get("results") or [] if isinstance(r, dict) and r.get("agent")]
+            # a single run's one result is that run, which its completion notice names by run id
+            alias = (
+                run_id if isinstance(run_id, str) and details.get("mode") == "single" and len(results) == 1 else None
+            )
             for index, result in enumerate(details.get("results") or []):
                 if not isinstance(result, dict) or not result.get("agent"):
                     continue
                 child_launched = result.get("sessionFile") or result.get("exitCode") == 0
                 if child_launched:
                     launched = True
-                    self.pi_count_spawn(ts, f"{call_id}:{result.get('index', index)}", result["agent"])
+                    self.pi_count_spawn(ts, f"{call_id}:{result.get('index', index)}", result["agent"], alias)
                 elif result.get("exitCode") not in (None, 0) and self.countable(ts):
                     self.add("agent_efficiency_spawn_errors_total", 1, "other")
             if launched and self.s["spawn_ts"] is None:

@@ -1904,6 +1904,72 @@ def test_pi_single_async_run_is_counted_from_its_background_task_notify(eff: Har
     assert total(samples, "agent_efficiency_spawns_total", agent="pi") == 1
 
 
+PI_ASYNC_RUN = "9ccea31c-997f-4ba1-9e8e-4d5e4545ed93"
+PI_ASYNC_NOTICE = (
+    "Background task completed: **lane-worker**\n\nlane-worker:\ndone\n\nAgent: lane-worker  \n\n"
+    f"Retention-managed async directory: /h/tmp/async-subagent-runs/{PI_ASYNC_RUN}\n\n"
+    "Session file: /h/s/run-0/session.jsonl"
+)
+PI_WORKFLOW_NOTICE = (
+    f"Background task completed: **workflow**\nWorkflow run: {PI_ASYNC_RUN}\n"
+    f"Child runs: mapper={PI_CHILDREN[0]} (completed), lane-worker={PI_CHILDREN[1]} (completed)\n\n"
+    f"Retention-managed async directory: /h/tmp/async-subagent-runs/{PI_ASYNC_RUN}"
+)
+
+
+@pytest.mark.parametrize(
+    "launch, details, notices, spawns",
+    [
+        # the same run's notify seen twice
+        (
+            {"agent": "lane-worker", "task": "one", "async": True},
+            {"mode": "single", "runId": PI_ASYNC_RUN, "asyncId": PI_ASYNC_RUN, "results": []},
+            [PI_ASYNC_NOTICE, PI_ASYNC_NOTICE],
+            1,
+        ),
+        # the launch result already names the child's session: counted there, not again at the notify
+        (
+            {"action": "run", "agent": "lane-worker", "task": "one", "async": True},
+            {
+                "mode": "single",
+                "runId": PI_ASYNC_RUN,
+                "asyncId": PI_ASYNC_RUN,
+                "results": [{"agent": "lane-worker", "index": 0, "sessionFile": "/h/s/run-0/session.jsonl"}],
+            },
+            [PI_ASYNC_NOTICE],
+            1,
+        ),
+        # an async workflow: its children count, the workflow run itself does not
+        (
+            {"workflowScript": "w.js", "async": True, "tasks": [{"agent": "mapper"}, {"agent": "lane-worker"}]},
+            {"mode": "workflow", "runId": PI_ASYNC_RUN, "asyncId": PI_ASYNC_RUN, "results": []},
+            [PI_WORKFLOW_NOTICE],
+            2,
+        ),
+    ],
+)
+def test_pi_async_run_is_counted_once(eff: Harness, launch, details, notices, spawns):
+    start = eff.now - 500
+    eff.baseline = start - 10
+    directory = eff.hot / PI / "sessions" / "-synthetic-"
+    directory.mkdir(parents=True)
+    lines = [
+        pi_record(start - 2, "session", id=PI_ROOT, cwd="/synthetic/cwd", version=3),
+        pi_message(start + 1, "u1", "user", content=[{"type": "text", "text": "synthetic root"}]),
+        pi_call(start + 2, "a1", "r1", "spawn", "subagent", launch),
+        pi_result(start + 3, "s1", "spawn", "subagent", details=details),
+        pi_call(start + 4, "a2", "r2"),
+    ]
+    for n, notice in enumerate(notices):
+        lines.append(
+            pi_record(start + 20 + n, "custom_message", id=f"n{n}", customType="subagent-notify", content=notice)
+        )
+    lines.append(pi_call(start + 30, "a3", "r3"))
+    (directory / f"{PI_ROOT_BASE}.jsonl").write_text("".join(lines), encoding="utf-8")
+    samples = eff.collect(eff.now)
+    assert total(samples, "agent_efficiency_spawns_total", agent="pi") == spawns
+
+
 def pi_parse(tmp_path: Path, lines: list[str], skip: float) -> EfficiencyParser:
     relative = f"{PI}/sessions/-synthetic-/{PI_ROOT_BASE}.jsonl"
     state = read_efficiency_state(tmp_path / "absent-state.json", skip)

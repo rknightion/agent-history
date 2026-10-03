@@ -319,31 +319,279 @@ SHELL_KEYWORDS = {"if", "then", "elif", "else", "do", "while", "until", "!", "ti
 GIT_OPTS_WITH_VALUE = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix", "--config-env"}
 
 
-def _command_segments(command: Any) -> list[tuple[list[str], str | None, str | None]]:
-    """(words, operator before, operator after) per shell segment. Grouping tokens `( ) { }` count as no operator."""
-    if isinstance(command, list):
-        words = [w for w in command if isinstance(w, str)]
-        if len(words) >= 3 and PurePosixPath(words[0]).name in {"bash", "sh", "zsh"} and words[1] in {"-c", "-lc"}:
-            return _command_segments(words[2])
-        command = shlex.join(words)
-    if not isinstance(command, str) or not command.strip():
-        return []
-    tokens = _tokens(command)
+_CONTROL = ("&&", "||", ";;", "|&", ";", "&", "|", "(", ")")
+_COMPOUND = {"if": "fi", "while": "done", "until": "done", "for": "done", "select": "done", "case": "esac"}
+_RESERVED = {"then", "elif", "else", "fi", "do", "done", "esac", "in", "}"}
+_STARTERS = {"then", "elif", "else", "do", "{", "!", "time", "if", "while", "until"}
+
+
+class _ShellSyntax(Exception):
+    """The command is not shell this reader can follow; it proves nothing."""
+
+
+_HEREDOC = re.compile(r"<<(-?)[ \t]*(?:'([^'\n]*)'|\"([^\"\n]*)\"|\\?([A-Za-z0-9_.-]+))")
+
+
+def _strip_heredocs(command: str) -> str | None:
+    """The command without here-document bodies, which are data rather than commands.
+
+    A body starts after the first unquoted newline that follows its `<<WORD` and ends at a line that is
+    exactly WORD (leading tabs ignored for `<<-`). None when a body never ends.
+    """
+    if "<<" not in command:
+        return command
+    out: list[str] = []
+    pending: list[tuple[str, bool]] = []
+    quote: str | None = None
+    word_start = True
+    i, n = 0, len(command)
+    while i < n:
+        ch = command[i]
+        if ch == "\\" and quote != "'":
+            out.append(command[i:i + 2])
+            i += 2
+            word_start = False
+            continue
+        if quote:
+            quote = None if ch == quote else quote
+        elif ch in "'\"":
+            quote = ch
+        elif ch == "#" and word_start:
+            end = command.find("\n", i)
+            end = n if end < 0 else end
+            out.append(command[i:end])
+            i = end
+            continue
+        elif command.startswith("<<<", i):
+            out.append("<<<")
+            i += 3
+            word_start = False
+            continue
+        elif command.startswith("<<", i) and (match := _HEREDOC.match(command, i)):
+            word = next(g for g in match.group(2, 3, 4) if g is not None)
+            pending.append((word, match.group(1) == "-"))
+            out.append(match.group(0))
+            i = match.end()
+            word_start = False
+            continue
+        elif ch == "\n" and pending:
+            out.append(ch)
+            i += 1
+            for word, tabs in pending:
+                while True:
+                    if i >= n:
+                        return None
+                    end = command.find("\n", i)
+                    end = n if end < 0 else end
+                    line, i = command[i:end], end + 1
+                    if (line.lstrip("\t") if tabs else line) == word:
+                        break
+            pending = []
+            word_start = True
+            continue
+        word_start = quote is None and ch in " \t\n;&|()<>"
+        out.append(ch)
+        i += 1
+    return None if pending else "".join(out)
+
+
+def _join_continuations(command: str) -> str:
+    """Drop backslash-newline line continuations outside single quotes, as the shell does."""
+    out: list[str] = []
+    quoted = False
+    i = 0
+    while i < len(command):
+        c = command[i]
+        if c == "'" and not (i and command[i - 1] == "\\" and not quoted):
+            quoted = not quoted
+        elif c == "\\" and not quoted and command.startswith("\\\n", i):
+            i += 2
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def _shell_tokens(command: str) -> list[str] | None:
+    """Shell words with control operators as their own tokens; redirections stay words."""
+    stripped = _strip_heredocs(_join_continuations(command))
+    tokens = _tokens(stripped) if stripped is not None else None
     if tokens is None:
-        return []
-    found: list[tuple[list[str], str | None, str | None]] = []
-    segment: list[str] = []
-    before: str | None = None
-    for token in tokens + [";"]:
-        if token in OPERATORS or set(token) <= set(";&|()"):
-            if segment:
-                found.append((segment, before, None if token in {"(", ")", "{", "}"} else token))
-            segment = []
-            before = None if token in {"(", ")", "{", "}"} else token
+        return None
+    out: list[str] = []
+    for token in tokens:
+        if not token or not set(token) <= set("();<>|&"):
+            out.append(token)
+            continue
+        i = 0
+        while i < len(token):
+            if token[i] in "<>" or token.startswith("&>", i):
+                j = i + (2 if token.startswith("&>", i) else 1)
+                while j < len(token) and token[j] in "<>&|":
+                    j += 1
+                out.append(token[i:j])
+                i = j
+                continue
+            op = next(o for o in _CONTROL if token.startswith(o, i))
+            out.append(op)
+            i += len(op)
+    return out
+
+
+class _ShellReader:
+    """A list/and-or/pipeline tree of one shell command, enough to tell which git calls its exit status proves.
+
+    Nodes: list [(and_or, terminator)], and_or (pipelines, operators), pipeline (negated, pipefail, commands),
+    command ("simple", words) | ("group", list) | ("opaque",). Keyword compounds (if, loops, case) and
+    command substitutions are opaque: their exit status proves nothing about the commands inside.
+    """
+
+    def __init__(self, tokens: list[str]) -> None:
+        self.tokens, self.pos, self.pipefail = tokens, 0, False
+
+    def peek(self) -> str | None:
+        return self.tokens[self.pos] if self.pos < len(self.tokens) else None
+
+    def expect(self, token: str) -> None:
+        if self.peek() != token:
+            raise _ShellSyntax(token)
+        self.pos += 1
+
+    def parse(self) -> list[Any]:
+        items = self.list(None)
+        if self.peek() is not None:
+            raise _ShellSyntax(self.peek())
+        return items
+
+    def list(self, end: str | None) -> list[Any]:
+        items: list[Any] = []
+        while True:
+            while self.peek() == ";":
+                self.pos += 1
+            token = self.peek()
+            if token is None or token == end:
+                return items
+            and_or = self.and_or()
+            terminator = self.peek() if self.peek() in {";", "&"} else None
+            if terminator:
+                self.pos += 1
+            elif self.peek() not in {None, end}:
+                raise _ShellSyntax(self.peek())
+            items.append((and_or, terminator))
+
+    def and_or(self) -> tuple[list[Any], list[str]]:
+        pipelines, operators = [self.pipeline()], []
+        while self.peek() in {"&&", "||"}:
+            operators.append(self.tokens[self.pos])
+            self.pos += 1
+            while self.peek() == ";":   # a newline after the operator continues the command
+                self.pos += 1
+            pipelines.append(self.pipeline())
+        return pipelines, operators
+
+    def pipeline(self) -> tuple[bool, bool, list[Any]]:
+        negated = False
+        while self.peek() in {"!", "time", "-p"}:
+            negated = negated or self.peek() == "!"
+            self.pos += 1
+        pipefail, commands = self.pipefail, [self.command()]
+        while self.peek() in {"|", "|&"}:
+            self.pos += 1
+            while self.peek() == ";":
+                self.pos += 1
+            commands.append(self.command())
+        return negated, pipefail, commands
+
+    def command(self) -> Any:
+        token = self.peek()
+        if token is None or token in _CONTROL and token != "(" or token in _RESERVED:
+            raise _ShellSyntax(token)
+        if token == "function" or self.tokens[self.pos + 1:self.pos + 3] == ["(", ")"]:
+            # a function definition runs nothing: read its body for syntax, then forget it
+            self.pos += 2 if token == "function" else 1
+            if self.tokens[self.pos:self.pos + 2] == ["(", ")"]:
+                self.pos += 2
+            while self.peek() == ";":
+                self.pos += 1
+            saved = self.pipefail
+            self.command()
+            self.pipefail = saved
+            return ("opaque",)
+        if token == "(":
+            self.pos += 1
+            saved = self.pipefail   # a subshell's options end with it
+            node: Any = ("group", self.list(")"))
+            self.expect(")")
+            self.pipefail = saved
+        elif token == "{":
+            self.pos += 1
+            node = ("group", self.list("}"))
+            self.expect("}")
+        elif token in _COMPOUND:
+            self.skip_compound()
+            node = ("opaque",)
         else:
-            segment.append(token)
-    # a trailing `;` or newline ends the command; it is not a following command
-    return [(w, b, None if a == ";" and i == len(found) - 1 else a) for i, (w, b, a) in enumerate(found)]
+            return self.simple()
+        while self.peek() is not None and self.peek() not in _CONTROL:
+            self.pos += 1   # redirections after a group or compound
+        return node
+
+    def simple(self) -> tuple[str, list[str]]:
+        words: list[str] = []
+        while self.peek() is not None and (self.peek() not in _CONTROL or self.peek() == "("):
+            if self.peek() == "(":   # $( ) or <( ): never proven by this command's status
+                self.pos += 1
+                saved = self.pipefail
+                self.list(")")
+                self.expect(")")
+                self.pipefail = saved
+                continue
+            words.append(self.tokens[self.pos])
+            self.pos += 1
+        if words and words[0] == "set" and _PIPEFAIL_RE.search(" ".join(words)):
+            self.pipefail = True
+        return "simple", words
+
+    def skip_compound(self) -> None:
+        stack = [_COMPOUND[self.tokens[self.pos]]]
+        self.pos += 1
+        previous = "if"
+        while self.pos < len(self.tokens):
+            token = self.tokens[self.pos]
+            self.pos += 1
+            at_start = previous in _CONTROL or previous in _STARTERS
+            previous = token
+            if not at_start:
+                continue
+            if token in _COMPOUND:
+                stack.append(_COMPOUND[token])
+            elif token in {"fi", "done", "esac"}:
+                if token != stack.pop():
+                    raise _ShellSyntax(token)
+                if not stack:
+                    return
+        raise _ShellSyntax("unterminated compound")
+
+
+def _proven_ops(items: list[Any], proven: bool, ops: list[str]) -> None:
+    """Append the git ops of `items` in order, keeping only those an exit status of 0 proves succeeded."""
+    for index, ((pipelines, operators), terminator) in enumerate(items):
+        # only the last item of a list sets its status, and a backgrounded item's status is always 0
+        item_proven = proven and index == len(items) - 1 and terminator != "&"
+        for k, (negated, pipefail, commands) in enumerate(pipelines):
+            # status 0 shows this pipeline ran and passed only if it was reached by `&&` (or is first) and
+            # nothing after it could replace a failure with success: every later operator is `&&`
+            ran = k == 0 or operators[k - 1] == "&&"
+            pipeline_proven = item_proven and ran and all(op == "&&" for op in operators[k:]) and not negated
+            for j, node in enumerate(commands):
+                # without pipefail a pipeline's status is its last command's
+                node_proven = pipeline_proven and (j == len(commands) - 1 or pipefail)
+                if node[0] == "group":
+                    _proven_ops(node[1], node_proven, ops)
+                elif node[0] == "simple":
+                    op = _git_segment_op(node[1]) if node_proven else None
+                    if op:
+                        ops.append(op)
 
 
 def _git_segment_op(words: list[str]) -> str | None:
@@ -398,20 +646,29 @@ def git_ops_from_command(command: Any) -> list[str]:
     assignments, wrappers and `bash -c`; only a segment whose executable is git counts, so a quoted
     mention such as `echo "git commit"` yields nothing. Dry runs, `--help` and cherry-pick
     `--no-commit`/`--abort` yield nothing. Command text only: the caller must also know the command
-    succeeded, because a failed commit prints nothing a parser can tell apart. Only segments whose success
-    the command's exit status proves count: not before `||`, `;` plus another command, `&` or a pipe
-    (unless `set -o pipefail` is on), nor after `||`.
+    succeeded, because a failed commit prints nothing a parser can tell apart. Only git calls whose
+    success the command's exit status proves count: nothing later in the same list, or in any
+    enclosing group or subshell, may absorb a failure (a later `||`, `;` or newline followed by another
+    command, `&`, or a pipe without an earlier `set -o pipefail`), and none under `!`, inside a
+    keyword compound (`if`, loops, `case`) or inside a command substitution. Text this reader cannot
+    follow yields nothing.
     """
-    text = command if isinstance(command, str) else " ".join(map(str, command or []))
-    pipefail = bool(_PIPEFAIL_RE.search(text))
-    ops = []
-    for words, before, after in _command_segments(command):
-        op = _git_segment_op(words)
-        # the command's exit status must prove this segment succeeded: nothing may mask or skip it
-        if after in {"||", ";", "&", ";;"} or before in {"||", "&"} or (after in {"|", "|&"} and not pipefail):
-            continue
-        if op:
-            ops.append(op)
+    if isinstance(command, list):
+        words = [w for w in command if isinstance(w, str)]
+        if len(words) >= 3 and PurePosixPath(words[0]).name in {"bash", "sh", "zsh"} and words[1] in {"-c", "-lc"}:
+            return git_ops_from_command(words[2])
+        command = shlex.join(words)
+    if not isinstance(command, str) or not command.strip():
+        return []
+    tokens = _shell_tokens(command)
+    if tokens is None:
+        return []
+    try:
+        tree = _ShellReader(tokens).parse()
+    except (_ShellSyntax, RecursionError):
+        return []
+    ops: list[str] = []
+    _proven_ops(tree, True, ops)
     return ops
 
 

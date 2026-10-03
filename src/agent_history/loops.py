@@ -26,9 +26,12 @@ from .loop_launch import REPORT_HEADER, identity_fields, parse_launch, report_la
 ACTIVATED_AT = "1970-01-01T00:00:00Z"   # launches before this instant are ignored
 BARE_LAUNCH = re.compile(r"^`?\s*(\S*launch-[^\s`/]*\.(?:txt|md))\s*`?$")
 LANE_LINE = re.compile(r"^\s*Lane:\s*(\S+)", re.M)
-# The closing fence is a line of its own: a JSON string cannot hold a raw newline, so a fence quoted in
-# a field's text (a gate tail) never ends the block early.
-LANE_RETURN = re.compile(r"^ {0,3}```lane-return[ \t]*\n(.*?)\n {0,3}```[ \t]*$", re.S | re.M)
+# A lane-return block opens on a line of its own. Its JSON is decoded, so a fence quoted in a field's
+# text (a gate tail) never ends it early; the closing fence may follow the JSON on the same line.
+LANE_OPEN = re.compile(r"^ {0,3}```lane-return[ \t]*\r?\n", re.M)
+LANE_CLOSE = re.compile(r"\s*```")
+FENCE_LINE_END = re.compile(r"```[ \t]*\r?$", re.M)
+UNPARSED = object()
 LANE_STATUS_V2 = ("complete", "partial", "blocked", "failed")
 CAMPAIGN = re.compile(r"^report-(.*?)-(?:loop|wave)\d+\.md$")
 # wave-notify completion receipt: `sha256:<64 hex> request <id>`, or the legacy `request <id>`.
@@ -550,20 +553,21 @@ def _refresh_tasks_done(conn: psycopg.Connection) -> None:
     """Distinct backlog tasks that moved to Done in the loop's repo within [launch_ts, end_ts).
 
     Whatever session made the change: the evidence is the repo's own history, collected into
-    ah.backlog_done_event. An open window (running or stale) has no end. NULL when the loop's repo is
-    unknown or the collector has never read that repo's tracker; a repo it has read gets 0, not NULL.
+    ah.backlog_done_event. Only a running loop's window is open; a stale loop's ends at its end_ts, the
+    root's last observed activity. NULL when the loop's repo is unknown or the collector has not yet
+    finished that repo's first Done scan (ah.backlog_done_scan); a scanned repo gets 0, not NULL.
     Collector rows can arrive after a loop finishes, so every pass recomputes every loop.
     """
     conn.execute("""
         WITH tracked AS (
-            SELECT DISTINCT lower(regexp_replace(repo_slug, '^[^/]+/', '')) AS slug FROM ah.backlog_task
+            SELECT DISTINCT lower(regexp_replace(repo_slug, '^[^/]+/', '')) AS slug FROM ah.backlog_done_scan
         ), counted AS (
             SELECT l.launch_uid,
                    CASE WHEN EXISTS (SELECT 1 FROM tracked r WHERE r.slug = lower(l.repo))
                         THEN (SELECT count(DISTINCT d.task_key) FROM ah.backlog_done_event d
                               WHERE lower(regexp_replace(d.repo_slug, '^[^/]+/', '')) = lower(l.repo)
                                 AND d.done_at >= l.launch_ts
-                                AND d.done_at < COALESCE(CASE WHEN l.status = 'finished' THEN l.end_ts END, 'infinity'))
+                                AND d.done_at < COALESCE(l.end_ts, 'infinity'))
                    END AS n
             FROM ah.loops l WHERE l.repo IS NOT NULL AND l.launch_ts IS NOT NULL
         )
@@ -640,22 +644,39 @@ def _tag_tree(conn: psycopg.Connection, loop_id: int, root_id: int, start: Any, 
 def parse_lane_return(text: str) -> tuple[Any, str | None]:
     """(lane_return, return_status) of the last ```lane-return block in a lane's final message.
 
-    Two shapes, one projection: the earlier free-form object keeps any string `status`; the v2 object
-    (`"v":2`, with `lane` and `status` in complete|partial|blocked|failed) is stored whole and gives
-    return_status only when both are valid. A block that is not a JSON object is {"unparsed": true}.
+    Two shapes, one projection: the earlier free-form object (no `v` key) keeps any string `status`; the
+    v2 object (`"v"` the integer 2, with `lane` and `status` in complete|partial|blocked|failed) is stored
+    whole and gives return_status only when both are valid. An object with any other `v` is stored whole
+    with no return_status. A block that is not a JSON object is {"unparsed": true}. CRLF line endings
+    and a closing fence on the JSON's last line are accepted.
     """
-    blocks = LANE_RETURN.findall(text or "")
-    if not blocks:
-        return None, None
-    try:
-        value = json.loads(blocks[-1])
-    except (ValueError, RecursionError):
-        return {"unparsed": True}, None
-    if not isinstance(value, dict):
-        return {"unparsed": True}, None
+    text = text or ""
+    value: Any = None
+    pos = 0
+    while opened := LANE_OPEN.search(text, pos):
+        body = opened.end()
+        start = len(text) - len(text[body:].lstrip())
+        try:
+            candidate, end = json.JSONDecoder().raw_decode(text, start)
+            close = LANE_CLOSE.match(text, end)
+        except (ValueError, RecursionError):
+            close = None
+        if close is None:
+            # not one JSON value then a fence: the block runs to the next fence that ends a line
+            close = FENCE_LINE_END.search(text, body)
+            if close is None:
+                break
+            candidate = None
+        value = candidate if isinstance(candidate, dict) else UNPARSED
+        pos = close.end()
+    if value is None or value is UNPARSED:
+        return (None if value is None else {"unparsed": True}), None
     status = value.get("status")
-    if value.get("v") == 2:
-        valid = isinstance(value.get("lane"), str) and status in LANE_STATUS_V2
+    if "v" in value:
+        # a versioned object: only the integer 2 is v2, and an unknown version never falls back to the
+        # free-form shape
+        valid = (type(value["v"]) is int and value["v"] == 2 and isinstance(value.get("lane"), str)
+                 and status in LANE_STATUS_V2)
         return value, status if valid else None
     return value, status if isinstance(status, str) else None
 

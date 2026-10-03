@@ -328,18 +328,22 @@ Migration `026_loop_planner_signals.sql` adds the collector tables `ah.backlog_d
   collector table `ah.backlog_done_scan`, `repo_slug` and `widened_at`), and removes rows in the
   window whose commit the clone proves is no longer on the default branch. Rebuild keeps both tables.
 - `tasks_done bigint`: distinct tasks with a Done flip in the loop's `repo` between `launch_ts` and
-  `end_ts` (open for running and stale loops), whatever session made the change. NULL when `repo` is
-  unknown or the collector has not read that repo's tracker. Recomputed on every refresh because
-  collector rows can arrive after a loop finishes.
+  `end_ts`, whatever session made the change. Only a running loop's window is open; a stale loop's
+  ends at its `end_ts`, the root's last observed activity. NULL when `repo` is unknown or the collector
+  has not yet finished that repo's first Done scan (`ah.backlog_done_scan`). Recomputed on every
+  refresh because collector rows can arrive after a loop finishes.
 - `lanes_accepted bigint` and `lanes_reported bigint`: lanes with `status` exactly `accepted`, and
   all lanes, in the `lanes` list of the latest captured report's `## Data`, read under the identity
   rules above. NULL when no report was captured, its Data is absent, invalid or names another
   identity, or has no `lanes` list. `lanes_total` is unchanged: indexed lane sessions.
 
 `ah.lane.return_status` and `lane_return` come from the last `lane-return` fenced block in the lane's final
-message. A v2 block (`"v":2`, with `lane` and `status` in `complete|partial|blocked|failed`) is stored
-whole and gives `return_status` only when both are valid; the earlier free-form object keeps any
-string `status`. The closing fence is a line of its own.
+message. A v2 block (`"v"` the JSON integer 2, with `lane` and `status` in
+`complete|partial|blocked|failed`) is stored whole and gives `return_status` only when both are valid;
+an object with any other `v` is stored whole with no `return_status`; the earlier free-form object (no
+`v`) keeps any string `status`. The block's JSON is decoded, so a fence inside a string never ends it;
+the closing fence may sit on its own line or end the JSON's last line, and CRLF line endings are
+accepted.
 
 `ah.v_notify_lag` has one row per completion notification a session received (message class
 `task_notification_summary`, or source `subagent-notify` / `subagent-incremental-child-notify`):
@@ -348,9 +352,13 @@ notifications that joined a turn already running. Notifications steered into a r
 `task_notification` turn, so a turn-origin count under-reports them.
 
 Session capture rules that changed with these columns (parser versions bumped, so a rebuild or
-re-parse applies them): a `git commit`, `git push` or `git cherry-pick` command that succeeded but
-printed no `[branch sha]` line or push range yields a `git_event` with `evidence = 'command'`, NULL
-`sha_short` and `event_uid` `<call>:<op>:cmd<n>`; output-matched events are not duplicated. pi
+re-parse applies them): a `git commit`, `git push` or `git cherry-pick` that the successful command's
+exit status proves ran and succeeded, but that printed no `[branch sha]` line or push range, yields a
+`git_event` with `evidence = 'command'`, NULL `sha_short` and `event_uid` `<call>:<op>:cmd<n>`;
+output-matched events are not duplicated. Nothing later in the same list or in an enclosing group may
+absorb a failure (a later `||`, `;` or newline then another command, `&`, or a pipe without an earlier
+`set -o pipefail`), and nothing under `!`, in a keyword compound, a command substitution or a function
+body counts; here-document bodies are not commands. pi
 `cacheWrite` is stored as `cache_write_5m` with `cache_write_1h = 0` (0 stays 0), so loop
 `cache_write` and `priced_cost_usd` are known for pi loops. Codex `cache_write_input_tokens` is stored the
 same way (absent means 0, `cache_write_1h = 0`); a zeroed breakdown beside a non-zero total stays NULL. pi's `loop-pi-runtime` custom entry

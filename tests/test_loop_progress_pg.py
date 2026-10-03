@@ -255,6 +255,12 @@ def add_done(db, registry, repo_slug, task, sha, done_at):
     db.commit()
 
 
+def add_scan(db, registry, repo_slug):
+    registry["scan"].append(repo_slug)
+    db.execute("INSERT INTO ah.backlog_done_scan (repo_slug, widened_at) VALUES (%s, now())", (repo_slug,))
+    db.commit()
+
+
 def tasks_done(db):
     return db.execute("SELECT tasks_done FROM ah.loops").fetchone()[0]
 
@@ -262,9 +268,11 @@ def tasks_done(db):
 @pytest.fixture
 def collector_rows(clean):
     """Keys of the collector rows a test inserted; only those are removed (the tables survive the truncate)."""
-    inserted = {"done": [], "task": []}
+    inserted = {"done": [], "task": [], "scan": []}
     yield inserted
     clean.rollback()
+    for repo_slug in inserted["scan"]:
+        clean.execute("DELETE FROM ah.backlog_done_scan WHERE repo_slug = %s", (repo_slug,))
     for repo_slug, task, sha in inserted["done"]:
         clean.execute(
             "DELETE FROM ah.backlog_done_event WHERE repo_slug = %s AND task_key = %s AND sha = %s",
@@ -285,7 +293,10 @@ def test_tasks_done_counts_flips_in_the_loop_window_whatever_the_session(clean, 
     )
     clean.commit()
     load.post_passes(clean)
-    assert tasks_done(clean) == 0  # a tracked repo with no flips is zero
+    assert tasks_done(clean) is None  # tracker read, but no Done scan of its history yet
+    add_scan(clean, collector_rows, "github.com/example/project")
+    load.post_passes(clean)
+    assert tasks_done(clean) == 0  # a scanned repo with no flips is zero
     launch = clean.execute("SELECT launch_ts FROM ah.loops").fetchone()[0]
     day = launch.replace(microsecond=0)
     add_done(clean, collector_rows, "github.com/example/project", "EX-0001", "a" * 40, day + timedelta(hours=1))
@@ -308,6 +319,23 @@ def test_tasks_done_counts_flips_in_the_loop_window_whatever_the_session(clean, 
     clean.commit()
     load.post_passes(clean)
     assert tasks_done(clean) == 1
+
+
+def test_tasks_done_window_of_a_stale_loop_ends_at_its_last_activity(clean, collector_rows, tmp_path):
+    root, _ = populated(clean, tmp_path)
+    add_scan(clean, collector_rows, "github.com/example/project")
+    launch = clean.execute("SELECT launch_ts FROM ah.loops").fetchone()[0] - timedelta(days=5)
+    clean.execute("UPDATE ah.loop_run SET launch_ts = %s", (launch,))
+    clean.execute(
+        "UPDATE ah.session SET last_event_at = %s WHERE id = %s OR root_session_id = %s",
+        (launch + timedelta(hours=4), root, root),
+    )
+    clean.commit()
+    add_done(clean, collector_rows, "github.com/example/project", "EX-0001", "a" * 40, launch + timedelta(hours=1))
+    add_done(clean, collector_rows, "github.com/example/project", "EX-0002", "b" * 40, launch + timedelta(days=2))
+    load.post_passes(clean)
+    assert clean.execute("SELECT status, end_ts FROM ah.loops").fetchone() == ("stale", launch + timedelta(hours=4))
+    assert tasks_done(clean) == 1  # the flip two days after the root fell silent is not this loop's
 
 
 def test_lane_return_v2_fills_return_status_and_lane_return(clean, tmp_path):

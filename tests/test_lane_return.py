@@ -49,3 +49,19 @@ def test_last_block_wins_and_garbage_is_unparsed():
     assert parse_lane_return(block({"status": "partial"}) + block(V2))[1] == "complete"
     assert parse_lane_return(block("not json")) == ({"unparsed": True}, None)
     assert parse_lane_return("no block here") == (None, None)
+
+
+def test_crlf_line_endings_and_a_closing_fence_on_the_json_line():
+    crlf = block(V2).replace("\n", "\r\n")
+    assert parse_lane_return(crlf) == (V2, "complete")
+    same_line = 'Done.\n```lane-return\n{"status": "blocked", "job": "x"}```\n'
+    assert parse_lane_return(same_line) == ({"status": "blocked", "job": "x"}, "blocked")
+    compact = f"Done.\n```lane-return\n{json.dumps(V2)}```"
+    assert parse_lane_return(compact) == (V2, "complete")  # the fence inside the tail does not end it
+
+
+@pytest.mark.parametrize("version", ["2", 2.0, True, 3])
+def test_only_the_integer_2_is_v2_and_other_versions_give_no_status(version):
+    # an object that declares a version is never read as the free-form shape
+    value = {**V2, "v": version}
+    assert parse_lane_return(block(value)) == (value, None)

@@ -91,7 +91,7 @@ from .model import (ArtifactRow, AttachmentRow, CompactionRow, ContinuationRow, 
 from .parse_claude import _diff_counts, _nlines
 
 AGENT = "pi"
-PARSER_VERSION = "5"
+PARSER_VERSION = "6"
 PI_AGENT_FILES = frozenset({"mapper", "mapper-deep", "gate-runner", "lane-worker", "lane-worker-push",
                             "lane-worker-retry", "lane-worker-retry-push", "complex-worker", "complex-worker-push", "reviewer", "reviewer-high",
                             "security-reviewer", "rescue-sol", "rescue-astra"})
