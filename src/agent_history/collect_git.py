@@ -1343,6 +1343,9 @@ def main(argv: list[str] | None = None, dsn=None) -> int:
         conn = None if args.dry_run else connect(dsn, config)
         collector = Collector(conn, args.dry_run, started + RUNTIME_LIMIT_S, args.rescan_days)
         try:
+            from .collect_receipts import collect as collect_receipts
+
+            collect_receipts(collector, repo_roots(), machine)
             collector.repositories()
             collector.homes(machine, hostname)
         except Deadline:

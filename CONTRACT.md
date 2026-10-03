@@ -58,8 +58,8 @@ loses them. Keep your own copies if you want history to survive that.
 
 Not truncated by `rebuild`: `ah.change_log`, `ah.refresh_log`, `ah.embedding` (a paid cache keyed by
 model and input hash) and the collector tables (`git_commit`, `git_commit_file`, `ci_run`,
-`backlog_task`, `task_prefix`, `installed_feature`, `permission_log`, `session_summary`,
-`session_topic`).
+`backlog_task`, `task_prefix`, `installed_feature`, `permission_log`, `loop_receipt`,
+`session_summary`, `session_topic`).
 
 ## Namespaces and contexts
 
@@ -161,9 +161,11 @@ the goal, never the launch file's hash. Each unknown field is independently NULL
 
 A running launch can supply identity through an explicit canonical `# Loop: <owner/repo> loop<N> ·
 Goal: <sha256>` line, and its goal hash through a same-line manifest entry naming the exact goal
-path. Conflicting goal hashes leave only that hash unknown. There is no lookup of current files,
-Git remotes or directory names. Bare-path launches whose contents were not collected retain unknown
-identity fields. Legacy `wave<N>` launches are not asserted to have a `loop<N>` identity.
+path. Conflicting goal hashes leave only that hash unknown. Directory names and the indexer's own
+checkouts are never consulted. A bare-path launch whose contents were not collected supplies no
+identity itself; a captured report, a start receipt or a valid completion receipt (below) may
+populate its fields later. Legacy `wave<N>` launches are not
+asserted to have a `loop<N>` identity.
 
 Recorded report identity supersedes launch identity when a completed successful structured `Write`
 or `write` call records the exact report path and complete contents beginning with the header at
@@ -182,11 +184,15 @@ The migration changes no grants or roles, and imposes no constraint or default o
 
 The receiver seam also includes `status text`, `launch_ts timestamptz`, `end_ts timestamptz`:
 
-- `running`: no report-write or replacement-launch evidence, and the root's last recorded activity
+- `running`: no qualifying completion receipt or replacement-launch evidence (a report write alone
+  is not evidence), and the root's last recorded activity
   (or launch, if later) is within 24 hours of refresh. `end_ts` is NULL.
-- `finished`: the transcript records a write/edit/create/update/add of the launch's report path,
-  or the next recognised launch in the same root replaces it. `end_ts` is that evidence timestamp.
-  This is an observed end, not a claim of success or a parsed report outcome.
+- `finished`: a valid completion receipt exists for the launch (`end_evidence =
+  'completion_receipt'`, below), or the next recognised launch in the same root replaces it
+  (`next_launch`). `end_ts` is that evidence timestamp. This is an observed end, not a claim of
+  success or a parsed report outcome. A transcript write of the report is not terminal evidence
+  and no transcript or shell-command text is interpreted to decide an end. `report_write` is
+  retained only as the value on rows tagged before receipts existed.
 - `stale`: no terminal evidence and no root activity within 24 hours. `end_ts` is the last recorded
   root activity (at least `launch_ts`), not an inferred death time. A loop that died without a
   report becomes stale, never finished; new root activity can make it running again.
@@ -198,6 +204,73 @@ plus the delay until the next successful refresh. No refresh schedule or maximum
 guaranteed by this package. Consumers should check `observed_at` when freshness matters. Child-only
 activity is not root activity. Neither report-path parsing quality (`loop_run.status`) nor its
 fallback `root_last_event` end timestamp is terminal evidence. No heartbeat or phase feed is used.
+
+### Receipts: `completion_receipt` and start identity
+
+Migration `025_loop_receipts.sql` adds the collector table `ah.loop_receipt`, primary key
+`(machine, kind, path)`, indexed on `(kind, path)`. The hourly collector reads, for every configured
+repository, the exact files `codex/report-*.md.notified` and `codex/goal-*.md.started` that the
+wave-notify tool writes beside a report or goal only after a successful, non-degraded send or an
+accepted start. A `.tmp.notified` name is not a receipt. A row holds `kind` (`notified` or
+`started`), the absolute `path` of the receipt's target (the report or the goal), the receipt text
+`content`, its mtime `receipt_mtime`, whether the target exists (`target_exists`, true also when it exists but could not be read, in which
+case the hash and line are NULL), `target_sha256`
+and, for reports only, `target_line1` (stored only when it is a loop header line, else NULL; the read of
+the first line is bounded to 4096 bytes while the digest covers the whole file); plus `repo_origin`, the `owner/repo` of the checkout's
+`origin` remote when parsable, and `seen_at`. No report or goal body is stored. The table is not
+truncated by rebuild or analytics re-application. Work and Personal repositories are handled
+identically. The collector role needs `SELECT, INSERT, UPDATE` on it, which the migration grants to
+`ah_ingest` when that role exists at migration time (otherwise provision it with the other
+collector tables), and never `DELETE`; readers of `ah.loop_run` receive `SELECT`.
+
+A launch is finished with `end_evidence = 'completion_receipt'` when a `notified` receipt exists
+for its exact report path and
+
+- its mtime is at or after `launch_ts` and before the next launch of the same report path
+  (launches of one report path with equal `launch_ts` leave it unfinished; launches of other
+  report paths, including other campaigns in the same `codex/` directory, do not bound it);
+- no lane session of the loop starts after the receipt;
+- if the content is `sha256:<64 hex> request <id>`, the report existed when collected, the digest
+  equals `target_sha256` and `target_line1` is a loop header naming the launch's loop number (a
+  digest receipt whose report is missing does not finish the loop); a legacy `request <id>`
+  receipt counts on the exact path alone.
+
+`end_ts` is the earliest qualifying receipt mtime across machines. Only launches that have a
+receipt and are not already finished are examined. A root that pings before moving its report into
+place has no receipt, so its loop stays running or stale.
+
+The finish is an observed end, not a claim that nothing happened afterwards. A lane session linked
+to the loop that starts after the receipt blocks the finish whenever the loop is next evaluated, but
+a loop is re-evaluated only when its root or one of its sessions is re-indexed, so a late lane not
+yet indexed, or a root that sends the notification and carries on, leaves it finished. Re-tagging a
+root or a rebuild drops `report_write` evidence for good (rows already carrying it stay finished
+until then), so a loop with no receipt, which includes every loop that predates receipts, then reads
+running or stale, never finished, unless a receipt exists for it.
+
+A `started` receipt at the exact goal path of a launch (`loop_run.goal_path`) supplies `repo`,
+`loop` and `goal_sha256` when its content is exactly `<owner>/<repo>#loop<N>#<goal sha256>` (`owner/repo`
+characters `A-Za-z0-9_.-`, `loop<N>` the launch's own label, 64 lowercase hex). A receipt row is
+keyed by goal path and a relaunch overwrites it, so a receipt belongs to a launch only when its
+mtime is at most 120 seconds before the launch (clock skew allowance) and before the next launch of
+the same goal path. A receipt outside that window is not evidence about the launch and is ignored; a
+receipt inside the window of more than one launch (including equal `launch_ts`) cannot be
+attributed and leaves all three NULL for each of them. A receipt naming a different loop number is
+also ignored. Every other receipt for that goal on every machine must name the same repository as
+its own `repo_origin` (compared case-insensitively), agree with the others and not contradict
+identity already recorded from the launch or report. Any conflict or missing piece (different
+origin, no origin, disagreeing machines, malformed content, or a contradiction) leaves `repo`,
+`loop` and `goal_sha256` all NULL; repo is never filled from the origin alone and never from a
+basename. A launch finished by a valid completion receipt (the rule above; a running loop gets nothing from
+this path) also takes identity from it when the start receipt supplies none. `repo` is the
+receipt's `repo_origin`, never the name written in the report header. `loop` and `goal_sha256` are
+parsed from `target_line1`, which must match `# Loop: <name> loop<N> · Goal: <64 lowercase hex>`
+with `loop<N>` equal to the launch's own label. A receipt with no origin, no usable header (for
+example a legacy header without a goal digest) or a header naming another loop contributes
+nothing, leaving the other rules' result. Valid receipts on different machines that disagree on
+origin or header, or that contradict identity already recorded, leave all three NULL. A valid start
+receipt's identity wins; if both exist and disagree on any field, all three are NULL.
+Without a receipt the identity rules above are unchanged. The receiver seam
+cites this section and "Live loop lifecycle" for both rules.
 
 ### Progress fields
 
@@ -254,15 +327,18 @@ cannot recover transcripts already deleted from their source homes.
 ## Collector metadata
 
 The collector writes `task_prefix`, `backlog_task`, `git_commit`, `git_commit_file`, `ci_run`,
-`installed_feature` and `permission_log`. Git subjects, tracker titles, labels and project values,
+`installed_feature`, `permission_log` and `loop_receipt`. Git subjects, tracker titles, labels and project values,
 file paths, repository slugs, workflow names and installed-feature names are stored verbatim.
 Author emails are compared to configured identities but only `author_is_owner` is stored.
 Permission logs contribute timestamps, line hashes, tool names, command verbs, classifier reasons
-and sub-agent flags, never command arguments or target text. These metadata fields may themselves
+and sub-agent flags, never command arguments or target text. Loop receipts contribute the receipt
+text, a report's first line, target hashes and the checkout's origin slug, never a report or goal body. These metadata fields may themselves
 be sensitive. Protect collector homes, configuration and the catalogue accordingly.
 
 Repositories and homes are explicitly configured. A failed CI query is an attributable collection
-error, not a failed or successful CI run. Other repositories continue independently. Feature
+error, not a failed or successful CI run. Other repositories continue independently. A receipt that cannot be read, or changed while it was
+read, is skipped, reported in the run's `errors` and retried next run; like other step errors it
+does not fail the run (only `gh_unavailable` does). Feature
 snapshots reconcile removed features; task removal and off-default git flags require a successful
 remote fetch. The collector changes remote-tracking git refs, never the working tree or tracker.
 The hourly collector validates the server's session and current role as dedicated `ah_ingest`,

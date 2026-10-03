@@ -4,8 +4,9 @@ Runs inside load.post_passes' transaction over the roots of dirty sessions. Laun
 the root's operator text (human/queued prompts) with `loop_launch.parse_launch`. The indexer
 never reads launch or report files (they may live on another machine), so:
 - a bare `launch-*.txt|md` path launch is stored as status 'unresolved_path', never dropped;
-- the loop end comes from transcript evidence: a write of the report path, else the next launch
-  in the same root session, else the root session's last event.
+- a loop is finished by a wave-notify completion receipt collected into ah.loop_receipt, else
+  by the next launch in the same root session; the root session's last event is only a fallback
+  timestamp. Transcript text and shell commands are never interpreted for completion or identity.
 """
 
 from __future__ import annotations
@@ -13,12 +14,14 @@ from __future__ import annotations
 import json
 import os
 import re
+from datetime import timedelta
 from pathlib import PurePosixPath
-from typing import Any
+from typing import Any, Sequence
 
 import psycopg
 from psycopg.types.json import Jsonb
 
+from .collect_receipts import REPORT_HEADER
 from .loop_launch import identity_fields, parse_launch
 
 ACTIVATED_AT = "1970-01-01T00:00:00Z"   # launches before this instant are ignored
@@ -26,6 +29,15 @@ BARE_LAUNCH = re.compile(r"^`?\s*(\S*launch-[^\s`/]*\.(?:txt|md))\s*`?$")
 LANE_LINE = re.compile(r"^\s*Lane:\s*(\S+)", re.M)
 LANE_RETURN = re.compile(r"```lane-return\s*\n(.*?)```", re.S)
 CAMPAIGN = re.compile(r"^report-(.*?)-(?:loop|wave)\d+\.md$")
+# wave-notify completion receipt: `sha256:<64 hex> request <id>`, or the legacy `request <id>`.
+COMPLETION = re.compile(r"(?:sha256:([0-9a-f]{64}) )?request \S+\n?")
+# wave-notify start receipt: `<owner>/<repo>#loop<N>#<goal sha256>`.
+# The identity a completion receipt's report first line carries (the repo name in it is never used).
+HEADER_IDENTITY = re.compile(r"# Loop: [A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)? (loop[0-9]+) · Goal: ([0-9a-f]{64})")
+START = re.compile(r"([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#(loop[0-9]+)#([0-9a-f]{64})\n?")
+# Evidence values that end a loop. `report_write` only survives on rows tagged before receipts.
+START_SKEW = timedelta(seconds=120)  # a start ping may be stamped slightly before its launch message
+FINISHED_EVIDENCE = ("completion_receipt", "next_launch", "report_write")
 
 
 def _no_read(path: Any) -> str:  # noqa: ARG001
@@ -82,19 +94,22 @@ def run(conn: psycopg.Connection) -> dict[str, int]:
 def refresh_live(conn: psycopg.Connection) -> dict[str, int]:
     """Refresh lifecycle state even without dirty transcripts (silence ages on every pass).
 
-    A report write or replacement launch is terminal evidence. Otherwise, root activity within
-    24 hours is evidence of running, not proof of a live process. A silent root is stale and may
-    resume. Do not reuse loop_run's fallback end timestamp as evidence of completion.
+    A completion receipt or replacement launch is terminal evidence. Otherwise, root activity
+    within 24 hours is evidence of running, not proof of a live process. A silent root is stale and
+    may resume. Do not reuse loop_run's fallback end timestamp as evidence of completion.
     """
+    finished = _refresh_completion_receipts(conn)
     result = conn.execute("""
         INSERT INTO ah.loops (launch_uid, status, launch_ts, end_ts, observed_at)
         SELECT l.launch_uid,
-               CASE WHEN l.end_evidence IN ('report_write', 'next_launch') AND l.end_ts IS NOT NULL
+               CASE WHEN l.end_evidence IN ('completion_receipt', 'next_launch', 'report_write')
+                    AND l.end_ts IS NOT NULL
                     THEN 'finished'
                     WHEN greatest(s.last_event_at, l.launch_ts) >= now() - interval '24 hours'
                     THEN 'running' ELSE 'stale' END,
                l.launch_ts,
-               CASE WHEN l.end_evidence IN ('report_write', 'next_launch') AND l.end_ts IS NOT NULL
+               CASE WHEN l.end_evidence IN ('completion_receipt', 'next_launch', 'report_write')
+                    AND l.end_ts IS NOT NULL
                     THEN l.end_ts
                     WHEN greatest(s.last_event_at, l.launch_ts) >= now() - interval '24 hours'
                     THEN NULL ELSE greatest(s.last_event_at, l.launch_ts) END,
@@ -106,12 +121,209 @@ def refresh_live(conn: psycopg.Connection) -> dict[str, int]:
             observed_at = EXCLUDED.observed_at
     """)
     count = result.rowcount
-    _refresh_identity(conn)
+    _refresh_identity(conn, finished)
     _refresh_progress(conn)
     return {"live_loops": count}
 
 
-def _refresh_identity(conn: psycopg.Connection) -> None:
+COMPLETION_SQL = """
+    WITH cand AS (
+        SELECT l.id, l.launch_uid, l.root_session_id, l.loop_number, l.naming, l.launch_ts, l.report_path
+        FROM ah.loop_run l
+        WHERE l.launch_ts IS NOT NULL AND l.report_path IS NOT NULL
+          AND {scope}
+          AND EXISTS (SELECT 1 FROM ah.loop_receipt r WHERE r.kind = 'notified' AND r.path = l.report_path)
+    ), windows AS (
+        SELECT s.launch_uid,
+               lead(s.launch_ts) OVER (PARTITION BY s.report_path ORDER BY s.launch_ts, s.launch_uid) AS following,
+               count(*) OVER (PARTITION BY s.report_path, s.launch_ts) > 1 AS tied
+        FROM ah.loop_run s
+        WHERE s.launch_ts IS NOT NULL AND s.report_path IN (SELECT report_path FROM cand)
+    )
+    SELECT c.launch_uid, c.loop_number, c.naming, r.receipt_mtime, r.content,
+           r.target_exists, r.target_sha256, r.target_line1, r.repo_origin
+    FROM cand c
+    JOIN windows w USING (launch_uid)
+    JOIN ah.loop_receipt r ON r.kind = 'notified' AND r.path = c.report_path
+    WHERE NOT w.tied
+      AND r.receipt_mtime >= c.launch_ts
+      AND (w.following IS NULL OR r.receipt_mtime < w.following)
+      AND NOT EXISTS (
+          SELECT 1 FROM ah.session s
+          WHERE s.id <> c.root_session_id
+            AND (s.root_session_id = c.root_session_id OR s.loop_run_id = c.id)
+            AND s.first_event_at >= c.launch_ts
+            AND (w.following IS NULL OR s.first_event_at < w.following)
+            AND s.first_event_at > r.receipt_mtime)
+"""
+
+
+def _valid_completions(conn: psycopg.Connection, uid: str | None = None) -> dict[str, list[tuple]]:
+    """Valid completion receipts as {launch_uid: [(mtime, repo_origin, target_line1, has_digest)]}.
+
+    Without `uid`, only launches not already finished; with it, that one launch whatever its state.
+    A receipt is valid when it names the launch's exact report path inside the launch's window (at or
+    after launch, before the next launch of that report path, no lane of the loop starting after
+    it) and, when it carries a digest, the collected report exists, matches it, and its first line
+    names the launch's loop number. A legacy receipt is valid on the exact path alone.
+    """
+    if uid is None:
+        scope, params = "NOT COALESCE(l.end_evidence = ANY(%s), false)", (list(FINISHED_EVIDENCE),)
+    else:
+        scope, params = "l.launch_uid = %s", (uid,)
+    found: dict[str, list[tuple]] = {}
+    for row in conn.execute(COMPLETION_SQL.format(scope=scope), params):
+        uid_, number, naming, when, content, exists, digest, line1, origin = row
+        match = COMPLETION.fullmatch(content)
+        if not match:
+            continue
+        if match[1]:
+            # A digest receipt vouches for a report it can be checked against.
+            if not exists:
+                continue
+            head = REPORT_HEADER.fullmatch(line1 or "")
+            if match[1] != digest or not head or head[1] != naming or int(head[2]) != number:
+                continue
+        found.setdefault(uid_, []).append((when, origin, line1, bool(match[1])))
+    return found
+
+
+def _refresh_completion_receipts(conn: psycopg.Connection) -> list[str]:
+    """Finish unfinished launches that have a valid wave-notify completion receipt.
+
+    See `_valid_completions` for validity. The earliest valid mtime across machines is the end.
+    Only launches with a receipt are read, and nothing here reads transcript or command text.
+    Returns the launches finished by this call.
+    """
+    ends = {uid: min(r[0] for r in receipts) for uid, receipts in _valid_completions(conn).items()}
+    if ends:
+        with conn.cursor() as cur:
+            cur.executemany(
+                "UPDATE ah.loop_run SET end_ts = %s, end_evidence = 'completion_receipt' WHERE launch_uid = %s",
+                [(when, uid) for uid, when in ends.items()],
+            )
+    return list(ends)
+
+
+UNKNOWN = {"repo": None, "loop": None, "goal_sha256": None}
+
+
+def _start_identity(
+    conn: psycopg.Connection, goal_path: str | None, label: str | None, launch_ts: Any
+) -> tuple[str, dict[str, Any] | None]:
+    """The identity a wave-notify start receipt for the exact goal path carries.
+
+    Returns ("none", None) when no receipt applies, ("unknown", None) when receipts apply but
+    cannot be trusted, else ("ok", identity).
+
+    The receipt row is keyed by goal path, so a relaunch overwrites it. A receipt therefore belongs
+    to a launch only when its mtime is within START_SKEW before that launch and before the next
+    launch of the same goal path; outside that window it is not evidence about this launch. A
+    receipt inside the window of more than one launch cannot be attributed (unknown). A receipt
+    naming another loop is ignored. Every remaining receipt, on every machine, must parse, name the
+    repository its own checkout's origin names (case-insensitively) and agree with the others.
+    """
+    if not goal_path or launch_ts is None:
+        return "none", None
+    receipts = conn.execute(
+        "SELECT content, repo_origin, receipt_mtime FROM ah.loop_receipt "
+        "WHERE kind = 'started' AND path = %s ORDER BY machine",
+        (goal_path,),
+    ).fetchall()
+    if not receipts:
+        return "none", None
+    launches = sorted(
+        r[0]
+        for r in conn.execute(
+            "SELECT launch_ts FROM ah.loop_run WHERE goal_path = %s AND launch_ts IS NOT NULL", (goal_path,)
+        )
+    )
+
+    def inside(when: Any, start: Any) -> bool:
+        later = [t for t in launches if t > start]
+        return start - START_SKEW <= when and (not later or when < later[0])
+
+    applicable = []
+    for content, origin, when in receipts:
+        if not inside(when, launch_ts):
+            continue
+        if sum(inside(when, t) for t in launches) > 1:
+            return "unknown", None
+        match = START.fullmatch(content)
+        if match and label is not None and match[2] != label:
+            continue
+        if not match or label is None or not origin or match[1].lower() != origin.lower():
+            return "unknown", None
+        applicable.append(match.groups())
+    if not applicable:
+        return "none", None
+    if len({(repo.lower(), loop, digest) for repo, loop, digest in applicable}) != 1:
+        return "unknown", None
+    repo, loop, digest = applicable[0]
+    return "ok", {"repo": repo, "loop": loop, "goal_sha256": digest}
+
+
+def _completion_identity(
+    conn: psycopg.Connection, uid: str, label: str | None
+) -> tuple[str, dict[str, Any] | None]:
+    """The identity a finished launch's valid completion receipts carry, same return shape.
+
+    Only a launch finished by a receipt qualifies; a running loop has none. repo is the receipt's
+    checkout origin, never the name in the report header. loop and goal digest come from the
+    receipt's report first line, which must name the launch's own loop label. Only a digest receipt
+    binds that line to the notified bytes; a legacy receipt, or one without an origin or a usable
+    header, or naming another loop, contributes nothing. Valid receipts that
+    disagree with one another make the result unknown.
+    """
+    evidence = conn.execute("SELECT end_evidence FROM ah.loop_run WHERE launch_uid = %s", (uid,)).fetchone()
+    if not evidence or evidence[0] != "completion_receipt" or label is None:
+        return "none", None
+    seen = set()
+    for _, origin, line1, has_digest in _valid_completions(conn, uid).get(uid, []):
+        match = HEADER_IDENTITY.fullmatch(line1 or "")
+        if not has_digest or not match or match[1] != label or not origin:
+            continue
+        seen.add((origin.lower(), match[1], match[2]))
+    if not seen:
+        return "none", None
+    if len(seen) != 1:
+        return "unknown", None
+    ((origin, loop, digest),) = seen
+    return "ok", {"repo": origin, "loop": loop, "goal_sha256": digest}
+
+
+def _receipt_identity(
+    conn: psycopg.Connection, uid: str, goal_path: str | None, label: str | None, fields: dict[str, Any], launch_ts: Any
+) -> dict[str, Any]:
+    """Overlay receipt identity on what the launch and report recorded.
+
+    A valid start-receipt identity wins over the completion receipt's; if both exist and disagree on
+    any field the result is all NULL. Neither contradicts identity already recorded: that is NULL
+    too. No applicable receipt leaves `fields` untouched.
+    """
+    start, started_id = _start_identity(conn, goal_path, label, launch_ts)
+    if start == "unknown":
+        return dict(UNKNOWN)
+    done, done_id = _completion_identity(conn, uid, label)
+    if done == "unknown":
+        return dict(UNKNOWN)
+    if started_id and done_id and (
+        started_id["repo"].lower() != done_id["repo"].lower()
+        or started_id["loop"] != done_id["loop"]
+        or started_id["goal_sha256"] != done_id["goal_sha256"]
+    ):
+        return dict(UNKNOWN)
+    found = started_id or done_id
+    if not found:
+        return fields
+    if (fields["repo"] and fields["repo"].lower() != found["repo"].lower()) or (
+        fields["goal_sha256"] and fields["goal_sha256"] != found["goal_sha256"]
+    ):
+        return dict(UNKNOWN)
+    return found
+
+
+def _refresh_identity(conn: psycopg.Connection, finished: Sequence[str] = ()) -> None:
     """Re-project exact identity on every pass, including previously indexed launches.
 
     Only recorded metadata is authoritative: never read the current checkout or goal/report files.
@@ -121,6 +333,9 @@ def _refresh_identity(conn: psycopg.Connection) -> None:
     initial = conn.execute(
         "SELECT NOT EXISTS (SELECT 1 FROM ah.meta WHERE key = 'loops_identity_projection_v1')"
     ).fetchone()[0]
+    # Start receipts first seen since the last pass re-project their launch even when it is finished.
+    mark = conn.execute("SELECT value FROM ah.meta WHERE key = 'loops_receipt_identity_seen'").fetchone()
+    newest = conn.execute("SELECT max(seen_at) FROM ah.loop_receipt WHERE kind = 'started'").fetchone()[0]
     rows = conn.execute("""
         WITH ordered_launches AS (
             SELECT l.launch_uid, l.root_session_id,
@@ -144,8 +359,11 @@ def _refresh_identity(conn: psycopg.Connection) -> None:
         WHERE %s OR live.status = 'running' OR EXISTS (
             SELECT 1 FROM dirty_now d JOIN ah.session changed ON changed.id = d.session_id
             WHERE COALESCE(changed.root_session_id, changed.id) = l.root_session_id
-        )
-    """, (initial,)).fetchall()
+        ) OR EXISTS (
+            SELECT 1 FROM ah.loop_receipt r WHERE r.kind = 'started' AND r.path = l.goal_path
+              AND r.seen_at >= %s::timestamptz - interval '2 hours'
+        ) OR l.launch_uid = ANY(%s)
+    """, (initial, mark[0] if mark else "-infinity", list(finished))).fetchall()
     for uid, root, number, goal_path, report_path, started, launch_text, following, window_known, tied_start in rows:
         fields = identity_fields(launch_text or "", number, goal_path)
         # Match _tag_root's (ts, id) order before filtering refresh candidates. Missing
@@ -179,6 +397,9 @@ def _refresh_identity(conn: psycopg.Connection) -> None:
                     # Latest observed report identity supersedes launch metadata, including null
                     # for a conflicting Data block or a legacy basename without an owner.
                     fields = identity_fields(content, number, report=True)
+        fields = _receipt_identity(
+            conn, uid, goal_path, f"loop{number}" if number is not None else None, fields, started
+        )
         conn.execute(
             "UPDATE ah.loops SET repo = %s, loop = %s, goal_sha256 = %s WHERE launch_uid = %s "
             "AND (repo, loop, goal_sha256) IS DISTINCT FROM (%s, %s, %s)",
@@ -189,6 +410,12 @@ def _refresh_identity(conn: psycopg.Connection) -> None:
         conn.execute(
             "INSERT INTO ah.meta (key, value) VALUES ('loops_identity_projection_v1', '1') "
             "ON CONFLICT (key) DO NOTHING"
+        )
+    if newest is not None:
+        conn.execute(
+            "INSERT INTO ah.meta (key, value) VALUES ('loops_receipt_identity_seen', %s) "
+            "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+            (newest.isoformat(),),
         )
 
 
@@ -327,14 +554,6 @@ def _tag_root(conn: psycopg.Connection, root_id: int) -> int:
         meta = _report_meta(hit.get("report"))
         next_ts = launches[index + 1][1] if index + 1 < len(launches) else None
         end_ts, evidence = None, None
-        if hit.get("report"):
-            row = conn.execute(
-                "SELECT min(a.ts) FROM ah.artifact a JOIN ah.session s ON s.id = a.session_id "
-                "WHERE (s.id = %s OR s.root_session_id = %s) AND a.path = %s AND a.ts >= %s "
-                "AND a.action IN ('write','edit','create','update','add') AND (%s::timestamptz IS NULL OR a.ts < %s)",
-                (root_id, root_id, hit["report"], ts, next_ts, next_ts)).fetchone()
-            if row and row[0]:
-                end_ts, evidence = row[0], "report_write"
         if end_ts is None and next_ts is not None:
             end_ts, evidence = next_ts, "next_launch"
         if end_ts is None:

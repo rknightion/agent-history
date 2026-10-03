@@ -33,6 +33,7 @@ def conn():
 @pytest.fixture
 def clean(conn):
     conn.execute("TRUNCATE " + ", ".join(f"ah.{table}" for table in load.DATA_TABLES) + " RESTART IDENTITY CASCADE")
+    conn.execute("DELETE FROM ah.loop_receipt")
     conn.commit()
     yield conn
     conn.rollback()
@@ -70,7 +71,7 @@ def launched(clean, tmp_path):
     return sources
 
 
-def test_live_loop_report_and_next_launch(clean, launched):
+def test_live_loop_report_write_is_not_terminal_but_next_launch_is(clean, launched):
     assert clean.execute("SELECT status, end_ts FROM ah.loops").fetchone() == ("running", None)
     root_id = clean.execute("SELECT id FROM ah.session").fetchone()[0]
     clean.execute(
@@ -83,8 +84,9 @@ def test_live_loop_report_and_next_launch(clean, launched):
     clean.commit()
     load.post_passes(clean)
     row = clean.execute("SELECT status, end_ts FROM ah.loops").fetchone()
-    assert row[0] == "finished" and row[1] is not None
-    # Supersession is terminal evidence too, not an inferred stale failure.
+    # Writing the report is not a delivered completion notification; only a receipt finishes it.
+    assert row == ("running", None)
+    # Supersession is terminal evidence, not an inferred stale failure.
     clean.execute("UPDATE ah.loop_run SET end_evidence = 'next_launch'")
     clean.commit()
     load.post_passes(clean)

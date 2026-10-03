@@ -203,7 +203,7 @@ class EfficiencyCollector:
         rendered.add(
             "agent_efficiency_loop_labels",
             len(state["loops"]),
-            help_text="Loop label values currently carried by the efficiency series (bounded; excludes none).",
+            help_text="Loop label values currently carried by the efficiency series; a loop is retired after its retention window with no counted event (excludes none).",
         )
         families = rendered.families()
         # Publish only on success, and never retire a loop revived by this collection.

@@ -30,9 +30,12 @@ def conn():
 @pytest.fixture
 def clean(conn):
     conn.execute("TRUNCATE " + ", ".join(f"ah.{table}" for table in load.DATA_TABLES) + " RESTART IDENTITY CASCADE")
+    conn.execute("DELETE FROM ah.loop_receipt")
     conn.commit()
     yield conn
     conn.rollback()
+    conn.execute("DELETE FROM ah.loop_receipt")  # collector evidence outlives TRUNCATE of the data tables
+    conn.commit()
 
 
 def index_launch(conn, tmp_path, identity):
@@ -79,10 +82,12 @@ def record_report(conn, text, *, success=True, report_ts=None):
         "COALESCE(%s::timestamptz, now()),%s,0,0)",
         (root, report_ts, json.dumps({"file_path": REPORT, "content": text})),
     )
+    # The report's delivered notification: only a receipt finishes a loop, not the write itself.
     conn.execute(
-        "INSERT INTO ah.artifact (agent,event_uid,session_id,ts,kind,action,path,evidence_type,source_id,byte_offset) "
-        "VALUES ('claude','identity-report-artifact',%s,now(),'file','write',%s,'tool',0,0)",
-        (root, REPORT),
+        "INSERT INTO ah.loop_receipt (machine, path, kind, content, receipt_mtime, target_exists) "
+        "VALUES ('synthetic-machine', %s, 'notified', 'request identity-report', now(), true) "
+        "ON CONFLICT (machine, kind, path) DO UPDATE SET receipt_mtime = EXCLUDED.receipt_mtime",
+        (REPORT,),
     )
     conn.execute("INSERT INTO ah.dirty_session (session_id) VALUES (%s) ON CONFLICT DO NOTHING", (root,))
     conn.commit()

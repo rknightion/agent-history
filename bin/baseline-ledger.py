@@ -3,7 +3,7 @@
 The pg_dump schema body is retained byte for byte. This is not a schema dumper:
 when squashing schema changes, produce the schema-only dump separately first.
 020 is deliberately recorded without inserting its optional list-price data.
-021, 022 and 023 still run on fresh databases; all migrations still run on upgrades
+021 and 022-025 still run on fresh databases; all migrations still run on upgrades
 unless their ledger entry already exists.
 """
 
@@ -23,7 +23,13 @@ RECORDED = (
     "019_message_record_origin.sql",
     "020_gpt_6_1_sol_pricing.sql",
 )
-REPLAYED = ("021_drop_git_owner_alias.sql", "022_live_loops.sql", "023_loop_identity.sql", "024_loop_progress.sql")
+REPLAYED = (
+    "021_drop_git_owner_alias.sql",
+    "022_live_loops.sql",
+    "023_loop_identity.sql",
+    "024_loop_progress.sql",
+    "025_loop_receipts.sql",
+)
 
 
 def render(sql_dir: Path) -> str:
