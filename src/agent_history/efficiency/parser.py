@@ -336,13 +336,11 @@ EFFICIENCY_CLAUDE_MARKERS = (
 # Catalogue surrogate ids are never used: they are not stable across a catalogue rebuild.
 OPTIONAL_SECTIONS = frozenset({"loops"})
 LOOP_NONE = "none"
-LOOP_OTHER = "other"
 LOOP_DSN_FILE = ""
 LOOP_LOOKBACK_DAYS = 7  # loops that ended (or launched) this recently are mapped
 LOOP_OPEN_GRACE_SECONDS = 1800  # catalogue refresh lag tolerated before a live root's loop closes
 LOOP_MAP_MAX_AGE_SECONDS = 6 * 3600  # a cached map is used this long while the catalogue is down
 EFFICIENCY_LOOP_RETAIN_SECONDS = 2 * 86400  # a loop's series leave the textfile this long after its last event
-EFFICIENCY_MAX_LOOPS = 40  # concurrently emitted loop labels; beyond this new loops read `other`
 LOOP_SLUG_UNSAFE = re.compile(r"[^A-Za-z0-9._-]+")
 LOOP_ROOTS_SQL = (
     "SELECT rs.agent, rs.session_uid, rs.agent_id, r.repo_slug, r.campaign_slug, r.naming, r.loop_number, "
@@ -1046,18 +1044,12 @@ class EfficiencyRun:
         self.loop_seen: dict[str, float] = {}
 
     def loop_label(self, relative: str, file_state: dict[str, Any], ts: float | None, *, record: bool = True) -> str:
-        """The bounded loop label of one thread at `ts`; counting records the label's latest event time."""
+        """The mapped loop label of one thread at `ts`; counting records the label's latest event time."""
         key, parent = efficiency_session_keys(relative, file_state)
         label = self.loops.label(key, parent, ts)
         if label == LOOP_NONE:
             return label
         known: dict[str, float] = self.state["loops"]
-        if (
-            label not in known
-            and label not in self.loop_seen
-            and len(set(known) | set(self.loop_seen)) >= EFFICIENCY_MAX_LOOPS
-        ):
-            label = LOOP_OTHER
         if not record:
             return label
         if ts is not None:

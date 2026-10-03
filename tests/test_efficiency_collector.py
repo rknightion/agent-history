@@ -14,6 +14,67 @@ def value(families, name, **labels):
     return sum(s.value for f in families if f.name == name for s in f.samples if dict(s.labels) == labels)
 
 
+@pytest.mark.parametrize("retained_count", [40, 200])
+def test_mapped_loop_labels_are_not_capacity_limited(tmp_path: Path, monkeypatch, retained_count):
+    from agent_history.efficiency import parser as rules
+
+    now = datetime(2026, 1, 1, tzinfo=timezone.utc).timestamp()
+    monkeypatch.setattr("agent_history.metrics.efficiency.time.time", lambda: now)
+    source = tmp_path / "pi" / "sessions" / "synthetic"
+    source.mkdir(parents=True)
+    records = [
+        {"type": "session", "id": "synthetic", "timestamp": "2026-01-01T00:00:00Z"},
+        {
+            "type": "message",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "message": {"role": "user", "content": "hello"},
+        },
+        {
+            "type": "message",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "message": {
+                "role": "assistant",
+                "model": "test-model",
+                "usage": {"input": 10, "output": 3},
+                "content": [],
+            },
+        },
+    ]
+    (source / "test.jsonl").write_text("".join(json.dumps(record) + "\n" for record in records))
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    state_path = state_dir / "efficiency-state.json"
+    state = rules.read_efficiency_state(state_path, 0)
+    state["loops"] = {f"repo/loop{i}": now - 60 for i in range(retained_count)}
+    expired = "repo/loop-expired"
+    state["loops"][expired] = now - rules.EFFICIENCY_LOOP_RETAIN_SECONDS - 1
+    metric = "agent_efficiency_llm_calls_total"
+    state["totals"][metric] = {f"pi\tpi-local\tsolo\tuser\t{expired}": 7}
+    label = f"repo/loop{retained_count}"
+    state["loop_map"] = {
+        "fetched": now,
+        "roots": {},
+        "members": {rules.loop_session_key("pi", "synthetic", ""): label},
+    }
+    state_path.write_text(json.dumps(state))
+    config = parse_config(
+        {"sources": {"pi-local": str(tmp_path / "pi")}, "efficiency": {"baseline_ts": 0, "first_parse_days": 1000}}
+    )
+    collector = EfficiencyCollector(config, state_dir)
+    families = collector.collect()
+    labels = {"agent": "pi", "namespace": "pi-local", "role": "root", "trigger": "user"}
+    assert value(families, metric, **labels, loop=label) == 1
+    assert value(families, metric, **labels, loop="other") == 0
+    assert value(families, metric, **labels, loop=expired) == 0
+    assert value(families, "agent_efficiency_loop_labels") == retained_count + 1
+    saved = json.loads(state_path.read_text())
+    assert label in saved["loops"]
+    assert expired not in saved["loops"]
+    assert expired in collector.retired_loops[metric]
+    assert expired in saved["retired_loops"][metric]
+    assert value(EfficiencyCollector(config, state_dir).collect(), metric, **labels, loop=label) == 1
+
+
 def test_incremental_restart_and_partial_line(tmp_path: Path):
     source = tmp_path / "pi" / "sessions" / "synthetic"
     source.mkdir(parents=True)
