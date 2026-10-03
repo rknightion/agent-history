@@ -138,7 +138,9 @@ Instrument the actual psycopg connection/cursor boundary used by the workers:
 - `collect_git.connect`, `collect_git.py:877-907`;
 - `CatalogueCollector.collect`, `metrics/catalogue.py:133-217`;
 - the optional loop-map connection in `EfficiencyCollector.collect`, `metrics/efficiency.py:117-132`.
-Use driver-compatible connection/cursor subclasses or an equivalent adapter that preserves the existing transaction, cursor, copy and context-manager contracts. Do not change DSNs, SQL or database permissions.
+The SDK/traces/logs implementation supplies `telemetry.db_connect(*args, **kwargs)` as the shared connection factory, using driver-compatible connection/cursor subclasses or an equivalent adapter that preserves the existing transaction, cursor, copy and context-manager contracts. With telemetry disabled it delegates unchanged to psycopg.connect. Do not change DSNs, SQL or database permissions.
+The SDK/traces/logs implementation wires this factory only into its owned load and collect-git callsites. The metrics implementation owns the metrics-local connection replacements in CatalogueCollector and EfficiencyCollector, plus the exporter.collect and exporter.collector spans in MetricServer.metrics. These are additive wrappers in its already-owned metrics files; legacy values, labels, output and state remain unchanged. The SDK/traces/logs implementation must not edit metrics files or globally intercept psycopg to bypass this seam.
+SDK/traces/logs acceptance proves the shared factory and its owned worker/outbound paths against the local receiver. Exporter collection/database spans and their complete outbound-call proof are explicitly deferred to metrics integration, just as embedding request-level proof is deferred to embedding instrumentation. Final telemetry acceptance requires both integrations; deferred coverage is not a pass or a waived criterion.
 At the process edge, cover:
 - connection establishment: `db.connect`, `CLIENT`;
 - each `execute` or `executemany` operation: `db.query`, `CLIENT`;
@@ -494,10 +496,10 @@ Backend name/unit translation and resource-label promotion must be observed, not
 ## 11. Ownership and review boundary
 Implementation proceeds only after independent review of the materialised design.
 - SDK/traces/logs implementation owns `telemetry.py`, optional packaging, lifecycle and permitted worker/database/subprocess wrappers.
-- Metrics implementation owns the additive `metrics/` bridge and its all-family parity proof.
+- Metrics implementation owns the additive `metrics/` bridge and its all-family parity proof, the metrics-local uses of telemetry.db_connect, and exporter collection/collector spans with their local OTLP content and outbound-call proofs.
 - Embedding-request implementation owns request-level changes in `embed.py`, released GenAI spans/metrics and retry/content proof.
 - The embedding pass wrapper is the only embedder change made by the SDK/traces/logs implementation.
-- Final all-outbound-call acceptance includes embedding request instrumentation; the pass-only implementation cannot claim that portion independently.
+- Final all-outbound-call acceptance includes exporter/database instrumentation and embedding request instrumentation; SDK/traces/logs owned-path acceptance cannot claim either deferred portion independently.
 No production database, telemetry tenant or deployment mutation is needed to implement the local proof.
 ## 12. Upstream documentation and decisions
 Documentation inspected on 2026-10-03:
