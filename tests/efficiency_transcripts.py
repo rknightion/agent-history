@@ -21,7 +21,7 @@ CLAUDE = "claude-local"
 
 # Efficiency series that carry no loop label: parser health, account-wide quota and the loop map itself.
 UNLOOPED = re.compile(
-    r"agent_efficiency_(tracked_files|baseline_timestamp_seconds|rate_limit_.*|loop_map_.*|loop_labels)$"
+    r"agent_efficiency_(tracked_files|baseline_timestamp_seconds|malformed_records_total|rate_limit_.*|loop_map_.*|loop_labels)$"
 )
 
 
@@ -243,8 +243,16 @@ class Harness:
             efficiency["loop_dsn"] = loop_dsn
         return parse_config({"sources": sources, "efficiency": efficiency})
 
-    def families(self, now: float, loop_rows: tuple[list, list] | None = None, loop_error: Exception | None = None):
-        """One collection at `now`. `loop_rows` is a catalogue answer; `loop_error` an unreachable catalogue."""
+    def families(
+        self,
+        now: float,
+        loop_rows: tuple[list, list] | None = None,
+        loop_error: Exception | None = None,
+        **budget: object,
+    ):
+        """One collection at `now`. `loop_rows` is a catalogue answer; `loop_error` an unreachable catalogue.
+
+        `budget` passes the collector's parse budget and its clock (`budget=`, `monotonic=`)."""
         self.monkeypatch.setattr("agent_history.metrics.efficiency.time.time", lambda: now)
         dsn = None
         if loop_rows is not None or loop_error is not None:
@@ -257,7 +265,7 @@ class Harness:
                 yield _Connection(*loop_rows)
 
             self.monkeypatch.setattr("agent_history.metrics.efficiency.telemetry.db_connect", connect)
-        collector = EfficiencyCollector(self.config(dsn), self.state_dir)
+        collector = EfficiencyCollector(self.config(dsn), self.state_dir, **budget)
         families = collector.collect()
         self.last_collector = collector
         return families

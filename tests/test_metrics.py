@@ -337,7 +337,8 @@ def test_actual_collector_partial_cache_and_retirement(tmp_path, monkeypatch):
     # The actual collector's retention decision removes persisted exporter offsets too.
     clock[0] += rules.EFFICIENCY_LOOP_RETAIN_SECONDS + 1
     assert 'loop="a"' not in collection.metrics()
-    assert not offsets.counters
+    # Only the unlooped parser-health counter keeps an offset; every loop series is gone.
+    assert {json.loads(key)[0] for key in offsets.counters} <= {"agent_efficiency_malformed_records_total"}
 
 
 def test_failed_collector_does_not_apply_stale_retirement(tmp_path):
@@ -376,5 +377,5 @@ def test_retirement_replays_after_collector_restart(tmp_path, monkeypatch):
     EfficiencyCollector(config, directory).collect()
     collection = Collection([EfficiencyCollector(config, directory)], offsets)
     collection.metrics()
-    assert offsets.counters == {}
+    assert {json.loads(key)[0] for key in offsets.counters} <= {"agent_efficiency_malformed_records_total"}
     assert json.loads(path.read_text())["retired_loops"] == {}

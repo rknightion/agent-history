@@ -8,6 +8,7 @@ import tempfile
 import time
 from collections import defaultdict
 from pathlib import Path
+from typing import Callable
 
 from agent_history import telemetry
 from agent_history.config import Config
@@ -59,8 +60,17 @@ class EfficiencyCollector:
 
     name = "efficiency"
 
-    def __init__(self, config: Config, state_dir: Path) -> None:
+    def __init__(
+        self,
+        config: Config,
+        state_dir: Path,
+        *,
+        budget: float = rules.EFFICIENCY_BUDGET_SECONDS,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> None:
         self.config = config
+        self.budget = budget
+        self.monotonic = monotonic
         self.state_dir = Path(state_dir)
         self.section_health: dict[str, tuple[float, bool]] = {}
         self.retired_loops: dict[str, set[str]] = {}
@@ -137,7 +147,8 @@ class EfficiencyCollector:
             mtime_ns = sources[rel][2] if rel in sources else int(files[rel].get("mtime_ns") or 0)
             if mtime_ns < stale_ns:
                 del files[rel]
-        for rel, (file, size, mtime_ns) in sorted(sources.items()):
+        work: list[tuple[int, str]] = []
+        for rel, (file, size, mtime_ns) in sources.items():
             entry = files.get(rel)
             if entry is None:
                 if mtime_ns < stale_ns:
@@ -146,33 +157,30 @@ class EfficiencyCollector:
                 entry = files[rel] = rules.efficiency_file_state(rel, skip)
             if (entry["size"], entry["mtime_ns"]) == (size, mtime_ns) and entry["offset"] >= size:
                 continue
+            work.append((max(0, size - entry["offset"]), rel))
+        # Smallest remaining work first, so live sessions are not starved behind one long first parse.
+        # Whatever the budget leaves unread keeps its offset and resumes on the next collection.
+        deadline = self.monotonic() + self.budget
+        malformed: dict[str, int] = state["malformed"]
+        for _, rel in sorted(work):
+            if self.monotonic() > deadline:
+                continue
+            file, size, mtime_ns = sources[rel]
+            entry = files[rel]
             snapshot = json.dumps(entry)
             try:
-                with file.open("rb") as handle:
-                    head = rules.efficiency_head(handle)
-                    if size < entry["offset"] or (entry["head"] and head and head != entry["head"]):
-                        skip = max(float(entry["skip"]), float(entry["counted"] or 0))
-                        entry.clear()
-                        entry.update(rules.efficiency_file_state(rel, skip))
-                    entry["head"] = head
-                    handle.seek(entry["offset"])
-                    parser = rules.EfficiencyParser(run, entry, rel)
-                    for raw in handle:
-                        if not raw.endswith(b"\n"):
-                            break
-                        try:
-                            parser.line(raw)
-                        except (ValueError, TypeError, AttributeError, KeyError, IndexError, OverflowError):
-                            # Like the original collector, consume an unparseable complete record.
-                            pass
-                        entry["offset"] += len(raw)
-                entry["size"], entry["mtime_ns"] = size, mtime_ns
+                _, skipped = rules.efficiency_parse_file(
+                    run, file, rel, entry, size, mtime_ns, deadline, self.monotonic
+                )
             except OSError:
                 entry.clear()
                 entry.update(json.loads(snapshot))
                 run.rollback()
                 continue
             run.commit()
+            if skipped:
+                namespace = rel.split("/", 1)[0]
+                malformed[namespace] = int(malformed.get(namespace, 0)) + skipped
         rules.efficiency_close_lanes(run, files, {k: v[1:] for k, v in sources.items()}, now)
         run.commit()
         state["recent_calls"] = [x for x in state["recent_calls"] if x[0] >= now - rules.EFFICIENCY_ACTIVE_SECONDS]
@@ -204,6 +212,14 @@ class EfficiencyCollector:
             len(state["loops"]),
             help_text="Loop label values currently carried by the efficiency series; a loop is retired after its retention window with no counted event (excludes none).",
         )
+        for namespace in sorted(self.config.sources):
+            rendered.add(
+                "agent_efficiency_malformed_records_total",
+                state["malformed"].get(namespace, 0),
+                {"agent": namespace.split("-", 1)[0], "namespace": namespace},
+                help_text="Complete transcript records the efficiency parser could not read; each is skipped and consumed.",
+                metric_type="counter",
+            )
         families = rendered.families()
         # Publish only on success, and never retire a loop revived by this collection.
         self.retired_loops = {metric: set(loops) for metric, loops in state["retired_loops"].items()}

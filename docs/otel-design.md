@@ -398,9 +398,17 @@ Sources: `efficiency/parser.py:2396-2606`, `metrics/efficiency.py:190-207`.
 | `agent_efficiency_loop_map_age_seconds` | G | `s` | none |
 | `agent_efficiency_loop_labels` | G | `{loop}` | none |
 The two quantile families remain gauges with `quantile` attributes, not OTLP summaries or reconstructed histograms. Preserve percentages as percentages; do not divide by 100.
+### Efficiency parser health
+Sources: `efficiency/parser.py` (`efficiency_parse_file`), `metrics/efficiency.py` (`EfficiencyCollector.collect`).
+
+| Metric / OTLP name | Type | Unit | Attributes |
+|---|---|---|---|
+| `agent_efficiency_malformed_records_total` | C | `{record}` | `agent,namespace` |
+
+A malformed record is a complete transcript line the parser selected but could not read. It is consumed so it cannot pin the file's offset, and counted per configured namespace, which emits zero until one is seen. The family carries no `loop` and no record content.
+Each collection parses for at most `EFFICIENCY_BUDGET_SECONDS`, smallest remaining work first and checking the deadline before each file and every `EFFICIENCY_BUDGET_CHECK_LINES` lines. Unread lines keep their offset and resume on the next collection.
 ### Excluded historical families
-`metrics/parity-roster.json` describes legacy families explicitly dropped before this baseline, including SQLite activity/index and systemd families. It is not a list of currently emitted families.
-Do not recreate those dropped families as OTLP instruments. Rebase permissions in that roster concern the earlier legacy-exporter cutover; they do not waive equality between this exporter's Prometheus and OTLP snapshots.
+Legacy families dropped before this baseline, including SQLite activity/index and systemd families, are not emitted. Do not recreate them as OTLP instruments.
 ### Label safety
 Use the same existing public-label transformations for both outputs. Do not export original state keys before model mapping.
 Producer enums remain authoritative:
@@ -497,7 +505,7 @@ The metrics implementation supplies a documented local parity command. Its requi
 7. report missing, extra, rejected and unvalidated families distinctly and fail on any;
 8. demonstrate that unchanged Prometheus exposition remains byte-identical.
 Cover counter reset, independent original-source adjustment before public-label aggregation, unchanged repeated snapshots, restart with retained `counters.json`, collector failure, missing gauges, loop retirement and label counts above former capacity limits.
-Capture-time comparison between independent collections is weaker than this one-snapshot proof and does not replace it. The existing legacy/new Prometheus comparator remains useful but cannot validate OTLP by itself.
+Capture-time comparison between independent collections is weaker than this one-snapshot proof and does not replace it. The legacy/new Prometheus capture comparator was removed with the `/metrics` endpoint; `just otlp-parity` runs this proof.
 A skipped database test, absent receiver capture or comparison of two copies of the same output is not a pass.
 ### Deployment readback
 After local proof, the operator verifies traces, correlated logs and metrics at the configured backend for the exact deployed candidate. Check OTLP/Prometheus stream attribution so they are not accidentally summed together during coexistence.

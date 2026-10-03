@@ -16,6 +16,7 @@ from pathlib import Path
 import pytest
 
 from agent_history.efficiency.parser import (
+    EFFICIENCY_BUDGET_CHECK_LINES,
     EFFICIENCY_LOOP_RETAIN_SECONDS,
     LOOP_MAP_MAX_AGE_SECONDS,
     EfficiencyParser,
@@ -1414,6 +1415,71 @@ def test_malformed_record_is_skipped_without_pinning_the_file(eff: Harness, caps
     assert "not-a-number" not in capsys.readouterr().err
     entry = next(iter(eff.saved()["files"].values()))
     assert entry["offset"] == path.stat().st_size
+    # The skip is counted per namespace, never with record content; a clean namespace reads zero.
+    malformed = select(samples, "agent_efficiency_malformed_records_total")
+    assert malformed == {key(agent="codex", namespace=CODEX): 1, key(agent="claude", namespace=CLAUDE): 0}
+    assert "not-a-number" not in json.dumps(eff.saved().get("malformed"))
+    # A consumed record is not counted again, and a later one adds to the persisted total.
+    assert value(eff.collect(eff.now), "agent_efficiency_malformed_records_total", agent="codex", namespace=CODEX) == 1
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(codex(b + 30, "token_usage_record", {"usage": {"input_tokens": "not-a-number"}}))
+    samples = eff.collect(eff.now)
+    assert value(samples, "agent_efficiency_malformed_records_total", agent="codex", namespace=CODEX) == 2
+    assert calls(samples) == 1
+
+
+class _Ticking:
+    """A monotonic clock that advances one second every time the collector reads it."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        self.now += 1.0
+        return self.now
+
+
+def test_budget_exhaustion_defers_parsing_to_next_run(eff: Harness):
+    b = eff.baseline
+    path = eff.codex_file("rollout-budget.jsonl", [codex_meta(b + 1, "t"), record(b + 10, None, 10, 0, 1)])
+    samples = eff.collect(eff.now, budget=0, monotonic=_Ticking())
+    assert calls(samples) == 0
+    entry = next(iter(eff.saved()["files"].values()))
+    assert entry["offset"] == 0
+    samples = eff.collect(eff.now)
+    assert calls(samples) == 1
+    assert next(iter(eff.saved()["files"].values()))["offset"] == path.stat().st_size
+
+
+def test_budget_stops_mid_file_and_resumes_at_the_next_complete_line(eff: Harness):
+    b = eff.baseline
+    lines = [codex_meta(b + 1, "long")] + [
+        record(b + 10 + n, None, 10, 0, 1) for n in range(2 * EFFICIENCY_BUDGET_CHECK_LINES)
+    ]
+    path = eff.codex_file("rollout-long.jsonl", lines)
+    small = eff.codex_file("rollout-small.jsonl", [codex_meta(b + 1, "small"), record(b + 20, None, 10, 0, 1)])
+    # Budget 1.5s on a clock ticking once per read: the deadline passes after one file starts. Smaller
+    # remaining work goes first, so the short file is consumed and the long one waits.
+    samples = eff.collect(eff.now, budget=1.5, monotonic=_Ticking())
+    files = eff.saved()["files"]
+    long_entry = next(v for k, v in files.items() if k.endswith("rollout-long.jsonl"))
+    small_entry = next(v for k, v in files.items() if k.endswith("rollout-small.jsonl"))
+    assert small_entry["offset"] == small.stat().st_size
+    assert long_entry["offset"] == 0
+    assert calls(samples) == 1
+    # Now the long file starts and stops at its first in-file budget check, on a complete line.
+    samples = eff.collect(eff.now, budget=1.5, monotonic=_Ticking())
+    long_entry = next(v for k, v in eff.saved()["files"].items() if k.endswith("rollout-long.jsonl"))
+    consumed = "".join(lines[:EFFICIENCY_BUDGET_CHECK_LINES]).encode()
+    assert long_entry["offset"] == len(consumed)
+    assert calls(samples) == 1 + EFFICIENCY_BUDGET_CHECK_LINES - 1
+    samples = eff.collect(eff.now)
+    assert (
+        next(v for k, v in eff.saved()["files"].items() if k.endswith("rollout-long.jsonl"))["offset"]
+        == path.stat().st_size
+    )
+    assert calls(samples) == 1 + 2 * EFFICIENCY_BUDGET_CHECK_LINES
+    assert calls(eff.collect(eff.now)) == 1 + 2 * EFFICIENCY_BUDGET_CHECK_LINES
 
 
 # -- privacy ----------------------------------------------------------------------------------------

@@ -221,19 +221,6 @@ def main(argv: list[str] | None = None) -> int:
 
     sub.add_parser("collect-git", help="ingest commits of the configured [git] repos into ah.git_commit")
     sub.add_parser("mcp", help="run the read-only MCP server on stdio")
-    metrics = sub.add_parser("metrics", help="metrics cutover validation")
-    parity = metrics.add_subparsers(dest="metrics_command", required=True).add_parser("parity")
-    from .metrics.parity import ROSTER
-
-    parity.add_argument("--legacy", required=True, help="legacy exposition file or HTTP URL")
-    parity.add_argument("--new", required=True, help="new exposition file or HTTP URL")
-    parity.add_argument("--roster", type=Path, default=ROSTER)
-    parity.add_argument("--legacy-at", help="actual capture time: Unix seconds or timezone-qualified ISO timestamp")
-    parity.add_argument("--new-at", help="actual capture time: Unix seconds or timezone-qualified ISO timestamp")
-    parity.add_argument(
-        "--ended-loop", action="append", default=[], help="concluded loop label requiring exact equality"
-    )
-
     from . import reader
 
     reader_parser = reader.build_parser()
@@ -337,11 +324,6 @@ def _start_collection(args, runs_directory: Path):
 
 def _dispatch(args, parser, argv, reader_commands):
     from . import reader
-
-    if args.command == "metrics":
-        from .metrics.parity import run
-
-        return run(args)
 
     # Periodic workers reload config inside the suppressed single-shot iteration.
     if args.command in ("index", "embed") and args.every is not None:

@@ -194,33 +194,15 @@ Workflow journals and Codex `archived_sessions/` copies are never counted. Set
 `[efficiency] workflow_transcripts = false` to leave workflow agents out, for example to compare
 with a collector that never read them; turning it back on adds their calls from that point.
 
+Each collection parses transcripts for at most 20 seconds, smallest remaining work first; lines
+left unread keep their offset and are parsed by the next collection, so a long first parse delays
+counts rather than metric freshness. A complete record the parser cannot read is skipped and
+counted in `agent_efficiency_malformed_records_total` (`agent`, `namespace`; zero until one is
+seen, no record content), stored under that same name.
+
 Self-health keeps `storage`, `archive`, `efficiency` and `loops` separate from worker `runs`.
 `loops` times the optional catalogue loop-map fetch: a failed fetch sets its success to zero,
 records duration and retains its last-success timestamp, without failing overall collection.
-
-To compare two Prometheus captures from an older exporter, use the public CLI:
-
-```sh
-agent-history metrics parity --legacy legacy.prom --new new.prom \
-  --legacy-at 2026-01-01T12:00:05Z --roster src/agent_history/metrics/parity-roster.json
-```
-
-Files need their actual capture time, from a `# captured_at <timestamp>` comment or
-`--legacy-at`/`--new-at`; file modification times are never capture evidence. HTTP fetches use
-request start time when no capture comment is present. Captures must share a UTC minute bucket
-and be at most 60 seconds apart; an HTTP fetch crossing a minute boundary is also refused.
-Exit 0 means parity, 1 means an unrostered difference, and 2 means invalid or unsynchronised
-input. A `not synchronised` report explicitly says no comparison was performed: zero counts
-are not a pass. Reports are deterministic JSON, with kept-family counts and each rostered
-exception's class and reason. Kept families require identical types and label keys/values;
-new-only families are reported separately. Every kept value, including gauges, allows at most
-0.5% deviation. Repeat `--ended-loop <label>` for every concluded loop to require exact equality
-for its measurements. The roster lists retired SQLite/systemd families and sections as `dropped`,
-only process self counters as `rebase-allowed`, and four legacy activity families confirmed absent
-from the baseline as `not-emitted`. A `not-emitted` family appearing in either capture fails the
-comparison rather than silently waiving it. A `renamed` entry must identify its replacement
-family and still meet the same type, label and numeric checks. `loops` is never a roster exception.
-Use trusted labels matching the legacy capture when proving private deployment parity.
 
 This is not general metadata sanitisation. Other operator-configured namespaces, loop names and
 collector state can be sensitive. Local collector and counter state retain original source

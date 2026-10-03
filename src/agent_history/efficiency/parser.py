@@ -2195,7 +2195,7 @@ def efficiency_recover_protocol(path: Path, agent: str, limit: int) -> str | Non
 
 def efficiency_parse_file(
     run: EfficiencyRun,
-    hot: Path,
+    path: Path,
     relative: str,
     file_state: dict[str, Any],
     size: int,
@@ -2203,13 +2203,13 @@ def efficiency_parse_file(
     deadline: float,
     monotonic: Callable[[], float],
 ) -> tuple[bool, int]:
-    """Consume complete new lines of one file.
+    """Consume complete new lines of the transcript at `path`, keyed in state by `relative`.
 
     Returns whether the file was consumed within the run budget, and how many malformed records
     were skipped. A malformed record is consumed and skipped so it cannot pin the file's offset.
     """
     namespace = relative.split("/", 1)[0]
-    with (hot / relative).open("rb") as handle:
+    with path.open("rb") as handle:
         head = efficiency_head(handle)
         if size < file_state["offset"] or (file_state["head"] and head and head != file_state["head"]):
             skip = max(float(file_state["skip"]), float(file_state["counted"] or 0))
@@ -2222,7 +2222,7 @@ def efficiency_parse_file(
             proto = None
             if file_state["role"] != "worker" and file_state["offset"]:
                 limit = min(file_state["offset"], EFFICIENCY_PROTOCOL_SCAN_BYTES)
-                proto = efficiency_recover_protocol(hot / relative, namespace.split("-", 1)[0], limit)
+                proto = efficiency_recover_protocol(path, namespace.split("-", 1)[0], limit)
                 if proto is None and file_state["offset"] > EFFICIENCY_PROTOCOL_SCAN_BYTES:
                     proto = "none"
             file_state["proto"] = proto
@@ -2305,6 +2305,7 @@ def read_efficiency_state(path: Path, now: float) -> dict[str, Any]:
         ("agent_types", []),
         ("rate_limits", {}),
         ("loops", {}),
+        ("malformed", {}),
     ):
         if not isinstance(state.get(key), type(default)):
             state[key] = default

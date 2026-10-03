@@ -7,13 +7,88 @@ Missing, extra, rejected and unvalidated families are reported separately and an
 
 from __future__ import annotations
 
+import math
 import re
+from dataclasses import dataclass
 from typing import Iterable
 
 from . import otlp
-from .parity import parse
 
 CUMULATIVE = 2  # AggregationTemporality.AGGREGATION_TEMPORALITY_CUMULATIVE
+NAME = r"[a-zA-Z_:][a-zA-Z0-9_:]*"
+SAMPLE = re.compile(rf"^({NAME})(\{{.*\}})?\s+(\S+)(?:\s+[0-9]+)?$")
+LABEL = re.compile(r'([a-zA-Z_][a-zA-Z0-9_]*)="((?:[^"\\]|\\[\\"n])*)"')
+
+
+@dataclass
+class Capture:
+    types: dict[str, str]
+    samples: dict[str, dict[tuple[str, tuple[tuple[str, str], ...]], float]]
+
+
+def _labels(raw: str | None) -> tuple[tuple[str, str], ...]:
+    if not raw or raw == "{}":
+        return ()
+    text = raw[1:-1]
+    labels = {}
+    position = 0
+    while position < len(text):
+        match = LABEL.match(text, position)
+        if match is None or match[1] in labels:
+            raise ValueError("invalid or duplicate label")
+        labels[match[1]] = re.sub(r'\\([\\"n])', lambda m: "\n" if m[1] == "n" else m[1], match[2])
+        position = match.end()
+        if position != len(text):
+            if text[position] != ",":
+                raise ValueError("invalid label separator")
+            position += 1
+            if position == len(text):
+                raise ValueError("trailing label separator")
+    return tuple(sorted(labels.items()))
+
+
+def parse(text: str) -> Capture:
+    """Families and samples of one Prometheus exposition, refusing malformed or duplicate input."""
+    types = {}
+    raw_samples = []
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("# TYPE "):
+            parts = line.split()
+            if len(parts) != 4 or not re.fullmatch(NAME, parts[2]) or parts[3] not in {"gauge", "counter", "histogram"}:
+                raise ValueError("invalid family type")
+            if parts[2] in types:
+                raise ValueError("duplicate family type")
+            types[parts[2]] = parts[3]
+        elif line and not line.startswith("#"):
+            match = SAMPLE.fullmatch(line)
+            if match is None:
+                raise ValueError("invalid sample")
+            value = float(match[3])
+            if not math.isfinite(value):
+                raise ValueError("non-finite sample")
+            raw_samples.append((match[1], _labels(match[2]), value))
+    samples = {name: {} for name in types}
+    for name, labels, value in raw_samples:
+        family = name
+        if family not in types:
+            family = next(
+                (
+                    name.removesuffix(suffix)
+                    for suffix in ("_bucket", "_sum", "_count")
+                    if name.endswith(suffix) and types.get(name.removesuffix(suffix)) == "histogram"
+                ),
+                "",
+            )
+        if not family:
+            raise ValueError("sample without family type")
+        if types[family] != "gauge" and value < 0:
+            raise ValueError("negative counter or histogram")
+        key = name, labels
+        if key in samples[family]:
+            raise ValueError("duplicate sample")
+        samples[family][key] = value
+    return Capture(types, samples)
 
 
 def decode(body: bytes) -> dict[str, dict]:

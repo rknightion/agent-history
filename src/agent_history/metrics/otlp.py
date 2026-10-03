@@ -132,6 +132,13 @@ agent_efficiency_rate_limit_window_minutes min window
         prefix=EFFICIENCY,
     ),
     **_rows(
+        "C",
+        """
+agent_efficiency_malformed_records_total {record} -
+""",
+        prefix=EFFICIENCY,
+    ),
+    **_rows(
         "G",
         """
 agent_efficiency_active_roots_with_idle_workers {thread} -

@@ -241,6 +241,12 @@ agent_efficiency_loop_map_age_seconds 0.142857142857
 # HELP agent_efficiency_loop_map_loops Synthetic agent_efficiency_loop_map_loops.
 # TYPE agent_efficiency_loop_map_loops gauge
 agent_efficiency_loop_map_loops 0.142857142857
+# HELP agent_efficiency_malformed_records_total Synthetic agent_efficiency_malformed_records_total.
+# TYPE agent_efficiency_malformed_records_total counter
+agent_efficiency_malformed_records_total{agent="claude",namespace="claude-personal"} 0.142857142857
+agent_efficiency_malformed_records_total{agent="claude",namespace="codex-personal"} 2
+agent_efficiency_malformed_records_total{agent="codex",namespace="claude-personal"} 3
+agent_efficiency_malformed_records_total{agent="codex",namespace="codex-personal"} 0.571428571429
 # HELP agent_efficiency_model_calls_total Synthetic agent_efficiency_model_calls_total.
 # TYPE agent_efficiency_model_calls_total counter
 agent_efficiency_model_calls_total{agent="claude",loop="loop1",model="claude-sonnet-5",namespace="claude-personal",role="root"} 0.142857142857
@@ -1300,6 +1306,12 @@ agent_efficiency_loop_map_age_seconds 0.142857142857
 # HELP agent_efficiency_loop_map_loops Synthetic agent_efficiency_loop_map_loops.
 # TYPE agent_efficiency_loop_map_loops gauge
 agent_efficiency_loop_map_loops 0.142857142857
+# HELP agent_efficiency_malformed_records_total Synthetic agent_efficiency_malformed_records_total.
+# TYPE agent_efficiency_malformed_records_total counter
+agent_efficiency_malformed_records_total{agent="claude",namespace="claude-personal"} 0.142857142857
+agent_efficiency_malformed_records_total{agent="claude",namespace="codex-personal"} 2
+agent_efficiency_malformed_records_total{agent="codex",namespace="claude-personal"} 3
+agent_efficiency_malformed_records_total{agent="codex",namespace="codex-personal"} 0.571428571429
 # HELP agent_efficiency_model_calls_total Synthetic agent_efficiency_model_calls_total.
 # TYPE agent_efficiency_model_calls_total counter
 agent_efficiency_model_calls_total{agent="claude",loop="loop1",model="claude-sonnet-5",namespace="claude-personal",role="root"} 0.142857142857
@@ -2411,6 +2423,12 @@ agent_efficiency_loop_map_age_seconds 0.142857142857
 # HELP agent_efficiency_loop_map_loops Synthetic agent_efficiency_loop_map_loops.
 # TYPE agent_efficiency_loop_map_loops gauge
 agent_efficiency_loop_map_loops 0.142857142857
+# HELP agent_efficiency_malformed_records_total Synthetic agent_efficiency_malformed_records_total.
+# TYPE agent_efficiency_malformed_records_total counter
+agent_efficiency_malformed_records_total{agent="claude",namespace="claude-personal"} 0.214285714286
+agent_efficiency_malformed_records_total{agent="claude",namespace="codex-personal"} 3
+agent_efficiency_malformed_records_total{agent="codex",namespace="claude-personal"} 4.5
+agent_efficiency_malformed_records_total{agent="codex",namespace="codex-personal"} 0.857142857143
 # HELP agent_efficiency_model_calls_total Synthetic agent_efficiency_model_calls_total.
 # TYPE agent_efficiency_model_calls_total counter
 agent_efficiency_model_calls_total{agent="claude",loop="loop1",model="claude-sonnet-5",namespace="claude-personal",role="root"} 0.214285714286
