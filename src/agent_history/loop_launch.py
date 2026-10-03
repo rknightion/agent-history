@@ -43,6 +43,9 @@ _LOOP_SUFFIX_RE = re.compile(r"-loop(\d+)\.md$")
 _LEGACY_LOOP_SUFFIX_RE = re.compile(r"-(?:wave|loop)(\d+)\.md$")
 
 _BARE_LAUNCH_NAME_RE = re.compile(r"^launch-.*\.(?:txt|md)$")
+# A report's first line. The collector stores only a line of this shape as a receipt's
+# `target_line1`, and the loop finish rule matches the same pattern.
+REPORT_HEADER = re.compile(r"# Loop: [A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)? (loop|wave)([0-9]+) · Goal: [0-9a-f]{64}")
 
 # Optional "Time budget: <N>s|m|h" line in the recognised launch text (pasted or file-backed).
 _BUDGET_RE = re.compile(r"^\s*Time budget:\s*(\d+)\s*([smh])\b", re.IGNORECASE | re.MULTILINE)

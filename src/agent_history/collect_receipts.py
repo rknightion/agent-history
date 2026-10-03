@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import hashlib
 import os
-import re
 import stat
 import subprocess
 from datetime import datetime, timedelta, timezone
@@ -19,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from .collect_git import GIT_ENV, Deadline, parse_remote
+from .loop_launch import REPORT_HEADER
 
 COLS = [
     ("machine", "text"),
@@ -40,9 +40,6 @@ SOURCES = (
 )
 MAX_RECEIPT_BYTES = 4096
 MAX_LINE1_BYTES = 4096
-# A report's first line. Only a line of this shape is stored as `target_line1`; the finish rule in
-# loops.py matches the same pattern.
-REPORT_HEADER = re.compile(r"# Loop: [A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)? (loop|wave)([0-9]+) · Goal: [0-9a-f]{64}")
 _stat = os.stat  # the closing stat of a read; replaceable to exercise a concurrent rewrite
 
 

@@ -21,8 +21,7 @@ from typing import Any, Sequence
 import psycopg
 from psycopg.types.json import Jsonb
 
-from .collect_receipts import REPORT_HEADER
-from .loop_launch import identity_fields, parse_launch
+from .loop_launch import REPORT_HEADER, identity_fields, parse_launch
 
 ACTIVATED_AT = "1970-01-01T00:00:00Z"   # launches before this instant are ignored
 BARE_LAUNCH = re.compile(r"^`?\s*(\S*launch-[^\s`/]*\.(?:txt|md))\s*`?$")
