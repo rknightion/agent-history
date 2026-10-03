@@ -23,7 +23,7 @@ RECORDED = (
     "019_message_record_origin.sql",
     "020_gpt_6_1_sol_pricing.sql",
 )
-REPLAYED = ("021_drop_git_owner_alias.sql", "022_live_loops.sql", "023_loop_identity.sql")
+REPLAYED = ("021_drop_git_owner_alias.sql", "022_live_loops.sql", "023_loop_identity.sql", "024_loop_progress.sql")
 
 
 def render(sql_dir: Path) -> str:

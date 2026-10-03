@@ -107,6 +107,7 @@ def refresh_live(conn: psycopg.Connection) -> dict[str, int]:
     """)
     count = result.rowcount
     _refresh_identity(conn)
+    _refresh_progress(conn)
     return {"live_loops": count}
 
 
@@ -188,6 +189,121 @@ def _refresh_identity(conn: psycopg.Connection) -> None:
         conn.execute(
             "INSERT INTO ah.meta (key, value) VALUES ('loops_identity_projection_v1', '1') "
             "ON CONFLICT (key) DO NOTHING"
+        )
+
+
+PROGRESS_SELECTION_SQL = """
+    WITH changed AS MATERIALIZED (
+        SELECT s.id, s.root_session_id, s.loop_run_id
+        FROM dirty_now d CROSS JOIN LATERAL (
+            SELECT id, root_session_id, loop_run_id FROM ah.session WHERE id = d.session_id OFFSET 0
+        ) s
+    ), dirty_owners AS (
+        SELECT owned.launch_uid FROM changed c CROSS JOIN LATERAL (
+            SELECT launch_uid FROM ah.loop_run
+            WHERE root_session_id = COALESCE(c.root_session_id, c.id) OFFSET 0
+        ) owned
+        UNION
+        SELECT owned.launch_uid FROM changed c CROSS JOIN LATERAL (
+            SELECT launch_uid FROM ah.loop_run WHERE id = c.loop_run_id OFFSET 0
+        ) owned
+        UNION
+        SELECT owned.launch_uid FROM changed c CROSS JOIN LATERAL (
+            SELECT l.launch_uid FROM ah.session parent JOIN ah.loop_run l ON l.id = parent.loop_run_id
+            WHERE parent.id = c.root_session_id OFFSET 0
+        ) owned
+    )
+    SELECT launch_uid FROM ah.loops WHERE status = 'running'
+    UNION
+    SELECT launch_uid FROM dirty_owners
+"""
+
+
+def _refresh_progress(conn: psycopg.Connection) -> None:
+    """Refresh active/dirty loops plus at most 128 historical rows per transaction.
+
+    The cursor is transactional with the projection. Existing catalogues therefore backfill on
+    scheduled passes without rebuild, but never repeatedly aggregate all historical transcripts.
+    Root calls use the launch window; linked lane sessions contribute whole, as v_loop_summary does.
+    Unlike that view's display defaults, unknown totals remain null and costs must be fully priced.
+    """
+    key = "loops_progress_projection_v1"
+    saved = conn.execute("SELECT value FROM ah.meta WHERE key = %s", (key,)).fetchone()
+    cursor = saved[0] if saved else ""
+    historical = []
+    if cursor != "complete":
+        historical = [
+            r[0]
+            for r in conn.execute(
+                "SELECT launch_uid FROM ah.loops WHERE launch_uid > %s ORDER BY launch_uid LIMIT 128",
+                (cursor,),
+            )
+        ]
+    active = [r[0] for r in conn.execute(PROGRESS_SELECTION_SQL)]
+    for uid in dict.fromkeys(historical + active):
+        conn.execute(
+            """
+            WITH target AS (
+                SELECT l.id, l.root_session_id, l.launch_ts,
+                       CASE WHEN live.status = 'finished' THEN l.end_ts END AS end_ts
+                FROM ah.loop_run l JOIN ah.loops live USING (launch_uid) WHERE l.launch_uid = %s
+            ), members AS (
+                SELECT s.id, s.last_event_at, s.agent, s.id = l.root_session_id AS is_root,
+                       l.launch_ts, l.end_ts
+                FROM target l JOIN ah.session s ON s.id = l.root_session_id OR
+                    (s.loop_run_id = l.id AND s.id <> l.root_session_id)
+            ), calls AS (
+                SELECT c.* FROM members s JOIN ah.llm_call c ON c.session_id = s.id
+                WHERE NOT s.is_root OR (c.ts >= s.launch_ts AND c.ts < COALESCE(s.end_ts, 'infinity'))
+            ), usage AS (
+                SELECT NULLIF(count(*), 0) AS llm_calls,
+                       CASE WHEN count(input_uncached) = count(*) THEN sum(input_uncached) END AS input_uncached,
+                       CASE WHEN count(cache_read) = count(*) THEN sum(cache_read) END AS cache_read,
+                       CASE WHEN count(cache_write_5m) = count(*) AND count(cache_write_1h) = count(*)
+                            THEN sum(cache_write_5m + cache_write_1h) END AS cache_write,
+                       CASE WHEN count(output) = count(*) THEN sum(output) END AS output,
+                       CASE WHEN count(*) > 0 THEN count(*) FILTER (WHERE is_api_error) END AS api_errors
+                FROM calls
+            ), priced AS (
+                SELECT CASE WHEN input_uncached IS NOT NULL AND cache_read IS NOT NULL
+                                 AND cache_write_5m IS NOT NULL AND cache_write_1h IS NOT NULL
+                                 AND output IS NOT NULL
+                            THEN ah.priced_usd(model, ts::date, input_uncached, cache_read,
+                                               cache_write_5m, cache_write_1h, output) END AS cost FROM calls
+            ), costs AS (
+                SELECT CASE WHEN count(cost) = count(*) THEN sum(cost) END AS cost FROM priced
+            ), tools AS (
+                SELECT CASE WHEN count(*) > 0 AND count(t.outcome) = count(*)
+                            THEN count(*) FILTER (WHERE t.outcome = 'error') END AS errors
+                FROM members s JOIN ah.tool_call t ON t.session_id = s.id
+                WHERE NOT s.is_root OR (t.started_at >= s.launch_ts AND
+                                       t.started_at < COALESCE(s.end_ts, 'infinity'))
+            ), git AS (
+                SELECT NULLIF(count(*) FILTER (WHERE g.op IN ('commit','cherry_pick')), 0) AS commits,
+                       NULLIF(count(*) FILTER (WHERE g.op = 'push'), 0) AS pushes
+                FROM members s JOIN ah.git_event g ON g.session_id = s.id
+                WHERE NOT s.is_root OR (g.ts >= s.launch_ts AND g.ts < COALESCE(s.end_ts, 'infinity'))
+            ), lanes AS (
+                SELECT NULLIF(count(*), 0) AS total,
+                       NULLIF(count(*) FILTER (WHERE lane_return IS NOT NULL), 0) AS returned
+                FROM ah.lane WHERE loop_run_id = (SELECT id FROM target)
+            )
+            UPDATE ah.loops SET lanes_total = lanes.total, lanes_returned = lanes.returned,
+                last_activity_at = (SELECT max(last_event_at) FROM members),
+                llm_calls = usage.llm_calls, input_uncached = usage.input_uncached,
+                cache_read = usage.cache_read, cache_write = usage.cache_write, output = usage.output,
+                priced_cost_usd = costs.cost, tool_errors = tools.errors, api_errors = usage.api_errors,
+                commits = git.commits, pushes = git.pushes,
+                root_agent = (SELECT agent FROM members WHERE is_root)
+            FROM usage, costs, tools, git, lanes WHERE launch_uid = %s
+        """,
+            (uid, uid),
+        )
+    if cursor != "complete":
+        following = historical[-1] if len(historical) == 128 else "complete"
+        conn.execute(
+            "INSERT INTO ah.meta (key,value) VALUES (%s,%s) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value",
+            (key, following),
         )
 
 

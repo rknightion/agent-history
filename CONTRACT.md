@@ -199,6 +199,45 @@ guaranteed by this package. Consumers should check `observed_at` when freshness 
 activity is not root activity. Neither report-path parsing quality (`loop_run.status`) nor its
 fallback `root_last_event` end timestamp is terminal evidence. No heartbeat or phase feed is used.
 
+### Progress fields
+
+Migration `024_loop_progress.sql` adds nullable columns on the same grant-preserving table:
+
+- `lanes_total bigint`: indexed lane sessions; `lanes_returned bigint`: lanes with a recorded
+  `lane-return` value. No lanes or no captured returns means NULL, never a fabricated zero. A
+  return count does not imply success, nor that every scheduled lane's return was captured.
+- `last_activity_at timestamptz`: newest recorded session event time across the root and linked
+  lanes; `root_agent text`: the root's recorded harness (`pi`, `claude` or `codex`).
+- `llm_calls bigint`: recorded model calls; `input_uncached`, `cache_read`, `cache_write` and
+  `output` (all bigint): token totals. Cache writes combine the 5-minute and 1-hour buckets.
+  Missing calls or any missing component of a token total leaves that total NULL.
+- `priced_cost_usd numeric`: USD at the recorded model's effective catalogue price. No calls,
+  any unpriced call or any missing token component leaves the total NULL, not a partial cost or
+  zero. This is list-price accounting, not an invoice.
+- `tool_errors bigint` and `api_errors bigint`: recorded tool failures and API-error calls.
+  No tool/call evidence leaves the respective count NULL; known outcomes can establish zero.
+  `commits bigint` includes recorded commits/cherry-picks; `pushes bigint` counts recorded pushes.
+  No matching git event leaves the count NULL, rather than claiming none happened.
+
+These project existing catalogue evidence, with the same membership convention as
+`ah.v_loop_summary`: root calls/actions inside the launch window and linked lane sessions whole.
+Running/stale roots have no terminal cutoff; finished roots stop at the recorded end. Session
+activity timestamps describe the newest observed root/lane event, not process liveness. There is
+no new collector or heartbeat. NULL always means unknown, never an alias for zero.
+
+Every successful refresh post-pass updates running rows and roots of dirty root/child sessions,
+including heuristic lanes and their descendants. Progress selection starts from the partial
+`loops_progress_repo_idx` over running rows and resolves dirty owners through
+`loop_run_progress_owner_idx`; it does not walk finished-loop history. Receiver queries can use
+`WHERE repo = <exact owner/repo> AND status = 'running'` on that same repository index. This bounds
+progress selection, not the separate lifecycle and identity refreshes described above.
+Initial historical fill processes at most 128 additional rows per pass with a transactional cursor
+in `ah.meta`, so existing finished rows fill without rebuild and work stays bounded. The deployed
+refresh cadence is about 320 seconds today, not a package guarantee; historical fill may therefore
+take several passes. Rebuild re-projects retained transcript evidence. Analytics re-application
+preserves values, and both operations preserve table-level consumer SELECT grants. Identity and
+lifecycle meanings above are unchanged; consumers should still inspect `observed_at` for freshness.
+
 ## Efficiency classifier
 
 `ah.efficiency_calls(namespaces, session_uid, agent_id)` returns one row per model call with its
