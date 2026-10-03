@@ -62,7 +62,7 @@ loses them. Keep your own copies if you want history to survive that.
 
 Not truncated by `rebuild`: `ah.change_log`, `ah.refresh_log`, `ah.embedding` (a paid cache keyed by
 model and input hash) and the collector tables (`git_commit`, `git_commit_file`, `ci_run`,
-`backlog_task`, `task_prefix`, `installed_feature`, `permission_log`, `loop_receipt`,
+`backlog_task`, `backlog_done_event`, `backlog_done_scan`, `task_prefix`, `installed_feature`, `permission_log`, `loop_receipt`,
 `session_summary`, `session_topic`).
 
 ## Namespaces and contexts
@@ -315,6 +315,50 @@ take several passes. Rebuild re-projects retained transcript evidence. Analytics
 preserves values, and both operations preserve table-level consumer SELECT grants. Identity and
 lifecycle meanings above are unchanged; consumers should still inspect `observed_at` for freshness.
 
+### Planner and report signals
+
+Migration `026_loop_planner_signals.sql` adds the collector tables `ah.backlog_done_event`, primary key
+`(repo_slug, task_key, sha)`, and `ah.backlog_done_scan`, and three nullable `ah.loops` columns:
+
+- `backlog_done_event`: one row per first-parent commit of the default branch (a merge counts at the
+  merge, not at the branch's own commits) whose backlog task file has frontmatter `status` Done where
+  its first parent had another status. Only frontmatter counts; a `status:` line in a task body does
+  not. A task file created as Done, or moved while already Done, is not a flip. The collector reads
+  the same window as `git_commit`, widens it once per repo to every stored commit (recorded in the
+  collector table `ah.backlog_done_scan`, `repo_slug` and `widened_at`), and removes rows in the
+  window whose commit the clone proves is no longer on the default branch. Rebuild keeps both tables.
+- `tasks_done bigint`: distinct tasks with a Done flip in the loop's `repo` between `launch_ts` and
+  `end_ts` (open for running and stale loops), whatever session made the change. NULL when `repo` is
+  unknown or the collector has not read that repo's tracker. Recomputed on every refresh because
+  collector rows can arrive after a loop finishes.
+- `lanes_accepted bigint` and `lanes_reported bigint`: lanes with `status` exactly `accepted`, and
+  all lanes, in the `lanes` list of the latest captured report's `## Data`, read under the identity
+  rules above. NULL when no report was captured, its Data is absent, invalid or names another
+  identity, or has no `lanes` list. `lanes_total` is unchanged: indexed lane sessions.
+
+`ah.lane.return_status` and `lane_return` come from the last `lane-return` fenced block in the lane's final
+message. A v2 block (`"v":2`, with `lane` and `status` in `complete|partial|blocked|failed`) is stored
+whole and gives `return_status` only when both are valid; the earlier free-form object keeps any
+string `status`. The closing fence is a line of its own.
+
+`ah.v_notify_lag` has one row per completion notification a session received (message class
+`task_notification_summary`, or source `subagent-notify` / `subagent-incremental-child-notify`):
+`lag_s` is the wait to the session's next successful assistant model call, and `steered` marks
+notifications that joined a turn already running. Notifications steered into a running turn open no
+`task_notification` turn, so a turn-origin count under-reports them.
+
+Session capture rules that changed with these columns (parser versions bumped, so a rebuild or
+re-parse applies them): a `git commit`, `git push` or `git cherry-pick` command that succeeded but
+printed no `[branch sha]` line or push range yields a `git_event` with `evidence = 'command'`, NULL
+`sha_short` and `event_uid` `<call>:<op>:cmd<n>`; output-matched events are not duplicated. pi
+`cacheWrite` is stored as `cache_write_5m` with `cache_write_1h = 0` (0 stays 0), so loop
+`cache_write` and `priced_cost_usd` are known for pi loops. Codex `cache_write_input_tokens` is stored the
+same way (absent means 0, `cache_write_1h = 0`); a zeroed breakdown beside a non-zero total stays NULL. pi's `loop-pi-runtime` custom entry
+(`{v:1, variant, models:{<id>:{service_tier}}}`) sets `llm_call.service_tier` for calls to that model
+in the same session, else NULL. A pi `Background task completed|failed: **<agent>**` notification
+sets `completion_status` on the spawn row of the async launch named by its
+`async-subagent-runs/<runId>` line.
+
 ## Efficiency classifier
 
 `ah.efficiency_calls(namespaces, session_uid, agent_id)` returns one row per model call with its
@@ -330,8 +374,8 @@ cannot recover transcripts already deleted from their source homes.
 
 ## Collector metadata
 
-The collector writes `task_prefix`, `backlog_task`, `git_commit`, `git_commit_file`, `ci_run`,
-`installed_feature`, `permission_log` and `loop_receipt`. Git subjects, tracker titles, labels and project values,
+The collector writes `task_prefix`, `backlog_task`, `backlog_done_event`, `backlog_done_scan`, `git_commit`,
+`git_commit_file`, `ci_run`, `installed_feature`, `permission_log` and `loop_receipt`. Git subjects, tracker titles, labels and project values,
 file paths, repository slugs, workflow names and installed-feature names are stored verbatim.
 Author emails are compared to configured identities but only `author_is_owner` is stored.
 Permission logs contribute timestamps, line hashes, tool names, command verbs, classifier reasons

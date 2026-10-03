@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import os
+from datetime import timedelta
 from decimal import Decimal
 
 import pytest
@@ -242,3 +244,100 @@ def test_progress_selection_reads_running_set_not_history(clean):
     # A dirty finished root also resolves through the ownership index, not all historical loops.
     clean.execute("INSERT INTO dirty_now VALUES (1)")
     prove(PROGRESS_SELECTION_SQL, expected=4)
+
+
+def add_done(db, registry, repo_slug, task, sha, done_at):
+    registry["done"].append((repo_slug, task, sha))
+    db.execute(
+        "INSERT INTO ah.backlog_done_event (repo_slug, task_key, sha, done_at) VALUES (%s,%s,%s,%s)",
+        (repo_slug, task, sha, done_at),
+    )
+    db.commit()
+
+
+def tasks_done(db):
+    return db.execute("SELECT tasks_done FROM ah.loops").fetchone()[0]
+
+
+@pytest.fixture
+def collector_rows(clean):
+    """Keys of the collector rows a test inserted; only those are removed (the tables survive the truncate)."""
+    inserted = {"done": [], "task": []}
+    yield inserted
+    clean.rollback()
+    for repo_slug, task, sha in inserted["done"]:
+        clean.execute(
+            "DELETE FROM ah.backlog_done_event WHERE repo_slug = %s AND task_key = %s AND sha = %s",
+            (repo_slug, task, sha),
+        )
+    for repo_slug, task in inserted["task"]:
+        clean.execute("DELETE FROM ah.backlog_task WHERE repo_slug = %s AND task_key = %s", (repo_slug, task))
+    clean.commit()
+
+
+def test_tasks_done_counts_flips_in_the_loop_window_whatever_the_session(clean, collector_rows, tmp_path):
+    populated(clean, tmp_path)
+    collector_rows["task"].append(("github.com/example/project", "EX-0001"))
+    assert tasks_done(clean) is None  # the collector has not read this repo's tracker
+    clean.execute(
+        "INSERT INTO ah.backlog_task (task_key, repo_slug, context, status) "
+        "VALUES ('EX-0001','github.com/example/project','default','Done')"
+    )
+    clean.commit()
+    load.post_passes(clean)
+    assert tasks_done(clean) == 0  # a tracked repo with no flips is zero
+    launch = clean.execute("SELECT launch_ts FROM ah.loops").fetchone()[0]
+    day = launch.replace(microsecond=0)
+    add_done(clean, collector_rows, "github.com/example/project", "EX-0001", "a" * 40, day + timedelta(hours=1))
+    add_done(
+        clean, collector_rows, "github.com/Example/Project", "EX-0001", "b" * 40, day + timedelta(hours=2)
+    )  # reopened, again
+    add_done(clean, collector_rows, "github.com/example/project", "EX-0002", "c" * 40, day + timedelta(hours=3))
+    add_done(
+        clean, collector_rows, "github.com/example/project", "EX-0003", "d" * 40, day - timedelta(days=1)
+    )  # before launch
+    add_done(
+        clean, collector_rows, "github.com/example/other", "EX-0004", "e" * 40, day + timedelta(hours=1)
+    )  # another repo
+    load.post_passes(clean)
+    assert tasks_done(clean) == 2  # distinct tasks; no session involved
+    # a finished loop only counts flips before its end; late collector rows still reach it
+    clean.execute(
+        "UPDATE ah.loop_run SET end_evidence='next_launch', end_ts=%s", (day + timedelta(hours=2, minutes=30),)
+    )
+    clean.commit()
+    load.post_passes(clean)
+    assert tasks_done(clean) == 1
+
+
+def test_lane_return_v2_fills_return_status_and_lane_return(clean, tmp_path):
+    from agent_history import loops
+
+    _, child = populated(clean, tmp_path)
+    loop_id = clean.execute("SELECT id FROM ah.loop_run").fetchone()[0]
+    v2 = {
+        "v": 2,
+        "lane": "H1",
+        "status": "partial",
+        "sha": None,
+        "landed": False,
+        "base": "a" * 40,
+        "check": "just check",
+        "exit": 1,
+        "tail": "boom",
+        "ci": None,
+        "coderabbit": None,
+        "questions": ["q"],
+    }
+    clean.execute(
+        "INSERT INTO ah.message (agent, event_uid, session_id, namespace, profile, ts, role, message_class, text, "
+        "content_sha256, byte_length, source_id, byte_offset) VALUES ('claude','lane-report',%s,'claude-test','p',"
+        "now(),'assistant','subagent_report',%s,'x',1,0,0)",
+        (child, f"summary\n```lane-return\n{json.dumps(v2)}\n```\n"),
+    )
+    loops._lane(clean, loop_id, child, "lineage")
+    clean.commit()
+    assert clean.execute("SELECT return_status, lane_return FROM ah.lane WHERE session_id=%s", (child,)).fetchone() == (
+        "partial",
+        v2,
+    )

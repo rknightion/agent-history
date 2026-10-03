@@ -45,7 +45,8 @@ Messages (event_uid "<session uid>:<entry id>[:suffix]")
 LLM calls
   One row per assistant message: response_id = message.responseId, else "pi:<uid>:<entry id>";
   input_uncached = usage.input (pi reports it without cache reads), cache_read = cacheRead,
-  cache_write_5m = cacheWrite (pi has no TTL split), output (includes reasoning), reasoning; effort =
+  cache_write_5m = cacheWrite (pi has no TTL split; 0 stays 0 and cache_write_1h = 0, so loop
+  aggregates and priced cost stay known), output (includes reasoning), reasoning; effort =
   the session's thinking level at that point. stopReason 'error' -> is_api_error, error_kind from
   errorMessage ("upstream_request_timeout: ..." -> upstream_request_timeout; "(400)" -> status 400).
   `usage` entries and compaction/branch_summary `usage` -> rows "pi:<uid>:<entry id>" with
@@ -59,9 +60,17 @@ Subagents
   also names the spawning call (ToolCallRow.meta.run_id), and child_task_name = "<run dir>/run-<i>"
   when a child session path appears after that runId in the notify text (it can be truncated).
   Foreground results (details.results[].sessionFile) give spawn rows "<call id>:<index>".
+  A single async run completes with "Background task completed|failed: **<agent>**" (opening the
+  text) and a trailing "Retention-managed async directory: .../async-subagent-runs/<runId>" line;
+  the run id selects the launching call and its spawn row (spawn_uid = call id) gains
+  completion_status and completed_at. The "Session file:" line is not used (no run/path pairing).
+
+Runtime entry
+  `custom` entry `loop-pi-runtime` {v:1, variant, models:{<id>:{service_tier}}}: llm_call.service_tier
+  of calls to that model in the same session; absent means NULL.
 
 Known gaps: a pi `/fork` copy re-keys copied entries under the new session (entry ids are only
-unique within a file); a single (non-workflow) async run's notify format is unverified.
+unique within a file).
 """
 
 from __future__ import annotations
@@ -72,8 +81,9 @@ import re
 from datetime import datetime
 from typing import Any, Iterable
 
-from .common import (BOUNDED_STATE_SECONDS, artifact_kind, as_int, as_str, cmd_verb, git_from_output, json_size,
-                     linked_paths, parse_ts, prompt_origin, ssh_target)
+from .common import (BOUNDED_STATE_SECONDS, artifact_kind, as_int, as_str, cmd_verb, git_event_extras,
+                     git_from_output, git_ops_from_command, json_size, linked_paths, parse_ts, prompt_origin,
+                     ssh_target)
 from .model import (ArtifactRow, AttachmentRow, CompactionRow, ContinuationRow, FileContext, FileTouchRow,
                     GitEventRow, LinePos, LlmCallRow, MessageRow, ParseIssueRow, RecordTypeRow, Row,
                     PiRunResponseRow, SessionEventRow, SessionKey, SessionRow, SubagentSpawnRow, ToolCallRow,
@@ -81,7 +91,7 @@ from .model import (ArtifactRow, AttachmentRow, CompactionRow, ContinuationRow, 
 from .parse_claude import _diff_counts, _nlines
 
 AGENT = "pi"
-PARSER_VERSION = "4"
+PARSER_VERSION = "5"
 PI_AGENT_FILES = frozenset({"mapper", "mapper-deep", "gate-runner", "lane-worker", "lane-worker-push",
                             "lane-worker-retry", "lane-worker-retry-push", "complex-worker", "complex-worker-push", "reviewer", "reviewer-high",
                             "security-reviewer", "rescue-sol", "rescue-astra"})
@@ -100,6 +110,10 @@ CHILD_RUNS_RE = re.compile(r"^Child runs: (.+)$", re.M)
 CHILD_RUN_ITEM_RE = re.compile(rf"(?:([\w.-]+)=)?({UUID})(?: \(([\w-]+)\))?")
 CHILD_RUN_RE = re.compile(rf"^Child run: ({UUID})\s*$", re.M)
 CHILD_DONE_RE = re.compile(r"^Workflow child (\w+): \*\*([^*]+)\*\*", re.M)
+# a single async run's notify: "Background task completed|failed: **<agent>**", then the run's
+# "Retention-managed async directory: .../async-subagent-runs/<runId>" line
+ASYNC_DONE_RE = re.compile(r"Background task (completed|failed): \*\*([^*]+)\*\*")
+ASYNC_DIR_RE = re.compile(rf"^Retention-managed async directory: .*/async-subagent-runs/({UUID})[ \t]*$", re.M)
 # a child session path inside a notify: .../<root base>/<run dir>/run-<i>/<file>.jsonl
 SESSION_PATH_RE = re.compile(rf"/({UUID})/(run-\d+)/[^/\"\s]+\.jsonl")
 ERROR_KIND_RE = re.compile(r"^([a-z][a-z0-9_]{2,63}):")
@@ -170,6 +184,7 @@ class PiParser:
             "calls": {}, "wf": {},
         }
         self.s.update(state or {})
+        self.s.setdefault("tiers", {})   # model id -> service tier, from the session's loop-pi-runtime entry
         self.sub = ctx.file_role != "main"
         self.lin = lineage(ctx.rel_path)
         self._types: dict[tuple[str, str], list[Any]] = {}
@@ -237,6 +252,8 @@ class PiParser:
                                         f"usage:{as_str(record.get('kind')) or 'unknown'}", ts, pos))
         elif rtype in {"compaction", "branch_summary"}:
             rows.extend(self._compaction(rtype, record, uid, ts, pos))
+        elif rtype == "custom" and as_str(record.get("customType")) == "loop-pi-runtime":
+            self._runtime(record.get("data"))
         elif rtype == "session_info":
             name = as_str(record.get("name"))
             if name:
@@ -345,6 +362,14 @@ class PiParser:
             rows.append(ContinuationRow(AGENT, s["sid"], parent_uid, "fork", key, ts, pos.byte_offset,
                                         "parentSession"))
         return rows
+
+    def _runtime(self, data: Any) -> None:
+        """loop-pi-runtime {v:1, variant, models:{<id>:{service_tier}}}: tier per model for this session."""
+        models = data.get("models") if isinstance(data, dict) and data.get("v") == 1 else None
+        if not isinstance(models, dict):
+            return
+        self.s["tiers"] = {mid: tier[:32] for mid, cfg in models.items() if isinstance(mid, str)
+                           and isinstance(cfg, dict) and (tier := as_str(cfg.get("service_tier")))}
 
     def _model_change(self, record: dict[str, Any], uid: str, ts: datetime, pos: LinePos) -> list[Row]:
         model, provider = as_str(record.get("modelId")), as_str(record.get("provider"))
@@ -490,11 +515,14 @@ class PiParser:
         if not isinstance(usage, dict):
             return []
         kind, status = self._error_kind(error) if error is not None or stop == "error" else (None, None)
+        model = model or self.s["model"]
+        write = as_int(usage.get("cacheWrite"))   # pi has no TTL split: all of it prices as the 5m write
         return [LlmCallRow(AGENT, response_id, self._key(), ts, pos.byte_offset,
-                           turn_key=turn if turn is not None else self.s["cur"], model=model or self.s["model"],
+                           turn_key=turn if turn is not None else self.s["cur"], model=model,
                            stop_reason=stop, input_uncached=as_int(usage.get("input")),
                            cache_read=as_int(usage.get("cacheRead")),
-                           cache_write_5m=as_int(usage.get("cacheWrite")) or None, output=as_int(usage.get("output")),
+                           cache_write_5m=write, cache_write_1h=None if write is None else 0,
+                           output=as_int(usage.get("output")), service_tier=self.s["tiers"].get(model),
                            reasoning=as_int(usage.get("reasoning")), effort=self.s["effort"],
                            is_api_error=stop == "error", error_kind=kind, api_error_status=status,
                            is_sidechain=self.sub, line_count=1)]
@@ -639,6 +667,12 @@ class PiParser:
             for _old, new, _src, dst in pushes:
                 rows.append(GitEventRow(AGENT, f"{call_id}:push:{new}", key, ts, "push", "output_regex",
                                         pos.byte_offset, call.get("t"), call_id, self.s["cwd"], dst[:200], new[:12]))
+        if call["n"] == "bash" and not is_error:
+            commits, pushes = git_from_output(text or "")
+            ops = git_ops_from_command((call.get("a") or {}).get("command"))
+            for op, n in git_event_extras(ops, len(commits), len(pushes)):
+                rows.append(GitEventRow(AGENT, f"{call_id}:{'push' if op == 'push' else 'commit'}:cmd{n}", key, ts, op,
+                                        "command", pos.byte_offset, call.get("t"), call_id, self.s["cwd"]))
         return rows
 
     # --- subagents ----------------------------------------------------------------------------
@@ -681,6 +715,13 @@ class PiParser:
             for item in CHILD_RUN_ITEM_RE.finditer(line.group(1) if line else ""):
                 children[item.group(2)] = {"agent": item.group(1), "status": item.group(3)}
         rows: list[Row] = []
+        # the header opens the text and the directory line is the trailer; the middle is agent-authored
+        done, dirs = ASYNC_DONE_RE.match(text), list(ASYNC_DIR_RE.finditer(text))
+        launch = self.s["wf"].get(dirs[-1].group(1)) if done and dirs else None
+        if launch:
+            # the launching call's spawn row (spawn_uid = call id) gains its completion
+            rows.append(SubagentSpawnRow(AGENT, launch["c"], self._key(), launch["bo"],
+                                         completion_status=done.group(1), completed_at=ts))
         spawn = self.s["wf"].get(wf_id or "")
         for run_id, child in children.items():
             rows.append(SubagentSpawnRow(

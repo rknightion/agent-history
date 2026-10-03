@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from agent_history.common import ssh_target
+from agent_history.common import git_event_extras, git_ops_from_command, ssh_target
 
 
 @pytest.mark.parametrize("command, expected", [
@@ -45,3 +45,46 @@ def test_remote_commands(command, expected):
 ])
 def test_local_commands(command):
     assert ssh_target(command) is None
+
+
+@pytest.mark.parametrize("command, ops", [
+    ("git commit -q -m x", ["commit"]),
+    ('git -C "/a dir" commit -m x', ["commit"]),
+    ("git -c user.name=x -c core.pager=cat commit --amend", ["commit"]),
+    ('cd w && git add . && git commit -qm "a; git push" && git push -q origin main', ["commit", "push"]),
+    ("bash -lc 'git commit -qm hi'", ["commit"]),
+    ("(cd w && git commit -qm x)", ["commit"]),
+    ("git add . ; git commit -qm x", ["commit"]),
+    ("git commit -qm x;", ["commit"]),
+    ("set -o pipefail; git commit -qm x | tee log", ["commit"]),
+    ("set -euo pipefail; git commit -qm x | tee log", ["commit"]),
+    # success of the whole command does not prove the commit ran or worked
+    ("git commit -qm x || true", []),
+    ("git commit -qm x; echo done", []),
+    ("git commit -qm x\necho done", []),
+    ("git commit -qm x | tee log", []),
+    ("git commit -qm x | tee pipefail.log", []),
+    ("echo pipefail; git commit -qm x | tee log", []),
+    ("make test || git commit -qm x", []),
+    ("git commit -qm x &", []),
+    ("if git commit -q -m x; then echo ok; fi", []),
+    ("GIT_AUTHOR_NAME=x git cherry-pick abc", ["cherry_pick"]),
+    (["/bin/zsh", "-lc", "git -C . push origin main"], ["push"]),
+    ("echo 'git commit'", []),
+    ("git status | grep commit", []),
+    ("git push --dry-run", []),
+    ("git push -n origin main", []),
+    ("git commit --dry-run", []),
+    ("git cherry-pick --no-commit abc", []),
+    ("git log --oneline", []),
+    ("", []),
+    (None, []),
+])
+def test_git_ops_from_command(command, ops):
+    assert git_ops_from_command(command) == ops
+
+
+def test_git_event_extras_skip_what_output_already_showed():
+    # one output-matched commit covers one command commit; the second is command-only
+    assert git_event_extras(["commit", "commit", "push"], 1, 0) == [("commit", 1), ("push", 0)]
+    assert git_event_extras(["commit", "push"], 1, 1) == []

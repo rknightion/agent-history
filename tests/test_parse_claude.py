@@ -440,3 +440,39 @@ def test_v4_subagent_follow_ups(v4_store):
 def test_v4_batch_independence(batch):
     paths = [V4_MAIN, V4_SUB]
     assert _comparable(load(*paths, batch_lines=batch)) == _comparable(load(*paths))
+
+
+def _with_b3(tmp_path, command: str, output: str, is_error: bool = False) -> MemStore:
+    """The main fixture with its `git push` call (toolu_b3) rewritten to the given command and output."""
+    records = [json.loads(line) for line in MAIN.read_text().splitlines()]
+    for record in records:
+        for block in (record.get("message") or {}).get("content") or []:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "tool_use" and block.get("id") == "toolu_b3":
+                block["input"] = {"command": command}
+            if block.get("type") == "tool_result" and block.get("tool_use_id") == "toolu_b3":
+                block["content"], block["is_error"] = output, is_error
+                record["toolUseResult"] = {"stdout": "", "stderr": output, "interrupted": False}
+    target = tmp_path / "main.jsonl"
+    target.write_text("".join(json.dumps(record) + "\n" for record in records))
+    store = MemStore()
+    run_file(ClaudeParser, FileContext(str(target), f"claude-test/projects/synthetic/{SID}.jsonl", "claude-test",
+                                       "claude", "test", None, "main"), store)
+    return store
+
+
+def test_quiet_git_push_is_captured_by_command_text(tmp_path):
+    store = _with_b3(tmp_path, 'git -C "/w t" push -q origin main', "")
+    [event] = [r for r in store.rows("git_event") if r["event_uid"].startswith("toolu_b3:")]
+    assert (event["event_uid"], event["op"], event["evidence"], event["sha_short"]) == \
+        ("toolu_b3:push:cmd0", "push", "command", None)
+
+
+def test_command_text_adds_no_second_event_when_output_matched_or_call_failed(tmp_path):
+    out = "To example.invalid:x/y.git\n   1111111..2222222  main -> main"
+    matched = _with_b3(tmp_path, "git push origin main", out)
+    assert [r["evidence"] for r in matched.rows("git_event") if r["event_uid"].startswith("toolu_b3:")] == \
+        ["output_regex"]
+    failed = _with_b3(tmp_path, "git push -q origin main", "error: failed to push", is_error=True)
+    assert not [r for r in failed.rows("git_event") if r["event_uid"].startswith("toolu_b3:")]

@@ -137,3 +137,63 @@ def test_async_pi_child_type_uses_exact_run_and_response_evidence(clean, tmp_pat
     assert clean.execute("SELECT count(*) FROM ah.subagent_spawn WHERE agent='pi'").fetchone()[0] == 2
     assert clean.execute("SELECT count(*) FROM ah.dirty_session").fetchone()[0] == 0
     clean.rollback()
+
+
+def test_pi_loop_keeps_cache_write_and_priced_cost(clean, tmp_path):  # noqa: F811
+    # pi reports one cacheWrite (5m price) and often 0; the loop totals must stay known, not NULL
+    hot, cold = build(tmp_path)
+    added = clean.execute("INSERT INTO ah.model_pricing (model, effective_from, input_per_mtok, cached_input_per_mtok, "
+                          "cache_write_per_mtok, output_per_mtok) VALUES ('model-large','2000-01-01',1,1,1,1), "
+                          "('model-small','2000-01-01',1,1,1,1) ON CONFLICT DO NOTHING "
+                          "RETURNING model, effective_from").fetchall()
+    clean.commit()
+    try:
+        load.refresh(clean, hot, cold, textfile=None, log=lambda *_: None)
+        load.post_passes(clean)
+        row = clean.execute("SELECT cache_write, priced_cost_usd, llm_calls FROM ah.loops").fetchone()
+        assert row[2] > 0 and row[0] == 0 and row[1] is not None
+    finally:
+        clean.rollback()
+        for model, effective_from in added:  # only the rows this test inserted
+            clean.execute("DELETE FROM ah.model_pricing WHERE model = %s AND effective_from = %s",
+                          (model, effective_from))
+        clean.commit()
+
+
+def test_notify_lag_counts_steered_and_idle_notifications(clean, tmp_path):  # noqa: F811
+    hot, cold = tmp_path / "hot", tmp_path / "cold"
+    base = hot / "pi-local" / "sessions" / "--x--"
+    base.mkdir(parents=True)
+    (cold / ".archive-receipts").mkdir(parents=True)
+    (cold / ".archive-receipts" / "receipt.json").write_text("{}")
+    usage = {"input": 1, "output": 1, "cacheRead": 0, "cacheWrite": 0}
+
+    def ts(sec):
+        return f"2026-10-01T10:00:{sec:02d}.000Z"
+
+    def assistant(entry, sec, stop, content):
+        return {"type": "message", "id": entry, "timestamp": ts(sec),
+                "message": {"role": "assistant", "model": "m", "responseId": f"resp-{entry}", "stopReason": stop,
+                            "usage": usage, "content": content}}
+
+    def notify(entry, sec):
+        return {"type": "custom_message", "id": entry, "timestamp": ts(sec), "customType": "subagent-notify",
+                "content": "Background task completed: **lane-worker**\n\ndone"}
+
+    records = [
+        {"type": "session", "version": 3, "id": "lag1", "timestamp": ts(0), "cwd": "/p"},
+        {"type": "message", "id": "e1", "timestamp": ts(0), "message": {"role": "user", "content": "go"}},
+        assistant("a2", 1, "toolUse", [{"type": "toolCall", "id": "c1", "name": "bash", "arguments": {"command": "ls"}}]),
+        notify("n3", 2),   # steered into the running turn: opens no task_notification turn
+        {"type": "message", "id": "t4", "timestamp": ts(3),
+         "message": {"role": "toolResult", "toolCallId": "c1", "toolName": "bash", "isError": False,
+                     "content": [{"type": "text", "text": "ok"}]}},
+        assistant("a5", 5, "stop", []),
+        notify("n6", 10),  # idle: opens its own turn
+        assistant("a7", 14, "stop", []),
+    ]
+    (base / "2026-10-01T10-00-00-000Z_lag1.jsonl").write_text("".join(json.dumps(r) + "\n" for r in records))
+    load.refresh(clean, hot, cold, textfile=None, log=lambda *_: None)
+    rows = clean.execute("SELECT source, steered, lag_s::int FROM ah.v_notify_lag ORDER BY notified_at").fetchall()
+    assert rows == [("subagent-notify", True, 3), ("subagent-notify", False, 4)]
+    clean.rollback()

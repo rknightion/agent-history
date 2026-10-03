@@ -3,7 +3,7 @@
 The pg_dump schema body is retained byte for byte. This is not a schema dumper:
 when squashing schema changes, produce the schema-only dump separately first.
 020 is deliberately recorded without inserting its optional list-price data.
-021 and 022-025 still run on fresh databases; all migrations still run on upgrades
+021 and 022-026 still run on fresh databases; all migrations still run on upgrades
 unless their ledger entry already exists.
 """
 
@@ -29,6 +29,7 @@ REPLAYED = (
     "023_loop_identity.sql",
     "024_loop_progress.sql",
     "025_loop_receipts.sql",
+    "026_loop_planner_signals.sql",
 )
 
 

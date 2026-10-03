@@ -458,6 +458,29 @@ SELECT g.ts, g.sha_short, g.branch, g.op, g.evidence, g.cwd, s.agent, s.namespac
 FROM ah.git_event g JOIN ah.session s ON s.id = g.session_id
 WHERE g.op IN ('commit', 'cherry_pick', 'push', 'pr');
 
+-- Notify lag: for every completion notification a session received (class task_notification_summary,
+-- or detail.source subagent-notify or subagent-incremental-child-notify), the wait until the session's
+-- next successful assistant model call. Counts notifications steered into a running turn, which open
+-- no task_notification turn of their own, so it is not a function of turn.origin. steered: the
+-- notification joined a turn that started before it. lag_s is NULL when no later call exists.
+CREATE OR REPLACE VIEW ah.v_notify_lag AS
+SELECT m.id AS message_id, m.session_id, s.agent, s.namespace, s.session_uid, s.agent_id, s.loop_run_id,
+       m.detail ->> 'source' AS source, m.turn_key, m.ts AS notified_at,
+       COALESCE(t.started_at < m.ts, false) AS steered,
+       nc.response_id AS next_response_id, nc.ts AS next_call_at,
+       EXTRACT(EPOCH FROM (nc.ts - m.ts)) AS lag_s
+FROM ah.message m
+JOIN ah.session s ON s.id = m.session_id
+LEFT JOIN ah.turn t ON t.session_id = m.session_id AND t.turn_key = m.turn_key
+LEFT JOIN LATERAL (
+    SELECT c.response_id, c.ts FROM ah.llm_call c
+    WHERE c.session_id = m.session_id AND c.ts > m.ts AND c.is_api_error IS NOT TRUE
+      AND (c.stop_reason IS NULL OR (c.stop_reason NOT LIKE 'usage:%'
+                                     AND c.stop_reason NOT IN ('compaction', 'branch_summary')))
+    ORDER BY c.ts, c.id LIMIT 1) nc ON true
+WHERE m.message_class = 'task_notification_summary'
+   OR m.detail ->> 'source' IN ('subagent-notify', 'subagent-incremental-child-notify');
+
 -- Which session touched a file path.
 CREATE OR REPLACE FUNCTION ah.who_touched(path_like text, lim integer DEFAULT 50)
 RETURNS TABLE (ts timestamptz, action text, path text, agent text, namespace text, session_uid text,

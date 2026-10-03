@@ -433,3 +433,92 @@ def test_permission_line_keeps_structure_never_text():
     )
     assert web["cmd_verb"] is None and web["is_subagent"] is False
     assert C.permission_row("not json") is None and C.permission_row("\n") is None
+
+
+def _task(repo: Path, name: str, status: str, where: str = "backlog/tasks") -> None:
+    (repo / where).mkdir(parents=True, exist_ok=True)
+    (repo / where / name).write_text(
+        f"---\nid: {name.split(' - ')[0].upper()}\ntitle: t\nstatus: {status}\n---\n\nbody\n"
+    )
+
+
+def test_done_transitions_come_from_status_changes_in_task_files(tmp_path):
+    repo = tmp_path / "tracker"
+    _init_repo(repo)
+    one, two, three = "ex-0001 - First.md", "ex-0002 - Second.md", "ex-0003.01 - Third.md"
+    _task(repo, one, "To Do")
+    _task(repo, two, "Done")  # created Done: not a flip
+    _task(repo, three, "In Progress")
+    _git(repo, "add", "-A")
+    _commit(repo, "add tasks")
+    _task(repo, one, "Done")
+    _git(repo, "add", "-A")
+    flipped = _commit(repo, "close first")
+    _task(repo, one, "In Progress")
+    _git(repo, "add", "-A")
+    _commit(repo, "reopen first")
+    _task(repo, one, "Done")
+    _task(repo, three, "Done")
+    _git(repo, "add", "-A")
+    again = _commit(repo, "close first and third")
+    (repo / "backlog/completed").mkdir()
+    _git(repo, "mv", f"backlog/tasks/{two}", f"backlog/completed/{two}")
+    _commit(repo, "archive second")  # a move of an already Done file: not a flip
+    (repo / "README.md").write_text("status: Done\n")
+    _git(repo, "add", "-A")
+    _commit(repo, "unrelated file mentioning status")
+    info = {"path": repo, "ref": "main", "slug": "github.com/example/tracker"}
+    events = C.backlog_done_events(info, 30, 4)
+    assert sorted((e["task_key"], e["sha"], e["from_status"]) for e in events) == sorted(
+        [("EX-0001", flipped, "To Do"), ("EX-0001", again, "In Progress"), ("EX-0003.01", again, "In Progress")]
+    )
+    assert {e["repo_slug"] for e in events} == {"github.com/example/tracker"}
+    assert all(e["done_at"].tzinfo is not None for e in events)
+
+
+def test_done_transition_ignores_body_lines_and_reads_unicode_names(tmp_path):
+    repo = tmp_path / "tracker"
+    _init_repo(repo)
+    plain, unicode_name = "ex-0001 - Notes.md", 'ex-0002 - Café "quoted".md'
+    for name in (plain, unicode_name):
+        _task(repo, name, "To Do")
+    _git(repo, "add", "-A")
+    _commit(repo, "add")
+    # a `status: Done` line in the body of a task that stays To Do is not a transition
+    (repo / "backlog/tasks" / plain).write_text(
+        "---\nid: EX-0001\ntitle: t\nstatus: To Do\n---\n\nbody\nstatus: In Progress\n"
+    )
+    _git(repo, "add", "-A")
+    _commit(repo, "edit body")
+    (repo / "backlog/tasks" / plain).write_text(
+        "---\nid: EX-0001\ntitle: t\nstatus: To Do\n---\n\nbody\nstatus: Done\n"
+    )
+    _git(repo, "add", "-A")
+    _commit(repo, "body says done")
+    _task(repo, unicode_name, "Done")
+    _git(repo, "add", "-A")
+    closed = _commit(repo, "close the unicode-named task")
+    info = {"path": repo, "ref": "main", "slug": "github.com/example/tracker"}
+    assert [(e["task_key"], e["sha"]) for e in C.backlog_done_events(info, 30, 4)] == [("EX-0002", closed)]
+
+
+def test_done_transition_on_a_merged_branch_counts_once_at_the_merge(tmp_path):
+    repo = tmp_path / "tracker"
+    _init_repo(repo)
+    name = "ex-0001 - First.md"
+    _task(repo, name, "To Do")
+    _git(repo, "add", "-A")
+    _commit(repo, "add")
+    _git(repo, "checkout", "-q", "-b", "feature")
+    _task(repo, name, "Done")
+    _git(repo, "add", "-A")
+    branch_commit = _commit(repo, "close on branch")
+    _git(repo, "checkout", "-q", "main")
+    (repo / "other.txt").write_text("x\n")
+    _git(repo, "add", "-A")
+    _commit(repo, "main moves on")
+    _git(repo, "-c", "commit.gpgsign=false", "merge", "-q", "--no-ff", "-m", "merge feature", "feature")
+    merge = _git(repo, "rev-parse", "HEAD").strip()
+    info = {"path": repo, "ref": "main", "slug": "github.com/example/tracker"}
+    events = C.backlog_done_events(info, 30, 4)
+    assert [(e["task_key"], e["sha"]) for e in events] == [("EX-0001", merge)] and merge != branch_commit

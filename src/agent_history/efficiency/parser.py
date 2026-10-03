@@ -1924,6 +1924,11 @@ class EfficiencyParser:
             match = fmt.CHILD_RUNS_RE.search(text)
             for child in fmt.CHILD_RUN_ITEM_RE.finditer(match.group(1) if match else ""):
                 self.pi_count_spawn(ts, child.group(2), child.group(1))
+            # a single async run: the header opens the text, the directory line is the trailer
+            done = fmt.ASYNC_DONE_RE.match(text)
+            dirs = list(fmt.ASYNC_DIR_RE.finditer(text))
+            if done and dirs:
+                self.pi_count_spawn(ts, dirs[-1].group(1), done.group(2).strip())
 
     def pi_result(self, ts: float | None, message: dict[str, Any]) -> None:
         call_id = message.get("toolCallId")

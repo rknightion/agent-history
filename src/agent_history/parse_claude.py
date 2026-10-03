@@ -117,7 +117,7 @@ from pathlib import PurePosixPath
 from typing import Any, Iterable
 
 from .common import (BOUNDED_STATE_SECONDS, as_bool, as_int, as_str, artifact_kind, cmd_verb, ssh_target,
-                     git_from_output, json_size, key_set, linked_paths, mcp_split, parse_ts,
+                     git_ops_from_command, git_event_extras, git_from_output, json_size, key_set, linked_paths, mcp_split, parse_ts,
                      prompt_origin, sha256_text, text_blocks)
 from .model import (ArtifactRow, AttachmentRow, CompactionRow, ContinuationRow, CostStateRow,
                     FileContext, FileTouchRow, GitEventRow, HookEventRow, LinePos, LlmCallRow,
@@ -198,6 +198,7 @@ class ClaudeParser:
         s.setdefault("open_calls", {})        # id -> [name, ts_iso, turn, byte_offset]
         s.setdefault("closed_calls", {})      # recently answered calls, same shape (bounded LRU)
         s.setdefault("early_results", {})     # results seen before their call: id -> [ts_iso, had_duration]
+        s.setdefault("git_cmds", {})          # Bash tool_use id -> command's git ops (only when it has any)
         s.setdefault("spawns", {})            # tool_use id -> [kind, ts_iso] (Agent/Task/Workflow calls)
         s.setdefault("msg_lines", {})         # message.id -> line count (bounded LRU)
         s.setdefault("last", {})              # change detectors: perm, mode, model, effort, rl:<kind>
@@ -269,6 +270,10 @@ class ClaudeParser:
         if len(er) > STATE_KEYS_MAX:
             for k in list(er)[: len(er) - STATE_KEYS_MAX]:
                 del er[k]
+        gc = self.s["git_cmds"]
+        if len(gc) > STATE_KEYS_MAX:
+            for k in list(gc)[: len(gc) - STATE_KEYS_MAX]:
+                del gc[k]
         oc = self.s["open_calls"]
         if len(oc) > 4 * STATE_KEYS_MAX:
             for k in list(oc)[: len(oc) - 4 * STATE_KEYS_MAX]:
@@ -1214,7 +1219,9 @@ class ClaudeParser:
         if kind in SPAWN_TOOLS or kind == "Workflow":
             self._spawn_result(cid, kind, tur_d, ts, pos, out)
         if kind == "Bash":
-            self._git(cid, tur_d, ctext if isinstance(ctext, str) else "", ts, pos, rec, out)
+            self._git(cid, tur_d, ctext if isinstance(ctext, str) else "", ts, pos, rec, out,
+                      None if is_error else self.s["git_cmds"].get(cid))
+        self.s["git_cmds"].pop(cid, None)
 
     def _tool_io_result(self, rec, block, cid, name, turn, off, tur, ts, pos, out) -> None:
         content = block.get("content")
@@ -1279,7 +1286,7 @@ class ClaudeParser:
             row.background = True
         out.append(row)
 
-    def _git(self, cid, tur, output, ts, pos, rec, out):
+    def _git(self, cid, tur, output, ts, pos, rec, out, cmd_ops=None):
         cwd = as_str(rec.get("cwd"))
         turn = self.s["turn"]
 
@@ -1322,6 +1329,9 @@ class ClaudeParser:
         for _old, new, _src, dst in pushes:
             br = dst.removeprefix("refs/heads/")
             ev("push", f"push:{br}", "output_regex", branch=br, sha_short=new[:12])
+        # a command that succeeded but printed no commit line or push range (`git commit -q`)
+        for op, n in git_event_extras(cmd_ops or [], len(commits), len(pushes)):
+            ev(op, f"{'push' if op == 'push' else 'commit'}:cmd{n}", "command")
 
     # -- assistant lines --------------------------------------------------------------------
 
@@ -1423,6 +1433,9 @@ class ClaudeParser:
         if isinstance(caller, dict) and as_str(caller.get("type")):
             meta["caller"] = caller["type"]
         if name == "Bash":
+            ops = git_ops_from_command(inp.get("command"))
+            if ops:
+                self.s["git_cmds"][cid] = ops
             verb = cmd_verb(inp.get("command"))
             if verb:
                 meta["cmd_verb"] = verb

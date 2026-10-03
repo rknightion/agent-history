@@ -260,3 +260,39 @@ def test_identity_rows_and_foreign_grant_survive_reapply_and_rebuild(clean, tmp_
         with psycopg.connect(os.environ["AGENT_HISTORY_TEST_ADMIN_DSN"]) as admin:
             admin.execute("DROP OWNED BY synthetic_identity_reader")
             admin.execute("DROP ROLE synthetic_identity_reader")
+
+
+def lane_counts(conn):
+    return conn.execute("SELECT lanes_accepted, lanes_reported FROM ah.loops").fetchone()
+
+
+def test_report_data_lanes_give_accepted_and_reported_counts(clean, tmp_path):
+    index_launch(clean, tmp_path, "")
+    assert lane_counts(clean) == (None, None)
+    data = {
+        "repo": "example/project",
+        "loop": "loop1",
+        "goal_sha256": GOAL,
+        "lanes": [
+            {"id": "A", "status": "accepted"},
+            {"id": "B", "status": "parked"},
+            {"id": "C", "status": "accepted"},
+            {"id": "D"},
+        ],
+    }
+    record_report(clean, f"# Loop: example/project loop1 · Goal: {GOAL}\n\n## Data\n```json\n{json.dumps(data)}\n```\n")
+    assert lane_counts(clean) == (2, 4)
+
+
+def test_report_data_without_lanes_leaves_counts_unknown(clean, tmp_path):
+    index_launch(clean, tmp_path, "")
+    data = {"repo": "example/project", "loop": "loop1", "goal_sha256": GOAL}
+    record_report(clean, f"# Loop: example/project loop1 · Goal: {GOAL}\n\n## Data\n```json\n{json.dumps(data)}\n```\n")
+    assert lane_counts(clean) == (None, None)
+
+
+def test_lane_counts_need_matching_data_identity(clean, tmp_path):
+    index_launch(clean, tmp_path, "")
+    data = {"repo": "example/project", "loop": "loop2", "goal_sha256": GOAL, "lanes": [{"status": "accepted"}]}
+    record_report(clean, f"# Loop: example/project loop1 · Goal: {GOAL}\n\n## Data\n```json\n{json.dumps(data)}\n```\n")
+    assert lane_counts(clean) == (None, None)

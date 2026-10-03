@@ -53,6 +53,7 @@ MACHINE = None
 
 REVERT = re.compile(r"This reverts commit ([0-9a-f]{7,40})")
 TASK_ID = re.compile(r"^([A-Za-z]+)-(\d+)((?:\.\d+)*)$")
+TASK_FILE = re.compile(r"^([A-Za-z]+-\d+(?:\.\d+)*) - ")
 GIT_ENV = {**os.environ, "GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0", "LC_ALL": "C"}
 
 
@@ -734,6 +735,102 @@ def backlog(info: dict[str, Any]) -> tuple[dict[str, Any] | None, list[dict[str,
     )
 
 
+def parse_status_changes(text: str) -> list[tuple[str, str, str, str | None, int]]:
+    """`git log --first-parent --diff-merges=first-parent --name-status -z -M --format=%x1e%H%x1f%ct%x1f%P`
+    -> [(sha, parent, path, old_path, committed_ts)] for modified or renamed files; root commits are skipped."""
+    out = []
+    for record in text.split("\x1e")[1:]:
+        nul = record.find("\0")
+        head, rest = (record[:nul], record[nul + 1 :]) if nul >= 0 else (record, "")
+        sha, _, tail = head.partition("\x1f")
+        ct, _, parents = tail.partition("\x1f")
+        parent = parents.split()[0] if parents.split() else None
+        if not parent or not ct.strip().isdigit():
+            continue
+        tokens = [t for t in rest.lstrip("\n").split("\0") if t]
+        k = 0
+        while k < len(tokens):
+            change = tokens[k][:1]
+            if change in ("R", "C"):
+                if k + 2 >= len(tokens):
+                    break
+                if change == "R":
+                    out.append((sha, parent, tokens[k + 2], tokens[k + 1], int(ct)))
+                k += 3
+            else:
+                if k + 1 >= len(tokens):
+                    break
+                if change == "M":
+                    out.append((sha, parent, tokens[k + 1], None, int(ct)))
+                k += 2
+    return out
+
+
+def done_events_from(
+    slug: str,
+    context: str,
+    changes: list[tuple[str, str, str, str | None, int]],
+    blobs: dict[str, str],
+    pad: int | None,
+) -> list[dict[str, Any]]:
+    """Done transitions: the task file's frontmatter status was not Done at the first parent and is Done at the
+    commit. Only frontmatter counts, so a `status:` line in a task body is never a transition."""
+    rows: dict[tuple[str, str], dict[str, Any]] = {}
+    for sha, parent, path, old_path, ct in changes:
+        name = TASK_FILE.match(path.rsplit("/", 1)[-1])
+        key = task_key(name.group(1), pad) if name else None
+        before = parse_frontmatter(blobs.get(f"{parent}:{old_path or path}", ""))
+        after = parse_frontmatter(blobs.get(f"{sha}:{path}", ""))
+        if not key or not before or not after:
+            continue
+        old, new = before.get("status"), after.get("status")
+        if isinstance(new, str) and new.lower() == "done" and isinstance(old, str) and old.lower() != "done":
+            rows[(key, sha)] = {
+                "repo_slug": slug,
+                "task_key": key,
+                "sha": sha,
+                "context": context,
+                "done_at": datetime.fromtimestamp(ct, tz=timezone.utc),
+                "from_status": old[:60],
+            }
+    return list(rows.values())
+
+
+def backlog_done_events(info: dict[str, Any], days: int, pad: int | None) -> list[dict[str, Any]]:
+    """Done transitions of the repo's backlog tasks in the same window `git_commits` uses.
+
+    Walks first-parent history with merge diffs against the first parent, so a transition merged in counts
+    once at the merge and the branch's own commits are not visited. Statuses come from the task files at
+    both revisions, never from diff text.
+    """
+    out = git(
+        info["path"],
+        "-c",
+        "core.quotePath=false",
+        "log",
+        info["ref"],
+        f"--since={days}.days.ago",
+        "--first-parent",
+        "--diff-merges=first-parent",
+        "-G",
+        "^status:",
+        "--diff-filter=MR",
+        "-M",
+        "--name-status",
+        "-z",
+        "--no-ext-diff",
+        "--format=%x1e%H%x1f%ct%x1f%P",
+        "--",
+        *TASK_DIRS,
+        timeout=300,
+    )
+    changes = parse_status_changes(out)
+    specs = {f"{sha}:{path}" for sha, _, path, _, _ in changes}
+    specs |= {f"{parent}:{old or path}" for _, parent, path, old, _ in changes}
+    blobs = cat_files(info["path"], sorted(specs))
+    return done_events_from(info["slug"], repo_context(info["slug"]), changes, blobs, pad)
+
+
 def _skills_in(root: Path) -> list[str]:
     return sorted(p.parent.name for p in root.glob("*/SKILL.md")) if root.is_dir() else []
 
@@ -1020,6 +1117,14 @@ CI_COLS = [
     ("created_at", "timestamptz"),
     ("updated_at", "timestamptz"),
 ]
+DONE_COLS = [
+    ("repo_slug", "text"),
+    ("task_key", "text"),
+    ("sha", "text"),
+    ("context", "text"),
+    ("done_at", "timestamptz"),
+    ("from_status", "text"),
+]
 PREFIX_COLS = [("prefix", "text"), ("repo_slug", "text"), ("context", "text"), ("zero_pad", "smallint")]
 TASK_COLS = [
     ("task_key", "text"),
@@ -1211,6 +1316,7 @@ class Collector:
         prefixes_seen[prefix["prefix"]] = slug
         self.write("task_prefix", PREFIX_COLS, ["prefix"], [prefix])
         self.write("backlog_task", TASK_COLS, ["task_key"], tasks, TASK_GUARD)
+        self._backlog_done(info, prefix["zero_pad"])
         if not self.dry_run and info["fetched"]:
             # Keys gone from origin's tip become 'removed', only after a successful fetch and only when
             # the tip is newer than the task, so a stale Mac never removes a task it has not seen.
@@ -1222,6 +1328,48 @@ class Collector:
                     (slug, [t["task_key"] for t in tasks], tip),
                 )
                 self.add("backlog_task", removed=cur.rowcount)
+
+    def _backlog_done(self, info: dict[str, Any], pad: int | None) -> None:
+        """Done transitions in the `git_commit` window, widened once per repo.
+
+        The first scan of a repo covers every stored `git_commit` row; `ah.backlog_done_scan` records that
+        it happened, so later runs use the normal window even when the repo has no flips.
+        """
+        slug = info["slug"]
+        days = self.rescan_days or RESCAN_DAYS
+        widened = False
+        if not self.dry_run and not self.scalar("SELECT 1 FROM ah.backlog_done_scan WHERE repo_slug = %s", (slug,)):
+            widened = True
+            oldest = self.scalar("SELECT min(committed_at) FROM ah.git_commit WHERE repo_slug = %s", (slug,))
+            if oldest is not None:
+                days = max(days, (datetime.now(timezone.utc) - oldest).days + 1)
+        rows = backlog_done_events(info, days, pad)
+        self.write("backlog_done_event", DONE_COLS, ["repo_slug", "task_key", "sha"], rows)
+        if not self.dry_run and info["fetched"]:
+            # Rows in the window whose commit origin's branch no longer contains (rebased or force-pushed
+            # away). Only a sha this clone has and can prove is not an ancestor is removed.
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    "SELECT DISTINCT sha FROM ah.backlog_done_event WHERE repo_slug = %s "
+                    "AND done_at >= now() - make_interval(days => %s) AND NOT (sha = ANY(%s))",
+                    (slug, days, [r["sha"] for r in rows]),
+                )
+                candidates = [r[0] for r in cur.fetchall()]
+            self.conn.commit()
+            gone = [sha for sha in candidates if off_branch(info["path"], sha, info["ref"])]
+            if gone:
+                with self.conn.transaction(), self.conn.cursor() as cur:
+                    cur.execute(
+                        "DELETE FROM ah.backlog_done_event WHERE repo_slug = %s AND sha = ANY(%s)", (slug, gone)
+                    )
+                    self.add("backlog_done_event", off_default=cur.rowcount)
+        if widened:
+            with self.conn.transaction(), self.conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO ah.backlog_done_scan (repo_slug, widened_at) VALUES (%s, now()) "
+                    "ON CONFLICT (repo_slug) DO NOTHING",
+                    (slug,),
+                )
 
     # -- homes -------------------------------------------------------------------------------
     def homes(self, machine: str, hostname: str) -> None:

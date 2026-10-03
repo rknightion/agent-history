@@ -137,7 +137,7 @@ from datetime import datetime
 from typing import Any, Iterable
 
 from .common import (BOUNDED_STATE_SECONDS, artifact_kind, as_bool, as_int, as_str, cmd_verb, ssh_target,
-                     git_from_output, json_size, linked_paths, mcp_split, parse_ts, prompt_origin,
+                     git_event_extras, git_ops_from_command, git_from_output, json_size, linked_paths, mcp_split, parse_ts, prompt_origin,
                      sha256_text, text_blocks)
 from .model import (ArtifactRow, AttachmentRow, CompactionRow, ContinuationRow, FileContext, FileTouchRow,
                     GitEventRow, LinePos, LlmCallRow, MessageRow, ParseIssueRow, RateLimitRow, RecordTypeRow,
@@ -200,12 +200,14 @@ def _normalise(usage: dict[str, Any]) -> dict[str, int | None]:
     parts = [as_int(usage.get(k)) or 0 for k in ("input_tokens", "cached_input_tokens", "output_tokens")]
     if not any(parts) and (as_int(usage.get("total_tokens")) or 0) > 0:
         # 0.145.0-alpha.18 wrote zeroed breakdowns beside a non-zero total: unknown, not zero.
-        return {"input_uncached": None, "cache_read": None, "cache_write_5m": None, "output": None,
-                "reasoning": None}
+        return {"input_uncached": None, "cache_read": None, "cache_write_5m": None, "cache_write_1h": None,
+                "output": None, "reasoning": None}
     cached = as_int(usage.get("cached_input_tokens")) or 0
     write = as_int(usage.get("cache_write_input_tokens")) or 0
     uncached = None if inp is None else max(inp - cached - write, 0)
-    return {"input_uncached": uncached, "cache_read": cached, "cache_write_5m": write or None,
+    # Codex has no TTL split: all writes price as the 5m write, and 0 stays 0 (known) so loop
+    # cache_write and priced cost are not NULL
+    return {"input_uncached": uncached, "cache_read": cached, "cache_write_5m": write, "cache_write_1h": 0,
             "output": as_int(usage.get("output_tokens")),
             "reasoning": as_int(usage.get("reasoning_output_tokens"))}
 
@@ -1737,7 +1739,7 @@ class CodexParser:
             op.parsed_cmd_types = types or None
             op.output_bytes = json_size(item.get("aggregated_output"))
             op.is_error = status == "failed" or (op.exit_code is not None and op.exit_code != 0)
-            if op.cmd_verb in {"git", "gh"}:
+            if op.cmd_verb in {"git", "gh"} or git_ops_from_command(item.get("command")):
                 rows.extend(self._git(item, op, ts, pos))
         elif itype == "McpToolCall":
             op.mcp_server, op.mcp_tool = as_str(item.get("server")), as_str(item.get("tool"))
@@ -1763,12 +1765,15 @@ class CodexParser:
         key = self._key()
         assert key is not None
         output = item.get("aggregated_output")
-        if not isinstance(output, str) or not output:
-            return []
+        output = output if isinstance(output, str) else ""
         command = _command_text(item.get("command"))
         cwd = as_str(item.get("cwd"))
         rows: list[Row] = []
         commits, pushes = git_from_output(output)
+        if not op.is_error:
+            for kind, n in git_event_extras(git_ops_from_command(item.get("command")), len(commits), len(pushes)):
+                rows.append(GitEventRow(AGENT, f"{op.item_uid}:{'push' if kind == 'push' else 'commit'}:cmd{n}", key,
+                                        ts, kind, "command", pos.byte_offset, op.turn_key, cwd=cwd))
         commit_op = "cherry_pick" if "cherry-pick" in command else "commit"
         for branch, sha in commits:
             rows.append(GitEventRow(AGENT, f"{op.item_uid}:commit:{sha}", key, ts, commit_op, "output_regex",
@@ -1776,7 +1781,7 @@ class CodexParser:
         for _old, new, _src, dst in pushes:
             rows.append(GitEventRow(AGENT, f"{op.item_uid}:push:{new}", key, ts, "push", "output_regex",
                                     pos.byte_offset, op.turn_key, cwd=cwd, branch=dst[:200], sha_short=new[:12]))
-        if op.cmd_verb == "gh":
+        if op.cmd_verb == "gh" and output:
             match = re.search(r"\bgh\s+pr\s+([a-z-]+)", command)
             action = match.group(1) if match and match.group(1) in PR_ACTIONS else None
             seen: set[str] = set()

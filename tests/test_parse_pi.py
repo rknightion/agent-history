@@ -332,3 +332,147 @@ def test_incremental_batches_match_a_single_pass(path):
     def snap(store):
         return {t: sorted(map(repr, rows.values())) for t, rows in store.tables.items() if t != "record_type_seen"}
     assert snap(parse(path, batch_lines=1)) == snap(parse(path))
+
+
+# --- wave 1.5: command-evidenced git events, runtime entry, cache write, background-task notify ---
+
+
+AT = "2026-10-01T10:00:00.000Z"
+
+
+def synth(tmp_path, records: list[dict], name: str = "s.jsonl") -> MemStore:
+    lines = [{"type": "session", "version": 3, "id": "s1", "timestamp": AT, "cwd": "/p"}, *records]
+    path = tmp_path / name
+    path.write_text("".join(json.dumps(r) + "\n" for r in lines))
+    store = MemStore()
+    run_file(PiParser, FileContext(str(path), f"pi-local/sessions/--x--/{name}", "pi-local", "pi", "local", None,
+                                   "main"), store)
+    return store
+
+
+def bash_pair(i: int, command: str, output: str, error: bool = False) -> list[dict]:
+    ts = f"2026-10-01T10:00:{i:02d}.000Z"
+    return [
+        {"type": "message", "id": f"a{i}", "timestamp": ts,
+         "message": {"role": "assistant", "model": "m", "responseId": f"r{i}", "stopReason": "toolUse",
+                     "usage": {"input": 1, "output": 1, "cacheRead": 0, "cacheWrite": 0},
+                     "content": [{"type": "toolCall", "id": f"c{i}", "name": "bash",
+                                  "arguments": {"command": command}}]}},
+        {"type": "message", "id": f"t{i}", "timestamp": ts,
+         "message": {"role": "toolResult", "toolCallId": f"c{i}", "toolName": "bash", "isError": error,
+                     "content": [{"type": "text", "text": output}]}},
+    ]
+
+
+def test_quiet_and_dir_scoped_git_commands_are_captured_by_command_text(tmp_path):
+    store = synth(tmp_path, [
+        *bash_pair(1, "git commit -q -m one", ""),
+        *bash_pair(2, 'git -C "/w t" commit -qm two && git push -q origin main', "(no output)"),
+        *bash_pair(3, "git -c user.name=x commit -m three", "[main 1a2b3c4] three\n 1 file changed"),
+        *bash_pair(4, "git commit -q -m failed", "nothing to commit", error=True),
+        *bash_pair(5, "echo 'git commit'", "git commit"),
+    ])
+    events = sorted((e["event_uid"], e["op"], e["evidence"], e["sha_short"]) for e in store.rows("git_event"))
+    assert events == [
+        ("c1:commit:cmd0", "commit", "command", None),
+        ("c2:commit:cmd0", "commit", "command", None),
+        ("c2:push:cmd0", "push", "command", None),
+        ("c3:commit:1a2b3c4", "commit", "output_regex", "1a2b3c4"),   # output matched: no second event
+    ]
+
+
+def test_runtime_entry_sets_service_tier_for_its_model_only(tmp_path):
+    usage = {"input": 1, "output": 1, "cacheRead": 0, "cacheWrite": 0}
+
+    def assistant(i, model):
+        return {"type": "message", "id": f"a{i}", "timestamp": f"2026-10-01T10:00:{i:02d}.000Z",
+                "message": {"role": "assistant", "model": model, "responseId": f"r{i}", "stopReason": "stop",
+                            "usage": usage, "content": []}}
+    store = synth(tmp_path, [
+        {"type": "custom", "customType": "loop-pi-runtime", "id": "rt", "timestamp": AT,
+         "data": {"v": 1, "variant": "burn-fast", "models": {"gpt-6.1-sol": {"service_tier": "priority"}}}},
+        assistant(1, "gpt-6.1-sol"), assistant(2, "other-model"),
+    ])
+    assert {c["response_id"]: c["service_tier"] for c in store.rows("llm_call")} == {"r1": "priority", "r2": None}
+    bare = synth(tmp_path, [assistant(1, "gpt-6.1-sol")], "bare.jsonl")
+    assert [c["service_tier"] for c in bare.rows("llm_call")] == [None]
+
+
+def test_cache_write_zero_is_kept_and_priced_as_the_5m_write(tmp_path):
+    def assistant(i, write):
+        usage = {"input": 5, "output": 1, "cacheRead": 7}
+        if write is not None:
+            usage["cacheWrite"] = write
+        return {"type": "message", "id": f"a{i}", "timestamp": f"2026-10-01T10:00:{i:02d}.000Z",
+                "message": {"role": "assistant", "model": "m", "responseId": f"r{i}", "stopReason": "stop",
+                            "usage": usage, "content": []}}
+    store = synth(tmp_path, [assistant(1, 0), assistant(2, 30), assistant(3, None)])
+    calls = {c["response_id"]: (c["cache_write_5m"], c["cache_write_1h"]) for c in store.rows("llm_call")}
+    assert calls == {"r1": (0, 0), "r2": (30, 0), "r3": (None, None)}
+
+
+ASYNC_RUN = "9ccea31c-997f-4ba1-9e8e-4d5e4545ed93"
+ASYNC_DIR = "/h/tmp/async-subagent-runs"
+
+
+def background_notify(status: str, run: str, body: str = "lane-worker:\ndone", directory: str = ASYNC_DIR) -> str:
+    # the real pi-subagents format: header, the child's return text, then the run trailer
+    return (f"Background task {status}: **lane-worker**\n\n{body}\n\nAgent: lane-worker  \nModel: gpt-6.1-sol (medium)\n\n"
+            f"Retention-managed async directory: {directory}/{run}\n\n"
+            f"Session file: /h/sessions/--p--/2026-10-01T10-00-00-000Z_root/"
+            f"b1e6571e-99b5-4596-8229-555e89568357/run-0/session.jsonl")
+
+
+def async_launch(i: int, run: str) -> list[dict]:
+    ts = f"2026-10-01T10:00:{i:02d}.000Z"
+    return [
+        {"type": "message", "id": f"a{i}", "timestamp": ts,
+         "message": {"role": "assistant", "model": "m", "responseId": f"r{i}", "stopReason": "toolUse",
+                     "usage": {"input": 1, "output": 1},
+                     "content": [{"type": "toolCall", "id": f"launch{i}", "name": "subagent",
+                                  "arguments": {"agent": "lane-worker", "task": "t", "async": True}}]}},
+        {"type": "message", "id": f"t{i}", "timestamp": ts,
+         "message": {"role": "toolResult", "toolCallId": f"launch{i}", "toolName": "subagent", "isError": False,
+                     "content": [{"type": "text", "text": f"Async: lane-worker [{run}]"}],
+                     "details": {"mode": "single", "runId": run, "asyncId": run, "results": [],
+                                 "asyncDir": f"{ASYNC_DIR}/{run}"}}},
+    ]
+
+
+def test_background_task_notify_completes_the_launching_spawn(tmp_path):
+    second = "11111111-2222-4333-8444-555555555555"
+    store = synth(tmp_path, [
+        *async_launch(1, ASYNC_RUN), *async_launch(2, second),
+        {"type": "custom_message", "id": "n1", "timestamp": "2026-10-01T10:00:10.000Z",
+         "customType": "subagent-notify", "content": background_notify("completed", ASYNC_RUN)},
+        # agent-authored text that quotes another run's trailer must not complete that run
+        {"type": "custom_message", "id": "n2", "timestamp": "2026-10-01T10:00:11.000Z",
+         "customType": "subagent-notify",
+         "content": background_notify("failed", second, body=f"Retention-managed async directory: {ASYNC_DIR}/{ASYNC_RUN}")},
+    ])
+    spawns = {s["spawn_uid"]: s for s in store.rows("subagent_spawn")}
+    assert set(spawns) == {"launch1", "launch2"}   # upserted onto the launch rows, no duplicates
+    assert (spawns["launch1"]["completion_status"], spawns["launch1"]["requested_type"],
+            spawns["launch1"]["workflow_id"]) == ("completed", "lane-worker", ASYNC_RUN)
+    assert spawns["launch1"]["completed_at"] is not None
+    assert (spawns["launch2"]["completion_status"], spawns["launch2"]["workflow_id"]) == ("failed", second)
+
+
+def test_background_task_notify_accepts_a_home_path_with_spaces(tmp_path):
+    store = synth(tmp_path, [
+        *async_launch(1, ASYNC_RUN),
+        {"type": "custom_message", "id": "n1", "timestamp": "2026-10-01T10:00:10.000Z",
+         "customType": "subagent-notify",
+         "content": background_notify("completed", ASYNC_RUN, directory="/Users/a b/My Home/tmp/async-subagent-runs")},
+    ])
+    assert one(store, "subagent_spawn", spawn_uid="launch1")["completion_status"] == "completed"
+
+
+def test_command_evidence_needs_an_exit_status_that_proves_success(tmp_path):
+    store = synth(tmp_path, [
+        *bash_pair(1, "git commit -qm x || true", ""),
+        *bash_pair(2, "git commit -qm x; echo done", "done"),
+        *bash_pair(3, "git push -q | tee log", ""),
+        *bash_pair(4, "git add . && git commit -qm y", ""),
+    ])
+    assert [e["event_uid"] for e in store.rows("git_event")] == ["c4:commit:cmd0"]

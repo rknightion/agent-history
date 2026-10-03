@@ -164,6 +164,14 @@ def test_token_usage_record_per_response_and_turn_sum():
     assert calls["resp_b1"]["model"] == "model-n" and calls["resp_b1"]["context_window"] == 400000
 
 
+def test_codex_cache_write_zero_is_known_and_priced_as_the_5m_write():
+    # b1 reports no cache writes: 0 is a known value, not NULL; Codex has no TTL split so 1h is 0
+    store, _ = load("main_v155.jsonl")
+    calls = {r["response_id"]: r for r in store.rows("llm_call")}
+    assert (calls["resp_b1"]["cache_write_5m"], calls["resp_b1"]["cache_write_1h"]) == (0, 0)
+    assert (calls["resp_b2"]["cache_write_5m"], calls["resp_b2"]["cache_write_1h"]) == (100, 0)
+
+
 # --- messages and turns --------------------------------------------------------------------------
 
 
@@ -415,3 +423,35 @@ def test_v4_continuations_and_resume():
     assert [i.kind for i in store.issues] == ["late_session_meta"]  # v3 row kept
     sub, _ = load("fork_legacy_child.jsonl")
     assert not sub.rows("session_continuation")  # a subagent fork is a spawn, not a continuation
+
+
+def _with_ce1(tmp_path, command: list[str], output: str, exit_code: int = 0) -> MemStore:
+    """The v155 fixture with its git CommandExecution (ce-1) rewritten to the given command and output."""
+    records = [json.loads(line) for line in (FIX / "main_v155.jsonl").read_text().splitlines()]
+    for record in records:
+        item = (record.get("payload") or {}).get("item")
+        if isinstance(item, dict) and item.get("id") == "ce-1":
+            item["command"], item["aggregated_output"], item["exit_code"] = command, output, exit_code
+            item["status"] = "completed" if exit_code == 0 else "failed"
+    path = tmp_path / "rewritten.jsonl"
+    path.write_text("".join(json.dumps(record) + "\n" for record in records))
+    return load("rewritten.jsonl", path=path)[0]
+
+
+def _ce1_events(store: MemStore) -> list[tuple]:
+    return sorted((g["event_uid"], g["op"], g["evidence"], g["sha_short"]) for g in store.rows("git_event")
+                  if g["event_uid"].startswith("ce-1:"))
+
+
+def test_quiet_git_commands_are_captured_by_command_text(tmp_path):
+    store = _with_ce1(tmp_path, ["/bin/zsh", "-lc", 'git -C "/w" commit -qm x && git push -q'], "")
+    assert _ce1_events(store) == [("ce-1:commit:cmd0", "commit", "command", None),
+                                  ("ce-1:push:cmd0", "push", "command", None)]
+
+
+def test_command_text_is_skipped_when_output_matched_or_the_command_failed(tmp_path):
+    out = "[feature 1a2b3c4] synthetic\n   1111111..1a2b3c4  feature -> feature\n"
+    matched = _with_ce1(tmp_path, ["/bin/zsh", "-lc", "git commit -qm x && git push"], out)
+    assert [e[2] for e in _ce1_events(matched)] == ["output_regex", "output_regex"]
+    failed = _with_ce1(tmp_path, ["/bin/zsh", "-lc", "git commit -qm x"], "nothing to commit", exit_code=1)
+    assert _ce1_events(failed) == []

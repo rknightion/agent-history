@@ -21,12 +21,15 @@ from typing import Any, Sequence
 import psycopg
 from psycopg.types.json import Jsonb
 
-from .loop_launch import REPORT_HEADER, identity_fields, parse_launch
+from .loop_launch import REPORT_HEADER, identity_fields, parse_launch, report_lane_counts
 
 ACTIVATED_AT = "1970-01-01T00:00:00Z"   # launches before this instant are ignored
 BARE_LAUNCH = re.compile(r"^`?\s*(\S*launch-[^\s`/]*\.(?:txt|md))\s*`?$")
 LANE_LINE = re.compile(r"^\s*Lane:\s*(\S+)", re.M)
-LANE_RETURN = re.compile(r"```lane-return\s*\n(.*?)```", re.S)
+# The closing fence is a line of its own: a JSON string cannot hold a raw newline, so a fence quoted in
+# a field's text (a gate tail) never ends the block early.
+LANE_RETURN = re.compile(r"^ {0,3}```lane-return[ \t]*\n(.*?)\n {0,3}```[ \t]*$", re.S | re.M)
+LANE_STATUS_V2 = ("complete", "partial", "blocked", "failed")
 CAMPAIGN = re.compile(r"^report-(.*?)-(?:loop|wave)\d+\.md$")
 # wave-notify completion receipt: `sha256:<64 hex> request <id>`, or the legacy `request <id>`.
 COMPLETION = re.compile(r"(?:sha256:([0-9a-f]{64}) )?request \S+\n?")
@@ -330,7 +333,8 @@ def _refresh_identity(conn: psycopg.Connection, finished: Sequence[str] = ()) ->
     Shell command strings are not interpreted. Keep this independent of terminal-evidence tagging.
     """
     initial = conn.execute(
-        "SELECT NOT EXISTS (SELECT 1 FROM ah.meta WHERE key = 'loops_identity_projection_v1')"
+        "SELECT (SELECT count(*) FROM ah.meta WHERE key IN "
+        "('loops_identity_projection_v1', 'loops_lanes_projection_v1')) < 2"
     ).fetchone()[0]
     # Start receipts first seen since the last pass re-project their launch even when it is finished.
     mark = conn.execute("SELECT value FROM ah.meta WHERE key = 'loops_receipt_identity_seen'").fetchone()
@@ -365,6 +369,7 @@ def _refresh_identity(conn: psycopg.Connection, finished: Sequence[str] = ()) ->
     """, (initial, mark[0] if mark else "-infinity", list(finished))).fetchall()
     for uid, root, number, goal_path, report_path, started, launch_text, following, window_known, tied_start in rows:
         fields = identity_fields(launch_text or "", number, goal_path)
+        lane_counts = None   # no captured report yet
         # Match _tag_root's (ts, id) order before filtering refresh candidates. Missing
         # launch messages make report ownership uncertain, not permission to guess it.
         if report_path and window_known:
@@ -396,6 +401,7 @@ def _refresh_identity(conn: psycopg.Connection, finished: Sequence[str] = ()) ->
                     # Latest observed report identity supersedes launch metadata, including null
                     # for a conflicting Data block or a legacy basename without an owner.
                     fields = identity_fields(content, number, report=True)
+                    lane_counts = report_lane_counts(content) or (None, None)
         fields = _receipt_identity(
             conn, uid, goal_path, f"loop{number}" if number is not None else None, fields, started
         )
@@ -405,10 +411,16 @@ def _refresh_identity(conn: psycopg.Connection, finished: Sequence[str] = ()) ->
             (fields["repo"], fields["loop"], fields["goal_sha256"], uid,
              fields["repo"], fields["loop"], fields["goal_sha256"]),
         )
+        if lane_counts is not None:   # the latest captured report's Data, NULL when it has no exact count
+            conn.execute(
+                "UPDATE ah.loops SET lanes_accepted = %s, lanes_reported = %s WHERE launch_uid = %s "
+                "AND (lanes_accepted, lanes_reported) IS DISTINCT FROM (%s, %s)",
+                (*lane_counts, uid, *lane_counts),
+            )
     if initial:
         conn.execute(
-            "INSERT INTO ah.meta (key, value) VALUES ('loops_identity_projection_v1', '1') "
-            "ON CONFLICT (key) DO NOTHING"
+            "INSERT INTO ah.meta (key, value) VALUES ('loops_identity_projection_v1', '1'), "
+            "('loops_lanes_projection_v1', '1') ON CONFLICT (key) DO NOTHING"
         )
     if newest is not None:
         conn.execute(
@@ -525,12 +537,39 @@ def _refresh_progress(conn: psycopg.Connection) -> None:
         """,
             (uid, uid),
         )
+    _refresh_tasks_done(conn)
     if cursor != "complete":
         following = historical[-1] if len(historical) == 128 else "complete"
         conn.execute(
             "INSERT INTO ah.meta (key,value) VALUES (%s,%s) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value",
             (key, following),
         )
+
+
+def _refresh_tasks_done(conn: psycopg.Connection) -> None:
+    """Distinct backlog tasks that moved to Done in the loop's repo within [launch_ts, end_ts).
+
+    Whatever session made the change: the evidence is the repo's own history, collected into
+    ah.backlog_done_event. An open window (running or stale) has no end. NULL when the loop's repo is
+    unknown or the collector has never read that repo's tracker; a repo it has read gets 0, not NULL.
+    Collector rows can arrive after a loop finishes, so every pass recomputes every loop.
+    """
+    conn.execute("""
+        WITH tracked AS (
+            SELECT DISTINCT lower(regexp_replace(repo_slug, '^[^/]+/', '')) AS slug FROM ah.backlog_task
+        ), counted AS (
+            SELECT l.launch_uid,
+                   CASE WHEN EXISTS (SELECT 1 FROM tracked r WHERE r.slug = lower(l.repo))
+                        THEN (SELECT count(DISTINCT d.task_key) FROM ah.backlog_done_event d
+                              WHERE lower(regexp_replace(d.repo_slug, '^[^/]+/', '')) = lower(l.repo)
+                                AND d.done_at >= l.launch_ts
+                                AND d.done_at < COALESCE(CASE WHEN l.status = 'finished' THEN l.end_ts END, 'infinity'))
+                   END AS n
+            FROM ah.loops l WHERE l.repo IS NOT NULL AND l.launch_ts IS NOT NULL
+        )
+        UPDATE ah.loops l SET tasks_done = c.n
+        FROM counted c WHERE l.launch_uid = c.launch_uid AND l.tasks_done IS DISTINCT FROM c.n
+    """)
 
 
 def _tag_root(conn: psycopg.Connection, root_id: int) -> int:
@@ -598,6 +637,29 @@ def _tag_tree(conn: psycopg.Connection, loop_id: int, root_id: int, start: Any, 
         _lane(conn, loop_id, sid, method)
 
 
+def parse_lane_return(text: str) -> tuple[Any, str | None]:
+    """(lane_return, return_status) of the last ```lane-return block in a lane's final message.
+
+    Two shapes, one projection: the earlier free-form object keeps any string `status`; the v2 object
+    (`"v":2`, with `lane` and `status` in complete|partial|blocked|failed) is stored whole and gives
+    return_status only when both are valid. A block that is not a JSON object is {"unparsed": true}.
+    """
+    blocks = LANE_RETURN.findall(text or "")
+    if not blocks:
+        return None, None
+    try:
+        value = json.loads(blocks[-1])
+    except (ValueError, RecursionError):
+        return {"unparsed": True}, None
+    if not isinstance(value, dict):
+        return {"unparsed": True}, None
+    status = value.get("status")
+    if value.get("v") == 2:
+        valid = isinstance(value.get("lane"), str) and status in LANE_STATUS_V2
+        return value, status if valid else None
+    return value, status if isinstance(status, str) else None
+
+
 def _lane(conn: psycopg.Connection, loop_id: int, session_id: int, method: str) -> None:
     info = conn.execute(
         "SELECT s.agent_type, s.agent_role, s.agent_path, sp.name, sp.child_task_name, sp.requested_type, s.agent "
@@ -622,15 +684,7 @@ def _lane(conn: psycopg.Connection, loop_id: int, session_id: int, method: str) 
         "SELECT text FROM ah.message WHERE session_id = %s AND message_class = 'subagent_report' "
         "ORDER BY ts DESC LIMIT 1", (session_id,)).fetchone()
     if report:
-        m = LANE_RETURN.search(report[0])
-        if m:
-            try:
-                lane_return = json.loads(m.group(1))
-            except ValueError:
-                lane_return = {"unparsed": True}
-            if isinstance(lane_return, dict):
-                status = lane_return.get("status")
-                return_status = status if isinstance(status, str) else None
+        lane_return, return_status = parse_lane_return(report[0])
     conn.execute(
         "INSERT INTO ah.lane (loop_run_id, session_id, lane_name, role, link_method, return_status, lane_return) "
         "VALUES (%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (loop_run_id, session_id) DO UPDATE SET "

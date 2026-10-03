@@ -1874,6 +1874,36 @@ def test_pi_root_children_wait_status_spawn_and_loop(eff: Harness):
     assert sum(pi_hot) == 3
 
 
+def test_pi_single_async_run_is_counted_from_its_background_task_notify(eff: Harness):
+    start = eff.now - 500
+    eff.baseline = start - 10
+    directory = eff.hot / PI / "sessions" / "-synthetic-"
+    directory.mkdir(parents=True)
+    run = "9ccea31c-997f-4ba1-9e8e-4d5e4545ed93"
+    notice = (
+        "Background task completed: **lane-worker**\n\nlane-worker:\ndone\n\nAgent: lane-worker  \n\n"
+        f"Retention-managed async directory: /h/tmp/async-subagent-runs/{run}\n\nSession file: /h/s/run-0/session.jsonl"
+    )
+    launch = {"agent": "lane-worker", "task": "one", "async": True}
+    details = {"mode": "single", "runId": run, "asyncId": run, "results": []}
+    (directory / f"{PI_ROOT_BASE}.jsonl").write_text(
+        "".join(
+            [
+                pi_record(start - 2, "session", id=PI_ROOT, cwd="/synthetic/cwd", version=3),
+                pi_message(start + 1, "u1", "user", content=[{"type": "text", "text": "synthetic root"}]),
+                pi_call(start + 2, "a1", "r1", "spawn", "subagent", launch),
+                pi_result(start + 3, "s1", "spawn", "subagent", details=details),
+                pi_call(start + 4, "a2", "r2"),
+                pi_record(start + 20, "custom_message", id="n1", customType="subagent-notify", content=notice),
+                pi_call(start + 21, "a3", "r3"),
+            ]
+        ),
+        encoding="utf-8",
+    )
+    samples = eff.collect(eff.now)
+    assert total(samples, "agent_efficiency_spawns_total", agent="pi") == 1
+
+
 def pi_parse(tmp_path: Path, lines: list[str], skip: float) -> EfficiencyParser:
     relative = f"{PI}/sessions/-synthetic-/{PI_ROOT_BASE}.jsonl"
     state = read_efficiency_state(tmp_path / "absent-state.json", skip)

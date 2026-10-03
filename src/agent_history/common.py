@@ -315,6 +315,116 @@ def git_from_output(text: str) -> tuple[list[tuple[str, str]], list[tuple[str, s
     return commits, pushes
 
 
+SHELL_KEYWORDS = {"if", "then", "elif", "else", "do", "while", "until", "!", "time"}
+GIT_OPTS_WITH_VALUE = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix", "--config-env"}
+
+
+def _command_segments(command: Any) -> list[tuple[list[str], str | None, str | None]]:
+    """(words, operator before, operator after) per shell segment. Grouping tokens `( ) { }` count as no operator."""
+    if isinstance(command, list):
+        words = [w for w in command if isinstance(w, str)]
+        if len(words) >= 3 and PurePosixPath(words[0]).name in {"bash", "sh", "zsh"} and words[1] in {"-c", "-lc"}:
+            return _command_segments(words[2])
+        command = shlex.join(words)
+    if not isinstance(command, str) or not command.strip():
+        return []
+    tokens = _tokens(command)
+    if tokens is None:
+        return []
+    found: list[tuple[list[str], str | None, str | None]] = []
+    segment: list[str] = []
+    before: str | None = None
+    for token in tokens + [";"]:
+        if token in OPERATORS or set(token) <= set(";&|()"):
+            if segment:
+                found.append((segment, before, None if token in {"(", ")", "{", "}"} else token))
+            segment = []
+            before = None if token in {"(", ")", "{", "}"} else token
+        else:
+            segment.append(token)
+    # a trailing `;` or newline ends the command; it is not a following command
+    return [(w, b, None if a == ";" and i == len(found) - 1 else a) for i, (w, b, a) in enumerate(found)]
+
+
+def _git_segment_op(words: list[str]) -> str | None:
+    """The delivery op of one shell segment that runs git: commit | cherry_pick | push, else None."""
+    i = 0
+    while i < len(words):
+        word = words[i]
+        if word in SHELL_KEYWORDS:
+            i += 1
+        elif "=" in word and not word.startswith(("=", "-")) and word.split("=", 1)[0].replace("_", "").isalnum():
+            i += 1
+        elif PurePosixPath(word).name in WRAPPERS:
+            i += 1
+            while i < len(words) and (words[i].startswith("-") or words[i].replace(".", "").isdigit()):
+                i += 1
+        else:
+            break
+    if i >= len(words):
+        return None
+    if PurePosixPath(words[i]).name in {"bash", "sh", "zsh"} and i + 2 < len(words) and words[i + 1] in {"-c", "-lc"}:
+        ops = git_ops_from_command(words[i + 2])
+        return ops[0] if ops else None
+    if PurePosixPath(words[i]).name != "git":
+        return None
+    i += 1
+    while i < len(words) and words[i].startswith("-"):
+        i += 2 if words[i] in GIT_OPTS_WITH_VALUE else 1
+    if i >= len(words):
+        return None
+    sub, flags = words[i], words[i + 1:]
+    longs = {f for f in flags if f.startswith("--")}
+    shorts = "".join(f[1:] for f in flags if f.startswith("-") and not f.startswith("--"))
+    if "--help" in longs:
+        return None
+    if sub == "commit":
+        return None if "--dry-run" in longs else "commit"
+    if sub == "push":
+        return None if longs & {"--dry-run", "--delete"} or "n" in shorts else "push"
+    if sub == "cherry-pick":
+        skip = {"--no-commit", "--abort", "--quit", "--skip"}
+        return None if longs & skip or "n" in shorts else "cherry_pick"
+    return None
+
+
+_PIPEFAIL_RE = re.compile(r"(?:^|[;&|(\s])set\s+(?:-[A-Za-z]+\s+)*-[A-Za-z]*o\s+pipefail\b")
+
+
+def git_ops_from_command(command: Any) -> list[str]:
+    """Delivery ops a shell command would perform, one per git invocation, in order.
+
+    `commit`, `cherry_pick` or `push`. Tolerates global options (`-C <dir>`, `-c k=v`), env
+    assignments, wrappers and `bash -c`; only a segment whose executable is git counts, so a quoted
+    mention such as `echo "git commit"` yields nothing. Dry runs, `--help` and cherry-pick
+    `--no-commit`/`--abort` yield nothing. Command text only: the caller must also know the command
+    succeeded, because a failed commit prints nothing a parser can tell apart. Only segments whose success
+    the command's exit status proves count: not before `||`, `;` plus another command, `&` or a pipe
+    (unless `set -o pipefail` is on), nor after `||`.
+    """
+    text = command if isinstance(command, str) else " ".join(map(str, command or []))
+    pipefail = bool(_PIPEFAIL_RE.search(text))
+    ops = []
+    for words, before, after in _command_segments(command):
+        op = _git_segment_op(words)
+        # the command's exit status must prove this segment succeeded: nothing may mask or skip it
+        if after in {"||", ";", "&", ";;"} or before in {"||", "&"} or (after in {"|", "|&"} and not pipefail):
+            continue
+        if op:
+            ops.append(op)
+    return ops
+
+
+def git_event_extras(ops: list[str], commits_seen: int, pushes_seen: int) -> list[tuple[str, int]]:
+    """Command-evidence git events not already covered by output matches: [(op, n)], n counting up
+    per group. A command's commits and cherry-picks share one budget, so output that matched a
+    commit line suppresses one command-derived commit rather than adding a second event for it."""
+    commit_like = [op for op in ops if op != "push"]
+    extras = [(op, n) for n, op in enumerate(commit_like) if n >= commits_seen]
+    extras += [("push", n) for n in range(pushes_seen, sum(1 for op in ops if op == "push"))]
+    return extras
+
+
 def mcp_split(tool_name: str) -> tuple[str | None, str | None]:
     """`mcp__<server>__<tool>` -> (server, tool). Server names may contain single underscores."""
     if not tool_name.startswith("mcp__"):

@@ -229,6 +229,24 @@ def identity_fields(text, loop, goal_path=None, *, report=False):
     return result
 
 
+def report_lane_counts(text):
+    """(accepted, reported) from a report's `## Data` `lanes[]`, or None when no exact count exists.
+
+    Only a report whose first line is the canonical header and whose Data names the same repo, loop
+    and goal hash counts; a lane is accepted when its `status` is exactly "accepted". Absent, invalid
+    or ambiguous Data, or a Data without a `lanes` list, yields None rather than zero.
+    """
+    pattern = r"# Loop: ([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+) (loop[0-9]+) · Goal: ([0-9a-f]{64})"
+    first = re.fullmatch(pattern, re.split(r"\r\n|\r|\n", text, maxsplit=1)[0])
+    data = _identity_data(text) if first else None
+    if not data or any(data.get(k) != v for k, v in zip(("repo", "loop", "goal_sha256"), first.groups())):
+        return None
+    lanes = data.get("lanes")
+    if not isinstance(lanes, list) or not all(isinstance(lane, dict) for lane in lanes):
+        return None
+    return sum(1 for lane in lanes if lane.get("status") == "accepted"), len(lanes)
+
+
 def _identity_data(text):
     """Return a Data object, False when absent, or None when invalid/ambiguous."""
     sections, body, marker, in_data = [], [], None, False

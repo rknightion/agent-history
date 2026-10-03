@@ -85,3 +85,104 @@ def test_owner_allowlist_skips_other_owners(clean, repo):  # noqa: F811
     result = collect(clean, config)
     assert result["repos"] == 0 and result["skipped"] == ["widget: owner not in [identities] git_owners"]
     clean.rollback()
+
+
+def test_done_events_are_collected_idempotently_and_survive_rescans(clean, repo):  # noqa: F811
+    import time
+
+    from agent_history.collect_git import Collector
+
+    clean.execute("DELETE FROM ah.backlog_done_event WHERE repo_slug = 'github.com/example-org/widget'")
+    clean.execute("DELETE FROM ah.backlog_done_scan WHERE repo_slug = 'github.com/example-org/widget'")
+    clean.commit()
+    tasks = repo / "backlog" / "tasks"
+    tasks.mkdir(parents=True)
+    task = tasks / "ex-0001 - First.md"
+    task.write_text("---\nid: EX-0001\ntitle: t\nstatus: To Do\n---\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "add task")
+    task.write_text("---\nid: EX-0001\ntitle: t\nstatus: Done\n---\n")
+    git(repo, "commit", "-q", "-am", "close task")
+    info = {"path": repo, "ref": "main", "slug": "github.com/example-org/widget", "fetched": False}
+    try:
+        for _ in range(2):
+            Collector(clean, False, time.monotonic() + 60)._backlog_done(info, 4)
+        rows = clean.execute(
+            "SELECT task_key, from_status FROM ah.backlog_done_event WHERE repo_slug = 'github.com/example-org/widget'"
+        ).fetchall()
+        assert rows == [("EX-0001", "To Do")]
+    finally:
+        clean.rollback()
+        clean.execute("DELETE FROM ah.backlog_done_event WHERE repo_slug = 'github.com/example-org/widget'")
+        clean.execute("DELETE FROM ah.backlog_done_scan WHERE repo_slug = 'github.com/example-org/widget'")
+        clean.commit()
+
+
+def test_repo_with_no_done_events_is_widened_once(clean, repo, monkeypatch):  # noqa: F811
+    import time
+
+    from agent_history import collect_git
+    from agent_history.collect_git import RESCAN_DAYS, Collector
+
+    slug = "github.com/example-org/widget"
+    clean.execute("DELETE FROM ah.backlog_done_scan WHERE repo_slug = %s", (slug,))
+    clean.execute("DELETE FROM ah.backlog_done_event WHERE repo_slug = %s", (slug,))
+    clean.execute(
+        "INSERT INTO ah.git_commit (repo_slug, sha, context, committed_at, author_is_owner, subject, parent_count, "
+        "files_changed, insertions, deletions, on_default) "
+        "VALUES (%s, %s, 'default', now() - interval '100 days', true, 's', 1, 0, 0, 0, true)",
+        (slug, "f" * 40),
+    )
+    clean.commit()
+    windows = []
+    monkeypatch.setattr(collect_git, "backlog_done_events", lambda info, days, pad: windows.append(days) or [])
+    info = {"path": repo, "ref": "main", "slug": slug, "fetched": False}
+    try:
+        for _ in range(2):
+            Collector(clean, False, time.monotonic() + 60)._backlog_done(info, 4)
+        assert windows[0] > RESCAN_DAYS and windows[1] == RESCAN_DAYS  # no flips, yet only the first run widens
+    finally:
+        clean.rollback()
+        clean.execute("DELETE FROM ah.backlog_done_scan WHERE repo_slug = %s", (slug,))
+        clean.execute("DELETE FROM ah.git_commit WHERE repo_slug = %s", (slug,))
+        clean.commit()
+
+
+def test_done_events_for_commits_left_off_the_default_branch_are_removed(clean, repo):  # noqa: F811
+    import time
+
+    from agent_history.collect_git import Collector
+
+    slug = "github.com/example-org/widget"
+    git(repo, "checkout", "-q", "-b", "side")
+    (repo / "side.txt").write_text("x\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "side commit")
+    side = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"], capture_output=True, text=True, check=True
+    ).stdout.strip()
+    git(repo, "checkout", "-q", "main")
+    rows = [("EX-0001", side), ("EX-0002", "9" * 40)]  # a commit this clone has but main lacks; an unknown sha
+    clean.execute("DELETE FROM ah.backlog_done_scan WHERE repo_slug = %s", (slug,))
+    for task, sha in rows:
+        clean.execute(
+            "INSERT INTO ah.backlog_done_event (repo_slug, task_key, sha, done_at) VALUES (%s, %s, %s, now())",
+            (slug, task, sha),
+        )
+    clean.commit()
+    info = {"path": repo, "ref": "main", "slug": slug, "fetched": True}
+    try:
+        Collector(clean, False, time.monotonic() + 60)._backlog_done(info, 4)
+        kept = clean.execute(
+            "SELECT task_key FROM ah.backlog_done_event WHERE repo_slug = %s ORDER BY task_key", (slug,)
+        ).fetchall()
+        assert kept == [("EX-0002",)]  # unknown shas are never removed on a guess
+    finally:
+        clean.rollback()
+        for task, sha in rows:
+            clean.execute(
+                "DELETE FROM ah.backlog_done_event WHERE repo_slug = %s AND task_key = %s AND sha = %s",
+                (slug, task, sha),
+            )
+        clean.execute("DELETE FROM ah.backlog_done_scan WHERE repo_slug = %s", (slug,))
+        clean.commit()
