@@ -3,6 +3,9 @@ set shell := ["bash", "-euo", "pipefail", "-c"]
 # renovate: datasource=docker depName=paradedb/paradedb
 paradedb_image := "paradedb/paradedb:18-v0.25.10@sha256:188591a0bc317beb2c6d6d3f9ef0cb3e859d09ecc15a71dda5e9a027876686cf"
 
+# renovate: datasource=docker depName=prom/prometheus
+prometheus_image := "prom/prometheus:v3.15.0@sha256:efd719c99d83b060d9daefdcf00360461adf279f45ef5391f8d111892118753e"
+
 # List the recipes
 default:
     @just --list
@@ -37,11 +40,11 @@ test:
 
 # The pre-commit gate: format, lint, tests and the leak gate
 [group('check')]
-check: fmt-check lint baseline-ledger-check test leak
+check: fmt-check lint baseline-ledger-check alerts-check test leak
 
 # check plus the legs that need a Docker daemon
 [group('check')]
-ci: check pg-test
+ci: check pg-test alerts-test
 
 # Needs a Docker daemon: the database tests against a disposable ParadeDB container
 [group('check')]
@@ -74,6 +77,22 @@ pg-test:
 [group('check')]
 baseline-ledger-check:
     python3 bin/baseline-ledger.py
+
+# Verify the generated Grafana alert rules and fixtures match grafana/build_rules.py
+[group('check')]
+alerts-check:
+    python3 grafana/build_rules.py --check
+
+# Needs a Docker daemon: run the alert rule fixtures through promtool
+[group('check')]
+alerts-test:
+    docker run --rm --entrypoint promtool -v "{{ justfile_directory() }}/alerts/grafana-managed/fixtures:/fixtures:ro" \
+        "{{ prometheus_image }}" test rules /fixtures/embed.test.yaml
+
+# Regenerate the Grafana alert rules and their promtool fixtures
+[group('gen')]
+gen-alerts:
+    python3 grafana/build_rules.py
 
 # Regenerate the baseline's seed-data trailer, retaining the schema-only dump
 [group('gen')]

@@ -1,0 +1,89 @@
+{
+  "apiVersion": "rules.alerting.grafana.app/v0alpha1",
+  "kind": "AlertRule",
+  "metadata": {
+    "annotations": {
+      "grafana.app/folder": "REPLACE_WITH_FOLDER_UID"
+    },
+    "labels": {
+      "grafana.app/folder": "REPLACE_WITH_FOLDER_UID"
+    },
+    "name": "agent-history-embed-stale"
+  },
+  "spec": {
+    "annotations": {
+      "description": "The last successful embedding run is more than 3600 seconds old while agent_history_embed_pending_messages is above zero. Check the embedding run failed alert for the reason. Absent series do not fire (noDataState OK): this rule cannot tell a healthy embedder from an exporter that does not see the worker snapshot.",
+      "summary": "agent-history embeddings have not succeeded for over an hour with messages pending"
+    },
+    "execErrState": "Error",
+    "expressions": {
+      "A": {
+        "datasourceUID": "grafanacloud-prom",
+        "model": {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "grafanacloud-prom"
+          },
+          "expr": "(time() - max(agent_history_embed_last_success_timestamp_seconds{job=\"agent-history\"}) > 3600) and on() (max(agent_history_embed_pending_messages{job=\"agent-history\"}) > 0)",
+          "instant": true,
+          "range": false,
+          "refId": "A"
+        },
+        "queryType": "instant",
+        "relativeTimeRange": {
+          "from": "15m",
+          "to": "0s"
+        }
+      },
+      "B": {
+        "datasourceUID": "__expr__",
+        "model": {
+          "datasource": {
+            "type": "__expr__",
+            "uid": "__expr__"
+          },
+          "expression": "A",
+          "reducer": "last",
+          "refId": "B",
+          "type": "reduce"
+        }
+      },
+      "C": {
+        "datasourceUID": "__expr__",
+        "model": {
+          "conditions": [
+            {
+              "evaluator": {
+                "params": [
+                  0
+                ],
+                "type": "gt"
+              }
+            }
+          ],
+          "datasource": {
+            "type": "__expr__",
+            "uid": "__expr__"
+          },
+          "expression": "B",
+          "refId": "C",
+          "type": "threshold"
+        },
+        "source": true
+      }
+    },
+    "for": "15m",
+    "labels": {
+      "domain": "observability",
+      "service": "agent-history",
+      "severity": "critical",
+      "source": "agent-history"
+    },
+    "noDataState": "OK",
+    "paused": false,
+    "title": "agent-history embeddings stalled with messages pending",
+    "trigger": {
+      "interval": "1m"
+    }
+  }
+}

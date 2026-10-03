@@ -1,0 +1,89 @@
+{
+  "apiVersion": "rules.alerting.grafana.app/v0alpha1",
+  "kind": "AlertRule",
+  "metadata": {
+    "annotations": {
+      "grafana.app/folder": "REPLACE_WITH_FOLDER_UID"
+    },
+    "labels": {
+      "grafana.app/folder": "REPLACE_WITH_FOLDER_UID"
+    },
+    "name": "agent-history-embed-run-failed"
+  },
+  "spec": {
+    "annotations": {
+      "description": "The last embedding run failed with reason {{ $labels.reason }} (auth, billing_quota, rate_limit, route, provider_error, network, other, or unreported when the run reported no reason) for at least 15 minutes. billing_quota means the provider refused for credit or quota. Absent series do not fire (noDataState OK): this rule cannot tell a healthy embedder from an exporter that does not see the worker snapshot.",
+      "summary": "agent-history embedding run failed: {{ $labels.reason }}"
+    },
+    "execErrState": "Error",
+    "expressions": {
+      "A": {
+        "datasourceUID": "grafanacloud-prom",
+        "model": {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "grafanacloud-prom"
+          },
+          "expr": "max by (reason) ((agent_history_embed_last_failure_reason{job=\"agent-history\"} == 1) and on() (agent_history_embed_run_success{job=\"agent-history\"} == 0)) or on() label_replace(1 - min(agent_history_embed_run_success{job=\"agent-history\"}) == 1, \"reason\", \"unreported\", \"\", \"\")",
+          "instant": true,
+          "range": false,
+          "refId": "A"
+        },
+        "queryType": "instant",
+        "relativeTimeRange": {
+          "from": "15m",
+          "to": "0s"
+        }
+      },
+      "B": {
+        "datasourceUID": "__expr__",
+        "model": {
+          "datasource": {
+            "type": "__expr__",
+            "uid": "__expr__"
+          },
+          "expression": "A",
+          "reducer": "last",
+          "refId": "B",
+          "type": "reduce"
+        }
+      },
+      "C": {
+        "datasourceUID": "__expr__",
+        "model": {
+          "conditions": [
+            {
+              "evaluator": {
+                "params": [
+                  0
+                ],
+                "type": "gt"
+              }
+            }
+          ],
+          "datasource": {
+            "type": "__expr__",
+            "uid": "__expr__"
+          },
+          "expression": "B",
+          "refId": "C",
+          "type": "threshold"
+        },
+        "source": true
+      }
+    },
+    "for": "15m",
+    "labels": {
+      "domain": "observability",
+      "service": "agent-history",
+      "severity": "warning",
+      "source": "agent-history"
+    },
+    "noDataState": "OK",
+    "paused": false,
+    "title": "agent-history embedding run failed",
+    "trigger": {
+      "interval": "1m"
+    }
+  }
+}

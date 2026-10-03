@@ -1,0 +1,301 @@
+{
+  "evaluation_interval": "1m",
+  "rule_files": [],
+  "tests": [
+    {
+      "input_series": [
+        {
+          "series": "agent_history_embed_run_success{job=\"agent-history\"}",
+          "values": "0x150"
+        },
+        {
+          "series": "agent_history_embed_last_success_timestamp_seconds{job=\"agent-history\"}",
+          "values": "0x150"
+        },
+        {
+          "series": "agent_history_embed_last_failure_reason{reason=\"billing_quota\",job=\"agent-history\"}",
+          "values": "1x150"
+        },
+        {
+          "series": "agent_history_embed_pending_messages{job=\"agent-history\"}",
+          "values": "5x150"
+        }
+      ],
+      "interval": "1m",
+      "name": "HTTP 402 billing_quota failed run",
+      "promql_expr_test": [
+        {
+          "eval_time": "10m",
+          "exp_samples": [
+            {
+              "labels": "{reason=\"billing_quota\"}",
+              "value": 1
+            }
+          ],
+          "expr": "max by (reason) ((agent_history_embed_last_failure_reason{job=\"agent-history\"} == 1) and on() (agent_history_embed_run_success{job=\"agent-history\"} == 0)) or on() label_replace(1 - min(agent_history_embed_run_success{job=\"agent-history\"}) == 1, \"reason\", \"unreported\", \"\", \"\")"
+        },
+        {
+          "eval_time": "10m",
+          "exp_samples": [],
+          "expr": "(time() - max(agent_history_embed_last_success_timestamp_seconds{job=\"agent-history\"}) > 3600) and on() (max(agent_history_embed_pending_messages{job=\"agent-history\"}) > 0)"
+        }
+      ]
+    },
+    {
+      "input_series": [
+        {
+          "series": "agent_history_embed_run_success{job=\"agent-history\"}",
+          "values": "0x150"
+        },
+        {
+          "series": "agent_history_embed_last_success_timestamp_seconds{job=\"agent-history\"}",
+          "values": "0x150"
+        },
+        {
+          "series": "agent_history_embed_last_failure_reason{reason=\"rate_limit\",job=\"agent-history\"}",
+          "values": "1x150"
+        },
+        {
+          "series": "agent_history_embed_pending_messages{job=\"agent-history\"}",
+          "values": "5x150"
+        }
+      ],
+      "interval": "1m",
+      "name": "HTTP 429 rate_limit failed run",
+      "promql_expr_test": [
+        {
+          "eval_time": "10m",
+          "exp_samples": [
+            {
+              "labels": "{reason=\"rate_limit\"}",
+              "value": 1
+            }
+          ],
+          "expr": "max by (reason) ((agent_history_embed_last_failure_reason{job=\"agent-history\"} == 1) and on() (agent_history_embed_run_success{job=\"agent-history\"} == 0)) or on() label_replace(1 - min(agent_history_embed_run_success{job=\"agent-history\"}) == 1, \"reason\", \"unreported\", \"\", \"\")"
+        },
+        {
+          "eval_time": "10m",
+          "exp_samples": [],
+          "expr": "(time() - max(agent_history_embed_last_success_timestamp_seconds{job=\"agent-history\"}) > 3600) and on() (max(agent_history_embed_pending_messages{job=\"agent-history\"}) > 0)"
+        }
+      ]
+    },
+    {
+      "input_series": [
+        {
+          "series": "agent_history_embed_run_success{job=\"agent-history\"}",
+          "values": "0x150"
+        },
+        {
+          "series": "agent_history_embed_last_success_timestamp_seconds{job=\"agent-history\"}",
+          "values": "0x150"
+        },
+        {
+          "series": "agent_history_embed_pending_messages{job=\"agent-history\"}",
+          "values": "5x150"
+        }
+      ],
+      "interval": "1m",
+      "name": "failed run without a reported reason",
+      "promql_expr_test": [
+        {
+          "eval_time": "10m",
+          "exp_samples": [
+            {
+              "labels": "{reason=\"unreported\"}",
+              "value": 1
+            }
+          ],
+          "expr": "max by (reason) ((agent_history_embed_last_failure_reason{job=\"agent-history\"} == 1) and on() (agent_history_embed_run_success{job=\"agent-history\"} == 0)) or on() label_replace(1 - min(agent_history_embed_run_success{job=\"agent-history\"}) == 1, \"reason\", \"unreported\", \"\", \"\")"
+        },
+        {
+          "eval_time": "10m",
+          "exp_samples": [],
+          "expr": "(time() - max(agent_history_embed_last_success_timestamp_seconds{job=\"agent-history\"}) > 3600) and on() (max(agent_history_embed_pending_messages{job=\"agent-history\"}) > 0)"
+        }
+      ]
+    },
+    {
+      "input_series": [
+        {
+          "series": "agent_history_embed_run_success{job=\"agent-history\"}",
+          "values": "1x150"
+        },
+        {
+          "series": "agent_history_embed_last_success_timestamp_seconds{job=\"agent-history\"}",
+          "values": "0x150"
+        },
+        {
+          "series": "agent_history_embed_pending_messages{job=\"agent-history\"}",
+          "values": "5x150"
+        }
+      ],
+      "interval": "1m",
+      "name": "successful run",
+      "promql_expr_test": [
+        {
+          "eval_time": "10m",
+          "exp_samples": [],
+          "expr": "max by (reason) ((agent_history_embed_last_failure_reason{job=\"agent-history\"} == 1) and on() (agent_history_embed_run_success{job=\"agent-history\"} == 0)) or on() label_replace(1 - min(agent_history_embed_run_success{job=\"agent-history\"}) == 1, \"reason\", \"unreported\", \"\", \"\")"
+        },
+        {
+          "eval_time": "10m",
+          "exp_samples": [],
+          "expr": "(time() - max(agent_history_embed_last_success_timestamp_seconds{job=\"agent-history\"}) > 3600) and on() (max(agent_history_embed_pending_messages{job=\"agent-history\"}) > 0)"
+        }
+      ]
+    },
+    {
+      "input_series": [
+        {
+          "series": "agent_history_embed_pending_messages{job=\"agent-history\"}",
+          "values": "5x150"
+        }
+      ],
+      "interval": "1m",
+      "name": "absent worker snapshot",
+      "promql_expr_test": [
+        {
+          "eval_time": "2h",
+          "exp_samples": [],
+          "expr": "max by (reason) ((agent_history_embed_last_failure_reason{job=\"agent-history\"} == 1) and on() (agent_history_embed_run_success{job=\"agent-history\"} == 0)) or on() label_replace(1 - min(agent_history_embed_run_success{job=\"agent-history\"}) == 1, \"reason\", \"unreported\", \"\", \"\")"
+        },
+        {
+          "eval_time": "2h",
+          "exp_samples": [],
+          "expr": "(time() - max(agent_history_embed_last_success_timestamp_seconds{job=\"agent-history\"}) > 3600) and on() (max(agent_history_embed_pending_messages{job=\"agent-history\"}) > 0)"
+        }
+      ]
+    },
+    {
+      "input_series": [
+        {
+          "series": "agent_history_embed_run_success{job=\"agent-history\"}",
+          "values": "0x150"
+        },
+        {
+          "series": "agent_history_embed_last_success_timestamp_seconds{job=\"agent-history\"}",
+          "values": "0x150"
+        },
+        {
+          "series": "agent_history_embed_last_failure_reason{reason=\"billing_quota\",job=\"agent-history\"}",
+          "values": "1x150"
+        },
+        {
+          "series": "agent_history_embed_pending_messages{job=\"agent-history\"}",
+          "values": "5x150"
+        }
+      ],
+      "interval": "1m",
+      "name": "stale success with messages pending",
+      "promql_expr_test": [
+        {
+          "eval_time": "3660s",
+          "exp_samples": [
+            {
+              "labels": "{reason=\"billing_quota\"}",
+              "value": 1
+            }
+          ],
+          "expr": "max by (reason) ((agent_history_embed_last_failure_reason{job=\"agent-history\"} == 1) and on() (agent_history_embed_run_success{job=\"agent-history\"} == 0)) or on() label_replace(1 - min(agent_history_embed_run_success{job=\"agent-history\"}) == 1, \"reason\", \"unreported\", \"\", \"\")"
+        },
+        {
+          "eval_time": "3660s",
+          "exp_samples": [
+            {
+              "labels": "{}",
+              "value": 3660
+            }
+          ],
+          "expr": "(time() - max(agent_history_embed_last_success_timestamp_seconds{job=\"agent-history\"}) > 3600) and on() (max(agent_history_embed_pending_messages{job=\"agent-history\"}) > 0)"
+        }
+      ]
+    },
+    {
+      "input_series": [
+        {
+          "series": "agent_history_embed_run_success{job=\"agent-history\"}",
+          "values": "1x150"
+        },
+        {
+          "series": "agent_history_embed_last_success_timestamp_seconds{job=\"agent-history\"}",
+          "values": "0x150"
+        },
+        {
+          "series": "agent_history_embed_pending_messages{job=\"agent-history\"}",
+          "values": "5x150"
+        }
+      ],
+      "interval": "1m",
+      "name": "stale success at the threshold",
+      "promql_expr_test": [
+        {
+          "eval_time": "3600s",
+          "exp_samples": [],
+          "expr": "max by (reason) ((agent_history_embed_last_failure_reason{job=\"agent-history\"} == 1) and on() (agent_history_embed_run_success{job=\"agent-history\"} == 0)) or on() label_replace(1 - min(agent_history_embed_run_success{job=\"agent-history\"}) == 1, \"reason\", \"unreported\", \"\", \"\")"
+        },
+        {
+          "eval_time": "3600s",
+          "exp_samples": [],
+          "expr": "(time() - max(agent_history_embed_last_success_timestamp_seconds{job=\"agent-history\"}) > 3600) and on() (max(agent_history_embed_pending_messages{job=\"agent-history\"}) > 0)"
+        }
+      ]
+    },
+    {
+      "input_series": [
+        {
+          "series": "agent_history_embed_run_success{job=\"agent-history\"}",
+          "values": "1x150"
+        },
+        {
+          "series": "agent_history_embed_last_success_timestamp_seconds{job=\"agent-history\"}",
+          "values": "0x150"
+        },
+        {
+          "series": "agent_history_embed_pending_messages{job=\"agent-history\"}",
+          "values": "0x150"
+        }
+      ],
+      "interval": "1m",
+      "name": "stale success with nothing pending",
+      "promql_expr_test": [
+        {
+          "eval_time": "2h",
+          "exp_samples": [],
+          "expr": "max by (reason) ((agent_history_embed_last_failure_reason{job=\"agent-history\"} == 1) and on() (agent_history_embed_run_success{job=\"agent-history\"} == 0)) or on() label_replace(1 - min(agent_history_embed_run_success{job=\"agent-history\"}) == 1, \"reason\", \"unreported\", \"\", \"\")"
+        },
+        {
+          "eval_time": "2h",
+          "exp_samples": [],
+          "expr": "(time() - max(agent_history_embed_last_success_timestamp_seconds{job=\"agent-history\"}) > 3600) and on() (max(agent_history_embed_pending_messages{job=\"agent-history\"}) > 0)"
+        }
+      ]
+    },
+    {
+      "input_series": [
+        {
+          "series": "agent_history_embed_run_success{job=\"agent-history\"}",
+          "values": "1x150"
+        },
+        {
+          "series": "agent_history_embed_last_success_timestamp_seconds{job=\"agent-history\"}",
+          "values": "0x150"
+        }
+      ],
+      "interval": "1m",
+      "name": "stale success with pending count absent",
+      "promql_expr_test": [
+        {
+          "eval_time": "2h",
+          "exp_samples": [],
+          "expr": "max by (reason) ((agent_history_embed_last_failure_reason{job=\"agent-history\"} == 1) and on() (agent_history_embed_run_success{job=\"agent-history\"} == 0)) or on() label_replace(1 - min(agent_history_embed_run_success{job=\"agent-history\"}) == 1, \"reason\", \"unreported\", \"\", \"\")"
+        },
+        {
+          "eval_time": "2h",
+          "exp_samples": [],
+          "expr": "(time() - max(agent_history_embed_last_success_timestamp_seconds{job=\"agent-history\"}) > 3600) and on() (max(agent_history_embed_pending_messages{job=\"agent-history\"}) > 0)"
+        }
+      ]
+    }
+  ]
+}

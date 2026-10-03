@@ -46,6 +46,14 @@ weaken the leak gate to make CI green.
 - Database tests skip unless `AGENT_HISTORY_TEST_DSN` names a database whose name contains
   `agent_history_test`; they truncate tables. Never point them at a catalogue you use.
 
+## Alert rules
+
+`grafana/build_rules.py` generates the Grafana-managed alert rules in `alerts/grafana-managed/` and
+their promtool fixtures; never edit the generated JSON. `just gen-alerts` regenerates them, `just
+check` fails on drift and `just ci` runs the fixtures through promtool. `.github/workflows/grafana-sync.yml`
+publishes them from `main` with gcx; it never deletes a rule, and its verify step reports a stale
+live rule as a failure.
+
 ## Schema
 
 `src/agent_history/sql/baseline.sql` is generated; never edit it. Its schema body is a schema-only
