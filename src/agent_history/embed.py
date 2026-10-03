@@ -31,6 +31,8 @@ from typing import Callable
 
 import psycopg
 
+from . import telemetry
+
 from .load import ADVISORY_LOCK
 
 EMBED_LOCK = ADVISORY_LOCK + 2
@@ -519,6 +521,7 @@ def gate(conn: psycopg.Connection) -> str | None:
     return None
 
 
+@telemetry.instrument_pass("embed.pass")
 def run(conn: psycopg.Connection, provider: Provider, cap_tokens: int = 3_000_000,
         daily_cap: int = 30_000_000, batch_items: int = 2000, log=print,
         gc_interval_hours: float | None = None) -> EmbedStats:

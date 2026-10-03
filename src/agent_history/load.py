@@ -21,7 +21,7 @@ from typing import Any, Iterable, Iterator
 import psycopg
 from psycopg.types.json import Jsonb
 
-from . import model
+from . import model, telemetry
 from .common import parse_ts
 from .model import (KEEP, MAX, MIN, NOTHING, OR, UPDATE, AttachmentRow, FileContext, LinePos, MessageRow,
                     ParseIssueRow, RecordTypeRow, Row, SessionKey, SessionRow, ToolIoRow)
@@ -981,6 +981,7 @@ def task_refs(conn: psycopg.Connection) -> str:
     return "incremental"
 
 
+@telemetry.instrument_pass("postpass.pass")
 def post_passes(conn: psycopg.Connection, refresh_id: int | None = None) -> dict[str, int]:
     """Link, roll up and loop-tag the sessions dirty at the start; marks added meanwhile survive.
 
@@ -1156,7 +1157,7 @@ def connect(dsn: str | None = None) -> psycopg.Connection:
         dsn = os.environ.get("AGENT_HISTORY_DSN") or load_config().dsn
     if not dsn:
         raise SystemExit("agent-history: no database DSN (set AGENT_HISTORY_DSN or dsn in the config)")
-    return psycopg.connect(dsn, application_name="agent-history-index", autocommit=False)
+    return telemetry.db_connect(dsn, application_name="agent-history-index", autocommit=False)
 
 
 ANALYTICS_FILES = ("analytics.sql", "search.sql", "structure.sql", "efficiency.sql")
@@ -1235,6 +1236,7 @@ def create_post_load_indexes(conn: psycopg.Connection) -> None:
         conn.autocommit = False
 
 
+@telemetry.instrument_pass("index.pass")
 def refresh(conn: psycopg.Connection, hot: Path | None = HOT_ROOT, cold: Path | None = COLD_ROOT,
             namespaces: Iterable[str] | None = None, limit_files: int | None = None,
             textfile: Path | None = TEXTFILE, log=print, kind: str = "refresh",

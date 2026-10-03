@@ -38,6 +38,8 @@ from pathlib import Path
 from typing import Any
 
 import psycopg
+
+from . import telemetry
 from psycopg.types.json import Jsonb
 
 APP_DB = Path("/opt/agentic-journal/app.db")
@@ -149,6 +151,7 @@ def _session_map(conn: psycopg.Connection) -> dict[tuple[str, str, str], tuple[i
     return out
 
 
+@telemetry.instrument_pass("journal_sync.pass")
 def sync(conn: psycopg.Connection, db_path: Path = APP_DB) -> dict[str, Any]:
     result: dict[str, Any] = {
         "journal_rows": 0,
@@ -158,16 +161,18 @@ def sync(conn: psycopg.Connection, db_path: Path = APP_DB) -> dict[str, Any]:
         "journal_bad_json": 0,
     }
     try:
-        view = _open_view(db_path)
+        with telemetry.operation("journal.read", {"db.system.name": "sqlite"}):
+            view = _open_view(db_path)
     except _Skip as exc:
         result["journal_skipped_reason"] = exc.reason
         return result
 
     try:
         try:
-            instance_ids = sorted(
-                {row[0] for row in view.execute(f"SELECT app_instance_id FROM {VIEW}") if row[0] is not None}
-            )
+            with telemetry.operation("journal.read", {"db.system.name": "sqlite"}):
+                instance_ids = sorted(
+                    {row[0] for row in view.execute(f"SELECT app_instance_id FROM {VIEW}") if row[0] is not None}
+                )
         except sqlite3.Error as exc:
             result["journal_skipped_reason"] = f"cannot read {VIEW}: {exc}"
             return result
@@ -201,7 +206,9 @@ def sync(conn: psycopg.Connection, db_path: Path = APP_DB) -> dict[str, Any]:
             params = (since,)
         query += " ORDER BY analysed_at"
         try:
-            rows = view.execute(query, params).fetchall()
+            with telemetry.operation("journal.read", {"db.system.name": "sqlite"}) as read_span:
+                rows = view.execute(query, params).fetchall()
+                read_span.set_attribute("journal_rows", len(rows))
         except sqlite3.Error as exc:
             result["journal_skipped_reason"] = f"cannot read rows from {VIEW}: {exc}"
             return result

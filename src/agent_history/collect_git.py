@@ -24,6 +24,7 @@ from typing import Any, Iterable
 from zoneinfo import ZoneInfo
 
 from .common import cmd_verb
+from . import telemetry
 
 HOME = Path.home()
 ENV_FILE = Path(os.environ["AGENT_HISTORY_INGEST_ENV"]) if os.environ.get("AGENT_HISTORY_INGEST_ENV") else None
@@ -432,10 +433,27 @@ def permission_row(line: str) -> dict[str, Any] | None:
 # --------------------------------------------------------------------------------------------
 
 
+def _outbound_run(name, *args, **kwargs):
+    with telemetry.operation(name, client=True) as span:
+        result = subprocess.run(*args, **kwargs)
+        span.set_attribute("process.exit.code", result.returncode)
+        if result.returncode:
+            span.set_attributes({"agent_history.outcome": "error", "error.type": "status"})
+            telemetry.emit("outbound.call.failed", {"error.type": "status", "process.exit.code": result.returncode})
+        return result
+
+
 def git(repo: Path, *args: str, timeout: int = 60, check: bool = True) -> str:
-    result = subprocess.run(
-        ["git", "-C", str(repo), *args], capture_output=True, text=True, env=GIT_ENV, timeout=timeout, errors="replace"
-    )
+    with telemetry.operation("git.read") as span:
+        result = subprocess.run(
+            ["git", "-C", str(repo), *args],
+            capture_output=True,
+            text=True,
+            env=GIT_ENV,
+            timeout=timeout,
+            errors="replace",
+        )
+        span.set_attribute("process.exit.code", result.returncode)
     if check and result.returncode != 0:
         raise RuntimeError(f"git {args[0]} exit {result.returncode}")
     return result.stdout if result.returncode == 0 else ""
@@ -479,7 +497,8 @@ def classify_repo(repo: Path, forks: set[str] | None) -> tuple[dict[str, Any] | 
     # history, so a Mac that is behind (or ahead with unpushed commits) cannot flip on_default
     # or mark Backlog tasks removed. The fetch only updates remote-tracking refs.
     fetched = (
-        subprocess.run(
+        _outbound_run(
+            "git.fetch",
             ["git", "-C", str(repo), "fetch", "--quiet", "--no-tags", "origin", branch],
             capture_output=True,
             env=GIT_ENV,
@@ -528,7 +547,8 @@ def github_forks() -> set[str] | None:
     forks: set[str] = set()
     for owner in GITHUB_OWNERS:
         try:
-            out = subprocess.run(
+            out = _outbound_run(
+                "github.list_repositories",
                 ["gh", "repo", "list", owner, "--limit", "1000", "--json", "nameWithOwner,isFork"],
                 capture_output=True,
                 text=True,
@@ -605,7 +625,8 @@ class CICollectionError(RuntimeError):
 
 def ci_runs(slug: str) -> list[dict[str, Any]]:
     owner_name = slug.split("/", 1)[1]
-    out = subprocess.run(
+    out = _outbound_run(
+        "github.list_runs",
         [
             "gh",
             "run",
@@ -875,7 +896,6 @@ def _check_ingest_role(conn) -> None:
 
 
 def connect(dsn=None, config=None):
-    import psycopg
     from .config import load_config
 
     dsn = (
@@ -885,12 +905,12 @@ def connect(dsn=None, config=None):
         or (config or load_config()).dsn
     )
     if dsn:
-        conn = psycopg.connect(
+        conn = telemetry.db_connect(
             dsn, application_name="agent-history-collect", connect_timeout=10, options="-c statement_timeout=120000"
         )
     else:
         env = load_env()
-        conn = psycopg.connect(
+        conn = telemetry.db_connect(
             host=env.get("PGHOST"),
             port=env.get("PGPORT", "5432"),
             dbname=env.get("PGDATABASE"),
@@ -1264,6 +1284,7 @@ def configure(config) -> None:
     LOCK_FILE = setting.lock_file
 
 
+@telemetry.instrument_pass("collect_git.pass")
 def collect(conn, config, context=None):
     """Compatibility entry point for collect-git, using the common commit/file parser."""
     configure(config)
@@ -1303,6 +1324,15 @@ def machine_name() -> tuple[str, str]:
 
 
 def main(argv: list[str] | None = None, dsn=None) -> int:
+    with telemetry.lifecycle("agent-history-collect"):
+        with telemetry.pass_span("collect.pass") as span:
+            result = _main(argv, dsn)
+            if result:
+                span.counts({"errors": 1})
+            return result
+
+
+def _main(argv: list[str] | None = None, dsn=None) -> int:
     parser = argparse.ArgumentParser(
         prog="agent-history-collect", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
@@ -1360,6 +1390,8 @@ def main(argv: list[str] | None = None, dsn=None) -> int:
     finally:
         if conn is not None:
             conn.close()
+    with telemetry.pass_span("collect.pass") as span:
+        span.counts({"repositories": summary.get("repos", 0)})
     summary["duration_s"] = round(time.monotonic() - started, 1)
     summary["ts"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     print(json.dumps(summary, separators=(",", ":")), flush=True)

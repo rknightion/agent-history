@@ -15,7 +15,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import load
+from . import load, telemetry
 from .config import ConfigError, load_config
 
 SQL_DIR = Path(__file__).resolve().parent / "sql"
@@ -168,6 +168,28 @@ def main(argv: list[str] | None = None) -> int:
     journal.add_argument("--source-db", type=Path)
 
     args = parser.parse_args(argv)
+    workers = {
+        "index": "index.pass",
+        "embed": "embed.pass",
+        "postpass": "postpass.pass",
+        "journal-sync": "journal_sync.pass",
+        "collect-git": "collect_git.pass",
+        "collect": "collect.pass",
+    }
+    if args.command not in workers and args.command != "exporter":
+        return _dispatch(args, parser, argv, reader_commands)
+    with telemetry.lifecycle("agent-history-" + args.command):
+        if args.command == "exporter" or (args.command in ("index", "embed") and args.every is not None):
+            return _dispatch(args, parser, argv, reader_commands)
+        with telemetry.pass_span(workers[args.command]) as span:
+            result = _dispatch(args, parser, argv, reader_commands)
+            if result:
+                span.counts({"errors": 1})
+            return result
+
+
+def _dispatch(args, parser, argv, reader_commands):
+    from . import reader
 
     if args.command == "metrics":
         from .metrics.parity import run
@@ -241,6 +263,8 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"agent-history: {args.command} failed ({category}); retrying", file=sys.stderr)
                 else:
                     print(f"agent-history: {args.command} succeeded", file=sys.stderr)
+                # Ended iteration spans/logs reach OTLP before the idle interval.
+                telemetry.force_flush()
                 time.sleep(args.every)
         finally:
             if args.command == "index":
