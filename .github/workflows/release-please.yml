@@ -16,6 +16,9 @@ jobs:
       contents: write
       pull-requests: write
       id-token: write
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
     steps:
       - id: bao
         uses: rknightion/.github/.github/actions/broker-token@f32275a4a7641f34db5cb005d270db961b54a680 # v1.25.3
@@ -30,3 +33,29 @@ jobs:
           token: ${{ steps.bao.outputs.token }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
+  publish:
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
+    uses: ./.github/workflows/publish.yml
+    permissions:
+      actions: read # permits reusable workflow metadata access
+      contents: write # publishes release metadata
+      packages: write # pushes the release image
+      id-token: write # obtains keyless signing credentials
+      attestations: write # publishes provenance attestations
+      security-events: write # uploads container scan results
+    with:
+      release_tag: ${{ needs.release-please.outputs.tag_name }}
+  edge:
+    needs: release-please
+    if: needs.release-please.outputs.release_created != 'true'
+    uses: ./.github/workflows/publish.yml
+    permissions:
+      actions: read # permits reusable workflow metadata access
+      contents: write # publishes edge metadata
+      packages: write # pushes the edge image
+      id-token: write # obtains keyless signing credentials
+      attestations: write # publishes provenance attestations
+      security-events: write # uploads container scan results
+    with:
+      release_tag: ""

@@ -1,0 +1,106 @@
+name: publish
+on:
+  workflow_call:
+    inputs:
+      release_tag:
+        required: false
+        type: string
+        default: ""
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: publish-${{ inputs.release_tag || github.ref }}
+  cancel-in-progress: false
+jobs:
+  metadata:
+    name: resolve source commit
+    if: github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      commit: ${{ steps.build.outputs.commit }}
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
+          persist-credentials: false
+      - id: build
+        run: |
+          commit="$(git rev-parse HEAD)"
+          # The reusable builds the ref head it checks out, so a head that moved past the
+          # triggering push would publish different source under this commit's tags.
+          if [ "${commit}" != "${GITHUB_SHA}" ]; then
+            # Not a failure of this commit: skip, so a landed SHA never reads red for a moved ref.
+            echo "::notice::ref head ${commit} is not the triggering commit ${GITHUB_SHA}; skipping, a newer run publishes it"
+            exit 0
+          fi
+          echo "commit=${commit}" >> "$GITHUB_OUTPUT"
+  image:
+    name: publish image
+    needs: metadata
+    if: needs.metadata.outputs.commit != ''
+    permissions:
+      contents: write # publishes release metadata through the reusable workflow
+      packages: write # pushes OCI images
+      id-token: write # obtains keyless signing credentials
+      attestations: write # publishes provenance attestations
+      security-events: write # uploads container scan results
+    uses: rknightion/.github/.github/workflows/container-publish.yml@f32275a4a7641f34db5cb005d270db961b54a680 # v1.25.3
+    with:
+      release-tag: ${{ inputs.release_tag }}
+      dockerfile: Dockerfile
+  sha-tag:
+    name: tag full commit SHA and report digest
+    needs: [metadata, image]
+    if: needs.metadata.outputs.commit != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      packages: write # adds the full-SHA tag to the published manifest list
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Tag the published digest with the full commit SHA
+        env:
+          COMMIT: ${{ needs.metadata.outputs.commit }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          IMAGE: ghcr.io/${{ github.repository }}
+        run: |
+          # The reusable tags every default-branch build main-<7 char sha> (docker/metadata-action
+          # type=sha) but offers no full-SHA tag and exposes no digest output.
+          # A release run is tagged by version (semver strips a leading v), an edge run main-<sha7>.
+          if [ -n "${RELEASE_TAG}" ]; then sources=("${RELEASE_TAG#v}" "${RELEASE_TAG}"); else sources=("main-${COMMIT:0:7}"); fi
+          digest=""
+          for source in "${sources[@]}"; do
+            digest="$(docker buildx imagetools inspect "${IMAGE}:${source}" --format '{{json .Manifest.Digest}}' 2>/dev/null | tr -d '"')" || digest=""
+            case "${digest}" in sha256:????????????????????????????????????????????????????????????????) break ;; *) digest="" ;; esac
+          done
+          if [ -z "${digest}" ]; then
+            echo "::error::could not resolve a digest for ${IMAGE} from ${sources[*]}"; exit 1
+          fi
+          # Same manifest list under a second tag: the digest, signature and attestation are unchanged.
+          docker buildx imagetools create -t "${IMAGE}:${COMMIT}" "${IMAGE}@${digest}"
+          tagged="$(docker buildx imagetools inspect "${IMAGE}:${COMMIT}" --format '{{json .Manifest.Digest}}' | tr -d '"')"
+          if [ "${tagged}" != "${digest}" ]; then
+            echo "::error::${IMAGE}:${COMMIT} resolved to ${tagged}, expected ${digest}"; exit 1
+          fi
+          {
+            echo "### agent-history image"
+            echo
+            echo "- Source commit: \`${COMMIT}\`"
+            echo "- Image: \`${IMAGE}:${COMMIT}\`"
+            echo "- Digest: \`${digest}\`"
+            echo "- Pin: \`${IMAGE}@${digest}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
