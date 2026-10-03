@@ -1,12 +1,24 @@
-FROM python:3.14-slim
+# Build against the same Python and libc as the minimal runtime.
+FROM cgr.dev/chainguard/python:latest-dev@sha256:96cb9c155159daf6b21e70555f244081909ff161c5589112ddf308624c1a1c77 AS builder
+USER 0
 WORKDIR /app
 COPY pyproject.toml README.md LICENSE ./
 COPY src/ ./src/
-RUN python -m pip install --no-cache-dir . && \
-    groupadd --system --gid 10001 agent && useradd --system --uid 10001 --gid agent --home-dir /nonexistent agent && \
+# Use the builder's pip to populate a pip-free virtualenv.
+RUN python -c 'import sys; assert sys.version_info[:2] == (3, 14)' && \
+    python -m venv --without-pip /opt/venv && \
+    python -m pip --python /opt/venv install --no-cache-dir . && \
     mkdir -p /state /var/lib/alloy/textfile-agent-history && \
-    chown agent:agent /state /var/lib/alloy/textfile-agent-history
+    chown 10001:10001 /state /var/lib/alloy/textfile-agent-history
+
+FROM cgr.dev/chainguard/python:latest@sha256:1961420e5f93bd056d4b0b40eca12cdf01b3ed09177aa4d6ec71fab38cbf158f
+WORKDIR /app
+COPY --from=builder /opt/venv /opt/venv
+COPY --from=builder /app /app
+COPY --from=builder --chown=10001:10001 /state /state
+COPY --from=builder --chown=10001:10001 /var/lib/alloy/textfile-agent-history /var/lib/alloy/textfile-agent-history
 USER 10001:10001
-ENV PYTHONDONTWRITEBYTECODE=1
+ENV PATH="/opt/venv/bin:${PATH}" \
+    PYTHONDONTWRITEBYTECODE=1
 ENTRYPOINT ["agent-history"]
 CMD ["exporter"]
