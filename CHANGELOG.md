@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.3.0](https://github.com/rknightion/agent-history/compare/v0.2.0...v0.3.0) (2026-10-03)
+
+
+### Features
+
+* project exact loop identity for receiver joins ([0a61376](https://github.com/rknightion/agent-history/commit/0a613764b4c2a63ecdcd62dd1b7bd4cc3a55a3bf))
+
+
+### Bug Fixes
+
+* bound loop identity refresh and validate launch headers ([3aefe0b](https://github.com/rknightion/agent-history/commit/3aefe0b47e54030682d105d0ea3a2e5991c66ff9))
+* isolate Python application in minimal runtime image ([a96ed74](https://github.com/rknightion/agent-history/commit/a96ed7415ca0f0f6fa429975cc741bfc817c9c10))
+* preserve ordered launch identity windows ([b944bc8](https://github.com/rknightion/agent-history/commit/b944bc832482b2e1a2d8fe57f1eb4cf821f8a00f))
+
+
+### Documentation
+
+* state that planned work is tracked off-repository ([5b7ec4a](https://github.com/rknightion/agent-history/commit/5b7ec4aac4a85246848dbadbe972d4d645112f55))
+
 ## [0.2.0](https://github.com/rknightion/agent-history/compare/v0.1.0...v0.2.0) (2026-10-02)
 
 
