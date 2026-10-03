@@ -1386,7 +1386,8 @@ def _main(argv: list[str] | None = None, dsn=None) -> int:
         if any(e.get("error") == "gh_unavailable" for e in collector.errors):
             summary["ok"] = False  # visible to a log/launchd check instead of silently skipping GitHub
     except Exception as error:  # a failed run is reported, never raised into launchd as a traceback storm
-        summary.update(ok=False, error=type(error).__name__, detail=(str(error).splitlines() or [""])[0][:200])
+        # The type only: a driver or OS message can quote a DSN, a path or row text into the log.
+        summary.update(ok=False, error=type(error).__name__)
     finally:
         if conn is not None:
             conn.close()
@@ -1398,5 +1399,17 @@ def _main(argv: list[str] | None = None, dsn=None) -> int:
     return 0 if summary["ok"] else 1
 
 
+def run(argv: list[str] | None = None) -> int:
+    """Console entry point: a failure outside the reported run is one bounded line, never a traceback."""
+    from .cli import bound_diagnostics, failure_line
+
+    bound_diagnostics()
+    try:
+        return main(argv)
+    except Exception as error:
+        print(failure_line("collect", error), file=sys.stderr)
+        return 1
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(run())

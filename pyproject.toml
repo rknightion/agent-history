@@ -13,8 +13,8 @@ mcp = ["mcp>=2.0"]
 otel = ["opentelemetry-api>=1.39,<2", "opentelemetry-sdk>=1.39,<2", "opentelemetry-exporter-otlp-proto-http>=1.39,<2"]
 
 [project.scripts]
-agent-history = "agent_history.cli:main"
-agent-history-collect = "agent_history.collect_git:main"
+agent-history = "agent_history.cli:run"
+agent-history-collect = "agent_history.collect_git:run"
 agent-history-mcp = "agent_history.mcp_server:main"
 
 [dependency-groups]

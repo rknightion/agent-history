@@ -27,6 +27,9 @@ missing, the file unreadable or locked (the indexer runs under systemd ProtectSy
 read-only view of the filesystem), the view missing, or the view lacking a required column, is
 treated as "nothing to do this run" -- reported in the returned dict, never raised. Only an
 unexpected Postgres error propagates (refresh() already wraps this call in try/except).
+
+Skip reasons are printed by the CLI and shipped as worker logs, so they are fixed text plus at most an
+exception type name: never the database path or a driver message, which can quote schema or row text.
 """
 
 from __future__ import annotations
@@ -123,7 +126,7 @@ def _parse_topics(value: Any) -> list[tuple[str, str | None, float | None]] | No
 
 def _open_view(db_path: Path) -> sqlite3.Connection:
     if not db_path.is_file():
-        raise _Skip(f"{db_path} does not exist")
+        raise _Skip("journal database does not exist")
     try:
         view = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=30)
         view.execute("PRAGMA query_only = 1")
@@ -135,10 +138,10 @@ def _open_view(db_path: Path) -> sqlite3.Connection:
             pass
         msg = str(exc)
         if "no such table" in msg or "no such view" in msg:
-            raise _Skip(f"view {VIEW} does not exist in {db_path}") from exc
+            raise _Skip(f"view {VIEW} does not exist") from exc
         if "no such column" in msg:
-            raise _Skip(f"view {VIEW} is missing a required column: {exc}") from exc
-        raise _Skip(f"cannot open/read {db_path}: {exc}") from exc
+            raise _Skip(f"view {VIEW} is missing a required column") from exc
+        raise _Skip(f"cannot open/read the journal database ({type(exc).__name__})") from exc
     return view
 
 
@@ -178,7 +181,7 @@ def sync(conn: psycopg.Connection, db_path: Path = APP_DB) -> dict[str, Any]:
                     {row[0] for row in view.execute(f"SELECT app_instance_id FROM {VIEW}") if row[0] is not None}
                 )
         except sqlite3.Error as exc:
-            result["journal_skipped_reason"] = f"cannot read {VIEW}: {exc}"
+            result["journal_skipped_reason"] = f"cannot read {VIEW} ({type(exc).__name__})"
             return result
         if len(instance_ids) > 1:
             result["journal_skipped_reason"] = (
@@ -214,7 +217,7 @@ def sync(conn: psycopg.Connection, db_path: Path = APP_DB) -> dict[str, Any]:
                 rows = view.execute(query, params).fetchall()
                 read_span.set_attribute("journal_rows", len(rows))
         except sqlite3.Error as exc:
-            result["journal_skipped_reason"] = f"cannot read rows from {VIEW}: {exc}"
+            result["journal_skipped_reason"] = f"cannot read rows from {VIEW} ({type(exc).__name__})"
             return result
     finally:
         view.close()

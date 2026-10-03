@@ -10,8 +10,10 @@ from __future__ import annotations
 import argparse
 from contextlib import redirect_stderr, redirect_stdout
 import json
+import logging
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -19,6 +21,86 @@ from . import load, telemetry
 from .config import ConfigError, load_config
 
 SQL_DIR = Path(__file__).resolve().parent / "sql"
+
+# Commands whose stdout/stderr is shipped as worker logs. A failure there is reported as one line with
+# a fixed category and the exception type, never the exception message: driver, provider and OS
+# messages can quote a DSN, a path, a provider response body or row text.
+WORKER_COMMANDS = frozenset(
+    {
+        "index",
+        "embed",
+        "postpass",
+        "journal-sync",
+        "collect-git",
+        "collect",
+        "init",
+        "seed-pricing",
+        "rebuild",
+        "create-indexes",
+        "embed-gc",
+        "create-vector-index",
+    }
+)
+_command: str | None = None  # the parsed subcommand of the current process, for run()
+
+
+def failure_category(error: BaseException) -> str:
+    """A fixed, content-free category for an exception."""
+    if isinstance(error, ConfigError):
+        return "config"
+    if type(error).__name__ == "ProviderError":
+        return "provider"
+    if type(error).__module__.split(".")[0] == "psycopg":
+        return "database"
+    if isinstance(error, OSError):
+        return "io"
+    if isinstance(error, LookupError):
+        return "provider"
+    return "error"
+
+
+def failure_line(command: str, error: BaseException) -> str:
+    return f"agent-history: {command} failed ({failure_category(error)}: {type(error).__name__})"
+
+
+class _WithheldLog(logging.Handler):
+    """Last-resort handler: a library warning names its logger and level, never its message."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            sys.stderr.write(f"agent-history: {record.name} {record.levelname} (message withheld)\n")
+        except Exception:
+            pass
+
+
+def _thread_failure(hook: threading.ExceptHookArgs) -> None:
+    if hook.exc_type is SystemExit:
+        return
+    category = failure_category(hook.exc_value) if hook.exc_value is not None else "error"
+    print(f"agent-history: background thread failed ({category}: {hook.exc_type.__name__})", file=sys.stderr)
+
+
+def _unraisable(hook) -> None:
+    print(f"agent-history: ignored exception ({type(hook.exc_value).__name__})", file=sys.stderr)
+
+
+def bound_diagnostics() -> None:
+    """Process-wide: unhandled-thread, unraisable and unconfigured-logging output stays content-free."""
+    logging.lastResort = _WithheldLog(logging.WARNING)
+    threading.excepthook = _thread_failure
+    sys.unraisablehook = _unraisable
+
+
+def run(argv: list[str] | None = None) -> int:
+    """Console entry point. A worker command fails loudly with one bounded line instead of a traceback."""
+    bound_diagnostics()
+    try:
+        return main(argv)
+    except Exception as error:
+        if _command not in WORKER_COMMANDS:
+            raise
+        print(failure_line(_command, error), file=sys.stderr)
+        return 1
 
 
 def _sources(config, overrides: list[str] | None) -> dict[str, Path]:
@@ -28,13 +110,12 @@ def _sources(config, overrides: list[str] | None) -> dict[str, Path]:
     for item in overrides:
         namespace, sep, directory = item.partition("=")
         if not sep:
-            raise SystemExit(f"--source expects NAMESPACE=DIR, got {item!r}")
+            # Never echo the supplied value: a worker's stderr is shipped as logs.
+            raise SystemExit("--source expects NAMESPACE=DIR")
         from .config import NAMESPACE
 
         if not NAMESPACE.match(namespace):
-            raise SystemExit(
-                f"--source namespace {namespace!r} must look like claude-<name>, codex-<name> or pi-<name>"
-            )
+            raise SystemExit("--source namespace must look like claude-<name>, codex-<name> or pi-<name>")
         out[namespace] = Path(directory).expanduser().resolve()
     return out
 
@@ -167,6 +248,8 @@ def main(argv: list[str] | None = None) -> int:
     journal.add_argument("--source-db", type=Path)
 
     args = parser.parse_args(argv)
+    global _command
+    _command = args.command
     workers = {
         "index": "index.pass",
         "embed": "embed.pass",
@@ -496,4 +579,4 @@ def _dispatch(args, parser, argv, reader_commands):
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(run())
