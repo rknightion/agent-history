@@ -1,5 +1,32 @@
 # Changelog
 
+## [0.3.0](https://github.com/rknightion/agent-history/compare/v0.2.0...v0.3.0) (2026-10-04)
+
+
+### Features
+
+* add GenAI client spans and histograms for embeddings requests ([68fd57b](https://github.com/rknightion/agent-history/commit/68fd57b9dd347e020f1948c2403064512d5e58f3))
+* add optional content-free worker telemetry ([f872584](https://github.com/rknightion/agent-history/commit/f87258490466d6836c4148b295b39bfe1b9e84d9))
+* project exact loop identity for receiver joins ([0a61376](https://github.com/rknightion/agent-history/commit/0a613764b4c2a63ecdcd62dd1b7bd4cc3a55a3bf))
+* publish the legacy metric families through the OTel meter ([15204d2](https://github.com/rknightion/agent-history/commit/15204d2cddf37e1fb534e1564cc6b2f1dcdec908))
+
+
+### Bug Fixes
+
+* apply the public model allowlist to embeddings telemetry ([ecf7d97](https://github.com/rknightion/agent-history/commit/ecf7d971c45748e9c19c76ecd5eb23e170fb66fa))
+* bound loop identity refresh and validate launch headers ([3aefe0b](https://github.com/rknightion/agent-history/commit/3aefe0b47e54030682d105d0ea3a2e5991c66ff9))
+* fix telemetry service.name to package-chosen literals ([04b43a4](https://github.com/rknightion/agent-history/commit/04b43a4a51524ebdf01666c19d907c827728b23f))
+* isolate Python application in minimal runtime image ([a96ed74](https://github.com/rknightion/agent-history/commit/a96ed7415ca0f0f6fa429975cc741bfc817c9c10))
+* keep the journal read span successful on an expected skip ([5294707](https://github.com/rknightion/agent-history/commit/52947074de67c4e6fea51b6217c926e812ac7296))
+* preserve ordered launch identity windows ([b944bc8](https://github.com/rknightion/agent-history/commit/b944bc832482b2e1a2d8fe57f1eb4cf821f8a00f))
+
+
+### Documentation
+
+* assign exporter span ownership and shared connection seam ([3088758](https://github.com/rknightion/agent-history/commit/3088758b788c0a1e9a6b5e6552870727435478eb))
+* freeze optional OpenTelemetry design seam ([6234700](https://github.com/rknightion/agent-history/commit/62347001f0f4ed1edd84579ca24ae5be2b30b9a1))
+* state that planned work is tracked off-repository ([5b7ec4a](https://github.com/rknightion/agent-history/commit/5b7ec4aac4a85246848dbadbe972d4d645112f55))
+
 ## [0.2.0](https://github.com/rknightion/agent-history/compare/v0.1.0...v0.2.0) (2026-10-02)
 
 
