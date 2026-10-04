@@ -30,7 +30,7 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
       - name: Set up just
-        uses: rknightion/.github/.github/actions/setup-just@3b145adef40aecb043c24f80bfe44c95d57741a2 # v1.25.4
+        uses: rknightion/.github/.github/actions/setup-just@c36bf7ded21407b0a5169ecb2502d6a3a385be30 # v1.25.5
       - name: Set up uv
         uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
       - name: Install the leak-gate hooks (just check verifies them)
@@ -98,7 +98,7 @@ jobs:
     name: actionlint
     permissions:
       contents: read
-    uses: rknightion/.github/.github/workflows/actionlint.yml@3b145adef40aecb043c24f80bfe44c95d57741a2 # v1.25.4
+    uses: rknightion/.github/.github/workflows/actionlint.yml@c36bf7ded21407b0a5169ecb2502d6a3a385be30 # v1.25.5
 
   zizmor:
     name: zizmor
@@ -106,4 +106,4 @@ jobs:
       security-events: write
       contents: read
       actions: read
-    uses: rknightion/.github/.github/workflows/zizmor.yml@3b145adef40aecb043c24f80bfe44c95d57741a2 # v1.25.4
+    uses: rknightion/.github/.github/workflows/zizmor.yml@c36bf7ded21407b0a5169ecb2502d6a3a385be30 # v1.25.5
