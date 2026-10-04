@@ -276,6 +276,14 @@ jobs:
               | python3 -c '
           import json
           import sys
+          def pruned(value):
+              # Grafana drops empty lists and objects (fieldConfig mappings: []) on write-back.
+              if isinstance(value, dict):
+                  value = {k: pruned(v) for k, v in value.items()}
+                  return {k: v for k, v in value.items() if v not in ([], {})}
+              if isinstance(value, list):
+                  return [pruned(v) for v in value]
+              return value
           expected = json.load(open(sys.argv[1]))
           live = json.load(sys.stdin)
           live_folder = live.get("metadata", {}).get("annotations", {}).get("grafana.app/folder")
@@ -284,7 +292,7 @@ jobs:
           if live_folder != want_folder:
               problems.append(f"folder {live_folder} != {want_folder}")
           for key in ("title", "elements", "layout", "variables"):
-              if live.get("spec", {}).get(key) != expected["spec"].get(key):
+              if pruned(live.get("spec", {}).get(key)) != pruned(expected["spec"].get(key)):
                   problems.append(f"spec.{key} differs")
           if "__AH_PRIVATE_TERMS__" in json.dumps(live):
               problems.append("redaction placeholder left in the live dashboard")
