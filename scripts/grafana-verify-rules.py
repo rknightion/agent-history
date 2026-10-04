@@ -71,7 +71,8 @@ def semantic_rule(resource: dict[str, Any]) -> dict[str, Any]:
         "folder": folder_uid(resource),
         "title": spec.get("title"),
         "paused": spec.get("paused", False),
-        "for": canonical_duration(spec.get("for")),
+        # Grafana omits a zero pending period on write-back, as it omits paused: false.
+        "for": canonical_duration(spec.get("for", "0s")),
         "noDataState": spec.get("noDataState"),
         "execErrState": spec.get("execErrState"),
         "trigger": spec.get("trigger"),
