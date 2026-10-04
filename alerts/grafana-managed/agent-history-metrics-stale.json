@@ -12,8 +12,8 @@
   },
   "spec": {
     "annotations": {
-      "description": "agent_sessions_metrics_collection_runs_total from the agent-history-index service has not increased in 15m, or is absent. The periodic indexer runs the metric collectors on its own thread; check that the indexer container is running with OTLP metric export configured, and look for telemetry.configuration.invalid in its OTLP logs. A failing collector section does not fire this rule: read agent_sessions_metrics_section_success_ratio.",
-      "summary": "agent-history metric collection has not completed a run for 15 minutes"
+      "description": "agent_sessions_metrics_collection_runs_total from the agent-history-index service has not increased in 15m, is absent, or the last successful collection is more than 900 seconds old. The periodic indexer runs the metric collectors on its own thread; check that the indexer container is running with OTLP metric export configured, and look for telemetry.configuration.invalid in its OTLP logs. A single failing collector section fires agent-history-collector-section-failing instead.",
+      "summary": "agent-history metric collection has stopped or stopped succeeding"
     },
     "execErrState": "Error",
     "expressions": {
@@ -24,7 +24,7 @@
             "type": "prometheus",
             "uid": "grafanacloud-prom"
           },
-          "expr": "((sum(increase(agent_sessions_metrics_collection_runs_total{job=\"agent-history-index\"}[15m])) < bool 1) == 1) or on() absent_over_time(agent_sessions_metrics_collection_runs_total{job=\"agent-history-index\"}[15m])",
+          "expr": "((sum(increase(agent_sessions_metrics_collection_runs_total{job=\"agent-history-index\"}[15m])) < bool 1) == 1) or on() absent_over_time(agent_sessions_metrics_collection_runs_total{job=\"agent-history-index\"}[15m]) or on() (time() - max(agent_sessions_metrics_last_success_timestamp_seconds{job=\"agent-history-index\"}) > 900)",
           "instant": true,
           "range": false,
           "refId": "A"
@@ -75,8 +75,9 @@
     "for": "5m",
     "labels": {
       "domain": "observability",
+      "page": "true",
       "service": "agent-history",
-      "severity": "warning",
+      "severity": "critical",
       "source": "agent-history"
     },
     "noDataState": "Ok",

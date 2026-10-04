@@ -8,12 +8,12 @@
     "labels": {
       "grafana.app/folder": "REPLACE_WITH_FOLDER_UID"
     },
-    "name": "agent-history-embed-stale-pending"
+    "name": "agent-history-archive-timer-inactive"
   },
   "spec": {
     "annotations": {
-      "description": "The last successful embedding run is more than 3600 seconds old while agent_history_embed_pending_messages is above zero. Check the embedding run failed alert for the reason. Absent series do not fire (noDataState OK): this rule cannot tell a healthy embedder from a metric collection that does not see the worker snapshot. agent-history-metrics-stale covers a stopped collection.",
-      "summary": "agent-history embeddings have not succeeded for over an hour with messages pending"
+      "description": "The archive timer is not active, or its systemd state series is absent. Cold archive and hot retention will not run until the timer is started.",
+      "summary": "agent-session-archive.timer is not active"
     },
     "execErrState": "Error",
     "expressions": {
@@ -24,7 +24,7 @@
             "type": "prometheus",
             "uid": "grafanacloud-prom"
           },
-          "expr": "(time() - max(agent_history_embed_last_success_timestamp_seconds{job=\"agent-history-index\"}) > 3600) and on() (max(agent_history_embed_pending_messages{job=\"agent-history-index\"}) > 0)",
+          "expr": "((max(node_systemd_unit_state{job=\"agent-sessions\",name=\"agent-session-archive.timer\",state=\"active\"}) < bool 1) == 1) or on() absent(node_systemd_unit_state{job=\"agent-sessions\",name=\"agent-session-archive.timer\",state=\"active\"})",
           "instant": true,
           "range": false,
           "refId": "A"
@@ -72,7 +72,7 @@
         "source": true
       }
     },
-    "for": "15m",
+    "for": "10m",
     "labels": {
       "domain": "observability",
       "page": "true",
@@ -82,7 +82,7 @@
     },
     "noDataState": "Ok",
     "paused": false,
-    "title": "agent-history embeddings stalled with messages pending",
+    "title": "agent-history archive timer inactive",
     "trigger": {
       "interval": "1m"
     }

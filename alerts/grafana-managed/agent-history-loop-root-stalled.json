@@ -8,12 +8,12 @@
     "labels": {
       "grafana.app/folder": "REPLACE_WITH_FOLDER_UID"
     },
-    "name": "agent-history-embed-stale-pending"
+    "name": "agent-history-loop-root-stalled"
   },
   "spec": {
     "annotations": {
-      "description": "The last successful embedding run is more than 3600 seconds old while agent_history_embed_pending_messages is above zero. Check the embedding run failed alert for the reason. Absent series do not fire (noDataState OK): this rule cannot tell a healthy embedder from a metric collection that does not see the worker snapshot. agent-history-metrics-stale covers a stopped collection.",
-      "summary": "agent-history embeddings have not succeeded for over an hour with messages pending"
+      "description": "A live loop root in this namespace has had no lane in flight for over 20 minutes. A deliberate pause or a drain can trigger it as easily as a stuck loop.",
+      "summary": "{{ $labels.namespace }} has had no lane in flight for {{ $values.A.Value | humanizeDuration }}"
     },
     "execErrState": "Error",
     "expressions": {
@@ -24,7 +24,7 @@
             "type": "prometheus",
             "uid": "grafanacloud-prom"
           },
-          "expr": "(time() - max(agent_history_embed_last_success_timestamp_seconds{job=\"agent-history-index\"}) > 3600) and on() (max(agent_history_embed_pending_messages{job=\"agent-history-index\"}) > 0)",
+          "expr": "max by (namespace) (agent_efficiency_root_no_lane_seconds{job=\"agent-history-index\"}) > 1200",
           "instant": true,
           "range": false,
           "refId": "A"
@@ -72,17 +72,18 @@
         "source": true
       }
     },
-    "for": "15m",
+    "for": "5m",
     "labels": {
       "domain": "observability",
-      "page": "true",
+      "page": "false",
       "service": "agent-history",
-      "severity": "critical",
+      "severity": "warning",
+      "skipinvestigation": "true",
       "source": "agent-history"
     },
     "noDataState": "Ok",
     "paused": false,
-    "title": "agent-history embeddings stalled with messages pending",
+    "title": "agent-history loop root stalled",
     "trigger": {
       "interval": "1m"
     }

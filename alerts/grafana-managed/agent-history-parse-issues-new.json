@@ -8,12 +8,12 @@
     "labels": {
       "grafana.app/folder": "REPLACE_WITH_FOLDER_UID"
     },
-    "name": "agent-history-embed-stale-pending"
+    "name": "agent-history-parse-issues-new"
   },
   "spec": {
     "annotations": {
-      "description": "The last successful embedding run is more than 3600 seconds old while agent_history_embed_pending_messages is above zero. Check the embedding run failed alert for the reason. Absent series do not fire (noDataState OK): this rule cannot tell a healthy embedder from a metric collection that does not see the worker snapshot. agent-history-metrics-stale covers a stopped collection.",
-      "summary": "agent-history embeddings have not succeeded for over an hour with messages pending"
+      "description": "agent_history_parse_issues_total for this kind rose in the last 6h. A new unknown_type or missing_field often means a harness changed its transcript format; query the catalogue's parse issues for the affected sessions.",
+      "summary": "{{ $values.A.Value }} new {{ $labels.kind }} parse issues in the last 6h"
     },
     "execErrState": "Error",
     "expressions": {
@@ -24,7 +24,7 @@
             "type": "prometheus",
             "uid": "grafanacloud-prom"
           },
-          "expr": "(time() - max(agent_history_embed_last_success_timestamp_seconds{job=\"agent-history-index\"}) > 3600) and on() (max(agent_history_embed_pending_messages{job=\"agent-history-index\"}) > 0)",
+          "expr": "(max by (kind) (agent_history_parse_issues_total{job=\"agent-history-index\"}) - max by (kind) (agent_history_parse_issues_total{job=\"agent-history-index\"} offset 6h) > 0) or (max by (kind) (agent_history_parse_issues_total{job=\"agent-history-index\"}) > 0 unless max by (kind) (agent_history_parse_issues_total{job=\"agent-history-index\"} offset 6h))",
           "instant": true,
           "range": false,
           "refId": "A"
@@ -72,17 +72,18 @@
         "source": true
       }
     },
-    "for": "15m",
+    "for": "0s",
     "labels": {
       "domain": "observability",
-      "page": "true",
+      "page": "false",
       "service": "agent-history",
-      "severity": "critical",
+      "severity": "warning",
+      "skipinvestigation": "true",
       "source": "agent-history"
     },
     "noDataState": "Ok",
     "paused": false,
-    "title": "agent-history embeddings stalled with messages pending",
+    "title": "agent-history new parse issues",
     "trigger": {
       "interval": "1m"
     }

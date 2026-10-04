@@ -310,7 +310,7 @@
         {
           "eval_time": "30m",
           "exp_samples": [],
-          "expr": "((sum(increase(agent_sessions_metrics_collection_runs_total{job=\"agent-history-index\"}[15m])) < bool 1) == 1) or on() absent_over_time(agent_sessions_metrics_collection_runs_total{job=\"agent-history-index\"}[15m])"
+          "expr": "((sum(increase(agent_sessions_metrics_collection_runs_total{job=\"agent-history-index\"}[15m])) < bool 1) == 1) or on() absent_over_time(agent_sessions_metrics_collection_runs_total{job=\"agent-history-index\"}[15m]) or on() (time() - max(agent_sessions_metrics_last_success_timestamp_seconds{job=\"agent-history-index\"}) > 900)"
         }
       ]
     },
@@ -332,7 +332,7 @@
               "value": 1
             }
           ],
-          "expr": "((sum(increase(agent_sessions_metrics_collection_runs_total{job=\"agent-history-index\"}[15m])) < bool 1) == 1) or on() absent_over_time(agent_sessions_metrics_collection_runs_total{job=\"agent-history-index\"}[15m])"
+          "expr": "((sum(increase(agent_sessions_metrics_collection_runs_total{job=\"agent-history-index\"}[15m])) < bool 1) == 1) or on() absent_over_time(agent_sessions_metrics_collection_runs_total{job=\"agent-history-index\"}[15m]) or on() (time() - max(agent_sessions_metrics_last_success_timestamp_seconds{job=\"agent-history-index\"}) > 900)"
         }
       ]
     },
@@ -349,7 +349,7 @@
               "value": 1
             }
           ],
-          "expr": "((sum(increase(agent_sessions_metrics_collection_runs_total{job=\"agent-history-index\"}[15m])) < bool 1) == 1) or on() absent_over_time(agent_sessions_metrics_collection_runs_total{job=\"agent-history-index\"}[15m])"
+          "expr": "((sum(increase(agent_sessions_metrics_collection_runs_total{job=\"agent-history-index\"}[15m])) < bool 1) == 1) or on() absent_over_time(agent_sessions_metrics_collection_runs_total{job=\"agent-history-index\"}[15m]) or on() (time() - max(agent_sessions_metrics_last_success_timestamp_seconds{job=\"agent-history-index\"}) > 900)"
         }
       ]
     }

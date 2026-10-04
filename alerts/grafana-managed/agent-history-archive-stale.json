@@ -8,12 +8,12 @@
     "labels": {
       "grafana.app/folder": "REPLACE_WITH_FOLDER_UID"
     },
-    "name": "agent-history-embed-stale-pending"
+    "name": "agent-history-archive-stale"
   },
   "spec": {
     "annotations": {
-      "description": "The last successful embedding run is more than 3600 seconds old while agent_history_embed_pending_messages is above zero. Check the embedding run failed alert for the reason. Absent series do not fire (noDataState OK): this rule cannot tell a healthy embedder from a metric collection that does not see the worker snapshot. agent-history-metrics-stale covers a stopped collection.",
-      "summary": "agent-history embeddings have not succeeded for over an hour with messages pending"
+      "description": "The daily hot-to-cold archive has not written a successful receipt for 129600 seconds. Check the archive service's journal and the cold tier's availability.",
+      "summary": "The latest session archive receipt is {{ $values.A.Value | humanizeDuration }} old"
     },
     "execErrState": "Error",
     "expressions": {
@@ -24,7 +24,7 @@
             "type": "prometheus",
             "uid": "grafanacloud-prom"
           },
-          "expr": "(time() - max(agent_history_embed_last_success_timestamp_seconds{job=\"agent-history-index\"}) > 3600) and on() (max(agent_history_embed_pending_messages{job=\"agent-history-index\"}) > 0)",
+          "expr": "time() - max(agent_sessions_archive_receipt_timestamp_seconds{job=\"agent-history-index\"}) > 129600",
           "instant": true,
           "range": false,
           "refId": "A"
@@ -72,17 +72,18 @@
         "source": true
       }
     },
-    "for": "15m",
+    "for": "10m",
     "labels": {
       "domain": "observability",
-      "page": "true",
+      "page": "false",
       "service": "agent-history",
-      "severity": "critical",
+      "severity": "warning",
+      "skipinvestigation": "true",
       "source": "agent-history"
     },
     "noDataState": "Ok",
     "paused": false,
-    "title": "agent-history embeddings stalled with messages pending",
+    "title": "agent-history archive receipt stale",
     "trigger": {
       "interval": "1m"
     }

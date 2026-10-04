@@ -75,8 +75,10 @@
     "for": "15m",
     "labels": {
       "domain": "observability",
+      "page": "false",
       "service": "agent-history",
       "severity": "warning",
+      "skipinvestigation": "true",
       "source": "agent-history"
     },
     "noDataState": "Ok",

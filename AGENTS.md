@@ -52,7 +52,9 @@ weaken the leak gate to make CI green.
 their promtool fixtures; never edit the generated JSON. `just gen-alerts` regenerates them, `just
 check` fails on drift and `just ci` runs the fixtures through promtool. `.github/workflows/grafana-sync.yml`
 publishes them from `main` with gcx; it never deletes a rule, and its verify step reports a stale
-live rule as a failure.
+live rule as a failure. Renaming or removing a rule therefore needs a manual delete of the live rule.
+The archive timer and service rules read the deployment's node exporter systemd collector
+(`job="agent-sessions"`), not the indexer's OTLP families, so `STORED` does not list them.
 
 ## Schema
 

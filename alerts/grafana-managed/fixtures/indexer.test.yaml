@@ -1,0 +1,360 @@
+{
+  "evaluation_interval": "1m",
+  "rule_files": [],
+  "tests": [
+    {
+      "input_series": [
+        {
+          "series": "agent_sessions_metrics_collection_runs_total{job=\"agent-history-index\"}",
+          "values": "0+4x40"
+        },
+        {
+          "series": "agent_sessions_metrics_last_success_timestamp_seconds{job=\"agent-history-index\"}",
+          "values": "0+60x40"
+        }
+      ],
+      "interval": "1m",
+      "name": "collection succeeding",
+      "promql_expr_test": [
+        {
+          "eval_time": "30m",
+          "exp_samples": [],
+          "expr": "((sum(increase(agent_sessions_metrics_collection_runs_total{job=\"agent-history-index\"}[15m])) < bool 1) == 1) or on() absent_over_time(agent_sessions_metrics_collection_runs_total{job=\"agent-history-index\"}[15m]) or on() (time() - max(agent_sessions_metrics_last_success_timestamp_seconds{job=\"agent-history-index\"}) > 900)"
+        }
+      ]
+    },
+    {
+      "input_series": [
+        {
+          "series": "agent_sessions_metrics_collection_runs_total{job=\"agent-history-index\"}",
+          "values": "0+4x40"
+        },
+        {
+          "series": "agent_sessions_metrics_last_success_timestamp_seconds{job=\"agent-history-index\"}",
+          "values": "0x40"
+        }
+      ],
+      "interval": "1m",
+      "name": "collection runs without succeeding",
+      "promql_expr_test": [
+        {
+          "eval_time": "30m",
+          "exp_samples": [
+            {
+              "labels": "{}",
+              "value": 1800
+            }
+          ],
+          "expr": "((sum(increase(agent_sessions_metrics_collection_runs_total{job=\"agent-history-index\"}[15m])) < bool 1) == 1) or on() absent_over_time(agent_sessions_metrics_collection_runs_total{job=\"agent-history-index\"}[15m]) or on() (time() - max(agent_sessions_metrics_last_success_timestamp_seconds{job=\"agent-history-index\"}) > 900)"
+        }
+      ]
+    },
+    {
+      "input_series": [
+        {
+          "series": "agent_history_last_success_timestamp_seconds{job=\"agent-history-index\"}",
+          "values": "0x40"
+        }
+      ],
+      "interval": "1m",
+      "name": "index fresh at the threshold",
+      "promql_expr_test": [
+        {
+          "eval_time": "1800s",
+          "exp_samples": [],
+          "expr": "time() - max(agent_history_last_success_timestamp_seconds{job=\"agent-history-index\"}) > 1800"
+        }
+      ]
+    },
+    {
+      "input_series": [
+        {
+          "series": "agent_history_last_success_timestamp_seconds{job=\"agent-history-index\"}",
+          "values": "0x40"
+        }
+      ],
+      "interval": "1m",
+      "name": "index stale past the threshold",
+      "promql_expr_test": [
+        {
+          "eval_time": "1860s",
+          "exp_samples": [
+            {
+              "labels": "{}",
+              "value": 1860
+            }
+          ],
+          "expr": "time() - max(agent_history_last_success_timestamp_seconds{job=\"agent-history-index\"}) > 1800"
+        }
+      ]
+    },
+    {
+      "input_series": [
+        {
+          "series": "agent_history_run_success_ratio{job=\"agent-history-index\"}",
+          "values": "0x40"
+        }
+      ],
+      "interval": "1m",
+      "name": "index run failing",
+      "promql_expr_test": [
+        {
+          "eval_time": "10m",
+          "exp_samples": [
+            {
+              "labels": "{}",
+              "value": 1
+            }
+          ],
+          "expr": "1 - max(agent_history_run_success_ratio{job=\"agent-history-index\"}) > 0"
+        }
+      ]
+    },
+    {
+      "input_series": [
+        {
+          "series": "agent_history_run_success_ratio{job=\"agent-history-index\"}",
+          "values": "1x40"
+        }
+      ],
+      "interval": "1m",
+      "name": "index run succeeding",
+      "promql_expr_test": [
+        {
+          "eval_time": "10m",
+          "exp_samples": [],
+          "expr": "1 - max(agent_history_run_success_ratio{job=\"agent-history-index\"}) > 0"
+        }
+      ]
+    },
+    {
+      "input_series": [
+        {
+          "series": "agent_history_lag_bytes{job=\"agent-history-index\"}",
+          "values": "5x90"
+        }
+      ],
+      "interval": "1m",
+      "name": "lag never clears",
+      "promql_expr_test": [
+        {
+          "eval_time": "80m",
+          "exp_samples": [
+            {
+              "labels": "{}",
+              "value": 5
+            }
+          ],
+          "expr": "min_over_time(max(agent_history_lag_bytes{job=\"agent-history-index\"})[1h:1m]) > 0"
+        }
+      ]
+    },
+    {
+      "input_series": [
+        {
+          "series": "agent_history_lag_bytes{job=\"agent-history-index\"}",
+          "values": "5x40 0 5x50"
+        }
+      ],
+      "interval": "1m",
+      "name": "lag clears within the window",
+      "promql_expr_test": [
+        {
+          "eval_time": "80m",
+          "exp_samples": [],
+          "expr": "min_over_time(max(agent_history_lag_bytes{job=\"agent-history-index\"})[1h:1m]) > 0"
+        }
+      ]
+    },
+    {
+      "input_series": [
+        {
+          "series": "agent_history_parse_issues_total{kind=\"unknown_type\",job=\"agent-history-index\"}",
+          "values": "10x400"
+        }
+      ],
+      "interval": "1m",
+      "name": "parse issues flat",
+      "promql_expr_test": [
+        {
+          "eval_time": "390m",
+          "exp_samples": [],
+          "expr": "(max by (kind) (agent_history_parse_issues_total{job=\"agent-history-index\"}) - max by (kind) (agent_history_parse_issues_total{job=\"agent-history-index\"} offset 6h) > 0) or (max by (kind) (agent_history_parse_issues_total{job=\"agent-history-index\"}) > 0 unless max by (kind) (agent_history_parse_issues_total{job=\"agent-history-index\"} offset 6h))"
+        }
+      ]
+    },
+    {
+      "input_series": [
+        {
+          "series": "agent_history_parse_issues_total{kind=\"unknown_type\",job=\"agent-history-index\"}",
+          "values": "10x200 12x200"
+        }
+      ],
+      "interval": "1m",
+      "name": "parse issues rose",
+      "promql_expr_test": [
+        {
+          "eval_time": "390m",
+          "exp_samples": [
+            {
+              "labels": "{kind=\"unknown_type\"}",
+              "value": 2
+            }
+          ],
+          "expr": "(max by (kind) (agent_history_parse_issues_total{job=\"agent-history-index\"}) - max by (kind) (agent_history_parse_issues_total{job=\"agent-history-index\"} offset 6h) > 0) or (max by (kind) (agent_history_parse_issues_total{job=\"agent-history-index\"}) > 0 unless max by (kind) (agent_history_parse_issues_total{job=\"agent-history-index\"} offset 6h))"
+        }
+      ]
+    },
+    {
+      "input_series": [
+        {
+          "series": "agent_history_parse_issues_total{kind=\"unknown_type\",job=\"agent-history-index\"}",
+          "values": "_x200 3x200"
+        }
+      ],
+      "interval": "1m",
+      "name": "parse issue kind first seen",
+      "promql_expr_test": [
+        {
+          "eval_time": "390m",
+          "exp_samples": [
+            {
+              "labels": "{kind=\"unknown_type\"}",
+              "value": 3
+            }
+          ],
+          "expr": "(max by (kind) (agent_history_parse_issues_total{job=\"agent-history-index\"}) - max by (kind) (agent_history_parse_issues_total{job=\"agent-history-index\"} offset 6h) > 0) or (max by (kind) (agent_history_parse_issues_total{job=\"agent-history-index\"}) > 0 unless max by (kind) (agent_history_parse_issues_total{job=\"agent-history-index\"} offset 6h))"
+        }
+      ]
+    },
+    {
+      "input_series": [
+        {
+          "series": "agent_sessions_metrics_section_success_ratio{section=\"runs\",job=\"agent-history-index\"}",
+          "values": "1x60"
+        },
+        {
+          "series": "agent_history_exporter_collection_errors_total{collector=\"loops\",job=\"agent-history-index\"}",
+          "values": "0x60"
+        }
+      ],
+      "interval": "1m",
+      "name": "sections healthy",
+      "promql_expr_test": [
+        {
+          "eval_time": "45m",
+          "exp_samples": [],
+          "expr": "max by (section) ((min by (section) (agent_sessions_metrics_section_success_ratio{job=\"agent-history-index\"}) < bool 1) == 1 or label_replace((sum by (collector) (increase(agent_history_exporter_collection_errors_total{job=\"agent-history-index\"}[30m])) > bool 0) == 1, \"section\", \"$1\", \"collector\", \"(.*)\"))"
+        }
+      ]
+    },
+    {
+      "input_series": [
+        {
+          "series": "agent_sessions_metrics_section_success_ratio{section=\"runs\",job=\"agent-history-index\"}",
+          "values": "0x60"
+        },
+        {
+          "series": "agent_history_exporter_collection_errors_total{collector=\"loops\",job=\"agent-history-index\"}",
+          "values": "0x60"
+        }
+      ],
+      "interval": "1m",
+      "name": "section failing",
+      "promql_expr_test": [
+        {
+          "eval_time": "45m",
+          "exp_samples": [
+            {
+              "labels": "{section=\"runs\"}",
+              "value": 1
+            }
+          ],
+          "expr": "max by (section) ((min by (section) (agent_sessions_metrics_section_success_ratio{job=\"agent-history-index\"}) < bool 1) == 1 or label_replace((sum by (collector) (increase(agent_history_exporter_collection_errors_total{job=\"agent-history-index\"}[30m])) > bool 0) == 1, \"section\", \"$1\", \"collector\", \"(.*)\"))"
+        }
+      ]
+    },
+    {
+      "input_series": [
+        {
+          "series": "agent_sessions_metrics_section_success_ratio{section=\"runs\",job=\"agent-history-index\"}",
+          "values": "1x60"
+        },
+        {
+          "series": "agent_history_exporter_collection_errors_total{collector=\"loops\",job=\"agent-history-index\"}",
+          "values": "0+1x60"
+        }
+      ],
+      "interval": "1m",
+      "name": "collector errors without a failed section",
+      "promql_expr_test": [
+        {
+          "eval_time": "45m",
+          "exp_samples": [
+            {
+              "labels": "{section=\"loops\"}",
+              "value": 1
+            }
+          ],
+          "expr": "max by (section) ((min by (section) (agent_sessions_metrics_section_success_ratio{job=\"agent-history-index\"}) < bool 1) == 1 or label_replace((sum by (collector) (increase(agent_history_exporter_collection_errors_total{job=\"agent-history-index\"}[30m])) > bool 0) == 1, \"section\", \"$1\", \"collector\", \"(.*)\"))"
+        }
+      ]
+    },
+    {
+      "input_series": [
+        {
+          "series": "node_systemd_unit_state{job=\"agent-sessions\",name=\"agent-session-archive.timer\",state=\"active\"}",
+          "values": "1x20"
+        }
+      ],
+      "interval": "1m",
+      "name": "archive timer active",
+      "promql_expr_test": [
+        {
+          "eval_time": "10m",
+          "exp_samples": [],
+          "expr": "((max(node_systemd_unit_state{job=\"agent-sessions\",name=\"agent-session-archive.timer\",state=\"active\"}) < bool 1) == 1) or on() absent(node_systemd_unit_state{job=\"agent-sessions\",name=\"agent-session-archive.timer\",state=\"active\"})"
+        }
+      ]
+    },
+    {
+      "input_series": [
+        {
+          "series": "node_systemd_unit_state{job=\"agent-sessions\",name=\"agent-session-archive.timer\",state=\"active\"}",
+          "values": "0x20"
+        }
+      ],
+      "interval": "1m",
+      "name": "archive timer inactive",
+      "promql_expr_test": [
+        {
+          "eval_time": "10m",
+          "exp_samples": [
+            {
+              "labels": "{}",
+              "value": 1
+            }
+          ],
+          "expr": "((max(node_systemd_unit_state{job=\"agent-sessions\",name=\"agent-session-archive.timer\",state=\"active\"}) < bool 1) == 1) or on() absent(node_systemd_unit_state{job=\"agent-sessions\",name=\"agent-session-archive.timer\",state=\"active\"})"
+        }
+      ]
+    },
+    {
+      "input_series": [],
+      "interval": "1m",
+      "name": "archive timer series absent",
+      "promql_expr_test": [
+        {
+          "eval_time": "10m",
+          "exp_samples": [
+            {
+              "labels": "{job=\"agent-sessions\",name=\"agent-session-archive.timer\",state=\"active\"}",
+              "value": 1
+            }
+          ],
+          "expr": "((max(node_systemd_unit_state{job=\"agent-sessions\",name=\"agent-session-archive.timer\",state=\"active\"}) < bool 1) == 1) or on() absent(node_systemd_unit_state{job=\"agent-sessions\",name=\"agent-session-archive.timer\",state=\"active\"})"
+        }
+      ]
+    }
+  ]
+}

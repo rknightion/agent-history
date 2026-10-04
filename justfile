@@ -92,7 +92,7 @@ alerts-check:
 [group('check')]
 alerts-test:
     docker run --rm --entrypoint promtool -v "{{ justfile_directory() }}/alerts/grafana-managed/fixtures:/fixtures:ro" \
-        "{{ prometheus_image }}" test rules /fixtures/embed.test.yaml
+        "{{ prometheus_image }}" test rules /fixtures/embed.test.yaml /fixtures/indexer.test.yaml
 
 # Regenerate the Grafana alert rules and their promtool fixtures
 [group('gen')]

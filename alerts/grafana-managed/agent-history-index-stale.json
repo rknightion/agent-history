@@ -8,12 +8,12 @@
     "labels": {
       "grafana.app/folder": "REPLACE_WITH_FOLDER_UID"
     },
-    "name": "agent-history-embed-stale-pending"
+    "name": "agent-history-index-stale"
   },
   "spec": {
     "annotations": {
-      "description": "The last successful embedding run is more than 3600 seconds old while agent_history_embed_pending_messages is above zero. Check the embedding run failed alert for the reason. Absent series do not fire (noDataState OK): this rule cannot tell a healthy embedder from a metric collection that does not see the worker snapshot. agent-history-metrics-stale covers a stopped collection.",
-      "summary": "agent-history embeddings have not succeeded for over an hour with messages pending"
+      "description": "agent_history_last_success_timestamp_seconds is more than 1800 seconds old. The indexer refreshes every few minutes, so new transcripts are not reaching the catalogue. Check the indexer container and the agent-history index run failed alert for a failing pass. An absent series does not fire: agent-history-metrics-stale covers a stopped indexer.",
+      "summary": "The agent-history index has not completed a successful pass for {{ $values.A.Value | humanizeDuration }}"
     },
     "execErrState": "Error",
     "expressions": {
@@ -24,7 +24,7 @@
             "type": "prometheus",
             "uid": "grafanacloud-prom"
           },
-          "expr": "(time() - max(agent_history_embed_last_success_timestamp_seconds{job=\"agent-history-index\"}) > 3600) and on() (max(agent_history_embed_pending_messages{job=\"agent-history-index\"}) > 0)",
+          "expr": "time() - max(agent_history_last_success_timestamp_seconds{job=\"agent-history-index\"}) > 1800",
           "instant": true,
           "range": false,
           "refId": "A"
@@ -72,7 +72,7 @@
         "source": true
       }
     },
-    "for": "15m",
+    "for": "5m",
     "labels": {
       "domain": "observability",
       "page": "true",
@@ -82,7 +82,7 @@
     },
     "noDataState": "Ok",
     "paused": false,
-    "title": "agent-history embeddings stalled with messages pending",
+    "title": "agent-history index pass stale",
     "trigger": {
       "interval": "1m"
     }
