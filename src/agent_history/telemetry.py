@@ -306,11 +306,25 @@ def meter():
     return _active.metric if _active is not None and not _active.closed else _NOOP
 
 
+def _severity(event_name, attributes):
+    """OpenTelemetry severity name for an event: failures ERROR, an invalid configuration WARN, the rest INFO."""
+    if event_name.endswith(".failed") or attributes.get("agent_history.outcome") == "error":
+        return "ERROR"
+    if event_name == "telemetry.configuration.invalid":
+        return "WARN"
+    return "INFO"
+
+
 def emit(event_name, attributes=None):
     if event_name not in _EVENTS or _active is None or _active.logger is None or _active.closed:
         return
     try:
-        _active.logger.emit(body=event_name, event_name=event_name, attributes=_safe(attributes))
+        safe = _safe(attributes)
+        text = _severity(event_name, safe)
+        number = getattr(importlib.import_module("opentelemetry._logs").SeverityNumber, text)
+        _active.logger.emit(
+            body=event_name, event_name=event_name, attributes=safe, severity_number=number, severity_text=text
+        )
     except Exception:
         pass
 

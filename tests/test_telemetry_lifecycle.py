@@ -49,3 +49,40 @@ def test_only_explicit_signal_enabled(monkeypatch):
         assert isinstance(instance.metric, telemetry._Noop)
     finally:
         telemetry.shutdown()
+
+
+def test_every_log_record_carries_severity():
+    from opentelemetry._logs import SeverityNumber
+    from opentelemetry.sdk._logs import LoggerProvider
+    from opentelemetry.sdk._logs.export import InMemoryLogRecordExporter, SimpleLogRecordProcessor
+
+    telemetry.shutdown()
+    exporter = InMemoryLogRecordExporter()
+    provider = LoggerProvider(shutdown_on_exit=False)
+    provider.add_log_record_processor(SimpleLogRecordProcessor(exporter))
+    telemetry._active = telemetry.Telemetry("agent-history-index", [provider], logger=provider.get_logger("test"))
+    try:
+        with telemetry.pass_span("index.pass"):
+            pass
+        with telemetry.pass_span("embed.pass") as result:
+            result.skipped("lock_held")
+        try:
+            with telemetry.pass_span("postpass.pass"):
+                raise ValueError("synthetic")
+        except ValueError:
+            pass
+        telemetry.emit("outbound.call.failed", {"error.type": "io"})
+        telemetry.emit("telemetry.configuration.invalid", {})
+    finally:
+        telemetry.shutdown()
+    severities = {
+        record.log_record.body: (record.log_record.severity_number, record.log_record.severity_text)
+        for record in exporter.get_finished_logs()
+    }
+    assert severities == {
+        "worker.pass.completed": (SeverityNumber.INFO, "INFO"),
+        "worker.pass.skipped": (SeverityNumber.INFO, "INFO"),
+        "worker.pass.failed": (SeverityNumber.ERROR, "ERROR"),
+        "outbound.call.failed": (SeverityNumber.ERROR, "ERROR"),
+        "telemetry.configuration.invalid": (SeverityNumber.WARN, "WARN"),
+    }
