@@ -45,7 +45,7 @@ otlp-parity:
 
 # The pre-commit gate: format, lint, tests and the leak gate
 [group('check')]
-check: fmt-check lint baseline-ledger-check alerts-check test leak
+check: fmt-check lint baseline-ledger-check alerts-check dashboards-check test leak
 
 # check plus the legs that need a Docker daemon
 [group('check')]
@@ -88,6 +88,12 @@ baseline-ledger-check:
 alerts-check:
     python3 grafana/build_rules.py --check
 
+# Verify the generated dashboards match their generators in grafana/
+[group('check')]
+dashboards-check:
+    python3 grafana/build_catalogue_dashboard.py --check
+    python3 grafana/build_archive_dashboard.py --check
+
 # Needs a Docker daemon: run the alert rule fixtures through promtool
 [group('check')]
 alerts-test:
@@ -98,6 +104,12 @@ alerts-test:
 [group('gen')]
 gen-alerts:
     python3 grafana/build_rules.py
+
+# Regenerate the dashboards from their generators in grafana/
+[group('gen')]
+gen-dashboards:
+    python3 grafana/build_catalogue_dashboard.py
+    python3 grafana/build_archive_dashboard.py
 
 # Regenerate the baseline's seed-data trailer, retaining the schema-only dump
 [group('gen')]

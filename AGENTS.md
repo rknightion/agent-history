@@ -56,6 +56,17 @@ live rule as a failure. Renaming or removing a rule therefore needs a manual del
 The archive timer and service rules read the deployment's node exporter systemd collector
 (`job="agent-sessions"`), not the indexer's OTLP families, so `STORED` does not list them.
 
+## Dashboards
+
+`grafana/build_catalogue_dashboard.py` (uid `agent-history`, SQL over the catalogue plus metrics)
+and `grafana/build_archive_dashboard.py` (uid `agent-session-archive`, metrics, logs and traces)
+generate `dashboards/*.json`; never edit the generated JSON. `just gen-dashboards` regenerates them
+and `just check` fails on drift. `grafana-sync.yml` publishes them to the `agent-history dashboards`
+folder, outside GitSync. Keep both UIDs: other dashboards and alert links use them.
+The catalogue's presentation-mode redaction names private repositories and hosts, so the committed
+JSON carries the token `__AH_PRIVATE_TERMS__` and the workflow substitutes the `DASHBOARD_REDACT_TERMS`
+secret (a `|`-separated lowercase list) at publish time. Never commit the terms themselves.
+
 ## Schema
 
 `src/agent_history/sql/baseline.sql` is generated; never edit it. Its schema body is a schema-only
