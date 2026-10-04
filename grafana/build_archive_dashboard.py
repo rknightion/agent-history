@@ -125,6 +125,7 @@ def viz_config(
     inverse: bool = False,
     decimals: int | None = None,
     stack: bool = False,
+    axis_max: float | None = None,
 ) -> dict[str, Any]:
     defaults: dict[str, Any] = {
         "color": {"mode": "thresholds" if kind in ("stat", "gauge") else "palette-classic"},
@@ -133,6 +134,9 @@ def viz_config(
     }
     if decimals is not None:
         defaults["decimals"] = decimals
+    if axis_max is not None:
+        defaults["min"] = 0
+        defaults["max"] = axis_max
     if kind == "stat":
         options = {
             "colorMode": "background_solid",
@@ -241,6 +245,7 @@ class Panel:
     height: int = 8
     stack: bool = False
     source: str = "prometheus"
+    axis_max: float | None = None
 
     def element(self) -> dict[str, Any]:
         queries = [
@@ -266,6 +271,7 @@ class Panel:
                     inverse=self.inverse,
                     decimals=self.decimals,
                     stack=self.stack,
+                    axis_max=self.axis_max,
                 ),
             },
         }
@@ -359,6 +365,7 @@ def chart(
     warning: float | None = None,
     critical: float | None = None,
     source: str = "prometheus",
+    axis_max: float | None = None,
 ) -> Panel:
     return Panel(
         name,
@@ -373,6 +380,7 @@ def chart(
         warning=warning,
         critical=critical,
         source=source,
+        axis_max=axis_max,
     )
 
 
@@ -1883,6 +1891,7 @@ def build() -> dict[str, Any]:
                 [(attempt_errors, "error ratio")],
                 "Share of embeddings HTTP attempts whose span ended in error.",
                 "percentunit",
+                axis_max=1,
             ),
             chart(
                 "emb_attempt_latency",
