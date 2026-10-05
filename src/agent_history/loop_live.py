@@ -599,13 +599,11 @@ def jev_answers(response: dict) -> tuple[dict[str, float], str, dict[str, float]
 def request(config: LoopLive, kind: str, state: dict) -> dict:
     if kind == "jev":
         url = config.jev_url
-        # The configured native route already selects typesafe/jev. Its documented request
-        # envelope is input/state/questions, not a top-level model or invented version selector.
+        # The configured native route selects typesafe/jev. Match the frozen evaluation's
+        # top-level state/questions body; the response alone establishes the version pin.
         body = {
-            "input": {
-                "state": state["phase_input"],
-                "questions": {**HYBRID_QUESTIONS, "phase": WHOLE_PHASE_QUESTION},
-            }
+            "state": state["phase_input"],
+            "questions": {**HYBRID_QUESTIONS, "phase": WHOLE_PHASE_QUESTION},
         }
     else:
         url = config.summary_url

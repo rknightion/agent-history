@@ -164,13 +164,72 @@ def test_documented_jev_native_envelope_and_authoritative_returned_version(monke
     response = loop_live.request(config, "jev", state)
     assert captured == [
         {
-            "input": {
-                "state": state["phase_input"],
-                "questions": {**loop_live.HYBRID_QUESTIONS, "phase": loop_live.WHOLE_PHASE_QUESTION},
-            }
+            "state": state["phase_input"],
+            "questions": {**loop_live.HYBRID_QUESTIONS, "phase": loop_live.WHOLE_PHASE_QUESTION},
         }
     ]
     assert loop_live.jev_answers(response)[1] == "waiting"
+
+
+def test_jev_top_level_body_at_network_edge(monkeypatch):
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    from threading import Thread
+
+    from agent_history.config import LoopLive
+
+    state = loop_live.digest(loop_live.project([event("open"), event("judgement", text="Gate pending.")], AT))
+    captured = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.connection.settimeout(5)
+            captured.append(
+                {
+                    "path": self.path,
+                    "body": json.loads(self.rfile.read(int(self.headers["Content-Length"]))),
+                    "user_agent": self.headers["User-Agent"],
+                    "auth": self.headers["cf-aig-authorization"],
+                    "skip_cache": self.headers["cf-aig-skip-cache"],
+                    "content_type": self.headers["Content-Type"],
+                }
+            )
+            self.send_response(200)
+            self.send_header("Content-Length", "2")
+            self.end_headers()
+            self.wfile.write(b"{}")
+
+        def log_message(self, *_):
+            pass
+
+    monkeypatch.setenv("SYNTHETIC_LOOP_TOKEN", "synthetic")
+    with HTTPServer(("127.0.0.1", 0), Handler) as server:
+        server.timeout = 5
+        worker = Thread(target=server.handle_request)
+        worker.start()
+        try:
+            config = LoopLive(
+                enabled=True,
+                jev_url=f"http://127.0.0.1:{server.server_port}/workers-ai/run/typesafe/jev",
+                api_key_env="SYNTHETIC_LOOP_TOKEN",
+            )
+            assert loop_live.request(config, "jev", state) == {}
+        finally:
+            worker.join(timeout=6)
+        assert not worker.is_alive()
+
+    assert captured == [
+        {
+            "path": "/workers-ai/run/typesafe/jev",
+            "body": {
+                "state": state["phase_input"],
+                "questions": {**loop_live.HYBRID_QUESTIONS, "phase": loop_live.WHOLE_PHASE_QUESTION},
+            },
+            "user_agent": "agent-history-loop-live/1.0",
+            "auth": "Bearer synthetic",
+            "skip_cache": "true",
+            "content_type": "application/json",
+        }
+    ]
 
 
 @pytest.mark.parametrize("kind", ["jev", "summary"])
