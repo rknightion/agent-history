@@ -1865,6 +1865,14 @@ class EfficiencyParser:
                 kinds = efficiency_delivery_kinds(command)
                 if kinds:
                     extra = ["=" + kinds]
+            elif name == "watch_process":
+                # A blocking process watcher carries an explicit deadline in seconds, unlike
+                # watch_start, which only arms a future notification.
+                command = args.get("command") if isinstance(args.get("command"), str) else ""
+                cls, target, rule = "wait", efficiency_poll_target(command), "process_watch"
+                deadline = args.get("deadline_s")
+                if isinstance(deadline, (int, float)) and not isinstance(deadline, bool) and 0 <= deadline <= 3600:
+                    request = ("watch_process", deadline * 1000)
             elif name == "subagent":
                 action = args.get("action")
                 if action in ("list", "status"):
@@ -1938,9 +1946,18 @@ class EfficiencyParser:
         call_id = message.get("toolCallId")
         result_text = pi_format()._text(message.get("content"))
         details = message.get("details") if isinstance(message.get("details"), dict) else {}
-        entry = self.tool_output(
-            ts, call_id, lambda rule: "event" if rule == "agent" and details.get("results") else "timed_out"
-        )
+
+        def resolve(rule: str) -> str:
+            if rule == "process_watch":
+                # Only the recorded watcher envelope proves completion. A killed process at
+                # the deadline (or missing metadata) is not a delivered terminal event.
+                completed = (
+                    details.get("deadline_hit") is False and efficiency_int(details.get("exit_code")) is not None
+                )
+                return "event" if completed else "timed_out"
+            return "event" if rule == "agent" and details.get("results") else "timed_out"
+
+        entry = self.tool_output(ts, call_id, resolve)
         if entry is None:
             return
         if message.get("isError"):

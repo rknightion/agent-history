@@ -119,6 +119,86 @@ def test_incremental_restart_and_partial_line(tmp_path: Path):
     assert value(fourth, "agent_efficiency_llm_calls_total", **labels) == 2
 
 
+@pytest.mark.parametrize(
+    "deadline_hit,exit_code,result",
+    [
+        (False, 0, "event"),
+        (False, 1, "event"),
+        (True, None, "timed_out"),
+        (None, 0, "timed_out"),
+        (False, None, "timed_out"),
+    ],
+)
+def test_pi_process_watch_wait_counters_reach_otlp(tmp_path: Path, monkeypatch, deadline_hit, exit_code, result):
+    from agent_history.metrics.otlp import _index
+
+    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    monkeypatch.setattr("agent_history.metrics.efficiency.time.time", lambda: now.timestamp() + 100)
+    source = tmp_path / "pi" / "sessions" / "synthetic"
+    source.mkdir(parents=True)
+    transcript = source / "watch.jsonl"
+    records = [{"type": "session", "id": "synthetic", "timestamp": now.isoformat()}]
+    config = parse_config(
+        {"sources": {"pi-local": str(tmp_path / "pi")}, "efficiency": {"baseline_ts": 0, "first_parse_days": 1000}}
+    )
+    state = tmp_path / "state"
+    labels = {"agent": "pi", "namespace": "pi-local", "role": "solo", "loop": "none"}
+
+    for count in (1, 2):
+        records.extend(
+            [
+                {
+                    "type": "message",
+                    "timestamp": (now + timedelta(seconds=count * 10)).isoformat(),
+                    "message": {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "toolCall",
+                                "id": f"watch-{count}",
+                                "name": "watch_process",
+                                "arguments": {
+                                    "command": "gh run watch 123 --exit-status --interval 60",
+                                    "deadline_s": 30,
+                                    "tail_lines": 20,
+                                },
+                            }
+                        ],
+                    },
+                },
+                {
+                    "type": "message",
+                    "timestamp": (now + timedelta(seconds=count * 10 + 3)).isoformat(),
+                    "message": {
+                        "role": "toolResult",
+                        "toolCallId": f"watch-{count}",
+                        "content": [{"type": "text", "text": "synthetic watcher output"}],
+                        "details": {"exit_code": exit_code, "deadline_hit": deadline_hit, "tail": ""},
+                    },
+                },
+            ]
+        )
+        transcript.write_text("".join(json.dumps(record) + "\n" for record in records))
+        families = EfficiencyCollector(config, state).collect()
+        assert value(families, "agent_efficiency_wait_requests_total", **labels, tool="watch_process") == count
+        assert (
+            value(families, "agent_efficiency_wait_timeout_ms_total", **labels, tool="watch_process") == count * 30000
+        )
+        assert value(families, "agent_efficiency_poll_calls_total", **labels, target="ci", result=result) == count
+        assert value(families, "agent_efficiency_poll_seconds_total", **labels, target="ci", result=result) == count * 3
+        index = _index(families)
+        assert not index.rejected
+        for metric, expected in (
+            ("agent_efficiency_wait_requests_total", count),
+            ("agent_efficiency_wait_timeout_ms_total", count * 30000),
+        ):
+            assert index.observations[metric] == (
+                (tuple(sorted({**labels, "tool": "watch_process"}.items())), expected),
+            )
+        restarted = EfficiencyCollector(config, state).collect()
+        assert value(restarted, "agent_efficiency_wait_requests_total", **labels, tool="watch_process") == count
+
+
 @pytest.mark.parametrize("model", [{"unexpected": "model"}, ["unexpected"], 17])
 @pytest.mark.parametrize("record_kind", ["assistant", "model_change"])
 def test_malformed_pi_model_does_not_poison_cache_resume(tmp_path: Path, monkeypatch, model, record_kind):
