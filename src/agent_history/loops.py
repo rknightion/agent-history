@@ -3,7 +3,10 @@
 Runs inside load.post_passes' transaction over the roots of dirty sessions. Launches are found in
 the root's operator text (human/queued prompts) with `loop_launch.parse_launch`. The indexer
 never reads launch or report files (they may live on another machine), so:
-- a bare `launch-*.txt|md` path launch is stored as status 'unresolved_path', never dropped;
+- a bare `launch-*.txt|md` path is retained, and resolved only from a complete successful recorded
+  read of that exact file, never the indexer's filesystem;
+- exact path-only relaunches and successful final loop-state append invocations can join a root to
+  an existing run, but never supply identity or terminal evidence;
 - a loop is finished by a wave-notify completion receipt collected into ah.loop_receipt, else
   by the next launch in the same root session; the root session's last event is only a fallback
   timestamp. Transcript text and shell commands are never interpreted for completion or identity.
@@ -14,6 +17,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 from datetime import timedelta
 from pathlib import PurePosixPath
 from typing import Any, Sequence
@@ -50,13 +54,8 @@ def _no_read(path: Any) -> str:  # noqa: ARG001
 
 
 def _launch(text: str, cwd: str | None, ts_iso: str) -> dict[str, Any] | None:
-    try:
-        found = parse_launch(text, cwd, ts_iso, ACTIVATED_AT, read_file=_no_read)
-    except Exception:
-        found = None
-    if found:
-        found["status"] = "resolved"
-        return found
+    # Handle paths before the shared file-backed parser, so even existence checks cannot consult
+    # the indexer's filesystem. Only captured transcript reads resolve their contents below.
     bare = BARE_LAUNCH.match(text.strip())
     if bare:
         path = bare.group(1)
@@ -69,7 +68,13 @@ def _launch(text: str, cwd: str | None, ts_iso: str) -> dict[str, Any] | None:
         loop = re.search(r"-(?:loop|wave)(\d+)$", stem)
         return {"status": "unresolved_path", "launch_path": path, "report": report,
                 "loop": int(loop.group(1)) if loop else None, "mode": None, "launch_sha256": None, "budget": None}
-    return None
+    try:
+        found = parse_launch(text, cwd, ts_iso, ACTIVATED_AT, read_file=_no_read)
+    except Exception:
+        found = None
+    if found:
+        found["status"] = "resolved"
+    return found
 
 
 def _report_meta(report: str | None) -> dict[str, Any]:
@@ -86,13 +91,215 @@ def _report_meta(report: str | None) -> dict[str, Any]:
     return out
 
 
+def enqueue_backfill(conn: psycopg.Connection) -> None:
+    """Visit at most 128 retained sessions per refresh, atomically with their projections.
+
+    No schema change is needed: ah.meta already holds transactional projection cursors. Rebuild
+    explicitly resets this cursor with the derived session rows.
+    """
+    key = "loops_links_projection_v1"
+    saved = conn.execute("SELECT value FROM ah.meta WHERE key = %s", (key,)).fetchone()
+    cursor = saved[0] if saved else "0"
+    if cursor == "complete":
+        return
+    ids = [r[0] for r in conn.execute("SELECT id FROM ah.session WHERE id > %s ORDER BY id LIMIT 128", (int(cursor),))]
+    if ids:
+        with conn.cursor() as cur:
+            cur.executemany("INSERT INTO dirty_now VALUES (%s) ON CONFLICT DO NOTHING", [(sid,) for sid in ids])
+    conn.execute(
+        "INSERT INTO ah.meta (key, value) VALUES (%s, %s) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+        (key, str(ids[-1]) if len(ids) == 128 else "complete"),
+    )
+
+
+def repair_pi_spawns(conn: psycopg.Connection) -> None:
+    """Re-project missing foreground paths from retained, exact structured tool results.
+
+    Session content need not be reparsed just to fill this additive metadata. Names and timings
+    never choose a child; the same parent/call/index and recorded sessionFile supply its run path.
+    """
+    from .parse_pi import SESSION_PATH_RE
+    for parent, call, raw in conn.execute(
+        "SELECT i.session_id, i.call_uid, i.result_json FROM dirty_now d "
+        "JOIN ah.tool_io i ON i.session_id = d.session_id "
+        "WHERE i.agent = 'pi' AND i.tool_name = 'subagent' AND i.result_json IS NOT NULL "
+        "AND NOT COALESCE(i.output_truncated, false)",
+    ):
+        try:
+            details = json.loads(raw)
+        except (ValueError, RecursionError):
+            continue
+        results = details.get("results") if isinstance(details, dict) else None
+        if not isinstance(results, list):
+            continue
+        for n, result in enumerate(results):
+            if not isinstance(result, dict) or not isinstance(result.get("sessionFile"), str):
+                continue
+            path = SESSION_PATH_RE.search(result["sessionFile"])
+            index = result.get("index")
+            if path:
+                conn.execute(
+                    "UPDATE ah.subagent_spawn SET child_task_name = %s WHERE agent = 'pi' "
+                    "AND parent_session_id = %s AND spawn_uid = %s AND requested_type = %s "
+                    "AND child_task_name IS NULL",
+                    ("/".join(p for p in path.groups() if p), parent,
+                     f"{call}:{index if type(index) is int else n}", result.get("agent")),
+                )
+
+
+def _captured_launch(
+    conn: psycopg.Connection, root_id: int, hit: dict[str, Any], start: Any, following: Any = None
+) -> str | None:
+    """Complete successful structured reads of the exact launch file, never local file I/O.
+
+    Partial, failed and truncated reads do not resolve a path. Conflicting observed contents remain
+    unknown. A captured launch must name the protocol's exact report target.
+    """
+    path = hit.get("launch_path")
+    if not path:
+        return None
+    cwd = conn.execute("SELECT cwd FROM ah.session WHERE id = %s", (root_id,)).fetchone()[0]
+    texts = set()
+    for raw, output in conn.execute(
+        "SELECT i.input_text, i.output_text FROM ah.tool_io i JOIN ah.tool_call t "
+        "ON t.agent = i.agent AND t.call_uid = i.call_uid "
+        "WHERE i.session_id = %s AND lower(i.tool_name) = 'read' "
+        "AND t.outcome = 'ok' AND t.ended_at IS NOT NULL "
+        "AND NOT COALESCE(i.input_truncated, false) AND NOT COALESCE(i.output_truncated, false) "
+        "AND i.ts >= %s AND (%s::timestamptz IS NULL OR i.ts < %s)",
+        (root_id, start, following, following),
+    ):
+        try:
+            args = json.loads(raw or "")
+        except (ValueError, RecursionError):
+            continue
+        recorded_path = args.get("path", args.get("file_path")) if isinstance(args, dict) else None
+        if not isinstance(recorded_path, str) or os.path.normpath(os.path.join(cwd or "", recorded_path)) != path:
+            continue
+        if args.get("offset") not in (None, 1) or args.get("limit") is not None:
+            continue
+        if output:
+            texts.add(output)
+    if len(texts) != 1:
+        return None
+    text = next(iter(texts))
+    parsed = _launch(text, str(PurePosixPath(path).parent.parent), start.isoformat())
+    return text if parsed and parsed.get("report") == hit.get("report") and parsed["status"] == "resolved" else None
+
+
+def _resume_targets(conn: psycopg.Connection, root_id: int, cwd: str | None) -> set[str]:
+    """Exact path-only first prompts and successful loop-state append invocations.
+
+    Command text is linkage evidence only. It never supplies identity or a terminal outcome.
+    Do not interpret shell expansions, quoted text printed by echo, pipelines or substitutions.
+    """
+    targets = set()
+    first = conn.execute(
+        "SELECT text FROM ah.message WHERE session_id = %s "
+        "AND message_class IN ('human_prompt', 'queued_prompt') ORDER BY ts, id LIMIT 1",
+        (root_id,),
+    ).fetchone()
+    if first:
+        path = first[0].strip().strip("`")
+        if re.fullmatch(r"\S*/(?:launch|goal)-[^/\s]+\.(?:txt|md)", path):
+            path = os.path.normpath(os.path.join(cwd or "", path))
+            p = PurePosixPath(path)
+            if p.parent.name == "codex":
+                targets.add(str(p.with_name(re.sub(r"^(launch|goal)-", "report-", p.stem) + ".md")))
+    for raw in conn.execute(
+        "SELECT i.input_text FROM ah.tool_io i JOIN ah.tool_call t "
+        "ON t.agent = i.agent AND t.call_uid = i.call_uid "
+        "WHERE i.session_id = %s AND lower(i.tool_name) = 'bash' AND t.outcome = 'ok' "
+        "AND t.ended_at IS NOT NULL AND NOT COALESCE(i.input_truncated, false)",
+        (root_id,),
+    ):
+        try:
+            args = json.loads(raw[0] or "")
+            command = args.get("command") if isinstance(args, dict) else None
+            if not isinstance(command, str) or any(c in command for c in ("$", "`", "|", "&", "(", ")", "<", ">")):
+                continue
+            lexer = shlex.shlex(command.replace("\n", "\n;"), posix=True, punctuation_chars=";")
+            lexer.whitespace += "\n"
+            lexer.whitespace_split = True
+            tokens = list(lexer)
+        except (ValueError, RecursionError):
+            continue
+        for i in range(len(tokens) - 2):
+            if i and tokens[i - 1] != ";":
+                continue
+            if PurePosixPath(tokens[i]).name != "loop-state" or tokens[i + 1] != "append":
+                continue
+            # Whole-command success proves only the final simple invocation, not an earlier
+            # failure hidden by a later semicolon command.
+            if ";" in tokens[i + 3:]:
+                continue
+            path = os.path.normpath(os.path.join(cwd or "", tokens[i + 2]))
+            p = PurePosixPath(path)
+            if p.parent.name == "codex" and re.fullmatch(r"state-.+-(?:loop|wave)\d+\.jsonl", p.name):
+                targets.add(str(p.with_name(p.stem.replace("state-", "report-", 1) + ".md")))
+    return targets
+
+
+def _link_relaunch(conn: psycopg.Connection, root_id: int) -> bool:
+    root = conn.execute(
+        "SELECT cwd, first_event_at, session_uid, is_subagent FROM ah.session WHERE id = %s",
+        (root_id,),
+    ).fetchone()
+    if not root or root[3]:
+        return False
+    cwd, first_at, uid, _ = root
+    if (
+        first_at is None
+        or conn.execute(
+            "SELECT 1 FROM ah.loop_run WHERE root_session_id = %s LIMIT 1",
+            (root_id,),
+        ).fetchone()
+    ):
+        return False
+    # An explicit new root launch is not a continuation merely because it uses the same state log.
+    prompts = conn.execute(
+        "SELECT text FROM ah.message WHERE session_id = %s AND message_class IN ('human_prompt','queued_prompt')",
+        (root_id,),
+    )
+    if any(_launch(text, cwd, first_at.isoformat()) and not BARE_LAUNCH.match(text.strip()) for (text,) in prompts):
+        return False
+    targets = _resume_targets(conn, root_id, cwd)
+    if len(targets) != 1:
+        return False
+    matches = conn.execute(
+        "SELECT id, root_session_id, launch_ts FROM ah.loop_run "
+        "WHERE report_path = %s AND root_session_id <> %s AND launch_ts <= %s",
+        (next(iter(targets)), root_id, first_at),
+    ).fetchall()
+    if len(matches) != 1:
+        return False
+    loop_id, owner, start = matches[0]
+    conn.execute(
+        "UPDATE ah.session SET loop_run_id = %s, root_session_id = %s, loop_link_method = 'relaunch' "
+        "WHERE id = %s AND (loop_run_id IS NULL OR loop_run_id = %s)",
+        (loop_id, owner, root_id, loop_id),
+    )
+    conn.execute(
+        "UPDATE ah.session SET root_session_id = %s WHERE agent = 'pi' AND root_session_uid = %s AND id <> %s",
+        (owner, uid, root_id),
+    )
+    _tag_tree(conn, loop_id, owner, start, None)
+    return True
+
+
 def run(conn: psycopg.Connection) -> dict[str, int]:
     roots = [r[0] for r in conn.execute(
-        "SELECT DISTINCT COALESCE(s.root_session_id, s.id) FROM dirty_now d "
-        "JOIN ah.session s ON s.id = d.session_id")]
+        "WITH roots AS (SELECT DISTINCT COALESCE(s.root_session_id, s.id) AS id FROM dirty_now d "
+        "JOIN ah.session s ON s.id = d.session_id) "
+        "SELECT r.id FROM roots r JOIN ah.session s ON s.id = r.id "
+        "ORDER BY s.first_event_at NULLS LAST, r.id")]
     found = 0
     for root_id in roots:
-        found += _tag_root(conn, root_id)
+        if not _link_relaunch(conn, root_id):
+            found += _tag_root(conn, root_id)
+    # A root and its continuation may arrive together with either source order.
+    for root_id in roots:
+        _link_relaunch(conn, root_id)
     return {"loop_roots": len(roots), "launches": found}
 
 
@@ -119,7 +326,10 @@ def refresh_live(conn: psycopg.Connection) -> dict[str, int]:
                     WHEN greatest(s.last_event_at, l.launch_ts) >= now() - interval '24 hours'
                     THEN NULL ELSE greatest(s.last_event_at, l.launch_ts) END,
                now()
-        FROM ah.loop_run l LEFT JOIN ah.session s ON s.id = l.root_session_id
+        FROM ah.loop_run l LEFT JOIN LATERAL (
+            SELECT max(last_event_at) AS last_event_at FROM ah.session
+            WHERE id = l.root_session_id OR (loop_run_id = l.id AND loop_link_method = 'relaunch')
+        ) s ON true
         WHERE l.launch_ts IS NOT NULL
         ON CONFLICT (launch_uid) DO UPDATE SET status = EXCLUDED.status,
             launch_ts = EXCLUDED.launch_ts, end_ts = EXCLUDED.end_ts,
@@ -157,6 +367,7 @@ COMPLETION_SQL = """
           SELECT 1 FROM ah.session s
           WHERE s.id <> c.root_session_id
             AND (s.root_session_id = c.root_session_id OR s.loop_run_id = c.id)
+            AND s.loop_link_method IS DISTINCT FROM 'relaunch'
             AND s.first_event_at >= c.launch_ts
             AND (w.following IS NULL OR s.first_event_at < w.following)
             AND s.first_event_at > r.receipt_mtime)
@@ -489,7 +700,8 @@ def _refresh_progress(conn: psycopg.Connection) -> None:
                        CASE WHEN live.status = 'finished' THEN l.end_ts END AS end_ts
                 FROM ah.loop_run l JOIN ah.loops live USING (launch_uid) WHERE l.launch_uid = %s
             ), members AS (
-                SELECT s.id, s.last_event_at, s.agent, s.id = l.root_session_id AS is_root,
+                SELECT s.id, s.last_event_at, s.agent,
+                       (s.id = l.root_session_id OR s.loop_link_method = 'relaunch') AS is_root,
                        l.launch_ts, l.end_ts
                 FROM target l JOIN ah.session s ON s.id = l.root_session_id OR
                     (s.loop_run_id = l.id AND s.id <> l.root_session_id)
@@ -535,7 +747,7 @@ def _refresh_progress(conn: psycopg.Connection) -> None:
                 cache_read = usage.cache_read, cache_write = usage.cache_write, output = usage.output,
                 priced_cost_usd = costs.cost, tool_errors = tools.errors, api_errors = usage.api_errors,
                 commits = git.commits, pushes = git.pushes,
-                root_agent = (SELECT agent FROM members WHERE is_root)
+                root_agent = (SELECT agent FROM ah.session WHERE id = (SELECT root_session_id FROM target))
             FROM usage, costs, tools, git, lanes WHERE launch_uid = %s
         """,
             (uid, uid),
@@ -577,16 +789,19 @@ def _refresh_tasks_done(conn: psycopg.Connection) -> None:
 
 
 def _tag_root(conn: psycopg.Connection, root_id: int) -> int:
-    root = conn.execute("SELECT cwd, last_event_at, agent, session_uid, agent_id FROM ah.session WHERE id = %s",
-                        (root_id,)).fetchone()
+    root = conn.execute(
+        "SELECT cwd, last_event_at, agent, session_uid, agent_id FROM ah.session WHERE id = %s", (root_id,)
+    ).fetchone()
     if root is None:
         return 0
     cwd, root_last, agent, session_uid, agent_id = root
-    root_key = f"{agent}/{session_uid}/{agent_id}"   # natural key: launch_uid survives rebuild
+    root_key = f"{agent}/{session_uid}/{agent_id}"  # natural key: launch_uid survives rebuild
     launches: list[tuple[str, Any, dict[str, Any]]] = []
     for event_uid, ts, text in conn.execute(
-            "SELECT event_uid, ts, text FROM ah.message WHERE session_id = %s "
-            "AND message_class IN ('human_prompt','queued_prompt') ORDER BY ts, id", (root_id,)):
+        "SELECT event_uid, ts, text FROM ah.message WHERE session_id = %s "
+        "AND message_class IN ('human_prompt','queued_prompt') ORDER BY ts, id",
+        (root_id,),
+    ):
         if "root" not in text and "launch-" not in text:
             continue
         hit = _launch(text, cwd, ts.isoformat().replace("+00:00", "Z"))
@@ -595,6 +810,12 @@ def _tag_root(conn: psycopg.Connection, root_id: int) -> int:
     for index, (event_uid, ts, hit) in enumerate(launches):
         meta = _report_meta(hit.get("report"))
         next_ts = launches[index + 1][1] if index + 1 < len(launches) else None
+        captured = _captured_launch(conn, root_id, hit, ts, next_ts)
+        if captured:
+            base = str(PurePosixPath(hit["launch_path"]).parent.parent)
+            resolved = _launch(captured, base, ts.isoformat())
+            if resolved:
+                hit = {**resolved, "launch_path": hit["launch_path"]}
         end_ts, evidence = None, None
         if end_ts is None and next_ts is not None:
             end_ts, evidence = next_ts, "next_launch"
@@ -607,24 +828,45 @@ def _tag_root(conn: psycopg.Connection, root_id: int) -> int:
             "ON CONFLICT (launch_uid) DO UPDATE SET end_ts = EXCLUDED.end_ts, end_evidence = EXCLUDED.end_evidence, "
             "status = EXCLUDED.status, report_path = EXCLUDED.report_path, loop_number = EXCLUDED.loop_number, "
             "repo_slug = EXCLUDED.repo_slug, campaign_slug = EXCLUDED.campaign_slug, naming = EXCLUDED.naming, "
-            "goal_path = EXCLUDED.goal_path RETURNING id",
-            (f"{root_key}:{event_uid}", root_id, hit["status"], meta.get("repo_slug"), meta.get("campaign_slug"),
-             hit.get("loop"), meta.get("naming"), hit.get("mode"), hit.get("report"), meta.get("goal_path"),
-             hit.get("launch_path"), hit.get("launch_sha256"), ts, end_ts, evidence, hit.get("budget")),
+            "goal_path = EXCLUDED.goal_path, launch_path = EXCLUDED.launch_path, "
+            "launch_sha256 = EXCLUDED.launch_sha256, mode = EXCLUDED.mode, budget_s = EXCLUDED.budget_s RETURNING id",
+            (
+                f"{root_key}:{event_uid}",
+                root_id,
+                hit["status"],
+                meta.get("repo_slug"),
+                meta.get("campaign_slug"),
+                hit.get("loop"),
+                meta.get("naming"),
+                hit.get("mode"),
+                hit.get("report"),
+                meta.get("goal_path"),
+                hit.get("launch_path"),
+                hit.get("launch_sha256"),
+                ts,
+                end_ts,
+                evidence,
+                hit.get("budget"),
+            ),
         ).fetchone()[0]
-        _tag_tree(conn, loop_id, root_id, ts, end_ts)
+        _tag_tree(conn, loop_id, root_id, ts, next_ts)
     return len(launches)
 
 
 def _tag_tree(conn: psycopg.Connection, loop_id: int, root_id: int, start: Any, end: Any) -> None:
-    conn.execute("UPDATE ah.session SET loop_run_id = %s, loop_link_method = 'launch' WHERE id = %s "
-                 "AND (loop_run_id IS NULL OR loop_run_id = %s)", (loop_id, root_id, loop_id))
+    conn.execute(
+        "UPDATE ah.session SET loop_run_id = %s, loop_link_method = 'launch' WHERE id = %s "
+        "AND (loop_run_id IS NULL OR loop_run_id = %s)",
+        (loop_id, root_id, loop_id),
+    )
     members = conn.execute(
         "UPDATE ah.session s SET loop_run_id = %s, loop_link_method = 'lineage' "
         "WHERE s.root_session_id = %s AND s.id <> %s AND s.first_event_at >= %s "
-        "AND (%s::timestamptz IS NULL OR s.first_event_at <= %s) "
+        "AND s.loop_link_method IS DISTINCT FROM 'relaunch' "
+        "AND (%s::timestamptz IS NULL OR s.first_event_at < %s) "
         "AND (s.loop_run_id IS NULL OR s.loop_run_id = %s) RETURNING s.id",
-        (loop_id, root_id, root_id, start, end, end, loop_id)).fetchall()
+        (loop_id, root_id, root_id, start, end, end, loop_id),
+    ).fetchall()
     member_ids = [m[0] for m in members]
     # Heuristic: Codex exec sessions started while a lineage session ran a Codex command in the same
     # cwd tree and inside the loop window.
@@ -636,7 +878,8 @@ def _tag_tree(conn: psycopg.Connection, loop_id: int, root_id: int, start: Any, 
         "AND x.first_event_at BETWEEN t.started_at AND COALESCE(t.ended_at, t.started_at + interval '2 hours') "
         "AND t.started_at >= %s AND (%s::timestamptz IS NULL OR t.started_at <= %s) "
         "AND (x.cwd = ts.cwd OR x.cwd LIKE ts.cwd || '/%%' OR ts.cwd LIKE x.cwd || '/%%') RETURNING x.id",
-        (loop_id, root_id, root_id, start, end, end)).fetchall()
+        (loop_id, root_id, root_id, start, end, end),
+    ).fetchall()
     for sid, method in [(m, "lineage") for m in member_ids] + [(h[0], "heuristic") for h in heuristic]:
         _lane(conn, loop_id, sid, method)
 

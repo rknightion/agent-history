@@ -67,7 +67,8 @@ def file_role(agent: str, parts: tuple[str, ...]) -> str | None:
             return None
         if len(parts) == 3:
             return "main"
-        return "subagent" if len(parts) >= 6 and parts[-2].startswith("run-") else None
+        from .parse_pi import lineage
+        return "subagent" if lineage("/".join(parts)).get("depth", 0) > 0 else None
     if parts[0] != "projects":
         return None
     if "subagents" in parts:
@@ -501,8 +502,8 @@ def parser_for(agent: str, role: str | None = None) -> tuple[type, str]:
         from .parse_claude import ClaudeParser
         return ClaudeParser, model.PARSER_VERSION_CLAUDE
     if agent == "pi":
-        from .parse_pi import PARSER_VERSION, PiArtifactParser, PiParser
-        return (PiArtifactParser if role == "pi_artifact" else PiParser), PARSER_VERSION
+        from .parse_pi import ARTIFACT_PARSER_VERSION, PARSER_VERSION, PiArtifactParser, PiParser
+        return (PiArtifactParser, ARTIFACT_PARSER_VERSION) if role == "pi_artifact" else (PiParser, PARSER_VERSION)
     from .parse_codex import CodexParser
     return CodexParser, model.PARSER_VERSION_CODEX
 
@@ -607,6 +608,10 @@ def _process_source(conn: psycopg.Connection, writer: Writer, entry: SourceEntry
     else:
         source_id = existing["id"]
         offset = existing["indexed_offset"]
+        if entry.role == "pi_artifact" and existing["parser_version"] == "6" and parser_version == "6-links1":
+            # Additive metadata-only replay: PiArtifactParser emits no session/content rows. KEEP
+            # fills only the previously unknown agent name, without replacing known evidence.
+            offset = 0
         if existing["parser_version"] != parser_version and offset:
             # Reparsing in place cannot correct DO NOTHING / KEEP rows: a parser upgrade needs
             # `agent-history rebuild`. Refuse, loudly, rather than mix parser versions.
@@ -617,7 +622,7 @@ def _process_source(conn: psycopg.Connection, writer: Writer, entry: SourceEntry
             conn.commit()
             stats.errors += 1
             return
-        unchanged = (stat.st_size == offset and existing["status"] == "indexed"
+        unchanged = (existing["parser_version"] == parser_version and stat.st_size == offset and existing["status"] == "indexed"
                      and existing["mtime_ns"] == stat.st_mtime_ns and existing["tier"] == entry.tier)
         if unchanged:
             return
@@ -728,7 +733,7 @@ LINK_SQL = [
     FROM ah.session p
     WHERE c.agent = 'pi' AND c.parent_session_id IS NULL AND c.parent_session_uid IS NULL
       AND c.spawn_depth > 1 AND c.agent_path IS NOT NULL
-      AND p.agent = 'pi' AND p.agent_path = regexp_replace(c.agent_path, '/[^/]+/[^/]+$', '')
+      AND p.agent = 'pi' AND p.agent_path = regexp_replace(c.agent_path, '/[^/]+(/run-[0-9]+)?$', '')
     """,
     """
     UPDATE ah.session c SET root_session_id = r.id
@@ -1032,6 +1037,8 @@ def post_passes(conn: psycopg.Connection, refresh_id: int | None = None) -> dict
             UNION SELECT parent_session_id FROM pending WHERE parent_session_id IS NOT NULL
             ON CONFLICT DO NOTHING
         """)
+        # Repair historical loop/lane projections in bounded transactional batches.
+        loops.enqueue_backfill(conn)
         dirty = conn.execute("SELECT count(*) FROM dirty_now").fetchone()[0]
         result["dirty_sessions"] = dirty
         if not dirty:
@@ -1041,6 +1048,7 @@ def post_passes(conn: psycopg.Connection, refresh_id: int | None = None) -> dict
             if standalone:
                 finish_refresh(conn, refresh_id, True)
             return result
+        loops.repair_pi_spawns(conn)
         for statement in LINK_SQL:
             conn.execute(statement.replace("ah.dirty_now", "dirty_now"))
         conn.execute(ROLLUP_SQL.replace("ah.dirty_now", "dirty_now"))
@@ -1273,11 +1281,17 @@ def refresh(conn: psycopg.Connection, hot: Path | None = HOT_ROOT, cold: Path | 
         writer = Writer(conn)
         # Main files first so parents exist before children; stable order otherwise.
         order = sorted(entries.values(), key=lambda e: (e.role != "main", e.rel_path))
+        artifact_replays = 0
         for entry in order:
             if limit_files is not None and stats.files_parsed >= limit_files:
                 break
+            previous = existing.get(entry.rel_path)
+            if entry.role == "pi_artifact" and previous and previous["parser_version"] == "6":
+                if artifact_replays >= 128:
+                    continue
+                artifact_replays += 1
             stats.files_seen += 1
-            process_source(conn, writer, entry, existing.get(entry.rel_path), stats)
+            process_source(conn, writer, entry, previous, stats)
             if len(writer.session_ids) > 200_000:
                 writer.session_ids.clear()
         if cold_ok and not namespaces:
@@ -1456,7 +1470,7 @@ def rebuild(conn: psycopg.Connection, hot: Path | None = HOT_ROOT, cold: Path | 
                 conn.execute(f"UPDATE ah.{table} SET session_id = NULL WHERE session_id IS NOT NULL")
             conn.execute("TRUNCATE " + ", ".join(f"ah.{t}" for t in DATA_TABLES) + " RESTART IDENTITY CASCADE")
             # Derived enrichment is re-derived from scratch; collector-owned tables are kept.
-            conn.execute("DELETE FROM ah.meta WHERE key IN ('task_ref_hash')")
+            conn.execute("DELETE FROM ah.meta WHERE key IN ('task_ref_hash', 'loops_links_projection_v1')")
             # The embedder skips while this is set (it never holds the refresh lock across API calls).
             conn.execute("INSERT INTO ah.meta (key, value) VALUES ('rebuild_in_progress', now()::text) "
                          "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value")

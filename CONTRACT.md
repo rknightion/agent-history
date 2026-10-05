@@ -135,7 +135,10 @@ them; after a `kind = 'rebuild'` row in `ah.change_log`, re-page any cursor from
   known). Display names never supply a type.
 - pi: children of a pi-subagents run are linked to their parent by path; archived
   `subagent-artifacts/*_transcript.jsonl` copies pair a run id with the child's response id and are
-  indexed as evidence only (no messages or model calls).
+  indexed as evidence only (no messages or model calls). Both direct run-id directories and
+  legacy `run-<index>` children under a root session directory establish nested lineage. Explicit
+  agent names from retained spawn/artifact metadata, including `-low` agents, supply lane roles;
+  directory names and timing alone never choose an agent type.
 
 ## Structure, change feed and search
 
@@ -185,6 +188,20 @@ historical report scans. Subsequent refreshes project running loops and the root
 child sessions, updating identity only when a value changes. Rebuild recreates values from retained
 transcript evidence and preserves consumer table-level SELECT grants.
 The migration changes no grants or roles, and imposes no constraint or default on existing rows.
+
+Path-only launches can also resolve from a complete, successful structured read of the exact
+recorded launch path. Resolution uses captured bytes and the recorded working directory, never
+files on the indexer's machine. Partial, failed or conflicting reads supply no launch contents.
+A relaunched root joins an existing loop only through its exact launch-file path or a successful
+final simple `loop-state append` invocation naming that loop's existing state path. Ambiguous
+matches remain unlinked. A linked relaunch is another root session, not a lane; its activity
+contributes to the original loop without changing receipt-based terminal semantics.
+
+Historical linkage repair visits at most 128 retained sessions per refresh with a transactional
+`ah.meta` cursor. Existing structured foreground spawn results can repair missing child paths;
+metadata-only replay separately visits at most 128 retained pi artifact files per refresh. Neither
+path rebuilds session content or invents missing evidence. A content rebuild resets the linkage
+cursor; grants and collector tables retain their existing rebuild guarantees.
 
 The receiver seam also includes `status text`, `launch_ts timestamptz`, `end_ts timestamptz`:
 

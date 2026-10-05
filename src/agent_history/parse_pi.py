@@ -8,6 +8,7 @@ Files (load.file_role)
   sessions/<cwd-slug>/<ts>_<session id>.jsonl                   main (a root or a standalone run)
   sessions/<cwd-slug>/<root base>/<run dir>/run-<i>/<x>.jsonl   subagent (pi-subagents child); a
       nested child adds `session/<run dir>/run-<j>/` per level below its parent's run dir.
+      A run directory without run-<i> is also supported, including mixed nested layouts.
   sessions/<cwd-slug>/subagent-artifacts/*_transcript.jsonl       structural run evidence only.
       PiArtifactParser reads runId, resolved agent-file name and responseId from the version-1
       copy. It emits no message or LLM rows, so child calls remain counted once.
@@ -92,9 +93,10 @@ from .parse_claude import _diff_counts, _nlines
 
 AGENT = "pi"
 PARSER_VERSION = "6"
-PI_AGENT_FILES = frozenset({"mapper", "mapper-deep", "gate-runner", "lane-worker", "lane-worker-push",
-                            "lane-worker-retry", "lane-worker-retry-push", "complex-worker", "complex-worker-push", "reviewer", "reviewer-high",
-                            "security-reviewer", "rescue-sol", "rescue-astra"})
+# Only artifact metadata needs replay. Existing session content rows are unchanged.
+ARTIFACT_PARSER_VERSION = "6-links1"
+# Resolved agent-file names are evidence, including custom agents and route suffixes such as -low.
+PI_AGENT_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
 KNOWN_TYPES = {"session", "message", "model_change", "thinking_level_change", "usage", "compaction",
                "branch_summary", "custom", "custom_message", "label", "session_info", "context_edit"}
 TERMINAL = {"stop", "length", "error", "aborted"}
@@ -115,7 +117,7 @@ CHILD_DONE_RE = re.compile(r"^Workflow child (\w+): \*\*([^*]+)\*\*", re.M)
 ASYNC_DONE_RE = re.compile(r"Background task (completed|failed): \*\*([^*]+)\*\*")
 ASYNC_DIR_RE = re.compile(rf"^Retention-managed async directory: .*/async-subagent-runs/({UUID})[ \t]*$", re.M)
 # a child session path inside a notify: .../<root base>/<run dir>/run-<i>/<file>.jsonl
-SESSION_PATH_RE = re.compile(rf"/({UUID})/(run-\d+)/[^/\"\s]+\.jsonl")
+SESSION_PATH_RE = re.compile(rf"/({UUID})/(?:(run-\d+)/)?[^/\"\s]+\.jsonl")
 ERROR_KIND_RE = re.compile(r"^([a-z][a-z0-9_]{2,63}):")
 ERROR_STATUS_RE = re.compile(r"\((\d{3})\)")
 
@@ -160,19 +162,34 @@ def lineage(rel_path: str) -> dict[str, Any]:
         start = parts.index("sessions")
     except ValueError:
         return {}
-    rest = parts[start + 1:]
+    rest = parts[start + 1 :]
     if len(rest) < 2:
         return {}
-    if len(rest) == 2:   # sessions/<slug>/<file>
+    if len(rest) == 2:  # sessions/<slug>/<file>
         stem = rest[1].removesuffix(".jsonl")
         return {"root": stem.rsplit("_", 1)[-1], "depth": 0}
     base = rest[1]
-    segs = [p for p in rest[2:-1] if p != "session"]
-    if not segs or len(segs) % 2:
-        return {}
     root = base.rsplit("_", 1)[-1]
-    return {"root": root, "depth": len(segs) // 2, "path": "/".join([root, *segs]),
-            "task": "/".join(segs[-2:])}
+    if not re.fullmatch(UUID, root):
+        return {}
+    segs, runs = [], []
+    tail = rest[2:-1]
+    index = 0
+    while index < len(tail):
+        if tail[index] == "session" and runs:
+            index += 1
+        if index >= len(tail) or not re.fullmatch(UUID, tail[index]):
+            return {}
+        run = [tail[index]]
+        index += 1
+        if index < len(tail) and re.fullmatch(r"run-\d+", tail[index]):
+            run.append(tail[index])
+            index += 1
+        runs.append("/".join(run))
+        segs.extend(run)
+    if not runs:
+        return {}
+    return {"root": root, "depth": len(runs), "path": "/".join([root, *segs]), "task": runs[-1]}
 
 
 class PiParser:
@@ -690,7 +707,7 @@ class PiParser:
             exit_code = as_int(result.get("exitCode"))
             rows.append(SubagentSpawnRow(
                 AGENT, f"{call_id}:{index if index is not None else n}", self._key(), call["bo"],
-                turn_key=call.get("t"), child_task_name=f"{path.group(1)}/{path.group(2)}" if path else None,
+                turn_key=call.get("t"), child_task_name="/".join(p for p in path.groups() if p) if path else None,
                 spawned_at=datetime.fromtimestamp(call["e"], ts.tzinfo), requested_type=result["agent"],
                 requested_type_source="explicit",
                 requested_model=as_str(result.get("requestedModel")), resolved_model=as_str(result.get("model")),
@@ -754,8 +771,14 @@ class PiArtifactParser:
         response_id = as_str(message.get("responseId"))
         if not run_id or not response_id:
             return []
-        return [PiRunResponseRow(run_id, response_id, pos.byte_offset,
-                                 agent_name if agent_name in PI_AGENT_FILES else None)]
+        return [
+            PiRunResponseRow(
+                run_id,
+                response_id,
+                pos.byte_offset,
+                agent_name if agent_name and PI_AGENT_NAME.fullmatch(agent_name) else None,
+            )
+        ]
 
     def flush(self) -> Iterable[Row]:
         return []
