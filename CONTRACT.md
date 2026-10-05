@@ -62,7 +62,7 @@ loses them. Keep your own copies if you want history to survive that.
 
 Not truncated by `rebuild`: `ah.change_log`, `ah.refresh_log`, `ah.embedding` (a paid cache keyed by
 model and input hash) and the collector tables (`git_commit`, `git_commit_file`, `ci_run`,
-`backlog_task`, `backlog_done_event`, `backlog_done_scan`, `task_prefix`, `installed_feature`, `permission_log`, `loop_receipt`,
+`backlog_task`, `backlog_done_event`, `backlog_done_scan`, `collector_mutation_audit`, `task_prefix`, `installed_feature`, `permission_log`, `loop_receipt`,
 `session_summary`, `session_topic`).
 
 ## Namespaces and contexts
@@ -481,7 +481,7 @@ cannot recover transcripts already deleted from their source homes.
 
 ## Collector metadata
 
-The collector writes `task_prefix`, `backlog_task`, `backlog_done_event`, `backlog_done_scan`, `git_commit`,
+The collector writes `task_prefix`, `backlog_task`, `backlog_done_event`, `backlog_done_scan`, `collector_mutation_audit`, `git_commit`,
 `git_commit_file`, `ci_run`, `installed_feature`, `permission_log` and `loop_receipt`. Git subjects, tracker titles, labels and project values,
 file paths, repository slugs, workflow names and installed-feature names are stored verbatim.
 Author emails are compared to configured identities but only `author_is_owner` is stored.
@@ -500,6 +500,19 @@ The hourly collector validates the server's session and current role as dedicate
 rejecting administrative privileges and catalogue-owning role membership before collection.
 The guard completes its transaction before writes so each metadata write can commit normally.
 The pre-existing writer/indexer `collect-git` path accepts the indexer's connection separately.
+
+Migration `030_collector_mutation_audit.sql` adds the collector table `ah.collector_mutation_audit`.
+Each proven off-default reconciliation appends its table name, operation, full natural key in
+`row_key`, repository slug, compared ref and resolved commit SHA, and transaction timestamp
+`deleted_at`, before mutation in the same transaction. `operation = 'off_default'` records the
+existing `git_commit.on_default = false` UPDATE: the commit and its file rows are retained, not
+deleted. `operation = 'delete'` records the actual `backlog_done_event` DELETE. For an off-default
+UPDATE, `deleted_at` is the reconciliation timestamp, not evidence of physical deletion. Audit
+and mutation commit or roll back together; only exact locked rows are mutated. Unknown commits,
+on-default commits, unsuccessful fetches and dry runs produce neither mutation nor audit.
+Rebuild preserves this table. The dedicated collector receives SELECT and INSERT on it, never
+UPDATE or DELETE; a role provisioned after migration needs those permissions and USAGE on its
+identity sequence.
 
 ## MCP compatibility
 

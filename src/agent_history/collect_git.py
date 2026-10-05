@@ -1239,26 +1239,7 @@ class Collector:
             days = self.rescan_days or (RESCAN_DAYS if known else FIRST_RUN_DAYS)
             rows = git_commits(info, days)
             self.write("git_commit", GIT_COLS, ["repo_slug", "sha"], rows)
-            if not self.dry_run and info["fetched"]:
-                # Stored commits in the window that origin's branch no longer contains. Only a sha this
-                # clone has and can prove is not an ancestor is marked; unknown shas are left alone.
-                with self.conn.cursor() as cur:
-                    cur.execute(
-                        "SELECT sha FROM ah.git_commit WHERE repo_slug = %s AND on_default IS DISTINCT FROM false "
-                        "AND committed_at >= now() - make_interval(days => %s) AND NOT (sha = ANY(%s))",
-                        (slug, days, [r["sha"] for r in rows]),
-                    )
-                    candidates = [r[0] for r in cur.fetchall()]
-                self.conn.commit()
-                gone = [sha for sha in candidates if off_branch(info["path"], sha, info["ref"])]
-                if gone:
-                    with self.conn.transaction(), self.conn.cursor() as cur:
-                        cur.execute(
-                            "UPDATE ah.git_commit SET on_default = false, seen_at = now() "
-                            "WHERE repo_slug = %s AND sha = ANY(%s)",
-                            (slug, gone),
-                        )
-                        self.add("git_commit", off_default=cur.rowcount)
+            self._reconcile_off_branch(info, "git_commit", days, [r["sha"] for r in rows])
         except Exception as error:  # one repo never stops the run
             self.rollback()
             self.errors.append({"repo": slug, "step": "git_commit", "error": type(error).__name__})
@@ -1284,6 +1265,65 @@ class Collector:
         except Exception as error:
             self.rollback()
             self.errors.append({"repo": slug, "step": "backlog", "error": type(error).__name__})
+
+    def _reconcile_off_branch(self, info: dict[str, Any], table: str, days: int, observed: list[str]) -> None:
+        """Audit the existing off-default UPDATE or DELETE before it runs, in the same transaction."""
+        if self.dry_run or not info["fetched"]:
+            return
+        from psycopg import sql
+        from psycopg.types.json import Jsonb
+
+        # Only these two operations are authorised. Commit rows and their file rows are retained.
+        timestamp, key, operation = {
+            "git_commit": ("committed_at", ("repo_slug", "sha"), "off_default"),
+            "backlog_done_event": ("done_at", ("repo_slug", "task_key", "sha"), "delete"),
+        }[table]
+        target = sql.Identifier("ah", table)
+        guard = sql.SQL(" AND on_default IS DISTINCT FROM false" if table == "git_commit" else "")
+        predicate = sql.SQL("repo_slug = %s AND {} >= now() - make_interval(days => %s){}").format(
+            sql.Identifier(timestamp), guard
+        )
+        with self.conn.cursor() as cur:
+            cur.execute(
+                sql.SQL("SELECT DISTINCT sha FROM {} WHERE {} AND NOT (sha = ANY(%s))").format(target, predicate),
+                (info["slug"], days, observed),
+            )
+            candidates = [row[0] for row in cur.fetchall()]
+        self.conn.commit()
+        if not candidates:
+            return
+        # Prove against an immutable commit, not a ref another fetch could move during this scan.
+        ref_sha = git(info["path"], "rev-parse", "--verify", f"{info['ref']}^{{commit}}").strip()
+        gone = [sha for sha in candidates if off_branch(info["path"], sha, ref_sha)]
+        if not gone:
+            return
+        with self.conn.transaction(), self.conn.cursor() as cur:
+            cur.execute(
+                sql.SQL("SELECT {} FROM {} WHERE {} AND sha = ANY(%s) FOR UPDATE").format(
+                    sql.SQL(", ").join(map(sql.Identifier, key)), target, predicate
+                ),
+                (info["slug"], days, gone),
+            )
+            keys = cur.fetchall()
+            if not keys:
+                return
+            cur.executemany(
+                "INSERT INTO ah.collector_mutation_audit (table_name, operation, row_key, repo_slug, ref, ref_sha) "
+                "VALUES (%s, %s, %s, %s, %s, %s)",
+                [
+                    (table, operation, Jsonb(dict(zip(key, values, strict=True))), info["slug"], info["ref"], ref_sha)
+                    for values in keys
+                ],
+            )
+            # Restrict mutations to the exact locked and audited natural keys, including task_key.
+            match = sql.SQL(" AND ").join(sql.SQL("{} = %s").format(sql.Identifier(column)) for column in key)
+            if table == "git_commit":
+                statement = sql.SQL("UPDATE {} SET on_default = false, seen_at = now() WHERE {}")
+            else:
+                statement = sql.SQL("DELETE FROM {} WHERE {}")
+            cur.executemany(statement.format(target, match), keys)
+            changed = cur.rowcount
+        self.add(table, off_default=changed)
 
     def _git_commit_files(self, info: dict[str, Any], days: int) -> None:
         """Same window as `git_commit`, widened once per repo to backfill a repo with no file rows yet.
@@ -1345,24 +1385,7 @@ class Collector:
                 days = max(days, (datetime.now(timezone.utc) - oldest).days + 1)
         rows = backlog_done_events(info, days, pad)
         self.write("backlog_done_event", DONE_COLS, ["repo_slug", "task_key", "sha"], rows)
-        if not self.dry_run and info["fetched"]:
-            # Rows in the window whose commit origin's branch no longer contains (rebased or force-pushed
-            # away). Only a sha this clone has and can prove is not an ancestor is removed.
-            with self.conn.cursor() as cur:
-                cur.execute(
-                    "SELECT DISTINCT sha FROM ah.backlog_done_event WHERE repo_slug = %s "
-                    "AND done_at >= now() - make_interval(days => %s) AND NOT (sha = ANY(%s))",
-                    (slug, days, [r["sha"] for r in rows]),
-                )
-                candidates = [r[0] for r in cur.fetchall()]
-            self.conn.commit()
-            gone = [sha for sha in candidates if off_branch(info["path"], sha, info["ref"])]
-            if gone:
-                with self.conn.transaction(), self.conn.cursor() as cur:
-                    cur.execute(
-                        "DELETE FROM ah.backlog_done_event WHERE repo_slug = %s AND sha = ANY(%s)", (slug, gone)
-                    )
-                    self.add("backlog_done_event", off_default=cur.rowcount)
+        self._reconcile_off_branch(info, "backlog_done_event", days, [r["sha"] for r in rows])
         if widened:
             with self.conn.transaction(), self.conn.cursor() as cur:
                 cur.execute(

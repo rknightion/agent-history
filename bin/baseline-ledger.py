@@ -31,6 +31,7 @@ REPLAYED = (
     "025_loop_receipts.sql",
     "026_loop_planner_signals.sql",
     "029_loop_live.sql",
+    "030_collector_mutation_audit.sql",
 )
 
 
