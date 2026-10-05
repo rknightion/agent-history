@@ -92,8 +92,9 @@ from .model import (ArtifactRow, AttachmentRow, CompactionRow, ContinuationRow, 
 from .parse_claude import _diff_counts, _nlines
 
 AGENT = "pi"
-PARSER_VERSION = "6"
-# Only artifact metadata needs replay. Existing session content rows are unchanged.
+# Re-parse retained sessions to add compaction session events; existing content keys stay unchanged.
+PARSER_VERSION = "7"
+# Artifact metadata replay is independent of the session parser version.
 ARTIFACT_PARSER_VERSION = "6-links1"
 # Resolved agent-file names are evidence, including custom agents and route suffixes such as -low.
 PI_AGENT_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
@@ -581,6 +582,14 @@ class PiParser:
             rows.append(CompactionRow(AGENT, uid, self._key(), ts, pos.byte_offset, turn,
                                       trigger="extension" if record.get("fromHook") else None,
                                       pre_tokens=as_int(record.get("tokensBefore"))))
+            before = record.get("tokensBefore")
+            before = before if type(before) is int and before >= 0 else None
+            # pi records no authoritative post-context count. Summary-generation usage and later
+            # assistant input describe different prompts, not the context at this boundary.
+            rows.append(SessionEventRow(AGENT, uid, self._key(), ts, "compaction", pos.byte_offset, turn,
+                                        detail={"before_tokens": before,
+                                                "before_tokens_source": "compaction.tokensBefore" if before is not None else None,
+                                                "after_tokens": None, "after_tokens_source": None}))
         summary = record.get("summary")
         if isinstance(summary, str) and summary.strip():
             rows.append(self._msg(uid, ts, "user", "compaction_summary", summary.strip(), pos, turn,

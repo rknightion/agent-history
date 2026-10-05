@@ -315,6 +315,60 @@ def test_usage_entry_is_an_llm_call(tmp_path):
         ("pi:u1:f6g7h8i9", "usage:cache_warm", "claude-sonnet-4-5", 50000)
 
 
+@pytest.mark.parametrize("recorded,expected", [
+    (600000, 600000), (0, 0), (None, None), (-1, None), (True, None), (False, None),
+    (12.5, None), (12.0, None), ("12", None), ({"tokens": 12}, None), ([12], None),
+])
+def test_compaction_event_measurements_are_recorded_not_coerced(tmp_path, recorded, expected):
+    at = "2026-10-01T10:00:00Z"
+    records = [
+        {"type": "session", "version": 3, "id": "compact-test", "timestamp": at, "cwd": "/p"},
+        {"type": "message", "id": "prompt", "timestamp": at,
+         "message": {"role": "user", "content": "Synthetic compaction prompt."}},
+        {"type": "compaction", "id": "compact", "parentId": "prompt", "timestamp": at,
+         "tokensBefore": recorded, "firstKeptEntryId": "prompt", "fromHook": True,
+         "summary": "Synthetic compaction summary.",
+         "usage": {"input": 500000, "output": 4000, "cacheRead": 1, "cacheWrite": 2},
+         # Extension details are not an authoritative post-context measurement schema.
+         "details": {"tokensAfter": 42}},
+        {"type": "message", "id": "later", "parentId": "compact", "timestamp": at,
+         "message": {"role": "assistant", "model": "synthetic", "stopReason": "stop", "content": [],
+                     "usage": {"input": 10000, "output": 10, "cacheRead": 0, "cacheWrite": 0}}},
+    ]
+    if recorded is None:
+        records[2].pop("tokensBefore")
+    path = tmp_path / "compaction.jsonl"
+    path.write_text("".join(json.dumps(record) + "\n" for record in records))
+    ctx = FileContext(str(path), "pi-test/sessions/slug/compaction.jsonl", "pi-test", "pi", "test", None, "main")
+    store = MemStore()
+    run_file(PiParser, ctx, store, batch_lines=1)
+    event = one(store, "session_event", kind="compaction")
+    compaction = one(store, "compaction")
+    assert event["event_uid"] == compaction["event_uid"] == "compact-test:compact"
+    assert event["byte_offset"] == compaction["byte_offset"]
+    assert event["turn_key"] == compaction["turn_key"] == "prompt"
+    assert event["ts"] == compaction["ts"]
+    assert event["detail"] == {
+        "before_tokens": expected, "before_tokens_source": "compaction.tokensBefore" if expected is not None else None,
+        "after_tokens": None, "after_tokens_source": None,
+    }
+    assert one(store, "message", message_class="compaction_summary")["text"] == "Synthetic compaction summary."
+    usage = one(store, "llm_call", stop_reason="compaction")
+    assert (usage["input_uncached"], usage["output"], usage["cache_read"], usage["cache_write_5m"]) == (500000, 4000, 1, 2)
+    run_file(PiParser, ctx, store)
+    assert by(store, "session_event", kind="compaction") == [event]
+
+
+def test_branch_summary_is_not_a_compaction_event(tmp_path):
+    store = synth(tmp_path, [{"type": "branch_summary", "id": "branch", "timestamp": AT,
+                              "tokensBefore": 600000, "summary": "Synthetic branch summary.",
+                              "usage": {"input": 10, "output": 1, "cacheRead": 0, "cacheWrite": 0}}])
+    assert by(store, "session_event", kind="compaction") == []
+    assert store.rows("compaction") == []
+    assert one(store, "message", message_class="compaction_summary")["text"] == "Synthetic branch summary."
+    assert one(store, "llm_call")["stop_reason"] == "branch_summary"
+
+
 def test_messages_during_a_run_stay_in_its_turn(tmp_path):
     # synthetic, shaped like the fixtures: a steer and a push delivered between tool steps are part
     # of the running turn; only after the run settles does a push open the next turn

@@ -140,6 +140,20 @@ them; after a `kind = 'rebuild'` row in `ah.change_log`, re-page any cursor from
   agent names from retained spawn/artifact metadata, including `-low` agents, supply lane roles;
   directory names and timing alone never choose an agent type.
 
+### pi compaction session events
+
+Each recorded pi compaction also produces `ah.session_event` kind `compaction` with the same
+`event_uid` as `ah.compaction`. `detail.before_tokens` is the recorded `tokensBefore` value when
+it is a valid non-negative integer; `detail.before_tokens_source` is `compaction.tokensBefore`
+when known and NULL otherwise. `detail.after_tokens` and `detail.after_tokens_source` are NULL
+when no authoritative post-context measurement is captured. Summary-generation usage is never a
+post-compaction context measurement. Existing compaction rows, summary content, summary-generation
+model usage and rollups are unchanged. Branch summaries are not asserted to be compaction events.
+
+Unknown before/after measurements are independent. Validly recorded zero is known; absence,
+invalid values and inferred summary-token estimates are not zero. Historical session-event rows
+require retained transcripts to be re-parsed or rebuilt after the parser version changes.
+
 ## Structure, change feed and search
 
 - `ah.v_session_orchestration`: whether a session is a loop, wave or fan-out root, a lane, a poller,

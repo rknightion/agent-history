@@ -54,6 +54,110 @@ def test_pi_tree_loads_links_children_and_tags_the_launch(clean, tmp_path):  # n
     clean.rollback()
 
 
+def test_pi_compaction_projects_session_event_without_inventing_after(clean, tmp_path):  # noqa: F811
+    hot, cold = tmp_path / "hot", tmp_path / "cold"
+    base = hot / "pi-local" / "sessions" / "-synthetic-"
+    base.mkdir(parents=True)
+    (cold / ".archive-receipts").mkdir(parents=True)
+    (cold / ".archive-receipts" / "receipt.json").write_text("{}")
+    at = "2026-10-01T10:00:00Z"
+    records = [
+        {"type": "session", "id": ROOT_UID, "timestamp": at, "cwd": "/tmp/synthetic", "version": 3},
+        {
+            "type": "compaction",
+            "id": "compact",
+            "timestamp": at,
+            "tokensBefore": 600000,
+            "firstKeptEntryId": "kept",
+            "summary": "Synthetic retained compaction summary.",
+            # This is the summary-generation call, not the post-compaction context.
+            "usage": {"input": 500000, "output": 4000, "cacheRead": 0, "cacheWrite": 0},
+        },
+    ]
+    (base / f"2026-10-01T10-00-00-000Z_{ROOT_UID}.jsonl").write_text(
+        "".join(json.dumps(record) + "\n" for record in records)
+    )
+    stats = load.refresh(clean, hot, cold, textfile=None, log=lambda *_: None)
+    assert stats.errors == 0 and stats.files_parsed == 1
+    assert clean.execute("SELECT pre_tokens, post_tokens FROM ah.compaction").fetchall() == [(600000, None)]
+    assert clean.execute("SELECT text FROM ah.message WHERE message_class='compaction_summary'").fetchall() == [
+        ("Synthetic retained compaction summary.",)
+    ]
+    assert clean.execute("SELECT compactions, llm_calls FROM ah.session_rollup").fetchall() == [(1, 1)]
+    events = clean.execute("SELECT event_uid, detail FROM ah.session_event WHERE kind='compaction'").fetchall()
+    assert events == [
+        (
+            f"{ROOT_UID}:compact",
+            {
+                "before_tokens": 600000,
+                "before_tokens_source": "compaction.tokensBefore",
+                "after_tokens": None,
+                "after_tokens_source": None,
+            },
+        )
+    ]
+    assert load.refresh(clean, hot, cold, textfile=None, log=lambda *_: None).errors == 0
+    assert clean.execute("SELECT event_uid, detail FROM ah.session_event WHERE kind='compaction'").fetchall() == events
+    assert clean.execute("SELECT input_uncached, output, stop_reason FROM ah.llm_call").fetchall() == [
+        (500000, 4000, "compaction")]
+    # Replay the same real parser rows through Writer to exercise the event natural-key conflict,
+    # not just the unchanged-file fast path above. No source metadata or catalogue reset is needed.
+    from agent_history.model import FileContext, LinePos
+    from agent_history.parse_pi import PiParser
+
+    source_id, rel_path = clean.execute("SELECT id, rel_path FROM ah.source_file").fetchone()
+    ctx = FileContext(str(hot / rel_path), rel_path, "pi-local", "pi", "local", None, "main")
+    parser, offset = PiParser(ctx, {}), 0
+    writer = load.Writer(clean)
+    for number, record in enumerate(records, 1):
+        raw = (json.dumps(record) + "\n").encode()
+        writer.write(list(parser.line(record, LinePos(offset, len(raw), number))), source_id, ctx)
+        offset += len(raw)
+    assert clean.execute("SELECT event_uid, detail FROM ah.session_event WHERE kind='compaction'").fetchall() == events
+    assert clean.execute("SELECT count(*), min(pre_tokens), min(post_tokens) FROM ah.compaction").fetchone() == (1, 600000, None)
+    assert clean.execute("SELECT count(*), min(input_uncached), min(output) FROM ah.llm_call").fetchone() == (1, 500000, 4000)
+    clean.rollback()
+
+
+def test_pi_compaction_sql_keeps_zero_and_unknown_measurements(clean, tmp_path):  # noqa: F811
+    hot, cold = tmp_path / "hot", tmp_path / "cold"
+    base = hot / "pi-local" / "sessions" / "-synthetic-"
+    base.mkdir(parents=True)
+    (cold / ".archive-receipts").mkdir(parents=True)
+    (cold / ".archive-receipts" / "receipt.json").write_text("{}")
+    at = "2026-10-01T10:00:00Z"
+    records = [{"type": "session", "id": ROOT_UID, "timestamp": at, "cwd": "/tmp/synthetic", "version": 3}]
+    values = [0, None, -1, True, False, 12.5, 12.0, "12", {"tokens": 12}, [12]]
+    for index, value in enumerate(values):
+        record = {"type": "compaction", "id": f"compact-{index}", "timestamp": at,
+                  "tokensBefore": value, "firstKeptEntryId": "kept"}
+        if value is None:
+            record.pop("tokensBefore")
+        records.append(record)
+    records.append({"type": "branch_summary", "id": "branch", "timestamp": at,
+                    "summary": "Synthetic branch summary.", "tokensBefore": 600000})
+    (base / f"2026-10-01T10-00-00-000Z_{ROOT_UID}.jsonl").write_text(
+        "".join(json.dumps(record) + "\n" for record in records))
+    stats = load.refresh(clean, hot, cold, textfile=None, log=lambda *_: None)
+    assert stats.errors == 0 and stats.files_parsed == 1
+    events = clean.execute("SELECT event_uid, detail FROM ah.session_event WHERE kind='compaction' "
+                           "ORDER BY byte_offset").fetchall()
+    assert events == [(f"{ROOT_UID}:compact-{index}", {
+        "before_tokens": 0 if index == 0 else None,
+        "before_tokens_source": "compaction.tokensBefore" if index == 0 else None,
+        "after_tokens": None, "after_tokens_source": None,
+    }) for index in range(len(values))]
+    # Legacy compaction values stay byte-for-byte compatible with their existing conversion rules.
+    assert clean.execute("SELECT pre_tokens FROM ah.compaction ORDER BY byte_offset").fetchall() == [
+        (0,), (None,), (-1,), (None,), (None,), (12,), (12,), (12,), (None,), (None,)]
+    assert clean.execute("SELECT compactions, llm_calls FROM ah.session_rollup").fetchone() == (10, 0)
+    assert clean.execute("SELECT text FROM ah.message WHERE message_class='compaction_summary'").fetchall() == [
+        ("Synthetic branch summary.",)]
+    assert load.refresh(clean, hot, cold, textfile=None, log=lambda *_: None).errors == 0
+    assert clean.execute("SELECT count(*) FROM ah.session_event WHERE kind='compaction'").fetchone()[0] == 10
+    clean.rollback()
+
+
 def test_pi_refresh_is_idempotent(clean, tmp_path):  # noqa: F811
     hot, cold = build(tmp_path)
     load.refresh(clean, hot, cold, textfile=None, log=lambda *_: None)
