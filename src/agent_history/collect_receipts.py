@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import stat
 import subprocess
 from datetime import datetime, timedelta, timezone
@@ -40,6 +41,17 @@ SOURCES = (
 )
 MAX_RECEIPT_BYTES = 4096
 MAX_LINE1_BYTES = 4096
+MAX_STATE_BYTES = 16 * 1024 * 1024
+STATE_NAME = re.compile(r"state-[\w.-]*-(loop[0-9]+)\.jsonl")
+STATE_COLS = [
+    ("machine", "text"),
+    ("path", "text"),
+    ("loop", "text"),
+    ("repo_origin", "text"),
+    ("content", "text"),
+    ("state_mtime", "timestamptz"),
+]
+STATE_KEY = ["machine", "path"]
 _stat = os.stat  # the closing stat of a read; replaceable to exercise a concurrent rewrite
 
 
@@ -47,9 +59,10 @@ class Changed(OSError):
     """A file changed while it was being read."""
 
 
-def _open_regular(path: Path):
-    """Open a regular file for reading without blocking on a FIFO or device; anything else is an OSError."""
-    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+def _open_regular(path: Path, *, dir_fd: int | None = None, nofollow: bool = False):
+    """Open a regular file without blocking on special files; state inputs also refuse links."""
+    flags = os.O_RDONLY | os.O_NONBLOCK | (os.O_NOFOLLOW if nofollow else 0)
+    fd = os.open(path, flags, dir_fd=dir_fd)
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise OSError(f"not a regular file: {path.name}")
@@ -161,8 +174,63 @@ def receipts(repo: Path, machine: str, errors: list[dict[str, str]] | None = Non
                     errors.append({"repo": repo.name, "step": "loop_receipt", "error": type(error).__name__})
 
 
+def states(repo: Path, machine: str, errors: list[dict[str, str]] | None = None):
+    """Retain complete state-log bytes from configured copies, without path-based identity guesses.
+
+    The checkout origin and explicit open goal hash bind progress later. A concurrent rewrite,
+    oversized file or unreadable source is reported and retried, never partially collected.
+    """
+    # A configured checkout may be an alias; its canonical root is the source boundary.
+    # Internal directory/file links are rejected through anchored, no-follow descriptors.
+    repo = repo.resolve()
+    origin = None
+    resolved = False
+    for path in sorted((repo / "codex").glob("state-*-loop*.jsonl")):
+        match = STATE_NAME.fullmatch(path.name)
+        if not match:
+            continue
+        if not resolved:
+            origin, resolved = _origin(repo), True
+        try:
+            repo_fd = os.open(repo, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                codex_fd = os.open("codex", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=repo_fd)
+                try:
+                    directory = os.fstat(codex_fd)
+                    with _open_regular(Path(path.name), dir_fd=codex_fd, nofollow=True) as handle:
+                        before = os.fstat(handle.fileno())
+                        raw = handle.read(MAX_STATE_BYTES + 1)
+                        after = _stat(path)
+                        final = os.stat(path.name, dir_fd=codex_fd, follow_symlinks=False)
+                    parent = os.stat("codex", dir_fd=repo_fd, follow_symlinks=False)
+                    if not stat.S_ISDIR(parent.st_mode) or (parent.st_dev, parent.st_ino) != (
+                        directory.st_dev,
+                        directory.st_ino,
+                    ):
+                        raise Changed(path.name)
+                finally:
+                    os.close(codex_fd)
+            finally:
+                os.close(repo_fd)
+            if _version(before) != _version(after) or _version(before) != _version(final):
+                raise Changed(path.name)
+            if len(raw) > MAX_STATE_BYTES:
+                raise ValueError("oversized state")
+            yield {
+                "machine": machine,
+                "path": str(path.absolute()),
+                "loop": match[1],
+                "repo_origin": origin,
+                "content": raw.decode("utf-8"),
+                "state_mtime": _utc(before.st_mtime_ns),
+            }
+        except (OSError, ValueError) as error:
+            if errors is not None:
+                errors.append({"repo": repo.name, "step": "loop_state", "error": type(error).__name__})
+
+
 def collect(collector, repositories, machine: str) -> None:
-    """Collect the receipts of explicitly configured repositories, one transaction per repository."""
+    """Collect receipts and state snapshots of explicitly configured repositories."""
     for repo in repositories:
         collector.check_time()
         try:
@@ -176,3 +244,15 @@ def collect(collector, repositories, machine: str) -> None:
         except Exception as error:  # one repository must not stop the others
             collector.rollback()
             collector.errors.append({"repo": Path(repo).name, "step": "loop_receipt", "error": type(error).__name__})
+        collector.check_time()
+        try:
+            rows = []
+            for row in states(Path(repo), machine, collector.errors):
+                collector.check_time()
+                rows.append(row)
+            collector.write("loop_state", STATE_COLS, STATE_KEY, rows)
+        except Deadline:
+            raise
+        except Exception as error:
+            collector.rollback()
+            collector.errors.append({"repo": Path(repo).name, "step": "loop_state", "error": type(error).__name__})

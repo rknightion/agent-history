@@ -62,8 +62,8 @@ loses them. Keep your own copies if you want history to survive that.
 
 Not truncated by `rebuild`: `ah.change_log`, `ah.refresh_log`, `ah.embedding` (a paid cache keyed by
 model and input hash) and the collector tables (`git_commit`, `git_commit_file`, `ci_run`,
-`backlog_task`, `backlog_done_event`, `backlog_done_scan`, `collector_mutation_audit`, `task_prefix`, `installed_feature`, `permission_log`, `loop_receipt`,
-`session_summary`, `session_topic`).
+`backlog_task`, `backlog_done_event`, `backlog_done_scan`, `collector_mutation_audit`, `task_prefix`,
+`installed_feature`, `permission_log`, `loop_receipt`, `loop_state`, `session_summary`, `session_topic`).
 
 ## Namespaces and contexts
 
@@ -371,11 +371,13 @@ Migration `026_loop_planner_signals.sql` adds the collector tables `ah.backlog_d
   `end_ts`, whatever session made the change. Only a running loop's window is open; a stale loop's
   ends at its `end_ts`, the root's last observed activity. NULL when `repo` is unknown or the collector
   has not yet finished that repo's first Done scan (`ah.backlog_done_scan`). Recomputed on every
-  refresh because collector rows can arrive after a loop finishes.
+  refresh because collector rows can arrive after a loop finishes. Qualifying retained state
+  evidence supersedes this legacy fallback as described below.
 - `lanes_accepted bigint` and `lanes_reported bigint`: lanes with `status` exactly `accepted`, and
   all lanes, in the `lanes` list of the latest captured report's `## Data`, read under the identity
   rules above. NULL when no report was captured, its Data is absent, invalid or names another
-  identity, or has no `lanes` list. `lanes_total` is unchanged: indexed lane sessions.
+  identity, or has no `lanes` list. `lanes_total` is unchanged: indexed lane sessions. Qualifying
+  retained state evidence supersedes this legacy accepted-count fallback as described below.
 
 `ah.lane.return_status` and `lane_return` come from the last `lane-return` fenced block in the lane's final
 message. A v2 block (`"v"` the JSON integer 2, with `lane` and `status` in
@@ -406,6 +408,46 @@ same way (absent means 0, `cache_write_1h = 0`); a zeroed breakdown beside a non
 in the same session, else NULL. A pi `Background task completed|failed: **<agent>**` notification
 sets `completion_status` on the spawn row of the async launch named by its
 `async-subagent-runs/<runId>` line.
+
+### Retained state-log counts
+
+Migration `032_loop_state_counts.sql` adds `ah.loop_state`, a collector table keyed by
+`(machine, path)`. The hourly collector reads exact `codex/state-*-loop<N>.jsonl` files from
+explicitly configured repository copies, retaining complete UTF-8 JSONL `content`, absolute
+`path`, filename `loop`, checkout `repo_origin`, `state_mtime` and `seen_at`. Contents are
+unredacted; rebuild and analytics re-application preserve the table. Files above 16 MiB,
+non-regular or unreadable files, invalid UTF-8 and concurrent rewrites are skipped, reported as
+`loop_state` errors and retried without a partial snapshot. The configured checkout's canonical
+root defines the source boundary; state files and their `codex` directory are opened through
+anchored no-follow descriptors. File or directory links and replaced input identities are rejected.
+
+Snapshots join only to already observed `repo`, `loop` and `goal_sha256`: origin matches repo
+case-insensitively, the explicit filename loop label matches, and a valid frozen-v1
+`open.goal_sha256` matches. Local copy paths need not equal transcript paths. State contents do
+not establish identity, completion, live phase or root activity. The open must lie at most 120
+seconds before launch and before the next launch of that identity. An open attributable to more
+than one same-identity launch, including overlapping skew windows or equal timestamps, supplies
+no state override; proximity never chooses a root. Count events lie at or after launch and before the next
+launch of that identity; a stale root timestamp is not a state-event cutoff.
+
+With qualifying evidence, `lanes_accepted` counts distinct lanes on `ev=accept` events with JSON
+boolean `accepted=true`. A non-empty explicit `lane` is authoritative. A task-only acceptance
+identifies a lane only when that exact task has one distinct preceding dispatched lane in the
+qualifying cohort; never choose a worker over a reviewer, use timing proximity or infer from a
+return. Any unresolved true acceptance leaves `lanes_accepted` NULL, independently of known
+landed-task counts. False and string-shaped booleans and return statuses do not add lanes. This
+counts observed acceptance events, not final acceptance state: later rejection does not erase an
+earlier true event. `tasks_done` counts distinct non-empty `task` values on `ev=land`, never a
+return's `landed` claim. Duplicate events and machine copies do not inflate counts. A valid open
+without true acceptance or land events establishes zero for the respective count. Invalid framing
+supplies no state override; torn non-events are ignored while original bytes remain stored.
+Without qualifying state evidence, existing report accepted counts and collected Done-flip task
+counts remain fallbacks, never substitutes for ambiguous observed acceptance. `lanes_reported`,
+`lanes_total` and `tasks_landed` are unchanged.
+
+The migration copies existing receipt SELECT grants to the new table and grants only SELECT,
+INSERT and UPDATE to existing `ah_ingest`. Provision these privileges if that role is created
+later. Existing relation grants are unchanged.
 
 ### Live phase and generated summaries
 
@@ -493,6 +535,8 @@ cannot recover transcripts already deleted from their source homes.
 The collector writes `task_prefix`, `backlog_task`, `backlog_done_event`, `backlog_done_scan`, `collector_mutation_audit`, `git_commit`,
 `git_commit_file`, `ci_run`, `installed_feature`, `permission_log` and `loop_receipt`. Git subjects, tracker titles, labels and project values,
 file paths, repository slugs, workflow names and installed-feature names are stored verbatim.
+The collector also writes `loop_state`: complete unredacted JSONL snapshots, including judgement
+text, protected like transcripts. They supply progress counts only, not identity or completion.
 Author emails are compared to configured identities but only `author_is_owner` is stored.
 Permission logs contribute timestamps, line hashes, tool names, command verbs, classifier reasons
 and sub-agent flags, never command arguments or target text. Loop receipts contribute the receipt

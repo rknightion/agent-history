@@ -18,7 +18,7 @@ import json
 import os
 import re
 import shlex
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import PurePosixPath
 from typing import Any, Sequence
 
@@ -27,7 +27,7 @@ from psycopg.types.json import Jsonb
 
 from .loop_launch import REPORT_HEADER, identity_fields, parse_launch, report_lane_counts
 
-ACTIVATED_AT = "1970-01-01T00:00:00Z"   # launches before this instant are ignored
+ACTIVATED_AT = "1970-01-01T00:00:00Z"  # launches before this instant are ignored
 BARE_LAUNCH = re.compile(r"^`?\s*(\S*launch-[^\s`/]*\.(?:txt|md))\s*`?$")
 LANE_LINE = re.compile(r"^\s*Lane:\s*(\S+)", re.M)
 # A lane-return block opens on a line of its own. Its JSON is decoded, so a fence quoted in a field's
@@ -66,8 +66,15 @@ def _launch(text: str, cwd: str | None, ts_iso: str) -> dict[str, Any] | None:
         stem = PurePosixPath(path).stem.removeprefix("launch-")
         report = str(PurePosixPath(path).parent / f"report-{stem}.md")
         loop = re.search(r"-(?:loop|wave)(\d+)$", stem)
-        return {"status": "unresolved_path", "launch_path": path, "report": report,
-                "loop": int(loop.group(1)) if loop else None, "mode": None, "launch_sha256": None, "budget": None}
+        return {
+            "status": "unresolved_path",
+            "launch_path": path,
+            "report": report,
+            "loop": int(loop.group(1)) if loop else None,
+            "mode": None,
+            "launch_sha256": None,
+            "budget": None,
+        }
     try:
         found = parse_launch(text, cwd, ts_iso, ACTIVATED_AT, read_file=_no_read)
     except Exception:
@@ -120,6 +127,7 @@ def repair_pi_spawns(conn: psycopg.Connection) -> None:
     never choose a child; the same parent/call/index and recorded sessionFile supply its run path.
     """
     from .parse_pi import SESSION_PATH_RE
+
     for parent, call, raw in conn.execute(
         "SELECT i.session_id, i.call_uid, i.result_json FROM dirty_now d "
         "JOIN ah.tool_io i ON i.session_id = d.session_id "
@@ -143,8 +151,12 @@ def repair_pi_spawns(conn: psycopg.Connection) -> None:
                     "UPDATE ah.subagent_spawn SET child_task_name = %s WHERE agent = 'pi' "
                     "AND parent_session_id = %s AND spawn_uid = %s AND requested_type = %s "
                     "AND child_task_name IS NULL",
-                    ("/".join(p for p in path.groups() if p), parent,
-                     f"{call}:{index if type(index) is int else n}", result.get("agent")),
+                    (
+                        "/".join(p for p in path.groups() if p),
+                        parent,
+                        f"{call}:{index if type(index) is int else n}",
+                        result.get("agent"),
+                    ),
                 )
 
 
@@ -160,6 +172,7 @@ def _captured_launch(
     if not path:
         return None
     from .parse_pi import source_output_truncated
+
     cwd = conn.execute("SELECT cwd FROM ah.session WHERE id = %s", (root_id,)).fetchone()[0]
     texts = set()
     for raw, output, result in conn.execute(
@@ -236,7 +249,7 @@ def _resume_targets(conn: psycopg.Connection, root_id: int, cwd: str | None) -> 
                 continue
             # Whole-command success proves only the final simple invocation, not an earlier
             # failure hidden by a later semicolon command.
-            if ";" in tokens[i + 3:]:
+            if ";" in tokens[i + 3 :]:
                 continue
             recorded_path = tokens[i + 2]
             if any(c in recorded_path for c in "~*?[]"):
@@ -319,26 +332,35 @@ def retract_unproven_relaunches(conn: psycopg.Connection) -> None:
         ).fetchall()
         if targets == {report} and matches == [(loop_id,)]:
             continue
-        descendants = [r[0] for r in conn.execute(
-            "UPDATE ah.session SET root_session_id = %s, loop_run_id = NULL, loop_link_method = NULL "
-            "WHERE agent = 'pi' AND root_session_uid = %s AND root_session_id = %s "
-            "AND loop_run_id = %s AND id <> %s RETURNING id", (sid, uid, owner, loop_id, sid),
-        )]
+        descendants = [
+            r[0]
+            for r in conn.execute(
+                "UPDATE ah.session SET root_session_id = %s, loop_run_id = NULL, loop_link_method = NULL "
+                "WHERE agent = 'pi' AND root_session_uid = %s AND root_session_id = %s "
+                "AND loop_run_id = %s AND id <> %s RETURNING id",
+                (sid, uid, owner, loop_id, sid),
+            )
+        ]
         if descendants:
-            conn.execute("DELETE FROM ah.lane WHERE loop_run_id = %s AND session_id = ANY(%s)",
-                         (loop_id, descendants))
+            conn.execute("DELETE FROM ah.lane WHERE loop_run_id = %s AND session_id = ANY(%s)", (loop_id, descendants))
             conn.execute("INSERT INTO dirty_now SELECT unnest(%s::bigint[]) ON CONFLICT DO NOTHING", (descendants,))
-        conn.execute("UPDATE ah.session SET root_session_id = id, loop_run_id = NULL, loop_link_method = NULL "
-                     "WHERE id = %s", (sid,))
+        conn.execute(
+            "UPDATE ah.session SET root_session_id = id, loop_run_id = NULL, loop_link_method = NULL WHERE id = %s",
+            (sid,),
+        )
         conn.execute("INSERT INTO dirty_now VALUES (%s) ON CONFLICT DO NOTHING", (owner,))
 
 
 def run(conn: psycopg.Connection) -> dict[str, int]:
-    roots = [r[0] for r in conn.execute(
-        "WITH roots AS (SELECT DISTINCT COALESCE(s.root_session_id, s.id) AS id FROM dirty_now d "
-        "JOIN ah.session s ON s.id = d.session_id) "
-        "SELECT r.id FROM roots r JOIN ah.session s ON s.id = r.id "
-        "ORDER BY s.first_event_at NULLS LAST, r.id")]
+    roots = [
+        r[0]
+        for r in conn.execute(
+            "WITH roots AS (SELECT DISTINCT COALESCE(s.root_session_id, s.id) AS id FROM dirty_now d "
+            "JOIN ah.session s ON s.id = d.session_id) "
+            "SELECT r.id FROM roots r JOIN ah.session s ON s.id = r.id "
+            "ORDER BY s.first_event_at NULLS LAST, r.id"
+        )
+    ]
     found = 0
     for root_id in roots:
         if not _link_relaunch(conn, root_id):
@@ -384,7 +406,9 @@ def refresh_live(conn: psycopg.Connection) -> dict[str, int]:
     count = result.rowcount
     _refresh_identity(conn, finished)
     _refresh_progress(conn)
+    _refresh_state_counts(conn)
     from .loop_live import refresh as refresh_phase
+
     refresh_phase(conn)
     return {"live_loops": count}
 
@@ -527,9 +551,7 @@ def _start_identity(
     return "ok", {"repo": repo, "loop": loop, "goal_sha256": digest}
 
 
-def _completion_identity(
-    conn: psycopg.Connection, uid: str, label: str | None
-) -> tuple[str, dict[str, Any] | None]:
+def _completion_identity(conn: psycopg.Connection, uid: str, label: str | None) -> tuple[str, dict[str, Any] | None]:
     """The identity a finished launch's valid completion receipts carry, same return shape.
 
     Only a launch finished by a receipt qualifies; a running loop has none. repo is the receipt's
@@ -571,10 +593,14 @@ def _receipt_identity(
     done, done_id = _completion_identity(conn, uid, label)
     if done == "unknown":
         return dict(UNKNOWN)
-    if started_id and done_id and (
-        started_id["repo"].lower() != done_id["repo"].lower()
-        or started_id["loop"] != done_id["loop"]
-        or started_id["goal_sha256"] != done_id["goal_sha256"]
+    if (
+        started_id
+        and done_id
+        and (
+            started_id["repo"].lower() != done_id["repo"].lower()
+            or started_id["loop"] != done_id["loop"]
+            or started_id["goal_sha256"] != done_id["goal_sha256"]
+        )
     ):
         return dict(UNKNOWN)
     found = started_id or done_id
@@ -601,7 +627,8 @@ def _refresh_identity(conn: psycopg.Connection, finished: Sequence[str] = ()) ->
     # Start receipts first seen since the last pass re-project their launch even when it is finished.
     mark = conn.execute("SELECT value FROM ah.meta WHERE key = 'loops_receipt_identity_seen'").fetchone()
     newest = conn.execute("SELECT max(seen_at) FROM ah.loop_receipt WHERE kind = 'started'").fetchone()[0]
-    rows = conn.execute("""
+    rows = conn.execute(
+        """
         WITH ordered_launches AS (
             SELECT l.launch_uid, l.root_session_id,
                    CASE WHEN l.naming = 'loop' THEN l.loop_number END AS number,
@@ -628,14 +655,17 @@ def _refresh_identity(conn: psycopg.Connection, finished: Sequence[str] = ()) ->
             SELECT 1 FROM ah.loop_receipt r WHERE r.kind = 'started' AND r.path = l.goal_path
               AND r.seen_at >= %s::timestamptz - interval '2 hours'
         ) OR l.launch_uid = ANY(%s)
-    """, (initial, mark[0] if mark else "-infinity", list(finished))).fetchall()
+    """,
+        (initial, mark[0] if mark else "-infinity", list(finished)),
+    ).fetchall()
     for uid, root, number, goal_path, report_path, started, launch_text, following, window_known, tied_start in rows:
         fields = identity_fields(launch_text or "", number, goal_path)
-        lane_counts = None   # no captured report yet
+        lane_counts = None  # no captured report yet
         # Match _tag_root's (ts, id) order before filtering refresh candidates. Missing
         # launch messages make report ownership uncertain, not permission to guess it.
         if report_path and window_known:
-            for tool, raw in conn.execute("""
+            for tool, raw in conn.execute(
+                """
                 SELECT i.tool_name, i.input_text FROM ah.tool_io i
                 JOIN ah.tool_call t ON t.agent = i.agent AND t.call_uid = i.call_uid
                 JOIN ah.session s ON s.id = i.session_id
@@ -646,7 +676,9 @@ def _refresh_identity(conn: psycopg.Connection, finished: Sequence[str] = ()) ->
                   AND lower(i.tool_name) ~ '(^|[.])write$'
                   AND NOT COALESCE(i.input_truncated, false)
                 ORDER BY i.ts, i.id
-            """, (root, root, started, tied_start, started, following, following)):
+            """,
+                (root, root, started, tied_start, started, following, following),
+            ):
                 # Tool IO ids and message ids have no shared ordering. A write at a
                 # tied launch timestamp may precede the final launch; ignore it.
                 if (tool or "").rsplit(".", 1)[-1].lower() != "write":
@@ -670,10 +702,17 @@ def _refresh_identity(conn: psycopg.Connection, finished: Sequence[str] = ()) ->
         conn.execute(
             "UPDATE ah.loops SET repo = %s, loop = %s, goal_sha256 = %s WHERE launch_uid = %s "
             "AND (repo, loop, goal_sha256) IS DISTINCT FROM (%s, %s, %s)",
-            (fields["repo"], fields["loop"], fields["goal_sha256"], uid,
-             fields["repo"], fields["loop"], fields["goal_sha256"]),
+            (
+                fields["repo"],
+                fields["loop"],
+                fields["goal_sha256"],
+                uid,
+                fields["repo"],
+                fields["loop"],
+                fields["goal_sha256"],
+            ),
         )
-        if lane_counts is not None:   # the latest captured report's Data, NULL when it has no exact count
+        if lane_counts is not None:  # the latest captured report's Data, NULL when it has no exact count
             conn.execute(
                 "UPDATE ah.loops SET lanes_accepted = %s, lanes_reported = %s WHERE launch_uid = %s "
                 "AND (lanes_accepted, lanes_reported) IS DISTINCT FROM (%s, %s)",
@@ -836,6 +875,184 @@ def _refresh_tasks_done(conn: psycopg.Connection) -> None:
     """)
 
 
+def state_progress(content: str) -> tuple[str, datetime, list[dict[str, Any]]] | None:
+    """Read frozen v1 JSONL framing and count evidence, never a return's landed claim.
+
+    Preserve source bytes in the collector. A torn JSON object has no event and is ignored, as
+    by loop-state check. Other invalid framing or malformed count evidence leaves counts unknown.
+    """
+
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate state member")
+            result[key] = value
+        return result
+
+    def string(event, key):
+        return isinstance(event.get(key), str) and bool(event[key])
+
+    events = []
+    opened = None
+    previous = 0
+    for raw in content.splitlines():
+        if not raw.strip():
+            continue
+        try:
+            event = json.loads(raw, object_pairs_hook=unique)
+        except (ValueError, RecursionError):
+            # A cut-short object is not an observed event. A complete malformed object is invalid.
+            if raw.lstrip().startswith("{") and not raw.rstrip().endswith("}"):
+                continue
+            return None
+        if not isinstance(event, dict):
+            return None
+        seq, ts = event.get("seq"), event.get("ts")
+        if (
+            type(event.get("v")) is not int
+            or event["v"] != 1
+            or type(seq) is not int
+            or seq != previous + 1
+            or event.get("by") not in ("root", "dispatcher", "ext", "daemon")
+            or not isinstance(ts, str)
+            or not re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", ts)
+            or not string(event, "ev")
+        ):
+            return None
+        try:
+            at = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        previous = seq
+        ev = event["ev"]
+        if ev == "open":
+            goal = event.get("goal_sha256")
+            if (
+                opened is not None
+                or not isinstance(goal, str)
+                or not re.fullmatch(r"[0-9a-f]{64}", goal)
+                or event.get("tier") not in ("routine", "guarded")
+                or event.get("root") not in ("llm", "dispatcher")
+                or not string(event, "root_model")
+                or not isinstance(event.get("envelope"), list)
+                or not all(isinstance(task, str) for task in event["envelope"])
+            ):
+                return None
+            opened = (goal, at)
+        elif ev == "dispatch" and string(event, "task") and string(event, "lane"):
+            events.append({**event, "at": at})
+        elif ev in ("accept", "land"):
+            if not string(event, "task") or ("lane" in event and not string(event, "lane")):
+                return None
+            if ev == "accept":
+                if type(event.get("accepted")) is not bool or not string(event, "reason"):
+                    return None
+            elif (
+                not string(event, "sha")
+                or not string(event, "gate")
+                or event.get("mode") not in ("after-green", "pre-green")
+            ):
+                return None
+            events.append({**event, "at": at})
+    return (*opened, events) if opened else None
+
+
+def _state_event_counts(cohorts: list[tuple[datetime, list[dict[str, Any]]]]) -> tuple[int | None, int]:
+    """Correlate exact tasks using preceding recorded dispatches, never return status or role.
+
+    Copies sharing an open timestamp share the same frozen sequence. Union their dispatch evidence
+    before resolving accepts so identical copies deduplicate and conflicting copies stay ambiguous.
+    Different opens do not supply each other's sequence ordering.
+    """
+    dispatches: dict[datetime, dict[str, dict[int, set[str]]]] = {}
+    for opened, events in cohorts:
+        for event in events:
+            if event["ev"] == "dispatch":
+                task_dispatches = dispatches.setdefault(opened, {}).setdefault(event["task"], {})
+                task_dispatches.setdefault(event["seq"], set()).add(event["lane"])
+    accepted, landed = set(), set()
+    unresolved = False
+    for opened, events in cohorts:
+        for event in events:
+            if event["ev"] == "accept" and event["accepted"] is True:
+                if lane := event.get("lane"):
+                    accepted.add(lane)
+                    continue
+                candidates = set()
+                for seq, lanes in dispatches.get(opened, {}).get(event["task"], {}).items():
+                    if seq < event["seq"]:
+                        candidates.update(lanes)
+                if len(candidates) == 1:
+                    accepted.update(candidates)
+                else:
+                    unresolved = True
+            elif event["ev"] == "land":
+                landed.add(event["task"])
+    return (None if unresolved else len(accepted)), len(landed)
+
+
+def _refresh_state_counts(conn: psycopg.Connection) -> None:
+    """Exact origin/loop/open-goal joins work even when reconciled paths differ from transcripts.
+
+    A valid snapshot overrides legacy report and backlog projections. Unresolved true acceptance
+    leaves only the accepted count unknown. State bytes never supply identity, lifecycle or phase.
+    """
+    rows = conn.execute("""
+        SELECT launch_uid, lower(repo), loop, goal_sha256, launch_ts,
+               lead(launch_ts) OVER (
+                   PARTITION BY lower(repo), loop, goal_sha256 ORDER BY launch_ts, launch_uid
+               ) AS following,
+               count(*) OVER (PARTITION BY lower(repo), loop, goal_sha256, launch_ts) > 1 AS tied
+        FROM ah.loops WHERE repo IS NOT NULL AND loop IS NOT NULL AND goal_sha256 IS NOT NULL
+    """).fetchall()
+    windows = {}
+    for uid, repo, label, goal, started, following, _ in rows:
+        if started is not None:
+            windows.setdefault((repo, label, goal), []).append((uid, started - START_SKEW, following))
+    snapshots = {}
+    for uid, repo, label, goal, started, following, tied in rows:
+        if tied or started is None:
+            continue
+        key = (repo, label)
+        if key not in snapshots:
+            snapshots[key] = [
+                parsed
+                for (content,) in conn.execute(
+                    "SELECT content FROM ah.loop_state WHERE lower(repo_origin) = %s AND loop = %s",
+                    key,
+                )
+                if (parsed := state_progress(content)) is not None
+            ]
+        cohorts = []
+        for digest, opened, events in snapshots[key]:
+            if digest != goal:
+                continue
+            attributed = [
+                candidate for candidate, earliest, cutoff in windows[(repo, label, goal)]
+                if opened >= earliest and (cutoff is None or opened < cutoff)
+            ]
+            if attributed != [uid]:
+                continue
+            cohorts.append(
+                (
+                    opened,
+                    [
+                        event
+                        for event in events
+                        if event["at"] >= started and (not following or event["at"] < following)
+                    ],
+                )
+            )
+        if cohorts:
+            accepted, landed = _state_event_counts(cohorts)
+            conn.execute(
+                "UPDATE ah.loops SET lanes_accepted = %s, tasks_done = %s WHERE launch_uid = %s "
+                "AND (lanes_accepted, tasks_done) IS DISTINCT FROM (%s, %s)",
+                (accepted, landed, uid, accepted, landed),
+            )
+
+
 def _tag_root(conn: psycopg.Connection, root_id: int) -> int:
     root = conn.execute(
         "SELECT cwd, last_event_at, agent, session_uid, agent_id FROM ah.session WHERE id = %s", (root_id,)
@@ -966,8 +1183,12 @@ def parse_lane_return(text: str) -> tuple[Any, str | None]:
     if "v" in value:
         # a versioned object: only the integer 2 is v2, and an unknown version never falls back to the
         # free-form shape
-        valid = (type(value["v"]) is int and value["v"] == 2 and isinstance(value.get("lane"), str)
-                 and status in LANE_STATUS_V2)
+        valid = (
+            type(value["v"]) is int
+            and value["v"] == 2
+            and isinstance(value.get("lane"), str)
+            and status in LANE_STATUS_V2
+        )
         return value, status if valid else None
     return value, status if isinstance(status, str) else None
 
@@ -976,7 +1197,8 @@ def _lane(conn: psycopg.Connection, loop_id: int, session_id: int, method: str) 
     info = conn.execute(
         "SELECT s.agent_type, s.agent_role, s.agent_path, sp.name, sp.child_task_name, sp.requested_type, s.agent "
         "FROM ah.session s LEFT JOIN ah.subagent_spawn sp ON sp.child_session_id = s.id WHERE s.id = %s LIMIT 1",
-        (session_id,)).fetchone()
+        (session_id,),
+    ).fetchone()
     agent_type, agent_role, agent_path, spawn_name, task_name, requested, agent = info or (None,) * 7
     if agent == "pi":
         # a pi child's agent_path and spawn child_task_name end in "<run dir>/run-<i>", never a
@@ -987,14 +1209,18 @@ def _lane(conn: psycopg.Connection, loop_id: int, session_id: int, method: str) 
     if not name:
         brief = conn.execute(
             "SELECT m.text FROM ah.subagent_spawn sp JOIN ah.message m ON m.event_uid = sp.spawn_uid || ':brief' "
-            "WHERE sp.child_session_id = %s LIMIT 1", (session_id,)).fetchone()
+            "WHERE sp.child_session_id = %s LIMIT 1",
+            (session_id,),
+        ).fetchone()
         if brief:
             m = LANE_LINE.search(brief[0][:2000])
             name = m.group(1) if m else None
     lane_return, return_status = None, None
     report = conn.execute(
         "SELECT text FROM ah.message WHERE session_id = %s AND message_class = 'subagent_report' "
-        "ORDER BY ts DESC LIMIT 1", (session_id,)).fetchone()
+        "ORDER BY ts DESC LIMIT 1",
+        (session_id,),
+    ).fetchone()
     if report:
         lane_return, return_status = parse_lane_return(report[0])
     conn.execute(
@@ -1003,5 +1229,13 @@ def _lane(conn: psycopg.Connection, loop_id: int, session_id: int, method: str) 
         "lane_name = COALESCE(EXCLUDED.lane_name, lane.lane_name), role = COALESCE(EXCLUDED.role, lane.role), "
         "return_status = COALESCE(EXCLUDED.return_status, lane.return_status), "
         "lane_return = COALESCE(EXCLUDED.lane_return, lane.lane_return)",
-        (loop_id, session_id, name, agent_type or agent_role or requested, method, return_status,
-         Jsonb(lane_return) if lane_return is not None else None))
+        (
+            loop_id,
+            session_id,
+            name,
+            agent_type or agent_role or requested,
+            method,
+            return_status,
+            Jsonb(lane_return) if lane_return is not None else None,
+        ),
+    )
