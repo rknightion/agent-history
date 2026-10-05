@@ -18,7 +18,7 @@ def conn():
     conn = load.connect(DSN)
     load.apply_schema(conn, force=True)
     conn.execute("TRUNCATE " + ", ".join(f"ah.{t}" for t in load.DATA_TABLES) + " RESTART IDENTITY CASCADE")
-    conn.execute("DELETE FROM ah.meta WHERE key LIKE 'loops_links_projection_v1%%'")
+    conn.execute("DELETE FROM ah.meta WHERE key LIKE 'loops_links_projection_v%%'")
     conn.commit()
     yield conn
     conn.close()
@@ -242,7 +242,7 @@ def test_foreground_direct_child_without_artifact_and_historical_spawn_path(conn
     assert conn.execute("SELECT role FROM ah.lane").fetchone() == ("lane-worker-low",)
     assert conn.execute("SELECT child_task_name FROM ah.subagent_spawn").fetchone() == (RUN,)
     conn.execute("UPDATE ah.subagent_spawn SET child_task_name=NULL")
-    conn.execute("DELETE FROM ah.meta WHERE key='loops_links_projection_v1'")
+    conn.execute("DELETE FROM ah.meta WHERE key='loops_links_projection_v2'")
     conn.commit()
     load.post_passes(conn)
     assert conn.execute("SELECT child_task_name FROM ah.subagent_spawn").fetchone() == (RUN,)
@@ -296,20 +296,161 @@ def test_partial_or_failed_launch_reads_remain_unresolved(conn, tmp_path):
     assert conn.execute("SELECT status FROM ah.loop_run").fetchone() == ("unresolved_path",)
 
 
+@pytest.mark.parametrize(
+    "details,notice",
+    [
+        ({"truncation": {"truncated": True, "outputLines": 2000, "totalLines": 3000}}, ""),
+        (None, "\n\n[Showing lines 1-2000 of 3000. Use offset=2001 to continue.]"),
+        ({"truncation": {"truncated": False, "outputLines": 2000, "totalLines": 3000}}, ""),
+    ],
+)
+def test_source_truncated_launch_read_is_rejected_and_retained_evidence_cannot_restore_it(
+    conn, tmp_path, details, notice
+):
+    base, root_base = fixture(tmp_path)
+    path = base / (root_base + ".jsonl")
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+    for record in records:
+        msg = record.get("message", {})
+        if msg.get("role") == "toolResult":
+            msg["content"][0]["text"] = PROMPT + notice
+            if details is not None:
+                msg["details"] = details
+    write(path, records)
+    refresh(conn, tmp_path)
+    assert conn.execute("SELECT output_truncated FROM ah.tool_io WHERE tool_name='read'").fetchone() == (True,)
+    assert conn.execute("SELECT status, launch_sha256 FROM ah.loop_run").fetchone() == ("unresolved_path", None)
+    # Retained pre-fix rows have the structured result/notice but no projected flag. The new
+    # bounded projection must repair them even after the earlier cursor finished, without replay.
+    conn.execute("UPDATE ah.tool_io SET output_truncated=NULL")
+    conn.execute("UPDATE ah.loop_run SET status='resolved', launch_sha256='partial-digest'")
+    conn.execute(
+        "INSERT INTO ah.meta VALUES ('loops_links_projection_v1', 'complete') "
+        "ON CONFLICT (key) DO UPDATE SET value='complete'"
+    )
+    conn.execute("DELETE FROM ah.meta WHERE key='loops_links_projection_v2'")
+    conn.execute("DELETE FROM ah.dirty_session")
+    before = conn.execute("SELECT text FROM ah.message ORDER BY id").fetchall()
+    conn.commit()
+    assert load.post_passes(conn)["dirty_sessions"] == 2
+    assert conn.execute("SELECT status, launch_sha256 FROM ah.loop_run").fetchone() == ("unresolved_path", None)
+    assert conn.execute("SELECT text FROM ah.message ORDER BY id").fetchall() == before
+    # Even a false destination flag cannot override retained explicit incompleteness evidence.
+    conn.execute("UPDATE ah.tool_io SET output_truncated=false")
+    conn.execute("INSERT INTO ah.dirty_session SELECT id FROM ah.session ON CONFLICT DO NOTHING")
+    conn.commit()
+    load.post_passes(conn)
+    assert conn.execute("SELECT status FROM ah.loop_run").fetchone() == ("unresolved_path",)
+    assert conn.execute("SELECT role FROM ah.lane").fetchone() == ("lane-worker-low",)
+
+
+@pytest.mark.parametrize("absolute", [False, True])
+def test_changed_directory_append_requires_absolute_path_and_retracts_retained_false_link(conn, tmp_path, absolute):
+    base, _ = fixture(tmp_path, bare=False)
+    refresh(conn, tmp_path)
+    resume_uid = "ffffffff-ffff-4fff-8fff-ffffffffffff"
+    state = (CWD + "/" if absolute else "") + "codex/state-2026-10-04-loop14.jsonl"
+    records = [
+        header(resume_uid),
+        message("resume", "user", "Continue the interrupted root."),
+        assistant(
+            "append-call",
+            [
+                {
+                    "type": "toolCall",
+                    "id": "append",
+                    "name": "bash",
+                    "arguments": {
+                        "command": "cd /tmp/other-project; loop-state append " + state + " judgement text=continue"
+                    },
+                }
+            ],
+            stopReason="toolUse",
+        ),
+        message("append-result", "toolResult", [], toolCallId="append", toolName="bash", isError=False),
+    ]
+    for r in records:
+        r["timestamp"] = "2026-10-04T13:00:00Z"
+        if "message" in r:
+            r["message"]["timestamp"] = r["timestamp"]
+    resume_base = "2026-10-04T13-00-00Z_" + resume_uid
+    write(base / (resume_base + ".jsonl"), records)
+    resumed_child_uid = "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
+    resumed_run = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"
+    child_records = [header(resumed_child_uid), assistant("resumed-child-response", [], stopReason="stop")]
+    for record in child_records:
+        record["timestamp"] = "2026-10-04T13:00:00Z"
+        if "message" in record:
+            record["message"]["timestamp"] = record["timestamp"]
+    write(base / resume_base / resumed_run / "session.jsonl", child_records)
+    write(
+        base / "subagent-artifacts" / f"{resumed_run}_lane-worker-low_transcript.jsonl",
+        [
+            {
+                "version": 1,
+                "runId": resumed_run,
+                "agent": "lane-worker-low",
+                "message": {"responseId": "resumed-child-response"},
+            }
+        ],
+    )
+    refresh(conn, tmp_path)
+    linkage = conn.execute(
+        "SELECT loop_run_id, loop_link_method FROM ah.session WHERE session_uid=%s", (resume_uid,)
+    ).fetchone()
+    if absolute:
+        assert linkage[0] is not None and linkage[1] == "relaunch"
+        return
+    assert linkage == (None, None)
+    owner, loop_id = conn.execute("SELECT root_session_id, id FROM ah.loop_run").fetchone()
+    conn.execute(
+        "UPDATE ah.session SET loop_run_id=%s, root_session_id=%s, loop_link_method='relaunch' WHERE session_uid=%s",
+        (loop_id, owner, resume_uid),
+    )
+    conn.execute(
+        "UPDATE ah.session SET loop_run_id=%s, root_session_id=%s, loop_link_method='lineage' WHERE session_uid=%s",
+        (loop_id, owner, resumed_child_uid),
+    )
+    conn.execute(
+        "INSERT INTO ah.lane (loop_run_id, session_id, role, link_method) "
+        "SELECT %s, id, agent_type, 'lineage' FROM ah.session WHERE session_uid=%s",
+        (loop_id, resumed_child_uid),
+    )
+    conn.execute(
+        "INSERT INTO ah.dirty_session SELECT id FROM ah.session WHERE session_uid=%s ON CONFLICT DO NOTHING",
+        (resume_uid,),
+    )
+    conn.commit()
+    load.post_passes(conn)
+    assert conn.execute(
+        "SELECT loop_run_id, loop_link_method, root_session_id=id FROM ah.session WHERE session_uid=%s", (resume_uid,)
+    ).fetchone() == (None, None, True)
+    assert conn.execute(
+        "SELECT c.loop_run_id, c.agent_type, r.session_uid FROM ah.session c "
+        "JOIN ah.session r ON r.id=c.root_session_id WHERE c.session_uid=%s",
+        (resumed_child_uid,),
+    ).fetchone() == (None, "lane-worker-low", resume_uid)
+    assert conn.execute("SELECT role FROM ah.lane").fetchall() == [("lane-worker-low",)]
+    assert conn.execute("SELECT lanes_total FROM ah.loops").fetchone() == (1,)
+    conn.commit()
+    load.post_passes(conn)
+    assert conn.execute("SELECT loop_run_id FROM ah.session WHERE session_uid=%s", (resume_uid,)).fetchone() == (None,)
+
+
 def test_idle_backfill_is_bounded_and_repairs_retained_roles_and_paths(conn, tmp_path):
     fixture(tmp_path, direct_child=False)
     refresh(conn, tmp_path)
     conn.execute("UPDATE ah.loop_run SET status = 'unresolved_path'")
     conn.execute("UPDATE ah.lane SET role = NULL")
     conn.execute("DELETE FROM ah.dirty_session")
-    conn.execute("DELETE FROM ah.meta WHERE key LIKE 'loops_links_projection_v1%%'")
+    conn.execute("DELETE FROM ah.meta WHERE key='loops_links_projection_v2'")
     conn.commit()
     assert load.post_passes(conn)["dirty_sessions"] == 2
     assert conn.execute("SELECT status FROM ah.loop_run").fetchone() == ("resolved",)
     assert conn.execute("SELECT role FROM ah.lane").fetchone() == ("lane-worker-low",)
     conn.commit()
     assert load.post_passes(conn)["dirty_sessions"] == 0
-    conn.execute("DELETE FROM ah.meta WHERE key LIKE 'loops_links_projection_v1%%'")
+    conn.execute("DELETE FROM ah.meta WHERE key='loops_links_projection_v2'")
     conn.execute(
         "INSERT INTO ah.session (agent, session_uid, namespace) "
         "SELECT 'pi', 'synthetic-' || i, 'pi-test' FROM generate_series(1, 260) i"

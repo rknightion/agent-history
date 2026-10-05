@@ -122,6 +122,36 @@ ERROR_KIND_RE = re.compile(r"^([a-z][a-z0-9_]{2,63}):")
 ERROR_STATUS_RE = re.compile(r"\((\d{3})\)")
 
 
+def source_output_truncated(tool_name: str, text: str | None, details: Any) -> bool | None:
+    """Source completeness evidence, shared with retained-row loop projection.
+
+    pi read records details.truncation for default line/byte limits, but only a continuation
+    notice for a user-limited read. Preserve every byte; these notices veto completeness, never
+    remove content. Malformed or contradictory explicit truncation metadata fails closed.
+    """
+    truncated = None
+    if isinstance(details, dict) and "truncation" in details:
+        info = details["truncation"]
+        if not isinstance(info, dict) or type(info.get("truncated")) is not bool:
+            return True
+        truncated = info["truncated"]
+        if truncated or info.get("firstLineExceedsLimit"):
+            return True
+        for output, total in (("outputLines", "totalLines"), ("outputBytes", "totalBytes")):
+            if type(info.get(output)) is int and type(info.get(total)) is int and info[output] < info[total]:
+                return True
+    if tool_name.lower() == "read":
+        if re.search(
+            r"(?:^|\n)\[(?:Showing lines \d+-\d+ of \d+[^\n]*Use offset=\d+ to continue\."
+            r"|\d+ more lines in file\. Use offset=\d+ to continue\."
+            r"|Line \d+ is [^\n]*exceeds [^\n]*limit\. Use bash: [^\n]*)\][ \t\r\n]*$",
+            text or "",
+        ):
+            return True
+        return False if truncated is None else truncated
+    return truncated
+
+
 def _epoch(dt: datetime | None) -> float | None:
     return dt.timestamp() if dt is not None else None
 
@@ -670,7 +700,8 @@ class PiParser:
                                 outcome="error" if is_error else "ok", is_error=is_error, meta=meta or None))
         rows.append(ToolIoRow(AGENT, call_id, key, ts, pos.byte_offset, "call", tool_name=call["n"], call_uid=call_id,
                               turn_key=call.get("t"), output_text=text or None, result_json=_dumps(details),
-                              output_parts=parts or None, output_at=ts, output_byte_offset=pos.byte_offset))
+                              output_parts=parts or None, output_at=ts, output_byte_offset=pos.byte_offset,
+                              output_truncated=source_output_truncated(call["n"], text, details)))
         for img in parts:
             rows.append(AttachmentRow(AGENT, f"{call_id}:att:{img['index']}", key, ts, pos.byte_offset, "image",
                                       "tool_result", call_uid=call_id, turn_key=call.get("t"), mime=img["mime"],

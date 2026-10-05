@@ -68,6 +68,32 @@ def test_inventory_parses_sessions_children_and_artifact_evidence(tmp_path):
     assert load.parser_for("pi", "pi_artifact")[0] is PiArtifactParser
 
 
+@pytest.mark.parametrize("details,text,expected", [
+    ({"truncation": {"truncated": True}}, "prefix", True),
+    (None, "prefix\n\n[5 more lines in file. Use offset=3 to continue.]", True),
+    ({"truncation": {"truncated": False, "outputLines": 2, "totalLines": 7}}, "prefix", True),
+    ({"truncation": {"truncated": False, "outputLines": 2, "totalLines": 2}}, "complete", False),
+])
+def test_real_parser_projects_source_output_completeness(tmp_path, details, text, expected):
+    path = tmp_path / "read.jsonl"
+    records = [
+        {"type": "session", "id": ROOT_UID, "timestamp": "2026-10-04T12:00:00Z", "cwd": "/tmp/synthetic", "version": 3},
+        {"type": "message", "id": "call", "timestamp": "2026-10-04T12:00:00Z", "message": {
+            "role": "assistant", "stopReason": "toolUse", "content": [{"type": "toolCall", "id": "read", "name": "read",
+                "arguments": {"path": "/tmp/synthetic/launch.txt"}}]}},
+        {"type": "message", "id": "result", "timestamp": "2026-10-04T12:00:00Z", "message": {
+            "role": "toolResult", "toolCallId": "read", "toolName": "read", "isError": False,
+            "content": [{"type": "text", "text": text}], "details": details}},
+    ]
+    path.write_text("".join(json.dumps(record) + "\n" for record in records))
+    store = MemStore()
+    run_file(PiParser, FileContext(str(path), "pi-test/sessions/slug/read.jsonl", "pi-test", "pi", "test", None, "main"), store)
+    io = one(store, "tool_io", io_uid="read")
+    assert io["output_truncated"] is expected
+    assert io["output_text"] == text
+    assert json.loads(io["result_json"]) == details if details is not None else io["result_json"] is None
+
+
 def test_lineage_of_nested_children():
     rel = f"pi-local/sessions/slug/{ASYNC_ROOT}/{MAPPER_DIR}/run-0/session/{WORKER_DIR}/run-1/session.jsonl"
     assert lineage(rel) == {"root": ROOT_UID, "depth": 2, "task": f"{WORKER_DIR}/run-1",

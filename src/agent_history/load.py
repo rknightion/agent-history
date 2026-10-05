@@ -1039,6 +1039,7 @@ def post_passes(conn: psycopg.Connection, refresh_id: int | None = None) -> dict
         """)
         # Repair historical loop/lane projections in bounded transactional batches.
         loops.enqueue_backfill(conn)
+        loops.retract_unproven_relaunches(conn)
         dirty = conn.execute("SELECT count(*) FROM dirty_now").fetchone()[0]
         result["dirty_sessions"] = dirty
         if not dirty:
@@ -1470,7 +1471,7 @@ def rebuild(conn: psycopg.Connection, hot: Path | None = HOT_ROOT, cold: Path | 
                 conn.execute(f"UPDATE ah.{table} SET session_id = NULL WHERE session_id IS NOT NULL")
             conn.execute("TRUNCATE " + ", ".join(f"ah.{t}" for t in DATA_TABLES) + " RESTART IDENTITY CASCADE")
             # Derived enrichment is re-derived from scratch; collector-owned tables are kept.
-            conn.execute("DELETE FROM ah.meta WHERE key IN ('task_ref_hash', 'loops_links_projection_v1')")
+            conn.execute("DELETE FROM ah.meta WHERE key IN ('task_ref_hash', 'loops_links_projection_v1', 'loops_links_projection_v2')")
             # The embedder skips while this is set (it never holds the refresh lock across API calls).
             conn.execute("INSERT INTO ah.meta (key, value) VALUES ('rebuild_in_progress', now()::text) "
                          "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value")

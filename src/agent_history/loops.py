@@ -97,7 +97,8 @@ def enqueue_backfill(conn: psycopg.Connection) -> None:
     No schema change is needed: ah.meta already holds transactional projection cursors. Rebuild
     explicitly resets this cursor with the derived session rows.
     """
-    key = "loops_links_projection_v1"
+    # A new evidence policy needs a new bounded historical pass, not a reset of the old cursor.
+    key = "loops_links_projection_v2"
     saved = conn.execute("SELECT value FROM ah.meta WHERE key = %s", (key,)).fetchone()
     cursor = saved[0] if saved else "0"
     if cursor == "complete":
@@ -158,10 +159,11 @@ def _captured_launch(
     path = hit.get("launch_path")
     if not path:
         return None
+    from .parse_pi import source_output_truncated
     cwd = conn.execute("SELECT cwd FROM ah.session WHERE id = %s", (root_id,)).fetchone()[0]
     texts = set()
-    for raw, output in conn.execute(
-        "SELECT i.input_text, i.output_text FROM ah.tool_io i JOIN ah.tool_call t "
+    for raw, output, result in conn.execute(
+        "SELECT i.input_text, i.output_text, i.result_json FROM ah.tool_io i JOIN ah.tool_call t "
         "ON t.agent = i.agent AND t.call_uid = i.call_uid "
         "WHERE i.session_id = %s AND lower(i.tool_name) = 'read' "
         "AND t.outcome = 'ok' AND t.ended_at IS NOT NULL "
@@ -171,7 +173,10 @@ def _captured_launch(
     ):
         try:
             args = json.loads(raw or "")
+            details = json.loads(result) if result else None
         except (ValueError, RecursionError):
+            continue
+        if source_output_truncated("read", output, details):
             continue
         recorded_path = args.get("path", args.get("file_path")) if isinstance(args, dict) else None
         if not isinstance(recorded_path, str) or os.path.normpath(os.path.join(cwd or "", recorded_path)) != path:
@@ -233,7 +238,14 @@ def _resume_targets(conn: psycopg.Connection, root_id: int, cwd: str | None) -> 
             # failure hidden by a later semicolon command.
             if ";" in tokens[i + 3:]:
                 continue
-            path = os.path.normpath(os.path.join(cwd or "", tokens[i + 2]))
+            recorded_path = tokens[i + 2]
+            if any(c in recorded_path for c in "~*?[]"):
+                continue
+            # A preceding command can change the effective directory. Do not reconstruct shell
+            # state from text or resolve a relative final append against the session's old cwd.
+            if not os.path.isabs(recorded_path) and (i != 0 or not cwd or not os.path.isabs(cwd)):
+                continue
+            path = os.path.normpath(os.path.join(cwd or "", recorded_path))
             p = PurePosixPath(path)
             if p.parent.name == "codex" and re.fullmatch(r"state-.+-(?:loop|wave)\d+\.jsonl", p.name):
                 targets.add(str(p.with_name(p.stem.replace("state-", "report-", 1) + ".md")))
@@ -285,6 +297,40 @@ def _link_relaunch(conn: psycopg.Connection, root_id: int) -> bool:
     )
     _tag_tree(conn, loop_id, owner, start, None)
     return True
+
+
+def retract_unproven_relaunches(conn: psycopg.Connection) -> None:
+    """Remove only retained relaunch memberships contradicted by the current evidence policy.
+
+    The bounded historical cursor makes these roots dirty. Their exact pi root uid identifies
+    descendants that inherited the same false membership; unrelated lanes and content are untouched.
+    Re-enqueue the former owner so progress and lifecycle no longer attribute the rejected root.
+    """
+    candidates = conn.execute(
+        "SELECT s.id, s.cwd, s.session_uid, s.loop_run_id, l.root_session_id, l.report_path, s.first_event_at "
+        "FROM dirty_now d JOIN ah.session s ON s.id = d.session_id "
+        "JOIN ah.loop_run l ON l.id = s.loop_run_id WHERE s.loop_link_method = 'relaunch'",
+    ).fetchall()
+    for sid, cwd, uid, loop_id, owner, report, started in candidates:
+        targets = _resume_targets(conn, sid, cwd)
+        matches = conn.execute(
+            "SELECT id FROM ah.loop_run WHERE report_path = %s AND root_session_id <> %s AND launch_ts <= %s",
+            (report, sid, started),
+        ).fetchall()
+        if targets == {report} and matches == [(loop_id,)]:
+            continue
+        descendants = [r[0] for r in conn.execute(
+            "UPDATE ah.session SET root_session_id = %s, loop_run_id = NULL, loop_link_method = NULL "
+            "WHERE agent = 'pi' AND root_session_uid = %s AND root_session_id = %s "
+            "AND loop_run_id = %s AND id <> %s RETURNING id", (sid, uid, owner, loop_id, sid),
+        )]
+        if descendants:
+            conn.execute("DELETE FROM ah.lane WHERE loop_run_id = %s AND session_id = ANY(%s)",
+                         (loop_id, descendants))
+            conn.execute("INSERT INTO dirty_now SELECT unnest(%s::bigint[]) ON CONFLICT DO NOTHING", (descendants,))
+        conn.execute("UPDATE ah.session SET root_session_id = id, loop_run_id = NULL, loop_link_method = NULL "
+                     "WHERE id = %s", (sid,))
+        conn.execute("INSERT INTO dirty_now VALUES (%s) ON CONFLICT DO NOTHING", (owner,))
 
 
 def run(conn: psycopg.Connection) -> dict[str, int]:
