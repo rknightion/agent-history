@@ -1,5 +1,5 @@
 # Build against the same Python and libc as the minimal runtime.
-FROM cgr.dev/chainguard/python:latest-dev@sha256:48431f8d4bc6837b375af28570a4b0245410360b56d5633768de5490bbc283e4 AS builder
+FROM cgr.dev/chainguard/python:latest-dev@sha256:a876b1000774bdd68322ac020cd813aaf42b52941ca812f4d2f0149059bd0e67 AS builder
 USER 0
 WORKDIR /app
 COPY pyproject.toml README.md LICENSE ./
