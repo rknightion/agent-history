@@ -66,6 +66,21 @@ class Embedding:
 
 
 @dataclass
+class LoopLive:
+    """Optional paid enrichment. URLs and authentication are operator configuration only."""
+
+    enabled: bool = False
+    jev_url: str | None = None
+    summary_url: str | None = None
+    api_key_env: str | None = "AGENT_HISTORY_LOOP_LIVE_TOKEN"
+    api_key_file: str | None = None
+    reasoning: str | None = None  # Set only after the operator's summary evaluation.
+
+    def token(self) -> str:
+        return _secret(None, self.api_key_file, self.api_key_env, "loop live api key") or ""
+
+
+@dataclass
 class Identities:
     owner_emails: frozenset[str] = frozenset()
     git_owners: frozenset[str] = frozenset()  # "host/owner", e.g. "github.com/example-org"
@@ -142,6 +157,7 @@ class Config:
     git_days: int = 180
     collector: CollectorConfig = field(default_factory=CollectorConfig)
     embedding: Embedding = field(default_factory=Embedding)
+    loop_live: LoopLive = field(default_factory=LoopLive)
     efficiency: Efficiency = field(default_factory=Efficiency)
     exporter: Exporter = field(default_factory=Exporter)
     metrics_labels: MetricsLabels = field(default_factory=MetricsLabels)
@@ -175,6 +191,7 @@ def parse_config(data: dict[str, Any], path: Path | None = None) -> Config:
         "git",
         "collector",
         "embedding",
+        "loop_live",
         "efficiency",  # lane C
         "exporter",
         "metrics_labels",
@@ -235,6 +252,28 @@ def parse_config(data: dict[str, Any], path: Path | None = None) -> Config:
         lock_file=Path(col.get("lock_file", Path.home() / ".local/state/agent-history/collect.lock")).expanduser(),
         journal_db=Path(col["journal_db"]).expanduser() if col.get("journal_db") else None,
     )
+    live = _table(data, "loop_live")
+    live_keys = {"enabled", "jev_url", "summary_url", "api_key_env", "api_key_file", "reasoning"}
+    if set(live) - live_keys:
+        raise ConfigError(f"unknown loop_live keys: {', '.join(sorted(set(live) - live_keys))}")
+    loop_live = LoopLive(**live)
+    if not isinstance(loop_live.enabled, bool):
+        raise ConfigError("loop_live.enabled must be true or false")
+    if loop_live.reasoning not in (None, "off", "low", "high", "max"):
+        raise ConfigError("loop_live.reasoning must be off, low, high or max")
+    for key in ("jev_url", "summary_url", "api_key_env", "api_key_file"):
+        value = getattr(loop_live, key)
+        if value is not None and (not isinstance(value, str) or not value):
+            raise ConfigError(f"loop_live.{key} must be a non-empty string")
+    if loop_live.enabled:
+        from urllib.parse import urlsplit
+
+        for key in ("jev_url", "summary_url"):
+            url = urlsplit(getattr(loop_live, key) or "")
+            if url.scheme != "https" or not url.netloc or url.username or url.password or url.query or url.fragment:
+                raise ConfigError(f"loop_live.{key} requires an explicit HTTPS Gateway route")
+        if loop_live.reasoning is None:
+            raise ConfigError("loop_live.reasoning must be selected by the summary evaluation before enabling")
     emb = _table(data, "embedding")
     # Efficiency collector configuration (lane C).
     eff = _table(data, "efficiency")
@@ -305,6 +344,7 @@ def parse_config(data: dict[str, Any], path: Path | None = None) -> Config:
         git_days=int(git.get("days", 180)),
         collector=collector,
         embedding=embedding,
+        loop_live=loop_live,
         efficiency=efficiency,
         exporter=exporter,
         metrics_labels=_metrics_labels(data.get("metrics_labels")),

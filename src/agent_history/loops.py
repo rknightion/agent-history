@@ -384,6 +384,8 @@ def refresh_live(conn: psycopg.Connection) -> dict[str, int]:
     count = result.rowcount
     _refresh_identity(conn, finished)
     _refresh_progress(conn)
+    from .loop_live import refresh as refresh_phase
+    refresh_phase(conn)
     return {"live_loops": count}
 
 

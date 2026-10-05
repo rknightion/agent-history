@@ -398,6 +398,74 @@ in the same session, else NULL. A pi `Background task completed|failed: **<agent
 sets `completion_status` on the spawn row of the async launch named by its
 `async-subagent-runs/<runId>` line.
 
+### Live phase and generated summaries
+
+Additive `ah.loops` fields project retained catalogue evidence from pi roots and linked
+relaunches: successful complete append calls to the recorded state target, structured watches
+and heartbeats, explicit subagent metadata and retained returns. Projection never opens a local
+state file or uses a local path lookup to supply content or identity.
+
+`live_phase` is nullable and uses preparing, working, reviewing, gating, landing, waiting or
+closing. `phase_since` is the observed transition time. The frozen hybrid combines deterministic
+lane/timing evidence with Jev yes/no decisions; an explicit unexpired watch overrides nominal
+stale lanes and preparation. Stop/deadline retires the watch. Heartbeat evidence is deduplicated
+to one per five minutes. Independent nullable `jev_phase` and `jev_phase_probs` retain the whole
+phase decision. Jev results are accepted only when their authoritative returned model is
+`jev-1.13.0`, never an inferred alias or a request-field echo.
+
+Nullable structure includes `active_lanes` (lane/task/title/agent/started_at), `last_gate`
+(sha/scope/exit/at), `parks_total`, `last_park` (task/needs/reason), distinct `tasks_admitted` and
+`tasks_landed`, `last_judgement` (at most 500 characters), `last_judgement_at` and explicit
+`ops_state`. Unknown stays NULL; an observed open establishes known empty/zero values.
+
+`headline` is at most 120 characters; `summary` is at most 600 characters and two to four
+sentences. Generation time/model/error and `final_summary` accompany them. Failure retains the
+last successful text. Full provider replies, including reasoning, are retained unredacted in
+the independent paid cache. `ah.loop_phase_event` records launch/time/phase/source/headline with
+a surrogate id for equal timestamps and a cascading launch foreign key. Only observed phase
+transitions or changed headlines append history. Rebuild clears derived history, reprojects
+retained evidence and restores cached summaries without another paid call.
+
+Refresh only projects database structure and queues one changed digest per loop/transaction,
+including explicit close. Meaningful phase/watch/quiet-bucket changes, not an exact minute
+schedule, admit work; closed loops do not keep ageing the quiet bucket. Heartbeat timestamps alone
+do not change the paid digest. Historical structural projection may restore existing cache but
+never itself authorises paid work: admission requires a selected running loop or a newly observed
+explicit close of an already tracked/live-admitted loop. Admitted closes take priority.
+The complete digest is
+bounded to 12,000 UTF-8 JSON bytes and the complete serialized inference request to 32,768 bytes;
+oversize is a visible error, not a partial lane list or transcript dump.
+
+Inference requires a separately scheduled worker on an idle autocommit connection, never inline
+on the collector. Results apply on later refreshes, including completed jobs on closed loops.
+Interrupted claims acquire a visible timeout error after five minutes. The collector marks only
+the exact completed outcome or deferral it observed before reading replies; a later completion
+stays unapplied for the following refresh, including on closed loops. Worker updates bind their
+exact claimed job identity. Unpaid auth and daily-cap refusals are recoverable deferrals in
+restricted queue metadata, not permanent cache entries. Unchanged unavailable prerequisites do
+not retry; admission may resume only when auth/routes become available or the refused UTC day
+advances. A successful paid step is reused when the remaining unpaid step is deferred.
+Committed reservations with unknown results remain terminal/uncertain: no inference retry or
+refund on token/day changes, missing usage, timeout or rebuild. Public `summary_error` contains
+finite reason/status labels only; full unredacted provider errors stay in restricted cache.
+The operator must configure routes and schedule this bounded worker before enabling enrichment.
+
+A catalogue-global atomic UTC-day USD 5 ceiling uses independent budget/reservation tables that
+survive refresh and rebuild. Reservations commit before calls and are never refunded, including
+missing usage, timeout or crash. Jev reserves 65,536 input tokens at USD 0.042/M with free output.
+Summary reserves the full 1,048,576-token context at peak USD 0.30/M uncached input and at most
+2,048 generated tokens (including reasoning) at USD 1.20/M. Both include a 1.05 fee allowance.
+This deliberately coarse summary ceiling allows about fourteen complete enrichments per day;
+the request-byte cap alone is not proof of a tighter tokenizer/framing ceiling. Development and
+evaluation calls are exempt from production admission.
+
+No existing reader grant or SELECT is widened. Consumers use additive `ah.loops` columns under
+the existing grant. Migration 029 revokes inherited/default reader and PUBLIC privileges on only
+`loop_live_job`, `loop_live_cache`, `loop_live_budget` and `loop_live_reservation`; existing loops,
+history and other table grants stay unchanged. Paid tables have no
+loop/session foreign keys, so derived-data rebuild cannot cascade into them. Existing identity,
+lifecycle, collector-key and paid-embedding-cache contracts are unchanged.
+
 ## Efficiency classifier
 
 `ah.efficiency_calls(namespaces, session_uid, agent_id)` returns one row per model call with its

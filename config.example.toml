@@ -75,3 +75,19 @@ dimensions = 1024
 api_key_env = "OPENAI_API_KEY"
 # api_key_file = "~/.config/agent-history/embedding.key"
 # headers = { "X-Extra-Header" = "value" }
+
+# Live phase structure is projected from catalogued pi root evidence, not local state files.
+# Paid enrichment is optional and never runs on the indexer's transaction or connection.
+# Run `python -m agent_history.loop_live` as an independent bounded queue drain after refresh.
+# A failed/slow provider keeps the previous summary and records an error. Inputs and outputs
+# are unredacted. The shared UTC daily reservation ceiling is fixed at USD 5 across both models.
+# Reservations use peak prices, a 5% fee allowance, the whole documented context ceiling and
+# a hard 2048-token generated-output limit (including reasoning); reservations are never refunded.
+# This deliberately limits daily throughput until a verified tighter input-token bound exists.
+[loop_live]
+enabled = false
+# jev_url and summary_url are complete Gateway request URLs supplied in private server config.
+# No default route, account identifier, provider fallback or automatic URL construction exists.
+# api_key_env = "AGENT_HISTORY_LOOP_LIVE_TOKEN"
+# api_key_file is an operator-managed token file, never a committed credential.
+# reasoning = "off"  # off, low, high or max; choose using the summary evaluation before enabling.
