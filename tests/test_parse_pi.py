@@ -430,6 +430,42 @@ def synth(tmp_path, records: list[dict], name: str = "s.jsonl") -> MemStore:
     return store
 
 
+@pytest.mark.parametrize(
+    "tag,cls",
+    [
+        ("system-reminder", "system_reminder"),
+        ("environment_context", "context_injection"),
+        ("hook_prompt", "hook_output"),
+        ("skill", "skill_body"),
+    ],
+)
+@pytest.mark.parametrize("mixed", [False, True])
+def test_user_injections_are_not_human_prompts(tmp_path, tag, cls, mixed):
+    block = f"<{tag}>syntheticboundaryneedle</{tag}>"
+    text = f"Human request before.\n{block}\nHuman request after." if mixed else block
+    store = synth(
+        tmp_path,
+        [
+            {
+                "type": "message",
+                "id": "boundary",
+                "timestamp": AT,
+                "message": {"role": "user", "content": [{"type": "text", "text": text}]},
+            }
+        ],
+    )
+    prompts = by(store, "message", message_class="human_prompt")
+    assert len(prompts) == int(mixed)
+    if mixed:
+        assert prompts[0]["text"] == "Human request before.\n\nHuman request after."
+    assert not any("syntheticboundaryneedle" in m["text"] for m in prompts)
+    injected = one(store, "message", message_class=cls)
+    assert injected["text"] == block
+    assert injected["detail"]["source"] == tag
+    assert (one(store, "session")["first_human_at"] is not None) == mixed
+
+
+
 def bash_pair(i: int, command: str, output: str, error: bool = False) -> list[dict]:
     ts = f"2026-10-01T10:00:{i:02d}.000Z"
     return [

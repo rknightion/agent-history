@@ -138,7 +138,7 @@ from typing import Any, Iterable
 
 from .common import (BOUNDED_STATE_SECONDS, artifact_kind, as_bool, as_int, as_str, cmd_verb, ssh_target,
                      git_event_extras, git_ops_from_command, git_from_output, json_size, linked_paths, mcp_split, parse_ts, prompt_origin,
-                     sha256_text, text_blocks)
+                     sha256_text, split_prompt_injections, text_blocks)
 from .model import (ArtifactRow, AttachmentRow, CompactionRow, ContinuationRow, FileContext, FileTouchRow,
                     GitEventRow, LinePos, LlmCallRow, MessageRow, ParseIssueRow, RateLimitRow, RecordTypeRow,
                     Row, SessionEventRow, SessionKey, SessionRow, SubagentSpawnRow, ToolCallRow, ToolIoRow,
@@ -904,42 +904,96 @@ class CodexParser:
                                    pos.byte_offset, pos.byte_length, pos.line_number, turn_id, turn["m"]))
         return rows
 
-    def _prompt(self, text: str, images: int, turn_id: str | None, ts: datetime | None, pos: LinePos,
-                uid: str, raw: str | None = None, parts: list[dict[str, Any]] | None = None,
-                skill: bool = False, source: str = "user_message") -> list[Row]:
+    def _prompt(
+        self,
+        text: str,
+        images: int,
+        turn_id: str | None,
+        ts: datetime | None,
+        pos: LinePos,
+        uid: str,
+        raw: str | None = None,
+        parts: list[dict[str, Any]] | None = None,
+        skill: bool = False,
+        source: str = "user_message",
+    ) -> list[Row]:
         key = self._key()
         turn_id = turn_id or self.s.get("cur")
         if key is None or ts is None:
             return []
         rows: list[Row] = []
         ri_images = self._match_user(text, images, rows)
-        self.s["lp"] = {"h": _hash(text), "end": pos.byte_offset + pos.byte_length, "t": turn_id} \
-            if text else None
+        self.s["lp"] = {"h": _hash(text), "end": pos.byte_offset + pos.byte_length, "t": turn_id} if text else None
         attachments = self._prompt_attachments(parts or [], ri_images, uid, ts, pos, turn_id)
         if self.s["sub"]:
             # Subagent threads never carry typed prompts; these are parent briefs and follow-ups.
             self._turn(turn_id, ts)["peer"] = True
             body = raw if isinstance(raw, str) and raw.strip() else text
             if body:
-                rows.append(MessageRow(AGENT, uid, key, ts, "user", "agent_message", body, pos.byte_offset,
-                                       pos.byte_length, pos.line_number, turn_id, detail={"source": source}))
+                rows.append(
+                    MessageRow(
+                        AGENT,
+                        uid,
+                        key,
+                        ts,
+                        "user",
+                        "agent_message",
+                        body,
+                        pos.byte_offset,
+                        pos.byte_length,
+                        pos.line_number,
+                        turn_id,
+                        detail={"source": source},
+                    )
+                )
             return rows + attachments
-        if text:
+        human, injections = split_prompt_injections(text)
+        for n, (cls, tag, body, start, stop) in enumerate(injections):
+            event_uid = uid if not human and n == 0 else f"{uid}:injection:{n}"
+            rows.append(
+                MessageRow(
+                    AGENT,
+                    event_uid,
+                    key,
+                    ts,
+                    "user",
+                    cls,
+                    body,
+                    pos.byte_offset,
+                    pos.byte_length,
+                    pos.line_number,
+                    turn_id,
+                    detail={"source": tag, "text_start": start, "text_end": stop},
+                )
+            )
+        if human:
             self._human(ts)
-            origin = prompt_origin(text)
-            if origin != "launch_message" and (skill or SKILL_INVOKE_RE.match(text)):
+            origin = prompt_origin(human)
+            if origin != "launch_message" and (skill or SKILL_INVOKE_RE.match(human)):
                 origin = "skill"
-            rows.append(MessageRow(AGENT, uid, key, ts, "user", "human_prompt", text, pos.byte_offset,
-                                   pos.byte_length, pos.line_number, turn_id, prompt_origin=origin))
+            rows.append(
+                MessageRow(
+                    AGENT,
+                    uid,
+                    key,
+                    ts,
+                    "user",
+                    "human_prompt",
+                    human,
+                    pos.byte_offset,
+                    pos.byte_length,
+                    pos.line_number,
+                    turn_id,
+                    prompt_origin=origin,
+                )
+            )
             if turn_id:
                 turn = self._turn(turn_id, ts)
                 if not turn["o"]:
                     turn["o"] = True
-                    rows.append(TurnRow(key, turn_id, pos.byte_offset,
-                                        origin="sdk" if self.s["exec"] else "human"))
+                    rows.append(TurnRow(key, turn_id, pos.byte_offset, origin="sdk" if self.s["exec"] else "human"))
         if images:
-            rows.append(SessionEventRow(AGENT, uid, key, ts, "image_attach", pos.byte_offset, turn_id,
-                                        str(images)))
+            rows.append(SessionEventRow(AGENT, uid, key, ts, "image_attach", pos.byte_offset, turn_id, str(images)))
         return rows + attachments
 
     def _prompt_attachments(self, parts: list[dict[str, Any]], ri_images: list[dict[str, Any]], uid: str,

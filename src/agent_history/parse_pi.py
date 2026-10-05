@@ -84,7 +84,7 @@ from typing import Any, Iterable
 
 from .common import (BOUNDED_STATE_SECONDS, artifact_kind, as_int, as_str, cmd_verb, git_event_extras,
                      git_from_output, git_ops_from_command, json_size, linked_paths, parse_ts, prompt_origin,
-                     ssh_target)
+                     split_prompt_injections, ssh_target)
 from .model import (ArtifactRow, AttachmentRow, CompactionRow, ContinuationRow, FileContext, FileTouchRow,
                     GitEventRow, LinePos, LlmCallRow, MessageRow, ParseIssueRow, RecordTypeRow, Row,
                     PiRunResponseRow, SessionEventRow, SessionKey, SessionRow, SubagentSpawnRow, ToolCallRow,
@@ -92,8 +92,8 @@ from .model import (ArtifactRow, AttachmentRow, CompactionRow, ContinuationRow, 
 from .parse_claude import _diff_counts, _nlines
 
 AGENT = "pi"
-# Re-parse retained sessions to add compaction session events; existing content keys stay unchanged.
-PARSER_VERSION = "7"
+# Rebuild retained sessions to separate reserved harness wrappers from human prompts.
+PARSER_VERSION = "8"
 # Artifact metadata replay is independent of the session parser version.
 ARTIFACT_PARSER_VERSION = "6-links1"
 # Resolved agent-file names are evidence, including custom agents and route suffixes such as -low.
@@ -463,23 +463,75 @@ class PiParser:
         rows: list[Row] = []
         text = _text(m.get("content"))
         self.s["users"] += 1
+        human, injections = split_prompt_injections(text) if not self.sub else (text, [])
         idle = self.s["cur"] is None or not self.s["busy"]
         if idle:
-            origin = "human" if not self.sub else ("subagent_brief" if self.s["users"] == 1 else "peer")
+            origin = (
+                ("human" if human or not injections else "unknown")
+                if not self.sub
+                else ("subagent_brief" if self.s["users"] == 1 else "peer")
+            )
             self.s["pend"] = None
             rows.append(self._open_turn(eid, origin, ts, pos))
         turn = self.s["cur"]
         if self.sub:
-            rows.append(self._msg(uid, ts, "user", "agent_message", text, pos, turn,
-                                  detail={"source": "subagent_task" if self.s["users"] == 1 else "parent_message"}))
+            rows.append(
+                self._msg(
+                    uid,
+                    ts,
+                    "user",
+                    "agent_message",
+                    text,
+                    pos,
+                    turn,
+                    detail={"source": "subagent_task" if self.s["users"] == 1 else "parent_message"},
+                )
+            )
         else:
-            self._human(ts)
-            rows.append(self._msg(uid, ts, "user", "human_prompt" if idle else "queued_prompt", text, pos, turn,
-                                  origin=prompt_origin(text)))
+            if human or not injections:
+                self._human(ts)
+                rows.append(
+                    self._msg(
+                        uid,
+                        ts,
+                        "user",
+                        "human_prompt" if idle else "queued_prompt",
+                        human,
+                        pos,
+                        turn,
+                        origin=prompt_origin(human),
+                    )
+                )
+            for n, (cls, tag, body, start, stop) in enumerate(injections):
+                event_uid = uid if not human and n == 0 else f"{uid}:injection:{n}"
+                rows.append(
+                    self._msg(
+                        event_uid,
+                        ts,
+                        "user",
+                        cls,
+                        body,
+                        pos,
+                        turn,
+                        detail={"source": tag, "text_start": start, "text_end": stop},
+                    )
+                )
         for img in _images(m.get("content")):
-            rows.append(AttachmentRow(AGENT, f"{uid}:att:{img['index']}", self._key(), ts, pos.byte_offset, "image",
-                                      "prompt", event_uid=uid, turn_key=turn, mime=img["mime"],
-                                      size_bytes=img["bytes"]))
+            rows.append(
+                AttachmentRow(
+                    AGENT,
+                    f"{uid}:att:{img['index']}",
+                    self._key(),
+                    ts,
+                    pos.byte_offset,
+                    "image",
+                    "prompt",
+                    event_uid=uid,
+                    turn_key=turn,
+                    mime=img["mime"],
+                    size_bytes=img["bytes"],
+                )
+            )
         return rows
 
     def _custom_message(self, record: dict[str, Any], eid: str, uid: str, ts: datetime, pos: LinePos) -> list[Row]:

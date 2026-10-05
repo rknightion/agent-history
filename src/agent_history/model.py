@@ -640,5 +640,5 @@ class Parser(Protocol):
     def state(self) -> dict[str, Any]: ...
 
 
-PARSER_VERSION_CLAUDE = "8"
-PARSER_VERSION_CODEX = "7"
+PARSER_VERSION_CLAUDE = "9"
+PARSER_VERSION_CODEX = "8"

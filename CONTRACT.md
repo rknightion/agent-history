@@ -122,6 +122,15 @@ them; after a `kind = 'rebuild'` row in `ah.change_log`, re-page any cursor from
   `system_reminder`, `context_injection`, `hook_output`, `command_expansion`, `skill_body`,
   `local_command_output`, `agent_message` and `interrupt_marker`. `detail.source` names the
   attachment type, tag or pi custom message type.
+Complete reserved harness wrappers carried inside user prompt text are split into separate classed
+rows with source and `text_start`/`text_end` character offsets. A non-blank human remainder keeps
+one prompt row and its existing `event_uid`; whitespace-only remainder is retained on injected
+rows rather than classified as a human prompt. Top-level code-fenced, Markdown-quoted, inline,
+unknown and incomplete markup remains human text. Fenced and Markdown-quoted literal tags inside
+an unambiguously complete reserved wrapper inherit its outer class without defining its boundary.
+Recognisers do not guess away provenance; stored content is retained losslessly. Updated parser versions require retained transcripts to be re-parsed or rebuilt before
+historical search and class counts reflect this boundary.
+
 - `message.prompt_origin` on prompts: `typed`, `pasted`, `slash_command`, `skill`, `local_command`,
   `launch_message` (a loop root's launch prompt) or `agent_message`.
 - `ah.tool_io`: one row per call (`kind = 'call'`) and per Codex executed operation (`kind = 'op'`),

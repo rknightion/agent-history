@@ -55,6 +55,247 @@ def main_store() -> MemStore:
     return load(MAIN)
 
 
+@pytest.mark.parametrize(
+    "tag,cls",
+    [
+        ("system-reminder", "system_reminder"),
+        ("local-command-caveat", "system_reminder"),
+        ("environment_context", "context_injection"),
+        ("hook_prompt", "hook_output"),
+        ("skill", "skill_body"),
+    ],
+)
+@pytest.mark.parametrize("mixed", [False, True])
+def test_user_injections_are_not_human_prompts(tmp_path, tag, cls, mixed):
+    block = f"<{tag}>syntheticboundaryneedle</{tag}>"
+    text = f"Human request before.\n{block}\nHuman request after." if mixed else block
+    record = {
+        "type": "user",
+        "sessionId": SID,
+        "uuid": "boundary",
+        "timestamp": "2026-10-01T10:00:00Z",
+        "origin": {"kind": "human"},
+        "message": {"role": "user", "content": text},
+    }
+    path = tmp_path / "boundary.jsonl"
+    path.write_text(json.dumps(record) + "\n")
+    store = MemStore()
+    run_file(
+        ClaudeParser,
+        FileContext(str(path), "claude-test/projects/boundary.jsonl", "claude-test", "claude", "test", None, "main"),
+        store,
+        batch_lines=1,
+    )
+    prompts = by(store, "message", message_class="human_prompt")
+    assert len(prompts) == int(mixed)
+    if mixed:
+        assert prompts[0]["text"] == "Human request before.\n\nHuman request after."
+        assert prompts[0]["event_uid"] == "boundary"
+    assert not any("syntheticboundaryneedle" in m["text"] for m in prompts)
+    injected = one(store, "message", message_class=cls)
+    assert injected["text"] == block
+    assert injected["detail"]["source"] == tag
+    session = one(store, "session")
+    assert (session["first_human_at"] is not None) == mixed
+
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Explain <system-reminder>literal markup</system-reminder> please.",
+        "```xml\n<system-reminder>literal markup</system-reminder>\n```",
+        "~~~xml\n<system-reminder>literal markup</system-reminder>\n~~~",
+        "> <system-reminder>quoted markup</system-reminder>",
+        "<example>ordinary XML</example>",
+        "<system-reminder>incomplete markup",
+    ],
+)
+def test_injection_splitter_does_not_guess_human_markup(text):
+    from agent_history.common import split_prompt_injections
+
+    assert split_prompt_injections(text) == (text, [])
+
+
+
+def test_injection_splitter_balances_nested_blocks_and_preserves_every_character():
+    from agent_history.common import split_prompt_injections
+
+    blocks = [
+        "<system-reminder>outer <system-reminder>inner</system-reminder> end</system-reminder>",
+        "<environment_context>synthetic environment</environment_context>",
+    ]
+    text = "Human before.\n" + "\n".join(blocks) + "\nHuman after."
+    human, injected = split_prompt_injections(text)
+    assert human == "Human before.\n\n\nHuman after."
+    assert [b[2] for b in injected] == blocks
+    # Reconstruct exact original text using recorded character offsets and the human remainder.
+    restored, pos = "", 0
+    for _, _, body, start, stop in injected:
+        gap = start - pos
+        restored += human[:gap] + body
+        human = human[gap:]
+        pos = stop
+    assert restored + human == text
+    whitespace = " \n" + "\n \n".join(blocks) + "\n "
+    human, injected = split_prompt_injections(whitespace)
+    assert human == ""
+    assert "".join(b[2] for b in injected) == whitespace
+
+
+
+@pytest.mark.parametrize("agent", ["claude", "codex", "pi"])
+@pytest.mark.parametrize("fence", ["```", "~~~", ">"])
+@pytest.mark.parametrize("mixed", [False, True])
+@pytest.mark.parametrize("case", ["fenced_closer", "fenced_opener", "incomplete"])
+def test_fenced_matching_tags_do_not_change_prompt_boundaries(tmp_path, agent, fence, mixed, case):
+    from agent_history.common import split_prompt_injections
+    from agent_history.parse_codex import CodexParser
+    from agent_history.parse_pi import PiParser
+
+    literal = "<system-reminder>literal example" if case == "fenced_opener" else "</system-reminder>"
+    if fence == ">":
+        block = f"<system-reminder>Boundary start\n> {literal}"
+    else:
+        block = f"<system-reminder>Boundary start\n{fence}xml\n{literal}\n{fence}"
+    if case != "incomplete":
+        block += "\nsyntheticinjectedtail\n</system-reminder>"
+    text = f"Human before.\n{block}\nHuman after." if mixed else block
+    expected_human = text if case == "incomplete" else "Human before.\n\nHuman after." if mixed else ""
+    human, injected = split_prompt_injections(text)
+    assert human == expected_human
+    if case == "incomplete":
+        assert injected == []
+    else:
+        start = text.index("<system-reminder>")
+        assert injected == [("system_reminder", "system-reminder", block, start, start + len(block))]
+        assert text[:start] + injected[0][2] + text[start + len(block):] == text
+
+    at = "2026-10-01T10:00:00Z"
+    records = {
+        "claude": [{
+            "type": "user", "sessionId": SID, "uuid": "boundary", "timestamp": at,
+            "message": {"role": "user", "content": text},
+        }],
+        "codex": [
+            {"type": "session_meta", "ordinal": 1, "timestamp": at,
+             "payload": {"id": SID, "source": "cli", "cli_version": "0.145.0"}},
+            {"type": "event_msg", "ordinal": 2, "timestamp": at,
+             "payload": {"type": "user_message", "message": text}},
+        ],
+        "pi": [
+            {"type": "session", "id": SID, "version": 3, "timestamp": at, "cwd": "/tmp/synthetic"},
+            {"type": "message", "id": "boundary", "timestamp": at,
+             "message": {"role": "user", "content": [{"type": "text", "text": text}]}},
+        ],
+    }
+    path = tmp_path / "boundary.jsonl"
+    path.write_text("".join(json.dumps(record) + "\n" for record in records[agent]))
+    store = MemStore()
+    parser = {"claude": ClaudeParser, "codex": CodexParser, "pi": PiParser}[agent]
+    run_file(parser, FileContext(str(path), f"{agent}-test/sessions/boundary.jsonl",
+                                f"{agent}-test", agent, "test", None, "main"), store, batch_lines=1)
+    prompts = by(store, "message", message_class="human_prompt")
+    assert [row["text"] for row in prompts] == ([expected_human] if expected_human else [])
+    original_uid = {"claude": "boundary", "codex": f"{SID}:2", "pi": f"{SID}:boundary"}[agent]
+    if prompts:
+        assert prompts[0]["event_uid"] == original_uid
+    wrappers = by(store, "message", message_class="system_reminder")
+    assert [row["text"] for row in wrappers] == ([] if case == "incomplete" else [block])
+    if wrappers:
+        assert wrappers[0]["detail"]["source"] == "system-reminder"
+        start = text.index("<system-reminder>")
+        assert (wrappers[0]["detail"]["text_start"], wrappers[0]["detail"]["text_end"]) == (start, start + len(block))
+        if not prompts:
+            assert wrappers[0]["event_uid"] == original_uid
+
+
+
+def test_injected_harness_text_is_searchable_only_outside_human_class_pg(tmp_path):
+    import os
+
+    dsn = os.environ.get("AGENT_HISTORY_TEST_DSN", "")
+    if not dsn or "agent_history_test" not in dsn:
+        pytest.skip("AGENT_HISTORY_TEST_DSN (a *_test database) not set")
+    pytest.importorskip("psycopg")
+    from agent_history import load as loader
+
+    at = "2026-10-01T10:00:00Z"
+    block = "<system-reminder>syntheticboundaryneedle</system-reminder>"
+    texts = [f"synthetichumanneedle before.\n{block}\nHuman after.", block]
+    hot, cold = tmp_path / "hot", tmp_path / "cold"
+    records = {
+        "claude": [
+            {
+                "type": "user",
+                "sessionId": SID,
+                "uuid": f"boundary-{n}",
+                "timestamp": at,
+                "message": {"role": "user", "content": text},
+            }
+            for n, text in enumerate(texts)
+        ],
+        "codex": [
+            {
+                "type": "session_meta",
+                "timestamp": at,
+                "payload": {"id": SID, "source": "cli", "cli_version": "0.145.0"},
+            },
+            *[
+                {"type": "event_msg", "timestamp": at, "payload": {"type": "user_message", "message": text}}
+                for text in texts
+            ],
+        ],
+        "pi": [
+            {"type": "session", "id": SID, "version": 3, "timestamp": at, "cwd": "/tmp/synthetic"},
+            *[
+                {
+                    "type": "message",
+                    "id": f"boundary-{n}",
+                    "timestamp": at,
+                    "message": {"role": "user", "content": [{"type": "text", "text": text}]},
+                }
+                for n, text in enumerate(texts)
+            ],
+        ],
+    }
+    paths = {
+        "claude": hot / "claude-local" / "projects" / "-synthetic-" / f"{SID}.jsonl",
+        "codex": hot / "codex-local" / "sessions" / f"rollout-2026-10-01T10-00-00-{SID}.jsonl",
+        "pi": hot / "pi-local" / "sessions" / "-synthetic-" / f"2026-10-01T10-00-00-000Z_{SID}.jsonl",
+    }
+    for agent, path in paths.items():
+        path.parent.mkdir(parents=True)
+        path.write_text("".join(json.dumps(r) + "\n" for r in records[agent]))
+    (cold / ".archive-receipts").mkdir(parents=True)
+    (cold / ".archive-receipts" / "receipt.json").write_text("{}")
+    with loader.connect(dsn) as conn:
+        loader.apply_schema(conn, force=True)
+        conn.execute("TRUNCATE " + ", ".join(f"ah.{t}" for t in loader.DATA_TABLES) + " RESTART IDENTITY CASCADE")
+        conn.commit()
+        stats = loader.refresh(conn, hot, cold, log=lambda *_: None)
+        assert stats.errors == 0 and stats.files_parsed == 3
+        assert conn.execute(
+            "SELECT agent, count(*) FROM ah.message WHERE message_class='human_prompt' GROUP BY agent ORDER BY agent"
+        ).fetchall() == [("claude", 1), ("codex", 1), ("pi", 1)]
+        assert conn.execute("SELECT DISTINCT text FROM ah.message WHERE message_class='human_prompt'").fetchall() == [
+            ("synthetichumanneedle before.\n\nHuman after.",)
+        ]
+        query = "SELECT agent, message_class FROM ah.search(%s, NULL, NULL, 20, 'any', %s) ORDER BY 1, 2"
+        assert conn.execute(query, ("syntheticboundaryneedle", ["human_prompt", "queued_prompt"])).fetchall() == []
+        assert conn.execute(query, ("syntheticboundaryneedle", ["system_reminder"])).fetchall() == [
+            (agent, "system_reminder") for agent in ("claude", "codex", "pi") for _ in range(2)
+        ]
+        assert conn.execute(query, ("synthetichumanneedle", ["human_prompt"])).fetchall() == [
+            (agent, "human_prompt") for agent in ("claude", "codex", "pi")
+        ]
+        # The persisted rows and search stay the same on the normal no-op refresh path.
+        again = loader.refresh(conn, hot, cold, log=lambda *_: None)
+        assert again.errors == 0 and again.files_parsed == 0
+        assert conn.execute("SELECT count(*) FROM ah.message").fetchone() == (9,)
+
+
+
 def test_multi_line_message_usage_merges_to_last_line(main_store):
     call = one(main_store, "llm_call", response_id="msg_1")
     assert call["output"] == 40            # MAX over the three content-block lines

@@ -118,7 +118,7 @@ from typing import Any, Iterable
 
 from .common import (BOUNDED_STATE_SECONDS, as_bool, as_int, as_str, artifact_kind, cmd_verb, ssh_target,
                      git_ops_from_command, git_event_extras, git_from_output, json_size, key_set, linked_paths, mcp_split, parse_ts,
-                     prompt_origin, sha256_text, text_blocks)
+                     prompt_origin, sha256_text, split_prompt_injections, text_blocks)
 from .model import (ArtifactRow, AttachmentRow, CompactionRow, ContinuationRow, CostStateRow,
                     FileContext, FileTouchRow, GitEventRow, HookEventRow, LinePos, LlmCallRow,
                     MessageRow, ParseIssueRow, RateLimitRow, RecordTypeRow, Row, SessionEventRow,
@@ -959,8 +959,11 @@ class ClaudeParser:
         content = msg.get("content")
         uid = self._uid(rec, pos)
         pid = as_str(rec.get("promptId"))
-        results = [b for b in content if isinstance(b, dict) and b.get("type") == "tool_result"] \
-            if isinstance(content, list) else []
+        results = (
+            [b for b in content if isinstance(b, dict) and b.get("type") == "tool_result"]
+            if isinstance(content, list)
+            else []
+        )
         perm = as_str(rec.get("permissionMode"))
         if perm:
             self._perm(perm, rec, pos, ts, out)
@@ -973,30 +976,51 @@ class ClaudeParser:
         if ts is None:
             return
         text = text_blocks(content, {"text"})
-        images = sum(1 for b in content if isinstance(b, dict) and b.get("type") == "image") \
-            if isinstance(content, list) else 0
+        images = (
+            sum(1 for b in content if isinstance(b, dict) and b.get("type") == "image")
+            if isinstance(content, list)
+            else 0
+        )
         origin, strong, cls = self._classify(rec, text)
         is_brief = False
         if self.role != "main" and not rec.get("isMeta"):
             is_brief = not self.s.get("brief_seen")
-            self.s["brief_seen"] = True     # v4: the first non-meta user line of a subagent file
+            self.s["brief_seen"] = True  # v4: the first non-meta user line of a subagent file
         if self.role == "subagent" and not self.s["first_user_seen"]:
             self.s["spawn_kind"] = "fork" if "<fork-boilerplate>" in text else "agent"
         if self.role == "subagent" and "<fork-boilerplate>" in text:
             self.s["spawn_kind"] = "fork"
         self.s["first_user_seen"] = True
         key = pid or f"u:{uid}"
-        self._start_or_join_turn(out, key, origin, strong, ts, pos, perm)
         prompt = cls in ("human_prompt", "queued_prompt")
+        human, injections = split_prompt_injections(text) if prompt else (text, [])
+        if injections and not human:
+            origin, strong = "meta", False
+        self._start_or_join_turn(out, key, origin, strong, ts, pos, perm)
         if cls and text:
-            out.append(self._msg(uid, ts, "user", cls, text, pos, rec, turn=key,
-                                 origin=prompt_origin(text) if prompt else None))
-        if prompt:
+            if human:
+                out.append(
+                    self._msg(
+                        uid, ts, "user", cls, human, pos, rec, turn=key, origin=prompt_origin(human) if prompt else None
+                    )
+                )
+            self._prompt_injections(out, injections, human, uid, key, ts, pos, rec)
+        if prompt and (human or not injections):
             self._human_time(ts)
-        nimg = len(self._images(out, uid, content, ts, pos, "queued_prompt" if cls == "queued_prompt" else "prompt",
-                                event_uid=uid, paste_ids=rec.get("imagePasteIds")))
-        if prompt and text:
-            self._pasted(out, uid, text, ts, pos, "queued_prompt" if cls == "queued_prompt" else "prompt", nimg)
+        nimg = len(
+            self._images(
+                out,
+                uid,
+                content,
+                ts,
+                pos,
+                "queued_prompt" if cls == "queued_prompt" else "prompt",
+                event_uid=uid,
+                paste_ids=rec.get("imagePasteIds"),
+            )
+        )
+        if prompt and human:
+            self._pasted(out, uid, human, ts, pos, "queued_prompt" if cls == "queued_prompt" else "prompt", nimg)
         if not (cls and text):
             self._user_v4(rec, content, text, origin, is_brief, uid, key, ts, pos, out)
         if images or rec.get("imagePasteIds"):
@@ -1004,8 +1028,7 @@ class ClaudeParser:
             self._event(out, uid, ts, "image_attach", pos, n)
         t = _strip_prefix(text)
         if origin == "interrupt":
-            self._event(out, uid, ts, "interrupt", pos,
-                        "tool_use" if "for tool use" in t[:60] else "user")
+            self._event(out, uid, ts, "interrupt", pos, "tool_use" if "for tool use" in t[:60] else "user")
         if origin == "slash_command":
             m = SLASH.search(t[:400])
             if m:
@@ -1017,6 +1040,24 @@ class ClaudeParser:
             self._task_notification(text, ts, pos, out, "user")
         if rec.get("isCompactSummary"):
             pass  # message emitted above as compaction_summary
+
+    def _prompt_injections(self, out, injections, human, uid, key, ts, pos, rec) -> None:
+        for n, (cls, tag, body, start, stop) in enumerate(injections):
+            event_uid = uid if not human and n == 0 else f"{uid}:injection:{n}"
+            out.append(
+                self._msg(
+                    event_uid,
+                    ts,
+                    "user",
+                    cls,
+                    body,
+                    pos,
+                    rec,
+                    turn=key,
+                    detail={"source": tag, "text_start": start, "text_end": stop},
+                )
+            )
+
 
     def _user_v4(self, rec, content, text, origin, is_brief, uid, key, ts, pos, out) -> None:
         """Parser v4: a class for the user lines v3 left unstored (see the module docstring)."""
@@ -1034,25 +1075,37 @@ class ClaudeParser:
         def emit(cls, detail, body=None, porigin=None):
             body = raw if body is None else body
             if body:
-                out.append(self._msg(uid, ts, "user", cls, body, pos, rec, turn=key, origin=porigin,
-                                     detail=detail))
+                human, injections = split_prompt_injections(body) if cls == "human_prompt" else (body, [])
+                if human:
+                    out.append(
+                        self._msg(uid, ts, "user", cls, human, pos, rec, turn=key, origin=porigin, detail=detail)
+                    )
+                self._prompt_injections(out, injections, human, uid, key, ts, pos, rec)
 
         if main and not meta and t.startswith(("<command-name>", "<command-message>")):
             m = SLASH.search(t[:400])
             name = m.group(1)[:80] if m else None
             skill = t.startswith("<command-message>") or (name is not None and ":" in name)
             porigin = "skill" if skill else "slash_command"
-            emit("human_prompt", {"source": "command", "command": name} if name else {"source": "command"},
-                 body=text, porigin=porigin)
+            emit(
+                "human_prompt",
+                {"source": "command", "command": name} if name else {"source": "command"},
+                body=text,
+                porigin=porigin,
+            )
             self.s["after_cmd"] = porigin
             return
         if main and not meta and t.startswith("<bash-input>"):
             emit("human_prompt", {"source": "bash-input"}, body=text, porigin="local_command")
             return
-        for tag, cls in (("<local-command-stdout>", "local_command_output"),
-                         ("<local-command-stderr>", "local_command_output"),
-                         ("<bash-stdout>", "local_command_output"), ("<bash-stderr>", "local_command_output"),
-                         ("<local-command-caveat>", "system_reminder"), ("<system-reminder>", "system_reminder")):
+        for tag, cls in (
+            ("<local-command-stdout>", "local_command_output"),
+            ("<local-command-stderr>", "local_command_output"),
+            ("<bash-stdout>", "local_command_output"),
+            ("<bash-stderr>", "local_command_output"),
+            ("<local-command-caveat>", "system_reminder"),
+            ("<system-reminder>", "system_reminder"),
+        ):
             if t.startswith(tag):
                 emit(cls, {"source": tag[1:-1]})
                 return
@@ -1079,7 +1132,7 @@ class ClaudeParser:
             return
         if is_brief:
             if self.role == "workflow_agent":
-                emit("agent_message", {"source": "brief"})   # v3 stored an earlier (meta) line as the brief
+                emit("agent_message", {"source": "brief"})  # v3 stored an earlier (meta) line as the brief
             return  # a subagent's brief is the parent's "<call_id>:brief" row
         if kind and kind != "human":
             emit("agent_message", {"source": kind})

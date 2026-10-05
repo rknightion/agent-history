@@ -175,6 +175,53 @@ def test_codex_cache_write_zero_is_known_and_priced_as_the_5m_write():
 # --- messages and turns --------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("version", ["0.145.0", "0.156.0"])
+@pytest.mark.parametrize(
+    "tag,cls",
+    [
+        ("system-reminder", "system_reminder"),
+        ("environment_context", "context_injection"),
+        ("hook_prompt", "hook_output"),
+        ("skill", "skill_body"),
+    ],
+)
+@pytest.mark.parametrize("mixed", [False, True])
+def test_user_injections_are_not_human_prompts(tmp_path, version, tag, cls, mixed):
+    block = f"<{tag}>syntheticboundaryneedle</{tag}>"
+    text = f"Human request before.\n{block}\nHuman request after." if mixed else block
+    records = [
+        {"type": "session_meta", "payload": {"id": P, "cli_version": version, "source": "cli"}},
+        {"type": "event_msg", "payload": {"type": "task_started", "turn_id": "boundary-turn"}},
+        {
+            "type": "response_item",
+            "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": text}]},
+        },
+        {"type": "event_msg", "payload": {"type": "user_message", "message": text}},
+    ]
+    if version == "0.156.0":
+        records[-1]["payload"] = {
+            "type": "item_completed",
+            "thread_id": P,
+            "turn_id": "boundary-turn",
+            "item": {"type": "UserMessage", "id": "boundary", "content": [{"type": "text", "text": text}]},
+        }
+    for record in records:
+        record["timestamp"] = "2026-10-01T10:00:00Z"
+    path = tmp_path / "boundary.jsonl"
+    path.write_text("".join(json.dumps(r) + "\n" for r in records))
+    store, _ = load(path.name, path=path, batch_lines=1)
+    prompts = by(store, "message", message_class="human_prompt")
+    assert len(prompts) == int(mixed)
+    if mixed:
+        assert prompts[0]["text"] == "Human request before.\n\nHuman request after."
+    assert not any("syntheticboundaryneedle" in m["text"] for m in prompts)
+    injected = one(store, "message", message_class=cls)
+    assert injected["text"] == block
+    assert injected["detail"]["source"] == tag
+    assert (one(store, "session")["first_human_at"] is not None) == mixed
+
+
+
 def test_prompt_source_by_version():
     old, _ = load("main_v145.jsonl")
     prompts = sorted(m["text"] for m in by(old, "message", message_class="human_prompt"))

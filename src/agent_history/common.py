@@ -93,6 +93,97 @@ def text_blocks(content: Any, allowed: set[str]) -> str:
     return "\n\n".join(values)
 
 
+# Reserved harness wrappers, not arbitrary XML supplied by a person. Unwrapped instruction
+# headings and unknown tags have no reliable end boundary and are deliberately not inferred.
+PROMPT_INJECTION_CLASSES = {
+    "system-reminder": "system_reminder",
+    "local-command-caveat": "system_reminder",
+    "environment_context": "context_injection",
+    "instructions": "context_injection",
+    "user_instructions": "context_injection",
+    "permissions": "context_injection",
+    "skill": "skill_body",
+    "hook_prompt": "hook_output",
+    "turn_aborted": "interrupt_marker",
+    "subagent_notification": "agent_message",
+    "task-notification": "agent_message",
+    "local-command-stdout": "local_command_output",
+    "local-command-stderr": "local_command_output",
+    "bash-stdout": "local_command_output",
+    "bash-stderr": "local_command_output",
+}
+PROMPT_TAG = re.compile(r"</?(?P<tag>" + "|".join(map(re.escape, PROMPT_INJECTION_CLASSES)) + r")(?:\s+[^<>]*?)?>")
+PROMPT_FENCE = re.compile(r"(?m)^ {0,3}(`{3,}|~{3,})([^\n]*)$")
+PROMPT_QUOTE = re.compile(r"(?m)^ {0,3}>[^\n]*$")
+
+
+def split_prompt_injections(text: str) -> tuple[str, list[tuple[str, str, str, int, int]]]:
+    """Separate complete reserved wrapper blocks without discarding a character.
+
+    Only block-position openers (line start, or immediately after another wrapper) count.
+    Markdown code fences, inline mentions, unknown wrappers and incomplete wrappers remain
+    user text. Same-tag nesting is balanced; nested content keeps the outer wrapper's class.
+    The human remainder stays one message, retaining its original key and prompt count.
+    Injection offsets are character offsets in the parser's original text, not file bytes.
+    """
+    code: list[tuple[int, int]] = []
+    fence: tuple[str, int, int] | None = None
+    for match in PROMPT_FENCE.finditer(text):
+        marker, rest = match.groups()
+        if fence is None:
+            fence = (marker[0], len(marker), match.start())
+        elif marker[0] == fence[0] and len(marker) >= fence[1] and not rest.strip():
+            code.append((fence[2], match.end()))
+            fence = None
+    if fence is not None:
+        code.append((fence[2], len(text)))
+    # Fenced and Markdown-quoted examples never define an enclosing wrapper's boundary.
+    # Their bytes still inherit its class when that outer wrapper is complete.
+    literal = code + [(match.start(), match.end()) for match in PROMPT_QUOTE.finditer(text)]
+    tokens = [match for match in PROMPT_TAG.finditer(text)
+              if not any(start <= match.start() < stop for start, stop in literal)]
+    injections: list[tuple[str, str, str, int, int]] = []
+    human: list[str] = []
+    end = 0
+    i = 0
+    while i < len(tokens):
+        match = tokens[i]
+        start, tag = match.start(), match.group("tag")
+        prefix = text[text.rfind("\n", 0, start) + 1 : start]
+        if match.group().startswith("</") or (prefix.strip() and start != end):
+            i += 1
+            continue
+        depth = 1
+        j = i + 1
+        while j < len(tokens):
+            other = tokens[j]
+            if other.group("tag") == tag:
+                depth += -1 if other.group().startswith("</") else 1
+                if depth == 0:
+                    break
+            j += 1
+        if depth:
+            i += 1
+            continue
+        stop = tokens[j].end()
+        human.append(text[end:start])
+        injections.append((PROMPT_INJECTION_CLASSES[tag], tag, text[start:stop], start, stop))
+        end = stop
+        i = j + 1
+    human.append(text[end:])
+    remainder = "".join(human)
+    if injections and not remainder.strip():
+        # Whitespace-only separators belong to the injected content, not a phantom human prompt.
+        # Retain them in the adjacent wrapper's text, along with the corresponding offsets.
+        expanded = []
+        for n, (cls, tag, _, start, stop) in enumerate(injections):
+            start = 0 if n == 0 else injections[n - 1][4]
+            stop = len(text) if n == len(injections) - 1 else stop
+            expanded.append((cls, tag, text[start:stop], start, stop))
+        return "", expanded
+    return remainder, injections
+
+
 def artifact_kind(path: str) -> str:
     suffix = PurePosixPath(path).suffix.lower()
     if suffix in {".xlsx", ".xls", ".csv", ".tsv", ".ods"}:
