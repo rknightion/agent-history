@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import shutil
 from pathlib import Path
+from decimal import Decimal
 
 import pytest
 
@@ -592,3 +593,409 @@ def test_command_evidence_needs_an_exit_status_that_proves_success(tmp_path):
         *bash_pair(4, "git add . && git commit -qm y", ""),
     ])
     assert [e["event_uid"] for e in store.rows("git_event")] == ["c4:commit:cmd0"]
+
+
+# --- nullable recorded telemetry, exercised through the incremental loader boundary ---
+
+REQUEST_MS = 1790848800000
+TELEMETRY = FIX / "telemetry.jsonl"
+
+
+def telemetry_store(path, *, batch_lines=5000):
+    store = MemStore()
+    ctx = FileContext(str(path), "pi-test/sessions/slug/telemetry.jsonl", "pi-test", "pi", "test", None, "main")
+    run_file(PiParser, ctx, store, batch_lines=batch_lines)
+    return store
+
+
+def telemetry_assistant(**overrides):
+    return {"role": "assistant", "model": "synthetic-model", "responseId": "recorded-call",
+            "timestamp": REQUEST_MS, "stopReason": "stop", "content": [],
+            "usage": {"input": 1, "output": 1, "cacheRead": 0, "cacheWrite": 0}, **overrides}
+
+
+def telemetry_call(tmp_path, *, entry_at="2026-10-01T10:00:02.500Z", **overrides):
+    return one(synth(tmp_path, [{"type": "message", "id": "call", "timestamp": entry_at,
+                                 "message": telemetry_assistant(**overrides)}]), "llm_call")
+
+
+@pytest.mark.parametrize("batch_lines", [1, 5000])
+def test_successful_recorded_default_async_launch_is_timed_and_typed(tmp_path, batch_lines):
+    records = async_launch(1, ASYNC_RUN)
+    records[0]["message"]["content"][0]["arguments"].pop("async")
+    records[0]["message"]["timestamp"] = REQUEST_MS  # generation is not the call-entry dispatch time
+    records[1]["timestamp"] = "2026-10-01T10:00:02Z"
+    path = tmp_path / "default-async.jsonl"
+    path.write_text("".join(json.dumps(r) + "\n" for r in [
+        {"type": "session", "version": 3, "id": "s1", "timestamp": AT}, *records]))
+    store = telemetry_store(path, batch_lines=batch_lines)
+    spawn = one(store, "subagent_spawn", spawn_uid="launch1")
+    call = one(store, "tool_call", call_uid="launch1")
+    assert spawn["spawned_at"] == call["started_at"]
+    assert spawn["spawned_at"].isoformat() == "2026-10-01T10:00:01+00:00"
+    assert (spawn["requested_type"], spawn["requested_type_source"], spawn["launch_status"],
+            spawn["workflow_id"], spawn["background"]) == ("lane-worker", "explicit", "launched", ASYNC_RUN, True)
+    assert spawn["completion_status"] is None
+    assert call["background"] is True
+
+
+@pytest.mark.parametrize("mutation", [
+    "absent_async_id", "absent_run_id", "conflicting_run_id", "invalid_id", "failed", "unknown_outcome",
+    "sync_mode", "absent_mode", "foreground_results", "explicit_false", "invalid_async", "missing_call_time",
+    "management_status", "management_send", "missing_task", "empty_task", "unmatched_call",
+])
+def test_default_async_launch_rejects_absent_failed_or_ambiguous_metadata(tmp_path, mutation):
+    records = async_launch(1, ASYNC_RUN)
+    args = records[0]["message"]["content"][0]["arguments"]
+    args.pop("async")
+    message = records[1]["message"]
+    details = message["details"]
+    if mutation == "absent_async_id":
+        details.pop("asyncId")
+    elif mutation == "absent_run_id":
+        details.pop("runId")
+    elif mutation == "conflicting_run_id":
+        details["runId"] = "11111111-2222-4333-8444-555555555555"
+    elif mutation == "invalid_id":
+        details["asyncId"] = details["runId"] = "not-a-run-id"
+    elif mutation == "failed":
+        message["isError"] = True
+    elif mutation == "unknown_outcome":
+        message.pop("isError")
+    elif mutation == "sync_mode":
+        details["mode"] = "sync"
+    elif mutation == "absent_mode":
+        details.pop("mode")
+    elif mutation == "foreground_results":
+        details["results"] = [{"agent": "synthetic-worker", "index": 0}]
+    elif mutation == "explicit_false":
+        args["async"] = False
+    elif mutation == "invalid_async":
+        args["async"] = "true"
+    elif mutation == "missing_call_time":
+        records[0].pop("timestamp")
+    elif mutation in {"management_status", "management_send"}:
+        args["action"] = "status" if mutation == "management_status" else "send"
+    elif mutation == "missing_task":
+        args.pop("task")
+    elif mutation == "empty_task":
+        args["task"] = " "
+    elif mutation == "unmatched_call":
+        message["toolCallId"] = "different-call"
+    store = synth(tmp_path, records)
+    assert by(store, "subagent_spawn", spawn_uid="launch1") == []
+
+
+def test_recorded_spawn_limits_have_attributable_result_sources():
+    store = telemetry_store(TELEMETRY, batch_lines=1)
+    assert one(store, "subagent_spawn", spawn_uid="sync:0")["timeout_ms"] == 0
+    assert one(store, "subagent_spawn", spawn_uid="async")["run_fanout_budget"] == 0
+    assert one(store, "subagent_spawn", spawn_uid="44444444-4444-4444-8444-444444444444")["spawn_budget"] == 3
+
+
+def test_recorded_call_identity_and_timing_headers():
+    call = one(telemetry_store(TELEMETRY), "llm_call")
+    assert (call["raw_stop_reason"], call["api"], call["provider"], call["request_id"], call["service_tier"]) == (
+        "completed", "synthetic-api", "call-provider", "synthetic-request", "priority")
+
+
+@pytest.mark.parametrize("batch_lines", [1, 5000])
+def test_recorded_telemetry_fixture_at_parser_memstore_boundary(batch_lines):
+    store = telemetry_store(TELEMETRY, batch_lines=batch_lines)
+    call = one(store, "llm_call")
+    assert (call["duration_ms"], call["latency_basis"], call["cost_usd"]) == (2500, "pi_request_to_entry", Decimal("0.0125"))
+    assert (call["raw_stop_reason"], call["api"], call["provider"], call["effort"]) == (
+        "completed", "synthetic-api", "call-provider", "high")
+    assert (call["ttft_ms"], call["attempts"], call["processing_ms"], call["request_id"], call["service_tier"]) == (
+        125, 2, 2100, "synthetic-request", "priority")
+    tool = one(store, "tool_call", call_uid="watch")
+    assert (tool["exit_code"], tool["deadline_hit"], tool["outcome"]) == (0, False, "ok")
+    io = one(store, "tool_io", io_uid="watch")
+    assert io["output_truncated"] is False and io["output_text"] == "Synthetic output retained."
+    assert json.loads(io["result_json"])["signal"] is None
+    sync = one(store, "subagent_spawn", spawn_uid="sync:0")
+    assert (sync["timeout_ms"], sync["run_fanout_budget"], sync["spawn_budget"], sync["active_async_capacity"],
+            sync["lifecycle_status"]) == (0, 4, 0, 2, "completed")
+    assert sync["deadline_at"].isoformat() == "2026-10-01T10:01:00+00:00"
+    assert sync["completion_status"] == "completed" and sync["background"] is False
+    async_row = one(store, "subagent_spawn", spawn_uid="async")
+    assert (async_row["timeout_ms"], async_row["run_fanout_budget"], async_row["spawn_budget"],
+            async_row["active_async_capacity"], async_row["lifecycle_status"]) == (0, 0, 0, 0, "running")
+    assert async_row["completion_status"] is None and async_row["launch_status"] == "launched"
+    workflow = one(store, "subagent_spawn", spawn_uid="44444444-4444-4444-8444-444444444444")
+    assert (workflow["timeout_ms"], workflow["run_fanout_budget"], workflow["spawn_budget"],
+            workflow["active_async_capacity"], workflow["lifecycle_status"]) == (60000, 4, 3, 2, "running")
+    assert workflow["completion_status"] == "completed"  # lifecycle does not overwrite completion policy
+    assert one(store, "message", message_class="reasoning")["text"] == "Synthetic reasoning retained."
+    assert one(store, "message", message_class="assistant_text")["text"] == "Synthetic reply retained."
+    assert not store.issues
+
+
+@pytest.mark.parametrize("entry,start,expected", [
+    ("2026-10-01T10:00:02.500Z", REQUEST_MS, 2500),
+    ("2026-10-01T10:00:00Z", REQUEST_MS, 0),
+    ("2026-10-01T09:59:59Z", REQUEST_MS, None),
+    (None, REQUEST_MS, None), ("invalid", REQUEST_MS, None),
+    ("2026-10-01T10:00:01", REQUEST_MS, None),
+    (AT, None, None), (AT, True, None), (AT, "invalid", None),
+    (AT, float("nan"), None), (AT, float("inf"), None), (AT, -1, None),
+    ("2026-12-01T10:00:00Z", REQUEST_MS, None),
+    ("2026-10-01T11:00:02.500+01:00", REQUEST_MS, 2500),
+])
+def test_recorded_call_interval_never_uses_fallback_entry_time(tmp_path, entry, start, expected):
+    call = telemetry_call(tmp_path, entry_at=entry, timestamp=start)
+    assert call["duration_ms"] == expected
+    assert call["latency_basis"] == ("pi_request_to_entry" if expected is not None else None)
+
+
+@pytest.mark.parametrize("cost,expected", [
+    (0, Decimal(0)), (0.0125, Decimal("0.0125")), (None, None), (-1, None),
+    (True, None), ("0.5", None), (float("nan"), None), (float("inf"), None), ({}, None),
+])
+def test_recorded_call_cost_is_numeric_not_inferred(tmp_path, cost, expected):
+    call = telemetry_call(tmp_path, usage={"input": 100, "output": 10, "cost": {"total": cost}})
+    assert call["cost_usd"] == expected
+
+
+@pytest.mark.parametrize("message,family,status", [
+    ("cyber_policy: synthetic refusal", "cyber_policy", None),
+    ('OpenAI API error: {"code":"cyber_policy","message":"synthetic refusal"}', "cyber_policy", None),
+    ("server_is_overloaded: synthetic failure", "server_is_overloaded", None),
+    ('OpenAI API error (503): {"code":"server_is_overloaded"}', "server_is_overloaded", 503),
+    ("stream_incomplete: synthetic failure", "stream_incomplete", None),
+    ("upstream_request_timeout: synthetic failure", "upstream_request_timeout", None),
+    ("OpenAI API error (401): synthetic failure", "http_error", 401),
+    ("Unclassified synthetic failure", "error", None),
+    ("network_error: synthetic body mentions stream_incomplete", "network_error", None),
+    ("OpenAI API error (503): " + "x" * 200 + " cyber_policy", "http_error", 503),
+])
+def test_recorded_error_families_do_not_store_error_message(tmp_path, message, family, status):
+    store = synth(tmp_path, [{"type": "message", "id": "call", "timestamp": AT,
+                             "message": telemetry_assistant(stopReason="error", rawStopReason="failed",
+                                                            errorMessage=message)}])
+    call = one(store, "llm_call")
+    assert (call["error_kind"], call["api_error_status"], call["is_api_error"]) == (family, status, True)
+    assert call["raw_stop_reason"] == "failed"
+    assert one(store, "session_event", kind="api_error")["value"] == family
+    assert message not in repr(store.tables)
+
+
+@pytest.mark.parametrize("level,expected", [("high", "high"), ("off", "off"), (None, "medium"), (False, "medium")])
+def test_per_call_effort_prefers_recording_without_changing_session_state(tmp_path, level, expected):
+    store = synth(tmp_path, [
+        {"type": "thinking_level_change", "id": "effort", "timestamp": AT, "thinkingLevel": "medium"},
+        {"type": "message", "id": "first", "timestamp": AT,
+         "message": telemetry_assistant(thinkingLevel=level)},
+        {"type": "message", "id": "second", "timestamp": AT,
+         "message": telemetry_assistant(responseId="second-call")},
+    ])
+    assert one(store, "llm_call", response_id="recorded-call")["effort"] == expected
+    assert one(store, "llm_call", response_id="second-call")["effort"] == "medium"
+
+
+@pytest.mark.parametrize("timing,expected", [
+    ({"firstTokenAt": REQUEST_MS, "attempts": 0, "processingMs": 0}, (0, 0, 0)),
+    ({"firstTokenAt": REQUEST_MS - 1, "attempts": -1, "processingMs": -1}, (None, None, None)),
+    ({"firstTokenAt": True, "attempts": False, "processingMs": True}, (None, None, None)),
+    ({"firstTokenAt": float("inf"), "attempts": 1.5, "processingMs": "1"}, (None, None, None)),
+    ({"firstTokenAt": None, "attempts": 2, "processingMs": 0}, (None, 2, 0)),
+    ({"firstTokenAt": REQUEST_MS + 2**31, "attempts": 2**31, "processingMs": 2**31}, (None, None, None)),
+    (None, (None, None, None)), ([], (None, None, None)),
+])
+def test_recorded_timing_zero_and_invalid_are_independent(tmp_path, timing, expected):
+    call = telemetry_call(tmp_path, loopPiTiming=timing)
+    assert (call["ttft_ms"], call["attempts"], call["processing_ms"]) == expected
+
+
+def test_recorded_timing_is_independent_of_entry_interval(tmp_path):
+    timing = {"firstTokenAt": REQUEST_MS + 1, "attempts": 1, "processingMs": 0}
+    missing_entry = telemetry_call(tmp_path, entry_at=None, loopPiTiming=timing)
+    assert missing_entry["duration_ms"] is None and missing_entry["ttft_ms"] == 1
+    missing_start = telemetry_call(tmp_path, timestamp=None, loopPiTiming=timing)
+    assert (missing_start["ttft_ms"], missing_start["attempts"], missing_start["processing_ms"]) == (None, 1, 0)
+
+
+def test_missing_call_telemetry_does_not_infer_from_model_or_session_provider(tmp_path):
+    store = synth(tmp_path, [
+        {"type": "model_change", "id": "model", "timestamp": AT, "provider": "session-provider", "modelId": "m"},
+        {"type": "message", "id": "call", "timestamp": AT, "message": telemetry_assistant(timestamp=None)},
+    ])
+    call = one(store, "llm_call")
+    assert all(call[k] is None for k in ("duration_ms", "latency_basis", "cost_usd", "raw_stop_reason", "api",
+                                        "provider", "ttft_ms", "attempts", "processing_ms", "request_id"))
+
+
+@pytest.mark.parametrize("details,exit_code,deadline,truncated", [
+    ({"exit_code": -9, "deadline_hit": True, "truncation": {"truncated": True}}, -9, True, True),
+    ({"exit_code": 0, "deadline_hit": False, "truncation": {"truncated": False}}, 0, False, False),
+    ({"exit_code": True, "deadline_hit": "false"}, None, None, None),
+    ({"exit_code": "1", "deadline_hit": 0}, None, None, None),
+    ({}, None, None, None),
+])
+def test_tool_result_metadata_preserves_known_false_and_zero(tmp_path, details, exit_code, deadline, truncated):
+    records = bash_pair(1, "printf synthetic", "Synthetic retained output.")
+    records[1]["message"]["details"] = details
+    store = synth(tmp_path, records)
+    call = one(store, "tool_call")
+    assert (call["exit_code"], call["deadline_hit"]) == (exit_code, deadline)
+    assert call["outcome"] == "ok" and call["timed_out"] is None
+    io = one(store, "tool_io")
+    assert io["output_truncated"] is truncated and io["output_text"] == "Synthetic retained output."
+    assert json.loads(io["result_json"]) == details
+
+
+@pytest.mark.parametrize("recorded", [None, -1, True, "2", 1.5, 2**63])
+def test_spawn_metadata_invalid_is_independently_null(tmp_path, recorded):
+    records = async_launch(1, ASYNC_RUN)
+    records[1]["message"]["details"].update({
+        "timeoutMs": recorded, "runFanoutBudget": recorded, "spawnBudget": recorded,
+        "activeAsyncCapacity": recorded, "deadlineAt": "2026-10-01T10:01:00", "lifecycleStatus": False,
+    })
+    store = synth(tmp_path, records)
+    spawn = one(store, "subagent_spawn")
+    assert all(spawn[k] is None for k in ("timeout_ms", "run_fanout_budget", "spawn_budget", "active_async_capacity",
+                                         "deadline_at", "lifecycle_status"))
+    assert spawn["launch_status"] == "launched" and spawn["completion_status"] is None
+
+
+@pytest.mark.parametrize("number_literal", ["1e999", "-1e999", "NaN"])
+def test_invalid_spawn_telemetry_does_not_poison_loader_checkpoint(tmp_path, number_literal):
+    from psycopg.types.json import Jsonb, JsonbDumper
+    from agent_history.load import adapt
+
+    records = async_launch(1, ASYNC_RUN)
+    for key in ("timeoutMs", "deadlineAt", "lifecycleStatus"):
+        records[1]["message"]["details"][key] = "NONFINITE_NUMBER"
+    records[1]["message"]["details"]["runFanoutBudget"] = {"limit": "NONFINITE_NUMBER"}
+    lines = [{"type": "session", "version": 3, "id": "s1", "timestamp": AT, "cwd": "/p"}, *records]
+    path = tmp_path / "checkpoint.jsonl"
+    path.write_text("".join(json.dumps(row).replace('"NONFINITE_NUMBER"', number_literal) + "\n" for row in lines))
+    store = MemStore()
+    _, state = run_file(PiParser, FileContext(str(path), "pi-local/checkpoint.jsonl", "pi-local", "pi", "local", None, "main"),
+                        store, batch_lines=1)
+    spawn = one(store, "subagent_spawn")
+    assert all(spawn[key] is None for key in ("timeout_ms", "deadline_at", "lifecycle_status", "run_fanout_budget"))
+    source = json.loads(path.read_text().splitlines()[-1])["message"]["details"]
+    assert one(store, "tool_io")["result_json"] == json.dumps(source, ensure_ascii=False, default=str)
+    # Exercise the actual loader's JSONB adaptation, not only the projected nullable row.
+    wire = JsonbDumper(Jsonb).dump(adapt(state))
+    assert b"Infinity" not in wire and b"NaN" not in wire
+    json.dumps(state, allow_nan=False)
+
+
+@pytest.mark.parametrize("batch_lines", [1, 5000])
+def test_native_recorded_limits_deadline_and_dispatch_survive_resumption(batch_lines):
+    store = telemetry_store(FIX / "native-limits.jsonl", batch_lines=batch_lines)
+    launch = one(store, "subagent_spawn", spawn_uid="native-launch")
+    workflow = one(store, "subagent_spawn", spawn_uid="77777777-7777-4777-8777-777777777777")
+    for spawn in (launch, workflow):
+        assert (spawn["run_fanout_budget"], spawn["spawn_budget"], spawn["active_async_capacity"]) == (64, 8, 2)
+        assert spawn["deadline_at"].isoformat() == "2026-10-01T10:01:00+00:00"
+    assert launch["spawned_at"].isoformat() == "2026-10-01T10:00:01+00:00"
+    assert launch["workflow_id"] == "55555555-5555-4555-8555-555555555555"
+    assert launch["completion_status"] is None
+    assert workflow["completion_status"] == "completed"
+    raw = json.loads(one(store, "tool_io", io_uid="native-launch")["result_json"])
+    assert raw["runFanoutBudget"] == {"used": 1, "limit": 64, "remaining": 63}
+    assert raw["spawnBudget"] == {"used": 3, "limit": 8, "remaining": 5}
+    assert raw["activeAsyncCapacity"] == {"used": 1, "limit": 2, "remaining": 1}
+    assert raw["deadlineAt"] == 1790848860000
+
+
+@pytest.mark.parametrize("recorded,expected", [
+    ({"limit": 5, "used": 2, "remaining": 3}, 5),
+    ({"limit": 0, "used": 9, "remaining": 7}, 0),
+    ({"limit": 2**31 - 1}, 2**31 - 1), (4, 4), (0, 0),
+    ({"used": 2, "remaining": 7}, None), ({"limit": None, "remaining": 7}, None),
+    ({"limit": "unlimited"}, None), ({"limit": "5"}, None), ({"limit": True}, None),
+    ({"limit": 5.0}, None), ({"limit": -1}, None), ({"limit": 2**31}, None),
+    ({"limit": float("inf")}, None), ({"limit": float("nan")}, None),
+    ({"limit": {"limit": 5}}, None), (None, None), ("unlimited", None),
+])
+def test_native_budget_promotes_only_the_recorded_integer_ceiling(tmp_path, recorded, expected):
+    records = async_launch(1, ASYNC_RUN)
+    details = records[1]["message"]["details"]
+    for key in ("runFanoutBudget", "spawnBudget", "activeAsyncCapacity"):
+        details[key] = recorded
+    store = synth(tmp_path, records)
+    spawn = one(store, "subagent_spawn")
+    assert (spawn["run_fanout_budget"], spawn["spawn_budget"], spawn["active_async_capacity"]) == (
+        expected, expected, expected)
+    # The full structured source, including invalid evidence, remains unredacted in ToolIO.
+    stored = one(store, "tool_io")["result_json"]
+    assert stored == json.dumps(details, ensure_ascii=False, default=str)
+
+
+@pytest.mark.parametrize("recorded,expected", [
+    (1790848860000, "2026-10-01T10:01:00+00:00"),
+    (1790848860000.5, "2026-10-01T10:01:00.000500+00:00"),
+    (0, "1970-01-01T00:00:00+00:00"), (-1, "1969-12-31T23:59:59.999000+00:00"),
+    ("2026-10-01T11:01:00+01:00", "2026-10-01T10:01:00+00:00"),
+    (None, None), (True, None), (False, None), (float("inf"), None), (float("nan"), None),
+    (10**1000, None), (-10**1000, None), ("invalid", None), ("1790848860000", None),
+    ("2026-10-01T10:01:00", None), ("0001-01-01T00:00:00+01:00", None),
+])
+def test_native_deadline_is_absolute_epoch_ms_or_aware_iso_not_inferred(tmp_path, recorded, expected):
+    records = async_launch(1, ASYNC_RUN)
+    records[1]["message"]["details"].update({"deadlineAt": recorded, "timeoutMs": 60000})
+    spawn = one(synth(tmp_path, records), "subagent_spawn")
+    actual = spawn["deadline_at"]
+    assert (actual.isoformat() if actual is not None else None) == expected
+    assert spawn["timeout_ms"] == 60000
+
+
+def test_foreground_child_limits_override_run_limits_without_guessing_missing_limit(tmp_path):
+    records = async_launch(1, ASYNC_RUN)
+    records[0]["message"]["content"][0]["arguments"]["async"] = False
+    records[1]["message"]["details"].update({
+        "mode": "sync", "runFanoutBudget": {"limit": 12}, "deadlineAt": 1790848860000,
+        "spawnBudget": {"limit": 7}, "activeAsyncCapacity": {"limit": 3},
+        "results": [{"agent": "synthetic-worker", "index": 0, "exitCode": 0,
+                     "spawnBudget": {"limit": 0, "used": 9}, "activeAsyncCapacity": {"remaining": 2}}],
+    })
+    spawn = one(synth(tmp_path, records), "subagent_spawn")
+    assert (spawn["run_fanout_budget"], spawn["spawn_budget"], spawn["active_async_capacity"]) == (12, 0, None)
+    assert spawn["deadline_at"].isoformat() == "2026-10-01T10:01:00+00:00"
+    assert spawn["completion_status"] == "completed"
+
+
+def test_recorded_telemetry_replay_enriches_without_erasing_or_rewriting_content(tmp_path):
+    records = [json.loads(line) for line in TELEMETRY.read_text().splitlines()]
+    path = tmp_path / "replay.jsonl"
+    path.write_text("".join(json.dumps(r) + "\n" for r in records))
+    ctx = FileContext(str(path), "pi-test/sessions/slug/replay.jsonl", "pi-test", "pi", "test", None, "main")
+    store = MemStore()
+    offset, state = run_file(PiParser, ctx, store, stop_after_lines=4, batch_lines=1)
+    run_file(PiParser, ctx, store, start=offset, state=state, line_base=4, batch_lines=1)
+    assert one(store, "tool_call", call_uid="watch")["deadline_hit"] is False
+    assert one(store, "subagent_spawn", spawn_uid="async")["spawn_budget"] == 0
+    assert one(store, "llm_call")["duration_ms"] == 2500
+    old_content = [dict(row) for row in store.rows("message")]
+    records[4]["message"]["details"]["deadline_hit"] = True
+    path.write_text("".join(json.dumps(r) + "\n" for r in records))
+    run_file(PiParser, ctx, store, batch_lines=1)
+    assert one(store, "tool_call", call_uid="watch")["deadline_hit"] is True
+    records[4]["message"]["details"]["deadline_hit"] = False
+    records[3]["message"]["usage"]["cost"]["total"] = 0
+    records[3]["message"]["loopPiTiming"]["attempts"] = 0
+    records[3]["message"]["content"][1]["text"] = "Replacement must not overwrite stored content."
+    path.write_text("".join(json.dumps(r) + "\n" for r in records))
+    run_file(PiParser, ctx, store, batch_lines=1)
+    assert one(store, "llm_call")["cost_usd"] == Decimal(0)
+    assert one(store, "llm_call")["attempts"] == 0
+    assert one(store, "tool_call", call_uid="watch")["deadline_hit"] is False
+    assert store.rows("message") == old_content
+    records[3]["timestamp"] = None
+    for key in ("loopPiTiming", "timestamp", "provider", "api", "rawStopReason"):
+        records[3]["message"].pop(key, None)
+    records[3]["message"]["usage"].pop("cost")
+    records[4]["message"]["details"] = {}
+    records[6]["message"]["details"] = {"runId": "22222222-2222-4222-8222-222222222222", "mode": "async"}
+    path.write_text("".join(json.dumps(r) + "\n" for r in records))
+    run_file(PiParser, ctx, store, batch_lines=1)
+    call = one(store, "llm_call")
+    assert (call["duration_ms"], call["cost_usd"], call["attempts"], call["provider"]) == (
+        2500, Decimal(0), 0, "call-provider")
+    assert one(store, "tool_call", call_uid="watch")["deadline_hit"] is False
+    assert one(store, "tool_io", io_uid="watch")["output_text"] == "Synthetic output retained."
+    assert one(store, "subagent_spawn", spawn_uid="async")["timeout_ms"] == 0

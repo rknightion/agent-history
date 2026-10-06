@@ -48,7 +48,9 @@ LLM calls
   input_uncached = usage.input (pi reports it without cache reads), cache_read = cacheRead,
   cache_write_5m = cacheWrite (pi has no TTL split; 0 stays 0 and cache_write_1h = 0, so loop
   aggregates and priced cost stay known), output (includes reasoning), reasoning; effort =
-  the session's thinking level at that point. stopReason 'error' -> is_api_error, error_kind from
+  message.thinkingLevel, falling back to session state. Nullable call telemetry comes only from
+  recorded assistant metadata, usage.cost.total and loopPiTiming; duration is request to entry,
+  never the parser's inherited timestamp. stopReason 'error' -> is_api_error, error_kind from
   errorMessage ("upstream_request_timeout: ..." -> upstream_request_timeout; "(400)" -> status 400).
   `usage` entries and compaction/branch_summary `usage` -> rows "pi:<uid>:<entry id>" with
   stop_reason "usage:<kind>" / "compaction" / "branch_summary".
@@ -79,7 +81,9 @@ from __future__ import annotations
 import json
 import os
 import re
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
+import math
 from typing import Any, Iterable
 
 from .common import (BOUNDED_STATE_SECONDS, artifact_kind, as_int, as_str, cmd_verb, git_event_extras,
@@ -92,8 +96,8 @@ from .model import (ArtifactRow, AttachmentRow, CompactionRow, ContinuationRow, 
 from .parse_claude import _diff_counts, _nlines
 
 AGENT = "pi"
-# Rebuild retained sessions to separate reserved harness wrappers from human prompts.
-PARSER_VERSION = "8"
+# Re-parse retained sessions to enrich nullable recorded call, tool and spawn telemetry.
+PARSER_VERSION = "9"
 # Artifact metadata replay is independent of the session parser version.
 ARTIFACT_PARSER_VERSION = "6-links1"
 # Resolved agent-file names are evidence, including custom agents and route suffixes such as -low.
@@ -121,6 +125,68 @@ ASYNC_DIR_RE = re.compile(rf"^Retention-managed async directory: .*/async-subage
 SESSION_PATH_RE = re.compile(rf"/({UUID})/(?:(run-\d+)/)?[^/\"\s]+\.jsonl")
 ERROR_KIND_RE = re.compile(r"^([a-z][a-z0-9_]{2,63}):")
 ERROR_STATUS_RE = re.compile(r"\((\d{3})\)")
+ERROR_FAMILY_RE = re.compile(r"\b(cyber_policy|server_is_overloaded|stream_incomplete|upstream_request_timeout)\b")
+SPAWN_BUDGET_KEYS = ("runFanoutBudget", "spawnBudget", "activeAsyncCapacity")
+
+
+def _recorded_int(value: Any, *, signed: bool = False, bits: int = 32) -> int | None:
+    """Nullable telemetry integers are recorded JSON integers, not coerced strings or booleans."""
+    lower = -(2 ** (bits - 1)) if signed else 0
+    return value if type(value) is int and lower <= value < 2 ** (bits - 1) else None
+
+
+def _recorded_epoch_ms(value: Any, *, nonnegative: bool = True) -> datetime | None:
+    if type(value) not in (int, float) or (nonnegative and value < 0):
+        return None
+    try:
+        return datetime.fromtimestamp(value / 1000, timezone.utc) if math.isfinite(value) else None
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _recorded_iso(value: Any) -> datetime | None:
+    """Telemetry endpoints require their own explicit timezone, without parser-time fallback."""
+    if not isinstance(value, str):
+        return None
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return dt.astimezone(timezone.utc) if dt.tzinfo is not None else None
+    except (OverflowError, ValueError):
+        return None
+
+
+def _recorded_deadline(value: Any) -> datetime | None:
+    # Numeric deadlines are explicitly epoch milliseconds, not seconds or relative timeouts.
+    return _recorded_iso(value) if isinstance(value, str) else _recorded_epoch_ms(value, nonnegative=False)
+
+
+def _recorded_limit(value: Any) -> int | None:
+    # The recorded ceiling is authoritative; used/remaining never supply a missing limit.
+    return _recorded_int(value.get("limit") if isinstance(value, dict) else value)
+
+
+def _interval_ms(start: datetime | None, end: datetime | None) -> int | None:
+    if start is None or end is None or end < start:
+        return None
+    return _recorded_int((end - start) // timedelta(milliseconds=1))
+
+
+def _recorded_cost(usage: Any) -> Decimal | None:
+    cost = usage.get("cost") if isinstance(usage, dict) else None
+    value = cost.get("total") if isinstance(cost, dict) else None
+    if type(value) not in (int, float):
+        return None
+    amount = Decimal(str(value))
+    return amount if amount.is_finite() and amount >= 0 else None
+
+
+def _spawn_telemetry(details: dict[str, Any]) -> dict[str, Any]:
+    return {"timeout_ms": _recorded_int(details.get("timeoutMs"), bits=64),
+            "deadline_at": _recorded_deadline(details.get("deadlineAt")),
+            "run_fanout_budget": _recorded_limit(details.get("runFanoutBudget")),
+            "spawn_budget": _recorded_limit(details.get("spawnBudget")),
+            "active_async_capacity": _recorded_limit(details.get("activeAsyncCapacity")),
+            "lifecycle_status": as_str(details.get("lifecycleStatus"))}
 
 
 def source_output_truncated(tool_name: str, text: str | None, details: Any) -> bool | None:
@@ -279,7 +345,7 @@ class PiParser:
         if rtype == "message":
             role = message.get("role")
             if role == "assistant":
-                rows.extend(self._assistant(message, eid, uid, ts, pos))
+                rows.extend(self._assistant(message, eid, uid, ts, pos, _recorded_iso(record.get("timestamp"))))
             elif role == "user":
                 rows.extend(self._user(message, eid, uid, ts, pos))
             elif role == "toolResult":
@@ -555,7 +621,8 @@ class PiParser:
             rows.extend(self._notify(ctype, text, turn, ts, pos))
         return rows
 
-    def _assistant(self, m: dict[str, Any], eid: str, uid: str, ts: datetime, pos: LinePos) -> list[Row]:
+    def _assistant(self, m: dict[str, Any], eid: str, uid: str, ts: datetime, pos: LinePos,
+                   entry_ts: datetime | None) -> list[Row]:
         rows: list[Row] = []
         model = as_str(m.get("model")) or self.s["model"]
         pend = self.s["pend"]
@@ -570,7 +637,8 @@ class PiParser:
         self.s["busy"] = stop not in TERMINAL
         response_id = as_str(m.get("responseId")) or f"pi:{uid}"
         rows.extend(self._usage_row(m.get("usage"), response_id, model, stop, ts, pos, turn,
-                                    error=as_str(m.get("errorMessage")) if stop == "error" else None))
+                                    error=as_str(m.get("errorMessage")) if stop == "error" else None,
+                                    message=m, entry_ts=entry_ts))
         if stop == "error":
             rows.append(SessionEventRow(AGENT, uid, self._key(), ts, "api_error", pos.byte_offset, turn,
                                         self._error_kind(as_str(m.get("errorMessage")))[0]))
@@ -598,7 +666,8 @@ class PiParser:
                 rows.append(self._msg(f"{uid}:think:{index}", ts, "assistant", "reasoning", block["thinking"].strip(),
                                       pos, turn, model))
             elif block.get("type") == "toolCall":
-                rows.extend(self._tool_call(block, uid, response_id, ts, pos, turn, model))
+                rows.extend(self._tool_call(block, uid, response_id, ts, pos, turn, model,
+                                            recorded_start=entry_ts is not None))
         return rows
 
     @staticmethod
@@ -607,13 +676,21 @@ class PiParser:
             return "error", None
         status = ERROR_STATUS_RE.search(message[:200])
         match = ERROR_KIND_RE.match(message)
-        kind = match.group(1) if match else ("http_error" if status else "error")
+        # Preserve an explicit leading family; later quoted/body tokens must not replace it.
+        family = ERROR_FAMILY_RE.search(message[:200])
+        kind = match.group(1) if match else (family.group(1) if family else ("http_error" if status else "error"))
         return kind, int(status.group(1)) if status else None
 
     def _usage_row(self, usage: Any, response_id: str, model: str | None, stop: str | None, ts: datetime,
-                   pos: LinePos, turn: str | None = None, error: str | None = None) -> list[Row]:
+                   pos: LinePos, turn: str | None = None, error: str | None = None,
+                   message: dict[str, Any] | None = None, entry_ts: datetime | None = None) -> list[Row]:
         if not isinstance(usage, dict):
             return []
+        m = message or {}
+        timing = m.get("loopPiTiming") if isinstance(m.get("loopPiTiming"), dict) else {}
+        headers = timing.get("headers") if isinstance(timing.get("headers"), dict) else {}
+        start = _recorded_epoch_ms(m.get("timestamp"))
+        duration = _interval_ms(start, entry_ts)
         kind, status = self._error_kind(error) if error is not None or stop == "error" else (None, None)
         model = model or self.s["model"]
         write = as_int(usage.get("cacheWrite"))   # pi has no TTL split: all of it prices as the 5m write
@@ -622,8 +699,16 @@ class PiParser:
                            stop_reason=stop, input_uncached=as_int(usage.get("input")),
                            cache_read=as_int(usage.get("cacheRead")),
                            cache_write_5m=write, cache_write_1h=None if write is None else 0,
-                           output=as_int(usage.get("output")), service_tier=self.s["tiers"].get(model),
-                           reasoning=as_int(usage.get("reasoning")), effort=self.s["effort"],
+                           output=as_int(usage.get("output")),
+                           service_tier=as_str(headers.get("service-tier")) or self.s["tiers"].get(model),
+                           request_id=as_str(headers.get("x-request-id")),
+                           reasoning=as_int(usage.get("reasoning")), effort=as_str(m.get("thinkingLevel")) or self.s["effort"],
+                           duration_ms=duration, latency_basis="pi_request_to_entry" if duration is not None else None,
+                           cost_usd=_recorded_cost(usage), raw_stop_reason=as_str(m.get("rawStopReason")),
+                           api=as_str(m.get("api")), provider=as_str(m.get("provider")),
+                           ttft_ms=_interval_ms(start, _recorded_epoch_ms(timing.get("firstTokenAt"))),
+                           attempts=_recorded_int(timing.get("attempts")),
+                           processing_ms=_recorded_int(timing.get("processingMs")),
                            is_api_error=stop == "error", error_kind=kind, api_error_status=status,
                            is_sidechain=self.sub, line_count=1)]
 
@@ -652,7 +737,7 @@ class PiParser:
     # --- tools --------------------------------------------------------------------------------
 
     def _tool_call(self, block: dict[str, Any], uid: str, response_id: str, ts: datetime, pos: LinePos,
-                   turn: str | None, model: str | None) -> list[Row]:
+                   turn: str | None, model: str | None, *, recorded_start: bool = False) -> list[Row]:
         call_id = as_str(block.get("id"))
         name = as_str(block.get("name")) or "?"
         if not call_id:
@@ -678,6 +763,9 @@ class PiParser:
         elif name in {"watch_start", "wake_at"}:
             background = True
         self.s["calls"][call_id] = {"n": name, "e": ts.timestamp(), "bo": pos.byte_offset, "t": turn, "m": meta,
+                                    "recorded_start": recorded_start, "async_omitted": "async" not in args,
+                                    "single_launch": "action" not in args and bool(as_str(args.get("task"))
+                                                                                and args["task"].strip()),
                                     "a": {k: args.get(k) for k in ("path", "command") if isinstance(args.get(k), str)}}
         family = "subagent" if name == "subagent" else ("builtin" if name in BUILTIN else "extension")
         rows: list[Row] = [
@@ -739,26 +827,50 @@ class PiParser:
         is_error = bool(m.get("isError"))
         meta = dict(call.get("m") or {})
         rows: list[Row] = []
+        default_async_launch = False
         if call["n"] == "subagent" and details:
             run_id = as_str(details.get("runId")) or as_str(details.get("asyncId"))
+            # A successful native single launch explicitly records both matching async/run ids.
+            # Request omission alone is not evidence of a launch or of background execution.
+            async_id = as_str(details.get("asyncId"))
+            default_async_launch = (
+                call.get("async_omitted") is True and call.get("recorded_start") is True
+                and call.get("single_launch") is True and m.get("isError") is False and details.get("mode") == "single"
+                and async_id is not None and re.fullmatch(UUID, async_id) is not None
+                and details.get("runId") == async_id and details.get("results", []) == [])
             if as_str(details.get("mode")):
                 meta["mode"] = details["mode"]
             if run_id:
                 meta["run_id"] = run_id
                 self.s["wf"][run_id] = {"c": call_id, "e": call["e"], "t": call.get("t"),
                                         "a": meta.get("agent"), "bo": call["bo"]}
-                if meta.get("agent") and (meta.get("async") is True or meta.get("mode") == "async") and not is_error:
+                # Cache validated, JSONB-safe telemetry only; raw evidence stays in ToolIO.
+                telemetry = _spawn_telemetry(details)
+                deadline = telemetry["deadline_at"]
+                self.s["wf"][run_id]["telemetry"] = {
+                    "timeoutMs": telemetry["timeout_ms"],
+                    "deadlineAt": deadline.isoformat() if deadline is not None else None,
+                    "lifecycleStatus": telemetry["lifecycle_status"],
+                    "runFanoutBudget": telemetry["run_fanout_budget"],
+                    "spawnBudget": telemetry["spawn_budget"],
+                    "activeAsyncCapacity": telemetry["active_async_capacity"]}
+                if meta.get("agent") and (meta.get("async") is True or meta.get("mode") == "async"
+                                          or default_async_launch) and not is_error:
                     rows.append(SubagentSpawnRow(
                         AGENT, call_id, key, call["bo"], turn_key=call.get("t"),
                         spawned_at=datetime.fromtimestamp(call["e"], ts.tzinfo),
                         requested_type=meta["agent"], requested_type_source="explicit",
-                        background=True, launch_status="launched", workflow_id=run_id))
+                        background=True, launch_status="launched", workflow_id=run_id, **_spawn_telemetry(details)))
             rows.extend(self._foreground(details, call_id, call, ts, pos))
         duration = int((ts.timestamp() - call["e"]) * 1000)
         parts = _images(content)
         rows.append(ToolCallRow(AGENT, call_id, key, call["n"], call["bo"], turn_key=call.get("t"), ended_at=ts,
                                 duration_ms=duration if duration >= 0 else None, output_bytes=json_size(content),
-                                outcome="error" if is_error else "ok", is_error=is_error, meta=meta or None))
+                                outcome="error" if is_error else "ok", is_error=is_error, meta=meta or None,
+                                background=True if default_async_launch else None,
+                                exit_code=_recorded_int((details or {}).get("exit_code"), signed=True),
+                                deadline_hit=(details or {}).get("deadline_hit")
+                                if type((details or {}).get("deadline_hit")) is bool else None))
         rows.append(ToolIoRow(AGENT, call_id, key, ts, pos.byte_offset, "call", tool_name=call["n"], call_uid=call_id,
                               turn_key=call.get("t"), output_text=text or None, result_json=_dumps(details),
                               output_parts=parts or None, output_at=ts, output_byte_offset=pos.byte_offset,
@@ -806,7 +918,8 @@ class PiParser:
                 reasoning_effort=as_str(result.get("thinking")), background=False,
                 name=as_str(result.get("workflowKey")) or result["agent"], launch_status="launched",
                 completion_status=None if exit_code is None else ("completed" if exit_code == 0 else "failed"),
-                completed_at=ts, reported_tokens=tokens, workflow_id=as_str(details.get("runId"))))
+                completed_at=ts, reported_tokens=tokens, workflow_id=as_str(details.get("runId")),
+                **_spawn_telemetry(details | result)))
         return rows
 
     def _notify(self, ctype: str, text: str, turn: str | None, ts: datetime, pos: LinePos) -> list[Row]:
@@ -841,7 +954,7 @@ class PiParser:
                 requested_type_source=None,
                 name=child.get("agent"), background=True,
                 launch_status="launched", completion_status=child.get("status"), completed_at=ts,
-                workflow_id=wf_id))
+                workflow_id=wf_id, **_spawn_telemetry(spawn.get("telemetry", {}) if spawn else {})))
         return rows
 
 
