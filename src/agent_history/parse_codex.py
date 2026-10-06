@@ -133,7 +133,7 @@ import json
 import mimetypes
 import re
 from collections import Counter
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Iterable
 
 from .common import (BOUNDED_STATE_SECONDS, artifact_kind, as_bool, as_int, as_str, cmd_verb, ssh_target,
@@ -464,7 +464,7 @@ class CodexParser:
             "burst": None, "inherited": 0, "last_ord": None, "last_iso": None, "own_turns": 0,
             "cur": None, "turns": {}, "model": None, "effort": None, "calls": {}, "spawns": {},
             "prev_total": None, "base": None, "tur": False, "rl": {}, "pre_meta": False,
-            "path": None,
+            "path": None, "service_tier": None,
             # v4: pending user-role response_item, last prompt, pending/last reasoning, recent closed
             # call ids, open io-only model calls, last web_search_end, last world_state hash
             "pu": None, "lp": None, "pr": None, "lr": None, "rc": [], "xc": {}, "lwe": None, "ws": None,
@@ -491,6 +491,7 @@ class CodexParser:
         item = payload.get("item") if ptype in {"item_completed", "item_started"} and isinstance(payload.get("item"), dict) else None
         itype = item.get("type") if item and isinstance(item.get("type"), str) else ""
         ts = parse_ts(record.get("timestamp"))
+        self._record_ts = ts   # Telemetry endpoints never use the legacy last_iso fallback.
         self._count(rtype, f"{ptype}/{itype}" if itype else ptype, payload, ts, pos)
         if ts is not None:
             self.s["last_iso"] = ts.isoformat()
@@ -541,6 +542,7 @@ class CodexParser:
             return rows
 
         self._seen(ts)
+        self._observe_boundary(rtype, ptype, payload)
         if rtype == "turn_context":
             rows.extend(self._turn_context(payload, ts, pos, uid))
         elif rtype == "response_item":
@@ -668,6 +670,63 @@ class CodexParser:
                 del self.s["turns"][turn_id]
         return rows
 
+    def _observe_boundary(self, rtype: str, ptype: str, p: dict[str, Any]) -> None:
+        """Track causal request boundaries after replay filtering, before outputs close calls."""
+        if rtype == "event_msg" and ptype == "thread_settings_applied":
+            settings = p.get("thread_settings")
+            tier = as_str(settings.get("service_tier")) if isinstance(settings, dict) else None
+            if tier is not None:
+                self.s["service_tier"] = tier
+        turn_id = _turn_of(p)
+        boundary = self._record_ts.isoformat() if self._record_ts else None
+        if rtype == "event_msg" and ptype == "task_started" and turn_id:
+            self._turn(turn_id)["boundary"] = boundary
+            self._turn(turn_id)["boundary_kind"] = "start"
+        elif rtype == "response_item" and ptype in {"function_call_output", "custom_tool_call_output",
+                                                   "tool_search_output"}:
+            call_id = as_str(p.get("call_id"))
+            call = self.s["calls"].get(call_id) or self.s["xc"].get(call_id)
+            call_turn = call.get("t") if call else None
+            if turn_id and call_turn and turn_id != call_turn:
+                self._turn(turn_id)["boundary"] = None
+                self._turn(call_turn)["boundary"] = None
+                return
+            turn_id = turn_id or call_turn
+            if turn_id:
+                self._turn(turn_id)["boundary"] = boundary
+                self._turn(turn_id)["boundary_kind"] = "output"
+            elif self.s.get("cur"):
+                # An orphan result cannot establish a request boundary for the current turn.
+                self._turn(self.s["cur"])["boundary"] = None
+        elif rtype == "event_msg" and ptype == "token_count":
+            turn_id = turn_id or self._timing_turn()
+            if turn_id:
+                self._turn(turn_id)["boundary"] = boundary
+                self._turn(turn_id)["boundary_kind"] = "tokens"
+
+    def _timing_turn(self) -> str | None:
+        opened = [tid for tid, turn in self.s["turns"].items() if turn.get("timing_open")]
+        return opened[0] if len(opened) == 1 else None
+
+    def _call_latency(self, p: dict[str, Any]) -> dict[str, Any]:
+        turn_id = as_str(p.get("turn_id")) or self._timing_turn()
+        turn = self.s["turns"].get(turn_id) if turn_id else None
+        if turn is None or not turn.get("timing_open"):
+            return {}
+        start = parse_ts(turn.pop("boundary", None))
+        end = self._record_ts
+        # Calls emitted after the boundary belong to this response, not to its input. Only
+        # unfinished calls preceding an output boundary make that boundary partial/ambiguous.
+        pending = start is not None and turn.get("boundary_kind") == "output" and any(
+            call.get("t") == turn_id and (call.get("e") is None or call["e"] <= start.timestamp())
+            for calls in (self.s["calls"], self.s["xc"]) for call in calls.values())
+        if start is None or end is None or end < start or pending:
+            return {}
+        duration = (end - start) // timedelta(milliseconds=1)
+        if duration > 2_147_483_647:   # The nullable seam is a PostgreSQL int.
+            return {}
+        return {"duration_ms": duration, "latency_basis": "codex_prev_boundary_to_usage"}
+
     # --- session_meta and replay --------------------------------------------------------------
 
     def _session_meta(self, p: dict[str, Any], ts: datetime | None, pos: LinePos) -> list[Row]:
@@ -752,6 +811,8 @@ class CodexParser:
                 pts = parse_ts(pend["ts"])
                 self._seen(pts)
                 rows.extend(self._task_started(pend["p"], pts, ppos, pend["uid"]))
+                turn = self._turn(as_str(pend["p"].get("turn_id")))
+                turn["boundary"], turn["boundary_kind"] = pend.get("boundary"), "start"
                 if b["ctx"] is not None:
                     rows.extend(self._turn_context(b["ctx"]["p"], parse_ts(b["ctx"]["ts"]),
                                                    LinePos(*b["ctx"]["pos"]), b["ctx"]["uid"]))
@@ -769,8 +830,9 @@ class CodexParser:
             if b["pend"] is not None:
                 b["before"] += 1 + b.get("tail", 0)
             keep = {k: payload[k] for k in ("turn_id", "started_at", "model_context_window",
-                                            "collaboration_mode_kind") if k in payload}
+                                            "collaboration_mode_kind", "trace_id", "root_turn_id") if k in payload}
             b["pend"] = {"p": keep, "ts": ts.isoformat() if ts else None,
+                         "boundary": self._record_ts.isoformat() if self._record_ts else None,
                          "pos": [pos.byte_offset, pos.byte_length, pos.line_number], "uid": uid}
             b["ctx"], b["tail"], b["own"] = None, 0, []
             return False, []
@@ -779,7 +841,7 @@ class CodexParser:
             if rtype == "turn_context":
                 keep = {k: payload[k] for k in ("turn_id", "model", "effort", "approval_policy",
                                                 "sandbox_policy", "permission_profile",
-                                                "collaboration_mode") if k in payload}
+                                                "collaboration_mode", "summary") if k in payload}
                 if isinstance(keep.get("collaboration_mode"), dict):
                     keep["collaboration_mode"] = {"mode": keep["collaboration_mode"].get("mode")}
                 b["ctx"] = {"p": keep, "ts": ts.isoformat() if ts else None,
@@ -843,6 +905,7 @@ class CodexParser:
             sandbox_type=as_str(sandbox.get("type")) if isinstance(sandbox, dict) else as_str(sandbox),
             permission_mode=as_str(profile.get("type")) if isinstance(profile, dict) else None,
             collaboration_mode=as_str(collab.get("mode")) if isinstance(collab, dict) else None,
+            reasoning_summary=p.get("summary") if p.get("summary") in ("none", "detailed") else None,
         )]
         if ts is not None:
             if model and self.s["model"] and model != self.s["model"]:
@@ -863,6 +926,7 @@ class CodexParser:
         self.s["cur"] = turn_id
         self.s["own_turns"] += 1
         turn = self._turn(turn_id, ts)
+        turn["timing_open"] = True
         cw = as_int(p.get("model_context_window"))
         turn["cw"] = cw or turn["cw"]
         origin = None
@@ -870,7 +934,8 @@ class CodexParser:
             origin, turn["o"] = "subagent_brief", True
         return [TurnRow(key, turn_id, pos.byte_offset, origin=origin,
                         started_at=parse_ts(p.get("started_at")) or ts, status="open", context_window=cw,
-                        collaboration_mode=as_str(p.get("collaboration_mode_kind")))]
+                        collaboration_mode=as_str(p.get("collaboration_mode_kind")),
+                        trace_id=as_str(p.get("trace_id")), root_turn_key=as_str(p.get("root_turn_id")))]
 
     def _turn_end(self, p: dict[str, Any], ts: datetime | None, pos: LinePos, uid: str, aborted: bool) -> list[Row]:
         key = self._key()
@@ -878,6 +943,8 @@ class CodexParser:
         if key is None or not turn_id:
             return []
         turn = self._turn(turn_id, ts)
+        turn["timing_open"] = False
+        turn["boundary"] = None
         origin = None
         if not turn["o"]:
             origin = "peer" if turn["peer"] else ("sdk" if self.s["exec"] else "unknown")
@@ -1256,7 +1323,7 @@ class CodexParser:
             turn = self._turn(turn_id, ts) if turn_id else {"m": self.s["model"]}
             rows: list[Row] = [MessageRow(AGENT, uid, key, ts, "assistant", "assistant_text", text,
                                           pos.byte_offset, pos.byte_length, pos.line_number, turn_id,
-                                          turn.get("m") or self.s["model"])]
+                                          turn.get("m") or self.s["model"], phase=as_str(p.get("phase")))]
             for path in linked_paths(text):
                 rows.append(ArtifactRow(AGENT, uid, key, ts, artifact_kind(path), "linked", path,
                                         "assistant_link", pos.byte_offset, turn_id,
@@ -1797,6 +1864,8 @@ class CodexParser:
                 rows.extend(self._git(item, op, ts, pos))
         elif itype == "McpToolCall":
             op.mcp_server, op.mcp_tool = as_str(item.get("server")), as_str(item.get("tool"))
+            op.mcp_plugin_id = as_str(item.get("pluginId"))
+            op.mcp_read_only = item.get("readOnlyHint") if isinstance(item.get("readOnlyHint"), bool) else None
             result = item.get("result")
             op.is_error = bool(status == "failed" or item.get("error") is not None or
                                (isinstance(result, dict) and as_bool(result.get("isError"))))
@@ -1914,7 +1983,7 @@ class CodexParser:
         rows.append(LlmCallRow(AGENT, f"codex-legacy:{uid}", key, ts, pos.byte_offset, turn_key=turn_id,
                                model=turn.get("m") or self.s["model"], effort=turn.get("ef") or self.s["effort"],
                                context_window=as_int(info.get("model_context_window")) or turn.get("cw"),
-                               line_count=1, **_normalise(last)))
+                               line_count=1, service_tier=self.s["service_tier"], **_normalise(last)))
         return rows
 
     def _token_record(self, p: dict[str, Any], ts: datetime | None, pos: LinePos, uid: str) -> list[Row]:
@@ -1928,7 +1997,8 @@ class CodexParser:
         response_id = as_str(p.get("response_id")) or f"codex-tur:{uid}"
         return [LlmCallRow(AGENT, response_id, key, ts, pos.byte_offset, turn_key=turn_id,
                            model=turn.get("m") or self.s["model"], effort=turn.get("ef") or self.s["effort"],
-                           context_window=turn.get("cw"), line_count=1, **_normalise(usage))]
+                           context_window=turn.get("cw"), line_count=1, service_tier=self.s["service_tier"],
+                           **self._call_latency(p), **_normalise(usage))]
 
     def _rate_limits(self, rl: Any, ts: datetime, pos: LinePos, uid: str) -> list[Row]:
         key = self._key()

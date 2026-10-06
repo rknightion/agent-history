@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 from pathlib import Path
@@ -49,6 +50,196 @@ def one(store: MemStore, table: str, **match) -> dict:
 def snapshot(store: MemStore) -> dict:
     # record_type_seen counts are per batch by contract, so they legitimately differ by batch size.
     return {t: sorted(map(repr, rows.values())) for t, rows in store.tables.items() if t != "record_type_seen"}
+
+
+# --- nullable transcript telemetry --------------------------------------------------------------
+
+
+TELEMETRY = {"llm_call": {"duration_ms", "latency_basis", "service_tier"},
+             "message": {"phase"}, "turn": {"reasoning_summary", "trace_id", "root_turn_key"},
+             "tool_op": {"mcp_plugin_id", "mcp_read_only"}}
+
+
+def telemetry_records():
+    return [json.loads(line) for line in (FIX / "nullable_telemetry.jsonl").read_text().splitlines()]
+
+
+def load_records(tmp_path, records):
+    path = tmp_path / "telemetry.jsonl"
+    path.write_text("".join(json.dumps(record) + "\n" for record in records))
+    return load(path.name, path=path, batch_lines=1)[0]
+
+
+def test_nullable_telemetry_real_parser_surface():
+    store, _ = load("nullable_telemetry.jsonl", batch_lines=1)
+    calls = {row["response_id"]: row for row in store.rows("llm_call")}
+    assert {rid: (row["duration_ms"], row["latency_basis"], row["service_tier"])
+            for rid, row in calls.items()} == {
+        "telemetry-first": (2000, "codex_prev_boundary_to_usage", "default"),
+        # Internal executed ops are not model request boundaries; the last parallel output is.
+        "telemetry-parallel": (2000, "codex_prev_boundary_to_usage", "priority"),
+        "telemetry-zero": (0, "codex_prev_boundary_to_usage", "priority"),
+        "telemetry-next": (1000, "codex_prev_boundary_to_usage", "priority"),
+    }
+    assert calls["telemetry-zero"]["output"] == 0
+    message = one(store, "message", message_class="assistant_text")
+    assert (message["phase"], message["text"], message["event_uid"]) == (
+        "commentary", "Synthetic telemetry reply.", "77777777-7777-4777-8777-777777777777:6")
+    turn = one(store, "turn", turn_key="telemetry-turn")
+    assert (turn["reasoning_summary"], turn["trace_id"], turn["root_turn_key"]) == (
+        "detailed", "synthetic-trace", "synthetic-root-turn")
+    assert one(store, "turn", turn_key="telemetry-next")["reasoning_summary"] == "none"
+    op = one(store, "tool_op", item_uid="synthetic-mcp-op")
+    assert (op["mcp_plugin_id"], op["mcp_read_only"]) == ("synthetic-plugin", False)
+    assert one(store, "tool_io", io_uid="item:synthetic-mcp-op")["output_text"] == "Synthetic operation output."
+
+
+@pytest.mark.parametrize("table,match,field,expected", [
+    ("message", {"message_class": "assistant_text"}, "phase", "commentary"),
+    ("turn", {"turn_key": "telemetry-turn"}, "reasoning_summary", "detailed"),
+    ("turn", {"turn_key": "telemetry-turn"}, "trace_id", "synthetic-trace"),
+    ("turn", {"turn_key": "telemetry-turn"}, "root_turn_key", "synthetic-root-turn"),
+    ("tool_op", {"item_uid": "synthetic-mcp-op"}, "mcp_plugin_id", "synthetic-plugin"),
+    ("tool_op", {"item_uid": "synthetic-mcp-op"}, "mcp_read_only", False),
+    ("llm_call", {"response_id": "telemetry-parallel"}, "service_tier", "priority"),
+])
+def test_explicit_telemetry_fields_independently(table, match, field, expected):
+    store, _ = load("nullable_telemetry.jsonl", batch_lines=1)
+    assert one(store, table, **match)[field] == expected
+
+
+def test_turn_first_usage_includes_calls_emitted_by_that_response(tmp_path):
+    records = telemetry_records()
+    call = {"type": "response_item", "timestamp": "2026-09-01T10:00:02.500Z",
+            "payload": {"type": "function_call", "call_id": "synthetic-inflight",
+                        "name": "synthetic", "arguments": "{}"}}
+    records.insert(7, call)
+    for record in records:
+        record.pop("ordinal", None)
+    row = one(load_records(tmp_path, records), "llm_call", response_id="telemetry-first")
+    assert (row["duration_ms"], row["latency_basis"]) == (2000, "codex_prev_boundary_to_usage")
+
+
+def test_legacy_calls_carry_active_tier_without_guessed_duration(tmp_path):
+    records = telemetry_records()
+    records[0]["payload"]["cli_version"] = "0.145.0"
+    usage = records[7]["payload"]["usage"]
+    records[7].update(type="event_msg", payload={"type": "token_count", "info": {
+        "last_token_usage": usage, "total_token_usage": usage}})
+    records = records[:8]
+    row = one(load_records(tmp_path, records), "llm_call")
+    assert row["service_tier"] == "default"
+    assert (row["duration_ms"], row["latency_basis"]) == (None, None)
+
+
+@pytest.mark.parametrize("case", ["missing-start", "invalid-start", "missing-end", "negative",
+                                  "unknown-turn", "pending-parallel", "no-new-boundary", "overlap"])
+def test_nullable_call_timing_rejects_unattributable_endpoints(tmp_path, case):
+    records = telemetry_records()
+    target = "telemetry-first"
+    if case in {"missing-start", "invalid-start"}:
+        records[2]["timestamp"] = None if case == "missing-start" else "not-a-timestamp"
+    elif case == "missing-end":
+        records[7].pop("timestamp")
+    elif case == "negative":
+        records[7]["timestamp"] = "2026-09-01T10:00:00Z"
+    elif case == "unknown-turn":
+        records[7]["payload"]["turn_id"] = "unobserved-turn"
+    elif case == "pending-parallel":
+        records[13], records[15] = records[15], records[13]
+        for record in records:
+            record.pop("ordinal", None)
+        target = "telemetry-parallel"
+    elif case == "no-new-boundary":
+        records.pop(16)
+        target = "telemetry-zero"
+    elif case == "overlap":
+        records.insert(7, {"type": "event_msg", "timestamp": "2026-09-01T10:00:02.500Z",
+                           "payload": {"type": "task_started", "turn_id": "overlapping-turn"}})
+        records[8]["payload"].pop("turn_id")
+        for record in records:
+            record.pop("ordinal", None)
+    row = one(load_records(tmp_path, records), "llm_call", response_id=target)
+    assert (row["duration_ms"], row["latency_basis"]) == (None, None)
+
+
+@pytest.mark.parametrize("value", [None, 123, {}, ""])
+def test_missing_invalid_metadata_is_null(tmp_path, value):
+    records = telemetry_records()
+    records[2]["payload"].update(trace_id=value, root_turn_id=value)
+    records[3]["payload"]["summary"] = value
+    records[6]["payload"]["phase"] = value
+    records[14]["payload"]["item"].update(pluginId=value, readOnlyHint=value)
+    store = load_records(tmp_path, records)
+    assert one(store, "message", message_class="assistant_text")["phase"] is None
+    turn = one(store, "turn", turn_key="telemetry-turn")
+    assert all(turn[name] is None for name in ("reasoning_summary", "trace_id", "root_turn_key"))
+    op = one(store, "tool_op", item_uid="synthetic-mcp-op")
+    assert (op["mcp_plugin_id"], op["mcp_read_only"]) == (None, None)
+
+
+def test_unknown_summary_mode_and_string_boolean_are_not_evidence(tmp_path):
+    records = telemetry_records()
+    records[3]["payload"]["summary"] = "Synthetic reasoning text is not a mode."
+    records[14]["payload"]["item"]["readOnlyHint"] = "false"
+    store = load_records(tmp_path, records)
+    assert one(store, "turn", turn_key="telemetry-turn")["reasoning_summary"] is None
+    assert one(store, "tool_op", item_uid="synthetic-mcp-op")["mcp_read_only"] is None
+
+
+def test_telemetry_enrichment_latest_nonnull_preserves_content_and_keys(tmp_path):
+    records = telemetry_records()
+    store = load_records(tmp_path, records)
+    keys = {table: set(rows) for table, rows in store.tables.items()}
+    records[2]["payload"].update(trace_id="synthetic-trace-new", root_turn_id="synthetic-root-new")
+    records[3]["payload"]["summary"] = "none"
+    records[6]["payload"].update(phase="final_answer")
+    records[6]["payload"]["content"][0]["text"] = "This must not replace immutable content."
+    records[14]["payload"]["item"].update(pluginId="synthetic-plugin-new", readOnlyHint=True)
+    path = tmp_path / "enrichment.jsonl"
+    path.write_text("".join(json.dumps(record) + "\n" for record in records))
+    load(path.name, path=path, store=store, batch_lines=1)
+    assert {table: set(rows) for table, rows in store.tables.items()} == keys
+    message = one(store, "message", message_class="assistant_text")
+    assert (message["phase"], message["text"]) == ("final_answer", "Synthetic telemetry reply.")
+    turn = one(store, "turn", turn_key="telemetry-turn")
+    assert (turn["reasoning_summary"], turn["trace_id"], turn["root_turn_key"]) == (
+        "none", "synthetic-trace-new", "synthetic-root-new")
+    op = one(store, "tool_op", item_uid="synthetic-mcp-op")
+    assert (op["mcp_plugin_id"], op["mcp_read_only"]) == ("synthetic-plugin-new", True)
+    records[6]["payload"].pop("phase")
+    records[14]["payload"]["item"].update(pluginId=None, readOnlyHint=False)
+    path.write_text("".join(json.dumps(record) + "\n" for record in records))
+    load(path.name, path=path, store=store, batch_lines=1)
+    assert one(store, "message", message_class="assistant_text")["phase"] == "final_answer"
+    op = one(store, "tool_op", item_uid="synthetic-mcp-op")
+    assert (op["mcp_plugin_id"], op["mcp_read_only"]) == ("synthetic-plugin-new", False)
+
+
+def test_telemetry_does_not_change_content_keys_or_classification():
+    # Captured from the frozen pre-telemetry parser over this exact synthetic fixture. Comparing
+    # the same bytes preserves offsets and MCP result_json, unlike removing metadata from input.
+    store, _ = load("nullable_telemetry.jsonl", batch_lines=1)
+    surface = {table: sorted(json.dumps({name: value for name, value in row.items()
+                                        if name not in TELEMETRY.get(table, set())},
+                                       sort_keys=True, default=str) for row in rows.values())
+               for table, rows in store.tables.items() if table != "record_type_seen"}
+    assert hashlib.sha256(json.dumps(surface, sort_keys=True).encode()).hexdigest() == (
+        "5a73a28860e927e396717458dc1992f6d2d4abcff3953293c7d1e5e1bcdc3eb8")
+
+
+@pytest.mark.parametrize("batch", [1, 2, 7])
+def test_nullable_telemetry_resume_each_boundary(batch):
+    whole, state = load("nullable_telemetry.jsonl")
+    parts, parts_state = load("nullable_telemetry.jsonl", batch_lines=batch)
+    assert snapshot(parts) == snapshot(whole)
+    assert parts_state == state
+    for cut in range(1, len(telemetry_records())):
+        store = MemStore()
+        c = ctx(FIX / "nullable_telemetry.jsonl")
+        end, saved = run_file(CodexParser, c, store, stop_after_lines=cut, batch_lines=batch)
+        run_file(CodexParser, c, store, start=end, state=saved, line_base=cut, batch_lines=batch)
+        assert snapshot(store) == snapshot(whole), cut
 
 
 # --- session identity --------------------------------------------------------------------------
