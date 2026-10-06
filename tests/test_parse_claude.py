@@ -9,8 +9,8 @@ from pathlib import Path
 import pytest
 
 from agent_history.memstore import MemStore, run_file
-from agent_history.model import FileContext, SessionKey
-from agent_history.parse_claude import ClaudeParser
+from agent_history.model import FileContext, LinePos, LlmCallRow, SessionKey
+from agent_history.parse_claude import ClaudeParser, RESPONSE_SEEN_BITS, STATE_KEYS_MAX
 
 FIX = Path(__file__).parent / "fixtures" / "claude"
 SID = "11111111-1111-4111-8111-111111111111"
@@ -329,6 +329,95 @@ def test_telemetry_streaming_response_and_parallel_causal_parent(batch):
     assert one(store, "message", event_uid="text-line")["text"] == "Synthetic answer retained in full."
     assert one(store, "tool_io", io_uid="parallel-a")["output_text"] == "Synthetic result A retained in full."
     assert one(store, "turn")["origin"] == "human"  # turnOrigin does not reclassify the prompt.
+
+
+@pytest.mark.parametrize("batch", [1, 5000])
+@pytest.mark.parametrize("content", [[], "", None])
+def test_telemetry_empty_final_assistant_line_is_an_endpoint(tmp_path, batch, content):
+    records = _telemetry_records()[:3]
+    records[-1]["message"]["content"] = content
+    records[-1]["thinkingDurationMs"] = 1600
+    path = tmp_path / "telemetry.jsonl"
+    path.write_text("".join(json.dumps(record) + "\n" for record in records))
+    context = FileContext(str(path), "claude-test/telemetry.jsonl", "claude-test", "claude", "test", None, "main")
+    store = MemStore()
+    run_file(ClaudeParser, context, store, batch_lines=batch)
+    call = one(store, "llm_call")
+    assert (call["duration_ms"], call["latency_basis"]) == (2005, "claude_parent_to_last_line")
+    assert call["line_count"] == 2 and call["output"] == 20 and call["stop_reason"] == "tool_use"
+    assert call["thinking_ms"] == 1600 and call["advisor_model"] == "synthetic-advisor-latest"
+    assert len(store.rows("message")) == 2  # Original prompt and reasoning, no invented answer.
+    assert one(store, "message", event_uid="thinking-line:think:0")["text"] == "Synthetic reasoning retained in full."
+    assert not store.rows("tool_call")
+
+
+@pytest.mark.parametrize("batch", [1, 5000])
+@pytest.mark.parametrize("gap", [STATE_KEYS_MAX, 4 * STATE_KEYS_MAX])
+def test_telemetry_evicted_streaming_parent_never_rebases_on_resume(tmp_path, batch, gap):
+    records = _telemetry_records()[:2]
+    for index in range(gap):
+        records.append({"type": "assistant", "sessionId": "telemetry", "uuid": f"unrelated-line-{index}",
+                        "parentUuid": "prompt", "timestamp": "2026-10-01T10:00:10Z",
+                        "message": {"id": f"unrelated-response-{index}", "model": "synthetic-model",
+                                    "content": [{"type": "text", "text": "Synthetic unrelated response."}]}})
+    final = _telemetry_records()[2]
+    final["timestamp"] = "2026-10-01T10:00:20Z"
+    final["thinkingDurationMs"] = 1600
+    records.append(final)
+    path = tmp_path / "telemetry.jsonl"
+    path.write_text("".join(json.dumps(record) + "\n" for record in records))
+    context = FileContext(str(path), "claude-test/telemetry.jsonl", "claude-test", "claude", "test", None, "main")
+    cut = len(records) - 1
+    store = MemStore()
+    offset, state = run_file(ClaudeParser, context, store, batch_lines=batch, stop_after_lines=cut)
+    state = json.loads(json.dumps(state))
+    assert "stream-response" not in state["response_parents"]
+    assert "stream-response" not in state["msg_lines"]
+    assert len(state["response_parents"]) <= STATE_KEYS_MAX
+    assert len(state["record_ts"]) <= 4 * STATE_KEYS_MAX
+    assert len(state["response_seen"]) <= RESPONSE_SEEN_BITS // 4
+    assert "Synthetic" not in json.dumps(state)
+    # Inspect the emitted observation as well as MemStore's NULL-preserving merge.
+    parser = ClaudeParser(context, json.loads(json.dumps(state)))
+    row = next(row for row in parser.line(final, LinePos(offset, 1, cut + 1)) if isinstance(row, LlmCallRow))
+    assert row.duration_ms is None and row.latency_basis is None
+    run_file(ClaudeParser, context, store, batch_lines=batch, start=offset, state=state, line_base=cut)
+    call = one(store, "llm_call", response_id="stream-response")
+    assert (call["duration_ms"], call["latency_basis"]) == (2000, "claude_parent_to_last_line")
+    assert call["thinking_ms"] == 1600 and call["advisor_model"] == "synthetic-advisor-latest"
+    assert len(store.rows("llm_call")) == gap + 1
+    assert _comparable(store) == _comparable(_load_telemetry_records(tmp_path, records))
+
+
+def test_telemetry_retained_lineage_survives_identity_filter_collisions():
+    store = MemStore()
+    _, state = run_file(ClaudeParser, ctx(TELEMETRY), store, stop_after_lines=2)
+    # A saturated identity filter is conservative only for uncached response identities.
+    state["response_seen"] = "f" * (RESPONSE_SEEN_BITS // 4)
+    parser = ClaudeParser(ctx(TELEMETRY), state)
+    final = _telemetry_records()[2]
+    final["timestamp"] = "2026-10-01T10:00:20Z"
+    row = next(row for row in parser.line(final, LinePos(0, 1, 3)) if isinstance(row, LlmCallRow))
+    assert row.duration_ms == 20000 and row.latency_basis == "claude_parent_to_last_line"
+    unseen = json.loads(json.dumps(final))
+    unseen["message"]["id"] = "synthetic-filter-collision"
+    row = next(row for row in parser.line(unseen, LinePos(0, 1, 4)) if isinstance(row, LlmCallRow))
+    assert row.duration_ms is None and row.latency_basis is None
+
+
+def test_telemetry_old_snapshot_keeps_known_lineage_without_guessing_lost_history():
+    store = MemStore()
+    _, state = run_file(ClaudeParser, ctx(TELEMETRY), store, stop_after_lines=2)
+    state.pop("response_seen")
+    parser = ClaudeParser(ctx(TELEMETRY), json.loads(json.dumps(state)))
+    final = _telemetry_records()[2]
+    row = next(row for row in parser.line(final, LinePos(0, 1, 3)) if isinstance(row, LlmCallRow))
+    assert row.duration_ms == 2005
+    state["response_parents"].clear()
+    state["msg_lines"].clear()
+    parser = ClaudeParser(ctx(TELEMETRY), state)
+    row = next(row for row in parser.line(final, LinePos(0, 1, 3)) if isinstance(row, LlmCallRow))
+    assert row.duration_ms is None and row.latency_basis is None
 
 
 def test_telemetry_selected_fields_and_known_zero_false_empty():

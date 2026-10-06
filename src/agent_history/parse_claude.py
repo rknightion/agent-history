@@ -150,6 +150,7 @@ TN_SUMMARY = re.compile(r"<summary>(.*?)</summary>", re.S)
 TN_RESULT = re.compile(r"<result>(.*?)</result>", re.S)
 SLASH = re.compile(r"<command-name>\s*(/?[\w:.\-]+)")
 STATE_KEYS_MAX = 512
+RESPONSE_SEEN_BITS = 65536  # Fixed-size identity filter; collisions only suppress unknown durations.
 
 # --- parser v4 -------------------------------------------------------------------------------
 TOUCH_TOOLS = {"Read": "read", "NotebookRead": "read", "Write": "create", "Edit": "edit",
@@ -217,6 +218,9 @@ class ClaudeParser:
         s.setdefault("msg_lines", {})         # message.id -> line count (bounded LRU)
         s.setdefault("record_ts", {})         # uuid -> explicit timestamp or NULL (bounded)
         s.setdefault("response_parents", {})  # response id -> first line's causal parent uuid
+        # Never forget that a response was observed, even after its exact lineage is evicted.
+        # An older snapshot lacks this history, so only its retained exact parents remain usable.
+        s.setdefault("response_seen", "f" * (RESPONSE_SEEN_BITS // 4) if state else "0")
         s.setdefault("last", {})              # change detectors: perm, mode, model, effort, rl:<kind>
         s.setdefault("perm_pending", None)    # [value, byte_offset] seen before any timestamp
         s.setdefault("first_offset", None)
@@ -468,14 +472,22 @@ class ClaudeParser:
         if mid is None:
             return None  # A fallback line uuid cannot establish a streaming response identity.
         parents = self.s["response_parents"]
+        seen = int(self.s["response_seen"], 16)
+        digest = sha256_text(mid)
+        mask = 0
+        for offset in range(0, 16, 4):
+            mask |= 1 << int(digest[offset:offset + 4], 16)
+        previously_seen = seen & mask == mask
+        self.s["response_seen"] = format(seen | mask, "x")
         if mid not in parents:
-            parents[mid] = as_str(rec.get("parentUuid"))
+            # A bounded identity filter has no false negatives. False positives conservatively
+            # leave the observation unknown, never relabel a continuation's parent as its first.
+            parents[mid] = None if previously_seen else as_str(rec.get("parentUuid"))
             self._bound_telemetry(parents, STATE_KEYS_MAX)
         parent = parents[mid]
         start = parse_ts(self.s["record_ts"].get(parent)) if parent else None
         end = parse_ts(rec.get("timestamp"))
-        content = msg.get("content")
-        if start is None or end is None or not isinstance(content, (str, list)) or not content:
+        if start is None or end is None:
             return None
         interval = end - start
         if interval < timedelta(0):
