@@ -1,7 +1,11 @@
 """The collector's receipt step runs from `main`, including without a database (--dry-run)."""
 
 import json
+import signal
 import subprocess
+import sys
+import time
+from pathlib import Path
 
 import pytest
 
@@ -42,6 +46,148 @@ def test_main_dry_run_counts_receipts_of_configured_repositories(tmp_path, monke
         assert summary["errors"][0]["step"] == "loop_state"
     assert summary["tables"]["loop_receipt"] == {"rows": 2}
     assert summary["tables"]["loop_state"] == {"rows": 1 if state_source == "regular" else 0}
+
+
+@pytest.mark.parametrize("outcome", ["normal", "locked", "mkdir", "open", "machine", "connect", "close", "interrupt"])
+@pytest.mark.parametrize("seconds, interval", [(0.0, 0.0), (120.0, 0.0), (120.0, 60.0)])
+def test_main_restores_callers_alarm(tmp_path, monkeypatch, outcome, seconds, interval):
+    config = tmp_path / "config.toml"
+    config.write_text(f'[git]\nrepos = []\n[collector]\nhomes = {{}}\nlock_file = "{tmp_path / "lock"}"\n')
+    monkeypatch.setattr(collect_git.Collector, "repositories", lambda self: None)
+    monkeypatch.setattr(collect_git.Collector, "homes", lambda self, machine, hostname: None)
+
+    def fail(*args, **kwargs):
+        raise OSError("synthetic edge failure")
+
+    def machine():
+        remaining, repeat = signal.getitimer(signal.ITIMER_REAL)
+        assert 590 < remaining <= 600 and repeat == 0
+        assert signal.getsignal(signal.SIGALRM) is not previous_handler
+        return "synthetic-mac", "synthetic-host"
+
+    monkeypatch.setattr(collect_git, "machine_name", machine)
+    if outcome == "locked":
+
+        def locked(*args):
+            raise BlockingIOError()
+
+        monkeypatch.setattr(collect_git.fcntl, "flock", locked)
+    elif outcome == "mkdir":
+        monkeypatch.setattr(Path, "mkdir", fail)
+    elif outcome == "open":
+        monkeypatch.setattr(collect_git, "open", fail, raising=False)
+    elif outcome == "machine":
+        monkeypatch.setattr(collect_git, "machine_name", fail)
+    elif outcome == "connect":
+        monkeypatch.setattr(collect_git, "connect", fail)
+    elif outcome == "close":
+
+        class Connection:
+            close = fail
+
+        monkeypatch.setattr(collect_git, "connect", lambda *args: Connection())
+    elif outcome == "interrupt":
+
+        def interrupted():
+            raise KeyboardInterrupt()
+
+        monkeypatch.setattr(collect_git, "machine_name", interrupted)
+
+    original_handler = signal.getsignal(signal.SIGALRM)
+    original_timer = signal.getitimer(signal.ITIMER_REAL)
+
+    def previous_handler(signum, frame):
+        pytest.fail("the caller's long alarm must not expire during this bounded test")
+
+    signal.signal(signal.SIGALRM, previous_handler)
+    signal.setitimer(signal.ITIMER_REAL, seconds, interval)
+    started = time.monotonic()
+    try:
+        argv = ["--config", str(config)]
+        if outcome not in ("connect", "close"):
+            argv.append("--dry-run")
+        if outcome in ("mkdir", "open", "machine", "close", "interrupt"):
+            with pytest.raises(KeyboardInterrupt if outcome == "interrupt" else OSError):
+                collect_git.main(argv)
+        else:
+            assert collect_git.main(argv) == (1 if outcome == "connect" else 0)
+        elapsed = time.monotonic() - started
+        assert signal.getsignal(signal.SIGALRM) is previous_handler
+        remaining, repeat = signal.getitimer(signal.ITIMER_REAL)
+        assert remaining == pytest.approx(max(0, seconds - elapsed), abs=0.1)
+        assert repeat == interval
+    finally:
+        # Only this test's own synthetic timer is cleaned up, after the assertions above.
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, original_handler)
+        signal.setitimer(signal.ITIMER_REAL, *original_timer)
+
+
+@pytest.mark.parametrize("interval", [0.0, 60.0])
+def test_collector_alarm_delivers_overdue_callers_timer(interval):
+    fired = []
+    original_handler = signal.getsignal(signal.SIGALRM)
+    original_timer = signal.getitimer(signal.ITIMER_REAL)
+
+    def previous_handler(signum, frame):
+        fired.append(signum)
+
+    signal.signal(signal.SIGALRM, previous_handler)
+    signal.setitimer(signal.ITIMER_REAL, 0.01, interval)
+    try:
+        with collect_git._collector_alarm():
+            time.sleep(0.03)
+            assert fired == []  # the caller's timer is suspended only inside this scope
+        # Let the promptly rearmed overdue signal reach Python, without waiting its old duration.
+        until = time.monotonic() + 0.5
+        while not fired and time.monotonic() < until:
+            time.sleep(0.001)
+        assert fired == [signal.SIGALRM]
+        assert signal.getsignal(signal.SIGALRM) is previous_handler
+        remaining, repeat = signal.getitimer(signal.ITIMER_REAL)
+        assert repeat == interval
+        assert (0 < remaining <= interval) if interval else remaining == 0
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, original_handler)
+        signal.setitimer(signal.ITIMER_REAL, *original_timer)
+
+
+def test_collector_cli_dry_run_and_active_hard_deadline(tmp_path):
+    config = tmp_path / "config.toml"
+    config.write_text(f'[git]\nrepos = []\n[collector]\nhomes = {{}}\nlock_file = "{tmp_path / "lock"}"\n')
+    cli = Path(sys.executable).with_name("agent-history-collect")
+    result = subprocess.run(
+        [str(cli), "--dry-run", "--config", str(config)], capture_output=True, text=True, timeout=10
+    )
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["ok"] is True
+    # Exercise the same installed console script with only its process edge replaced.
+    # Deliver SIGALRM now, rather than wait ten minutes or shorten the production deadline.
+    script = """
+import json, os, runpy, signal, subprocess, sys
+original_run = subprocess.run
+
+def process_edge(argv, *args, **kwargs):
+    if argv[0] == "/usr/sbin/scutil":
+        remaining, interval = signal.getitimer(signal.ITIMER_REAL)
+        print(json.dumps({"active_remaining": remaining, "interval": interval}), flush=True)
+        os.kill(os.getpid(), signal.SIGALRM)
+        raise AssertionError("hard deadline must exit, not return")
+    return original_run(argv, *args, **kwargs)
+
+subprocess.run = process_edge
+cli, config = sys.argv[1:]
+sys.argv = [cli, "--dry-run", "--config", config]
+runpy.run_path(cli, run_name="__main__")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(cli), str(config)], capture_output=True, text=True, timeout=10
+    )
+    assert result.returncode == 124, result.stderr
+    active, expired = map(json.loads, result.stdout.splitlines())
+    assert 590 < active["active_remaining"] <= 600 and active["interval"] == 0
+    assert expired == {"ok": False, "error": "runtime_limit", "limit_s": 600}
 
 
 def test_mtime_keeps_microsecond_precision():

@@ -18,6 +18,7 @@ import subprocess
 import sys
 import time
 import tomllib
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -1503,6 +1504,31 @@ def main(argv: list[str] | None = None, dsn=None) -> int:
             return result
 
 
+@contextmanager
+def _collector_alarm():
+    """Own the hard deadline only during collection, without leaking it to callers."""
+    previous_handler = signal.getsignal(signal.SIGALRM)
+    saved_at = time.monotonic()
+    remaining, interval = signal.setitimer(signal.ITIMER_REAL, 0)
+
+    def on_alarm(signum, frame):  # the hard bound: never let launchd accumulate a hung run
+        print(json.dumps({"ok": False, "error": "runtime_limit", "limit_s": RUNTIME_LIMIT_S + 60}), flush=True)
+        os._exit(124)
+
+    try:
+        signal.signal(signal.SIGALRM, on_alarm)
+        signal.alarm(RUNTIME_LIMIT_S + 60)
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
+        if remaining:
+            # Time spent collecting still counts against the caller's outstanding deadline.
+            # An overdue alarm is delivered promptly by its original handler, not discarded.
+            remaining = max(remaining - (time.monotonic() - saved_at), 0.000001)
+        signal.setitimer(signal.ITIMER_REAL, remaining, interval)
+
+
 def _main(argv: list[str] | None = None, dsn=None) -> int:
     parser = argparse.ArgumentParser(
         prog="agent-history-collect", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -1523,51 +1549,46 @@ def _main(argv: list[str] | None = None, dsn=None) -> int:
     configure(config)
     started = time.monotonic()
 
-    def on_alarm(signum, frame):  # the hard bound: never let launchd accumulate a hung run
-        print(json.dumps({"ok": False, "error": "runtime_limit", "limit_s": RUNTIME_LIMIT_S + 60}), flush=True)
-        os._exit(124)
+    with _collector_alarm():
+        LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(LOCK_FILE, "w") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                print(json.dumps({"ok": False, "error": "already_running"}), flush=True)
+                return 0
+            detected, hostname = machine_name()
+            machine = MACHINE or detected
+            summary: dict[str, Any] = {"ok": True, "machine": machine, "dry_run": args.dry_run}
+            conn = None
+            try:
+                conn = None if args.dry_run else connect(dsn, config)
+                collector = Collector(conn, args.dry_run, started + RUNTIME_LIMIT_S, args.rescan_days)
+                try:
+                    from .collect_receipts import collect as collect_receipts
 
-    signal.signal(signal.SIGALRM, on_alarm)
-    signal.alarm(RUNTIME_LIMIT_S + 60)
-    LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
-    lock = open(LOCK_FILE, "w")
-    try:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        print(json.dumps({"ok": False, "error": "already_running"}), flush=True)
-        return 0
-    detected, hostname = machine_name()
-    machine = MACHINE or detected
-    summary: dict[str, Any] = {"ok": True, "machine": machine, "dry_run": args.dry_run}
-    conn = None
-    try:
-        conn = None if args.dry_run else connect(dsn, config)
-        collector = Collector(conn, args.dry_run, started + RUNTIME_LIMIT_S, args.rescan_days)
-        try:
-            from .collect_receipts import collect as collect_receipts
-
-            collect_receipts(collector, repo_roots(), machine)
-            collector.repositories()
-            collector.homes(machine, hostname)
-        except Deadline:
-            summary.update(ok=False, error="deadline")
-        summary.update(
-            repos=collector.repos, tables=collector.counts, skipped=collector.skipped, errors=collector.errors
-        )
-        if any(e.get("error") == "gh_unavailable" for e in collector.errors):
-            summary["ok"] = False  # visible to a log/launchd check instead of silently skipping GitHub
-    except Exception as error:  # a failed run is reported, never raised into launchd as a traceback storm
-        # The type only: a driver or OS message can quote a DSN, a path or row text into the log.
-        summary.update(ok=False, error=type(error).__name__)
-    finally:
-        if conn is not None:
-            conn.close()
-    with telemetry.pass_span("collect.pass") as span:
-        span.counts({"repositories": summary.get("repos", 0)})
-    summary["duration_s"] = round(time.monotonic() - started, 1)
-    summary["ts"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    print(json.dumps(summary, separators=(",", ":")), flush=True)
-    return 0 if summary["ok"] else 1
+                    collect_receipts(collector, repo_roots(), machine)
+                    collector.repositories()
+                    collector.homes(machine, hostname)
+                except Deadline:
+                    summary.update(ok=False, error="deadline")
+                summary.update(
+                    repos=collector.repos, tables=collector.counts, skipped=collector.skipped, errors=collector.errors
+                )
+                if any(e.get("error") == "gh_unavailable" for e in collector.errors):
+                    summary["ok"] = False  # visible to a log/launchd check instead of silently skipping GitHub
+            except Exception as error:  # a failed run is reported, never raised into launchd as a traceback storm
+                # The type only: a driver or OS message can quote a DSN, a path or row text into the log.
+                summary.update(ok=False, error=type(error).__name__)
+            finally:
+                if conn is not None:
+                    conn.close()
+            with telemetry.pass_span("collect.pass") as span:
+                span.counts({"repositories": summary.get("repos", 0)})
+            summary["duration_s"] = round(time.monotonic() - started, 1)
+            summary["ts"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            print(json.dumps(summary, separators=(",", ":")), flush=True)
+            return 0 if summary["ok"] else 1
 
 
 def run(argv: list[str] | None = None) -> int:
