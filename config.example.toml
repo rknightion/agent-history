@@ -78,7 +78,13 @@ api_key_env = "OPENAI_API_KEY"
 
 # Live phase structure is projected from catalogued pi root evidence, not local state files.
 # Paid enrichment is optional and never runs on the indexer's transaction or connection.
-# Run `python -m agent_history.loop_live` as an independent bounded queue drain after refresh.
+# Run `python -m agent_history.loop_live` in a dedicated independently scheduled service,
+# never as an indexer subcommand or in the collector's transaction/process. Each invocation
+# admits at most 20 jobs and stops admitting jobs after 60 seconds; an in-flight job may finish
+# later. Add a supervisor wall-clock limit, for example systemd Type=exec, RuntimeMaxSec=90
+# and TimeoutStopSec=5 (RuntimeMaxSec does not bound Type=oneshot services). Give this worker
+# its own timer; do not make structural collection depend on its success or completion.
+# A supervisor interruption leaves committed paid reservations uncertain, never refunded/retried.
 # A failed/slow provider keeps the previous summary and records an error. Inputs and outputs
 # are unredacted. The shared UTC daily reservation ceiling is fixed at USD 5 across both models.
 # Reservations use peak prices, a 5% fee allowance, the whole documented context ceiling and
@@ -89,5 +95,12 @@ enabled = false
 # jev_url and summary_url are complete Gateway request URLs supplied in private server config.
 # No default route, account identifier, provider fallback or automatic URL construction exists.
 # api_key_env = "AGENT_HISTORY_LOOP_LIVE_TOKEN"
-# api_key_file is an operator-managed token file, never a committed credential.
-# reasoning = "off"  # off, low, high or max; choose using the summary evaluation before enabling.
+# api_key_file is an operator-managed read-only token mount, never a committed credential.
+# For file-only binding keep a valid non-empty api_key_env selector. TOML has no null, and
+# an empty selector is rejected. A populated selected environment variable overrides the file:
+# the dedicated worker must omit/sanitise that variable and unrelated inference credentials.
+# For the default selector, ExecStart can use `env -u AGENT_HISTORY_LOOP_LIVE_TOKEN` before
+# `python -m agent_history.loop_live`; sanitise the indexer's environment too if it shares config.
+# Verify the effective LoopLive.token() source digest equals the mounted file digest without
+# logging either token. A file's presence alone does not prove this service's effective binding.
+# reasoning = "high"  # off, low, high or max; select by observed route evaluation before enabling.

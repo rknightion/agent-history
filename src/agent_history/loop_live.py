@@ -13,11 +13,10 @@ import json
 import math
 import os
 import re
-import shlex
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import PurePosixPath
 from typing import Any
@@ -25,6 +24,7 @@ from typing import Any
 import psycopg
 from psycopg.types.json import Jsonb
 
+from .common import _join_continuations
 from .config import ConfigError, LoopLive, load_config
 
 PHASES = ("preparing", "working", "reviewing", "gating", "landing", "waiting", "closing")
@@ -145,39 +145,188 @@ def _json(raw: Any) -> Any:
     return raw
 
 
-def append_event(command: str, cwd: str | None, report: str, at: datetime) -> dict | None:
-    """Project only a successful final simple append to this launch's exact recorded target.
+def _without_heredoc_bodies(command: str) -> str | None:
+    """Remove data before command tokenisation, consuming each complete delimiter word.
 
-    The caller proves success. No filesystem access, shell evaluation, state-file read or content
-    reconstruction is used. A preceding command invalidates relative cwd resolution.
+    Quote removal applies to the whole delimiter, including mixed quoted/unquoted fragments.
+    Refuse unsupported words rather than stripping a prefix and promoting their body to code.
+    No expansions or here-document bodies are evaluated.
     """
-    if any(c in command for c in ("$", "`")):
+    out, pending = [], []
+    quote, word_start = None, True
+    i, n = 0, len(command)
+    while i < n:
+        ch = command[i]
+        if ch == "\\" and quote != "'":
+            out.append(command[i : i + 2])
+            i += 2
+            word_start = False
+            continue
+        if quote:
+            if ch == quote:
+                quote = None
+        elif ch in "'\"":
+            quote = ch
+        elif ch == "#" and word_start:
+            end = command.find("\n", i)
+            end = n if end < 0 else end
+            out.append(command[i:end])
+            i = end
+            continue
+        elif command.startswith("<<<", i):
+            out.append("<<<")
+            i += 3
+            word_start = False
+            continue
+        elif command.startswith("<<", i):
+            j = i + 2
+            tabs = j < n and command[j] == "-"
+            j += int(tabs)
+            while j < n and command[j] in " \t":
+                j += 1
+            delimiter, quoted = [], None
+            while j < n:
+                c = command[j]
+                if c == "\\" and quoted != "'":
+                    if j + 1 >= n:
+                        return None
+                    following = command[j + 1]
+                    if quoted == '"' and following not in '$`"\\\n':
+                        delimiter.append("\\")
+                    delimiter.append(following)
+                    j += 2
+                    continue
+                if quoted:
+                    if c == quoted:
+                        quoted = None
+                    else:
+                        delimiter.append(c)
+                elif c in "'\"":
+                    quoted = c
+                elif c in " \t\r\n;&|()<>":
+                    break
+                else:
+                    delimiter.append(c)
+                j += 1
+            word = "".join(delimiter)
+            if quoted or not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", word) or len(pending) >= 64:
+                return None
+            pending.append((word, tabs))
+            out.append(command[i:j])
+            i = j
+            word_start = False
+            continue
+        elif ch == "\n" and pending:
+            out.append(ch)
+            i += 1
+            for delimiter, tabs in pending:
+                while i < n:
+                    end = command.find("\n", i)
+                    end = n if end < 0 else end
+                    line, i = command[i:end], min(end + 1, n)
+                    if (line.lstrip("\t") if tabs else line) == delimiter:
+                        break
+                else:
+                    return None
+            pending = []
+            word_start = True
+            continue
+        word_start = quote is None and ch in " \t\r\n;&|()<>"
+        out.append(ch)
+        i += 1
+    return None if pending else "".join(out)
+
+
+def _literal_commands(command: str) -> list[tuple[list[str], list[bool], str]] | None:
+    """Bounded top-level words, retaining quote/expansion provenance. Never evaluate shell.
+
+    Here-document bodies are data. Compounds, groups and substitutions are outside this grammar;
+    redirections make a word nonliteral. Quoted operators remain values, not separators.
+    """
+    if len(command) > 262144:
         return None
-    try:
-        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|<>()\n")
-        lexer.whitespace = " \t\r"
-        lexer.whitespace_split = True
-        tokens = list(lexer)
-    except ValueError:
+    text = _without_heredoc_bodies(_join_continuations(command))
+    if text is None:
         return None
-    if any(set(t) <= set(";&|<>()\n") and any(c in t for c in "&|<>()") for t in tokens):
+    segments, words, literals, buf = [], [], [], []
+    quote, literal, started = None, True, False
+
+    def word():
+        nonlocal buf, literal, started
+        if started:
+            words.append("".join(buf))
+            literals.append(literal)
+        buf, literal, started = [], True, False
+
+    def segment(op):
+        nonlocal words, literals
+        word()
+        if words:
+            segments.append((words, literals, op))
+        words, literals = [], []
+
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if ch == "\\" and quote != "'":
+            if i + 1 >= len(text):
+                return None
+            following = text[i + 1]
+            # Double-quoted backslashes escape only the shell's documented special characters.
+            if quote == '"' and following not in '$`"\\\n':
+                buf.append("\\")
+            buf.append(following)
+            started = True
+            i += 2
+            continue
+        if quote:
+            if ch == quote:
+                quote = None
+            else:
+                buf.append(ch)
+                if quote == '"' and ch in "$`":
+                    literal = False
+            i += 1
+            continue
+        if ch in "'\"":
+            quote, started = ch, True
+        elif ch == "#" and not started:
+            end = text.find("\n", i)
+            i = len(text) if end < 0 else end
+            continue
+        elif ch in " \t\r":
+            word()
+        elif ch in ";\n&|":
+            op = ch
+            if ch != "\n" and i + 1 < len(text) and text[i + 1] == ch:
+                op += ch
+                i += 1
+            if op == ";;":
+                return None
+            segment(";" if op == "\n" else op)
+        elif ch in "(){}":
+            return None
+        else:
+            buf.append(ch)
+            started = True
+            if ch in "$`*?[]<>" or ch == "~" and len(buf) == 1:
+                literal = False
+        i += 1
+        if len(segments) > 256 or len(words) > 8192:
+            return None
+    if quote:
         return None
-    if any(";;" in t and set(t) <= {";", "\n"} for t in tokens):
+    segment("")
+    if any(
+        words[0] in {"if", "then", "else", "fi", "for", "while", "until", "case", "function", "!"}
+        for words, _, _ in segments
+    ):
         return None
-    start = max((i + 1 for i, t in enumerate(tokens) if set(t) <= {";", "\n"}), default=0)
-    args = tokens[start:]
+    return segments
+
+
+def _append_fields(args: list[str], at: datetime) -> dict | None:
     if len(args) < 4 or PurePosixPath(args[0]).name != "loop-state" or args[1] != "append":
-        return None
-    path = args[2]
-    if any(c in path for c in "~*?[]") or (not os.path.isabs(path) and (start or not cwd)):
-        return None
-    path = os.path.normpath(os.path.join(cwd or "", path))
-    expected = (
-        PurePosixPath(report)
-        .with_name(PurePosixPath(report).name.replace("report-", "state-", 1))
-        .with_suffix(".jsonl")
-    )
-    if path != str(expected):
         return None
     ev = args[3]
     if ev not in {
@@ -185,6 +334,7 @@ def append_event(command: str, cwd: str | None, report: str, at: datetime) -> di
         "admit",
         "dispatch",
         "return",
+        "accept",
         "gate",
         "park",
         "land",
@@ -205,7 +355,7 @@ def append_event(command: str, cwd: str | None, report: str, at: datetime) -> di
         if "=" not in token:
             return None
         key, value = token.split("=", 1)
-        if key in fields:
+        if not key or key in fields or key in {"_source_call", "_source_order"}:
             return None
         parsed = _json(value)
         string_fields = {
@@ -230,6 +380,231 @@ def append_event(command: str, cwd: str | None, report: str, at: datetime) -> di
             else parsed
         )
     return fields
+
+
+def _append_target(path: str, cwd: str | None, report: str) -> bool | None:
+    if not os.path.isabs(path) and not cwd:
+        return None
+    expected = (
+        PurePosixPath(report)
+        .with_name(PurePosixPath(report).name.replace("report-", "state-", 1))
+        .with_suffix(".jsonl")
+    )
+    return os.path.normpath(os.path.join(cwd or "", path)) == str(expected)
+
+
+def append_event(command: str, cwd: str | None, report: str, at: datetime) -> dict | None:
+    """Compatibility seam: caller-proven successful final simple append, not a batch proof."""
+    parts = _literal_commands(command)
+    if not parts or any(op not in {";", ""} for _, _, op in parts):
+        return None
+    if any(not _command_properties(args, literals)[1] for args, literals, _ in parts[:-1]):
+        return None
+    args, literals, _ = parts[-1]
+    fields = _append_fields(args, at)
+    if (
+        fields is None
+        or not all(literals)
+        or _append_target(args[2], cwd if len(parts) == 1 else None, report) is not True
+    ):
+        return None
+    return fields
+
+
+def _command_properties(args: list[str], literals: list[bool]) -> tuple[str, bool, bool]:
+    """Syntactic role, known return-to-shell behaviour and known cwd preservation.
+
+    Opaque executable wrappers are not quoted data. Their possible mutations stay unknown;
+    they cannot supply writer receipts. No argument body is interpreted as an executed command.
+    """
+    index = 0
+    while index < len(args) and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", args[index]):
+        index += 1
+    if index == len(args):
+        return "opaque", False, False
+    name = PurePosixPath(args[index]).name if literals[index] else None
+    returns = name in {
+        "loop-state",
+        "git",
+        "backlog",
+        "python",
+        "python3",
+        "cat",
+        "echo",
+        "printf",
+        "true",
+        "false",
+        "cd",
+        "bash",
+        "sh",
+        "zsh",
+        "env",
+        "timeout",
+    }
+    if index == 0 and name == "loop-state" and len(args) > 1 and args[1] == "append":
+        return "append", returns, all(literals)
+    if index == 0 and all(literals):
+        if name in {"echo", "printf"}:
+            return "data", returns, True
+        if name in {"true", "false"} or name == "backlog" and args[1:3] in (["task", "edit"], ["task", "list"]):
+            return "status", returns, True
+        if name == "cd":
+            return "cwd", returns, False
+    return "opaque", returns, False
+
+
+def append_events(
+    command: str,
+    cwd: str | None,
+    report: str,
+    at: datetime,
+    output: str | None,
+    *,
+    successful: bool = True,
+    input_truncated: bool = False,
+    output_truncated: bool = False,
+    call_uid: str | None = None,
+) -> list[dict]:
+    """Attribute native seq receipts only to causally reached literal top-level appends.
+
+    Receipt cardinality alone proves neither reachability nor origin. Batches need unambiguous
+    writer receipts and unconditional execution. A terminal all-AND chain can additionally use
+    its successful shell status, but a later producer or early-exit/opaque prefix cannot prove
+    that a conditional writer ran. Opaque wrappers propagate uncertainty, never known zero.
+    """
+    parts = _literal_commands(command) if not input_truncated else None
+    if parts is None:
+        return [{"ev": "uncertain", "at": at}]
+    properties = [_command_properties(args, literals) for args, literals, _ in parts]
+    candidate_count = sum(kind == "append" for kind, _, _ in properties)
+    receipt_lines = [line for line in (output or "").splitlines() if line.startswith("seq=")]
+    receipts = [re.fullmatch(r"seq=([1-9][0-9]{0,18})", line) for line in receipt_lines]
+    seqs = [int(m[1]) for m in receipts if m is not None]
+    complete_receipts = (
+        successful
+        and not output_truncated
+        and all(receipts)
+        and len(seqs) == candidate_count
+        and all(a < b for a, b in zip(seqs, seqs[1:]))
+    )
+    unique_receipts = all(kind in {"append", "status"} for kind, _, _ in properties)
+    # Only the final list item sets successful shell status. No OR, pipeline, background or
+    # possibly terminating prefix may use that status to claim an earlier conditional ran.
+    final_start = max((i + 1 for i, (_, _, op) in enumerate(parts[:-1]) if op in {";", "&"}), default=0)
+    terminal_chain = (
+        bool(parts)
+        and properties[-1][0] == "append"
+        and parts[-1][2] in {"", ";"}
+        and all(op == "&&" for _, _, op in parts[final_start:-1])
+        and all(returns for _, returns, _ in properties)
+    )
+    events = []
+    receipt_index = 0
+    prior_returns = True
+    previous = ""
+    for i, ((args, literals, op), (kind, returns, preserves_cwd)) in enumerate(zip(parts, properties)):
+        first_event = len(events)
+        if kind == "append":
+            fields = _append_fields(args, at)
+            target = _append_target(args[2], cwd, report) if len(args) > 2 and literals[2] else None
+            terminal_proof = terminal_chain and i >= final_start
+            unconditional = prior_returns and previous in {"", ";"} and op in {"", ";", "&&"}
+            if target is not False:
+                if (
+                    complete_receipts
+                    and fields is not None
+                    and all(literals)
+                    and target
+                    and (terminal_proof or unconditional and unique_receipts)
+                ):
+                    events.append({**fields, "seq": seqs[receipt_index]})
+                else:
+                    uncertainty = {"ev": "uncertain", "at": at}
+                    if fields is not None:
+                        uncertainty["for_ev"] = fields["ev"]
+                        if all(ok for word, ok in zip(args, literals) if word.startswith("task=")):
+                            uncertainty["task"] = fields.get("task")
+                    events.append(uncertainty)
+            receipt_index += 1
+        elif kind == "opaque":
+            events.append({"ev": "uncertain", "at": at})
+        if not preserves_cwd:
+            cwd = None
+        if call_uid is not None:
+            for e in events[first_event:]:
+                e["_source_call"] = call_uid
+                e["_source_order"] = i
+        prior_returns = prior_returns and returns
+        previous = op
+    return events
+
+
+def watch_events(records: list[tuple], hooks: list[tuple], start: datetime, end: datetime | None) -> list[dict]:
+    """Read native accepted watch ids and terminal observations, not WATCH prose as a start.
+
+    Native deadline_s is a duration. Its call-entry expiry bound is explicitly derived, never
+    labelled a native deadline or an OS process-start timestamp. Wake is activity, not heartbeat.
+    """
+    events, watches = [], {}
+    for session, name, raw, result, at, accepted_at in records:
+        args, value = _json(raw), _json(result)
+        if not isinstance(args, dict) or not isinstance(value, dict) or at is None or accepted_at is None:
+            if name == "watch_start" and accepted_at is not None:
+                events.append({"ev": "uncertain", "for_ev": "watch", "at": accepted_at})
+            continue
+        uid = value.get("id")
+        if not isinstance(uid, str) or not uid:
+            if name == "watch_start":
+                events.append({"ev": "uncertain", "for_ev": "watch", "at": accepted_at})
+            continue
+        key = f"{session}:{uid}"
+        if name == "watch_start":
+            seconds = args.get("deadline_s")
+            if type(seconds) not in (int, float) or not 0 < seconds <= 86400 or not math.isfinite(seconds):
+                events.append({"ev": "uncertain", "for_ev": "watch", "at": accepted_at})
+                continue
+            if key in watches:  # conflicting registrations never select one by proximity
+                watches[key] = None
+                events.append({"ev": "uncertain", "for_ev": "watch", "at": accepted_at})
+                continue
+            watches[key] = {
+                "ev": "watch",
+                "op": "start",
+                "what": key,
+                "at": at,
+                "deadline": _iso(at + timedelta(seconds=seconds)),
+                "deadline_basis": "call_entry_plus_deadline_s",
+            }
+    events[:0] = [e for e in watches.values() if e is not None]
+    for session, at, text, detail in hooks:
+        detail = detail if isinstance(detail, dict) else {}
+        source = detail.get("source")
+        value = detail.get("details") or _json(text)
+        if isinstance(value, dict) and value.get("op") in ("start", "stop") and isinstance(value.get("what"), str):
+            events.append({**value, "ev": "watch", "at": at})
+        elif source == "loop-heartbeat":
+            recorded = _timestamp(value.get("at")) if isinstance(value, dict) else None
+            if recorded and recorded >= start and (end is None or recorded < end):
+                events.append({"ev": "heartbeat", "at": recorded})
+        elif source == "loop-wake" and isinstance(value, dict) and isinstance(value.get("id"), str):
+            events.append({"ev": "wake", "at": at})
+        elif source == "loop-watch":
+            uid = value.get("id") if isinstance(value, dict) else None
+            receipt = value.get("receipt") if isinstance(value, dict) else None
+            terminal = isinstance(receipt, dict) and receipt.get("phase") in {"done", "failed"}
+            # The parser omits oversized details, but retains this complete native terminal text.
+            # No label, command or timing is reconstructed from it.
+            if not value and isinstance(text, str):
+                match = re.fullmatch(
+                    r"WATCH ([^\s]+) \(.*\): phase=(done|failed) exit_code=(?:-?[0-9]+|null|None) deadline_hit=(?:true|false)",
+                    text,
+                )
+                if match:
+                    uid, terminal = match[1], True
+            key = f"{session}:{uid}"
+            if terminal and watches.get(key) is not None and key in watches and at >= watches[key]["at"]:
+                events.append({"ev": "watch", "op": "stop", "what": key, "at": at})
+    return events
 
 
 def _role(agent: str | None) -> str:
@@ -281,11 +656,14 @@ def hybrid_decide(state: dict, answers: dict[str, float]) -> str:
 def project(events: list[dict], now: datetime, answers: dict[str, float] | None = None) -> dict:
     """Unknown fields stay NULL; counts establish zero only with an observed open event."""
     events = sorted(events, key=lambda e: e["at"])
+    uncertain = [e for e in events if e["ev"] == "uncertain"]
+    events = [e for e in events if e["ev"] != "uncertain"]
     fields: dict[str, Any] = dict.fromkeys(STRUCTURED)
     live: dict[str, dict] = {}
     dispatches = []
     opened = False
     gates, parks, lands, notes = [], [], [], []
+    snapshots: dict[str, dict] = {}
     watches: dict[str, dict] = {}
     activity = []
     heartbeat_at = None
@@ -308,13 +686,16 @@ def project(events: list[dict], now: datetime, answers: dict[str, float] | None 
             live.pop(e.get("run") or e.get("lane"), None)
         elif ev == "gate":
             gates.append(e)
+            snapshots[ev] = e
         elif ev == "park":
             parks.append(e)
+            snapshots[ev] = e
         elif ev == "land":
             lands.append(e)
         elif ev == "judgement":
             if isinstance(e.get("text"), str):
                 notes.append(e)
+                snapshots[ev] = e
         elif ev == "watch" and isinstance(e.get("what"), str):
             if e.get("op") == "start":
                 watches[e["what"]] = e
@@ -322,6 +703,7 @@ def project(events: list[dict], now: datetime, answers: dict[str, float] | None 
                 watches.pop(e["what"], None)
         elif ev == "ops" and isinstance(e.get("ops_state"), dict):
             fields["ops_state"] = e["ops_state"]
+            snapshots[ev] = e
     minutes = lambda at: max(0, (now - at).total_seconds() / 60)
     quiet = minutes(max(activity)) if activity else 0
     bucket = (
@@ -369,7 +751,7 @@ def project(events: list[dict], now: datetime, answers: dict[str, float] | None 
         "park_events_so_far": len(parks) if parks or opened else None,
         "watch_active": active_watch,
     }
-    if events:
+    if events and (opened or dispatches or active_watch or state["close_recorded"]):
         fields["live_phase"] = hybrid_decide(state, answers or {})
     if dispatches or opened:
         fields["active_lanes"] = [
@@ -391,11 +773,47 @@ def project(events: list[dict], now: datetime, answers: dict[str, float] | None 
         e = parks[-1]
         fields["last_park"] = {key: e.get(key) for key in ("task", "needs", "reason")}
     for key, ev in (("tasks_admitted", "admit"), ("tasks_landed", "land")):
-        tasks = {e["task"] for e in events if e["ev"] == ev and isinstance(e.get("task"), str)}
-        fields[key] = len(tasks) if tasks or opened else None
+        tasks = {e["task"] for e in events if e["ev"] == ev and isinstance(e.get("task"), str) and e["task"]}
+        unknown = any(
+            e.get("for_ev") in (None, ev) and (not e.get("task") or e["task"] not in tasks) for e in uncertain
+        )
+        fields[key] = None if unknown else len(tasks) if tasks or opened else None
     if notes:
         fields["last_judgement"] = notes[-1]["text"][:500]
         fields["last_judgement_at"] = _iso(notes[-1]["at"])
+    for key, kinds in {
+        "active_lanes": {"dispatch", "return"},
+        "parks_total": {"park"},
+        "last_park": {"park"},
+        "last_gate": {"gate"},
+        "last_judgement": {"judgement"},
+        "last_judgement_at": {"judgement"},
+        "ops_state": {"ops"},
+    }.items():
+        known = snapshots.get(next(iter(kinds))) if key not in {"active_lanes", "parks_total"} else None
+
+        # A later proven snapshot can supersede earlier uncertainty, but never repair a total.
+        # Equal timestamps alone cannot order calls; only an exact caller-recorded call id and
+        # the parsed command order can establish ordering within the same captured invocation.
+        def before_known(e):
+            return known is not None and (
+                e["at"] < known["at"]
+                or e["at"] == known["at"]
+                and e.get("_source_call") is not None
+                and e.get("_source_call") == known.get("_source_call")
+                and e.get("_source_order", 0) < known.get("_source_order", 0)
+            )
+
+        if any((e.get("for_ev") is None or e.get("for_ev") in kinds) and not before_known(e) for e in uncertain):
+            fields[key] = None
+    if (
+        any(e.get("for_ev") in (None, "dispatch", "return", "close", "watch") for e in uncertain)
+        and not active_watch
+        and not state["close_recorded"]
+    ):
+        fields["live_phase"] = None
+    # The classifier's alias must not turn an uncertain cumulative count back into exact zero.
+    state["park_events_so_far"] = fields["parks_total"]
     fields["phase_input"] = state
     fields["evidence_at"] = _iso(max(activity)) if activity else None
     fields["close_recorded"] = state["close_recorded"]
@@ -788,32 +1206,53 @@ def _events(
     if not roots:
         return []
     events = []
-    for raw, cwd, at in conn.execute(
-        "SELECT i.input_text,s.cwd,t.ended_at FROM ah.tool_io i JOIN ah.tool_call t USING(agent,call_uid) "
+    for raw, cwd, at, output, outcome, input_truncated, output_truncated, call_uid in conn.execute(
+        "SELECT i.input_text,s.cwd,t.ended_at,i.output_text,t.outcome,i.input_truncated,i.output_truncated,i.call_uid "
+        "FROM ah.tool_io i JOIN ah.tool_call t USING(agent,call_uid) "
         "JOIN ah.session s ON s.id=i.session_id WHERE i.session_id=ANY(%s) AND lower(i.tool_name)='bash' "
-        "AND t.outcome='ok' AND t.ended_at IS NOT NULL AND NOT COALESCE(i.input_truncated,false) "
-        "AND i.ts >= %s AND (%s::timestamptz IS NULL OR i.ts < %s) ORDER BY i.ts,i.id",
+        "AND t.ended_at IS NOT NULL AND t.started_at >= %s "
+        "AND (%s::timestamptz IS NULL OR t.ended_at < %s) ORDER BY t.ended_at,i.id",
         (roots, start, end, end),
     ):
         args = _json(raw)
         command = args.get("command") if isinstance(args, dict) else None
         if isinstance(command, str):
-            parsed = append_event(command, cwd, report, at)
-            if parsed:
-                events.append(parsed)
-    # Frozen structured watch/heartbeat payloads, not inferred prose about watching or waking.
-    for at, text, detail in conn.execute(
-        "SELECT ts,text,detail FROM ah.message WHERE session_id=ANY(%s) "
-        "AND detail->>'source' IN ('loop-watch','loop-wake','loop-heartbeat') "
-        "AND ts >= %s AND (%s::timestamptz IS NULL OR ts < %s) ORDER BY ts,id",
-        (roots, start, end, end),
-    ):
-        value = (detail or {}).get("details") or _json(text)
-        if isinstance(value, dict):
-            if value.get("op") in ("start", "stop") and isinstance(value.get("what"), str):
-                events.append({**value, "ev": "watch", "at": at})
-            elif value.get("ev") == "heartbeat" or (detail or {}).get("source") == "loop-heartbeat":
-                events.append({"ev": "heartbeat", "at": at})
+            events.extend(
+                append_events(
+                    command,
+                    cwd,
+                    report,
+                    at,
+                    output,
+                    successful=outcome == "ok",
+                    input_truncated=bool(input_truncated),
+                    output_truncated=bool(output_truncated),
+                    call_uid=call_uid,
+                )
+            )
+        elif input_truncated:
+            events.append({"ev": "uncertain", "at": at})
+    watch_records = list(
+        conn.execute(
+            "SELECT i.session_id,i.tool_name, "
+            "CASE WHEN COALESCE(i.input_truncated,false) OR COALESCE(i.output_truncated,false) THEN NULL ELSE i.input_text END, "
+            "CASE WHEN COALESCE(i.input_truncated,false) OR COALESCE(i.output_truncated,false) THEN NULL ELSE i.result_json END, "
+            "t.started_at,t.ended_at "
+            "FROM ah.tool_io i JOIN ah.tool_call t USING(agent,call_uid) WHERE i.session_id=ANY(%s) "
+            "AND i.tool_name='watch_start' AND t.outcome='ok' "
+            "AND t.started_at >= %s AND (%s::timestamptz IS NULL OR t.ended_at < %s) ORDER BY t.started_at,i.id",
+            (roots, start, end, end),
+        )
+    )
+    hooks = list(
+        conn.execute(
+            "SELECT session_id,ts,text,detail FROM ah.message WHERE session_id=ANY(%s) "
+            "AND detail->>'source' IN ('loop-watch','loop-wake','loop-heartbeat') "
+            "AND ts >= %s AND (%s::timestamptz IS NULL OR ts < %s) ORDER BY ts,id",
+            (roots, start, end, end),
+        )
+    )
+    events.extend(watch_events(watch_records, hooks, start, end))
     recorded_runs = {e.get("run") for e in events if e["ev"] == "dispatch"}
     aliases = {}
     for uid, workflow, at, agent, lane, completed, status, raw in conn.execute(

@@ -79,7 +79,7 @@ def transcript(tmp_path):
         },
     ]
 
-    def append(command, ok=True, tool="bash", details=None):
+    def append(command, ok=True, tool="bash", details=None, output="synthetic result"):
         n = len(records)
         ts = (at + timedelta(seconds=n)).isoformat()
         call = f"call-{n}"
@@ -109,18 +109,34 @@ def transcript(tmp_path):
                     "toolCallId": call,
                     "toolName": tool,
                     "isError": not ok,
-                    "content": [{"type": "text", "text": "synthetic result"}],
+                    "content": [{"type": "text", "text": output}],
                     "details": details or {"exitCode": 0 if ok else 1},
                 },
             }
         )
         path.write_text("".join(json.dumps(row) + "\n" for row in records))
 
+    sequence = 0
+
     def state(ev, fields="", ok=True):
-        append(f"loop-state append codex/state-synthetic-loop1.jsonl {ev} {fields}", ok=ok)
+        nonlocal sequence
+        sequence += 1
+        # Native seq receipts are the per-append proof, not a successful enclosing shell alone.
+        append(
+            f"loop-state append codex/state-synthetic-loop1.jsonl {ev} {fields}",
+            ok=ok,
+            output=f"seq={sequence}\n" if ok else "synthetic failure",
+        )
 
     state("open")
-    return {"sources": {"pi-test": source}, "append": append, "state": state, "records": records, "at": at}
+    return {
+        "sources": {"pi-test": source},
+        "append": append,
+        "state": state,
+        "records": records,
+        "at": at,
+        "path": path,
+    }
 
 
 def refresh(conn, transcript):
@@ -232,10 +248,11 @@ def test_real_collector_structure_summary_history_and_failed_call(clean, transcr
         (psycopg.types.json.Jsonb(fake_infer(live_config, "jev", {})),),
     )
     clean.commit()
-    # A failed recorded append is not structured evidence.
+    # Failed appends do not prove an event or an exact zero. A subsequent receipt for the
+    # same task resolves this distinct-task uncertainty, without counting the failed call.
     transcript["state"]("land", "task=TASK-1", ok=False)
     refresh(clean, transcript)
-    assert clean.execute("SELECT tasks_landed FROM ah.loops").fetchone()[0] == 0
+    assert clean.execute("SELECT tasks_landed FROM ah.loops").fetchone()[0] is None
     transcript["state"]("land", "task=TASK-1")
     refresh(clean, transcript)
     clean.commit()
@@ -361,6 +378,119 @@ def test_spawn_and_append_exact_run_dedup_title_and_return(clean, transcript, li
     transcript["state"]("return", "run=synthetic-review")
     refresh(clean, transcript)
     assert clean.execute("SELECT active_lanes FROM ah.loops").fetchone()[0] == []
+
+
+def test_native_batch_watch_and_frozen_parser_spawn_rows_at_catalogue_surface(clean, transcript, live_config):
+    # Default-async parsing is owned and independently proved upstream. Here its frozen
+    # canonical row interface is supplied explicitly; no parser patch or OS start is inferred.
+    n = len(transcript["records"])
+    call_uid = f"call-{n}"
+    transcript["append"](
+        {"agent": "complex-worker", "task": "Lane: BUILD · Task: TASK-1 (Repair synthetic gate)"},
+        tool="subagent",
+        details={"mode": "single", "runId": "native-run", "asyncId": "native-run", "results": []},
+    )
+    # Preserve the distinction between message generation, entry dispatch and accepted result.
+    entry = datetime.fromisoformat(transcript["records"][-2]["timestamp"])
+    transcript["records"][-2]["message"]["timestamp"] = int((entry - timedelta(seconds=6)).timestamp() * 1000)
+    transcript["records"][-1]["timestamp"] = (entry + timedelta(milliseconds=139)).isoformat()
+    transcript["path"].write_text("".join(json.dumps(r) + "\n" for r in transcript["records"]))
+    transcript["append"](
+        "loop-state append codex/state-synthetic-loop1.jsonl admit task=TASK-1; "
+        "loop-state append codex/state-synthetic-loop1.jsonl admit task=TASK-2; backlog task list --plain",
+        output="seq=12\nseq=13\nSynthetic list",
+    )
+    transcript["append"](
+        'loop-state append codex/state-synthetic-loop1.jsonl gate scope=composed exit=1 cmd="build && check"; '
+        "loop-state append codex/state-synthetic-loop1.jsonl judgement 'text=Check the unchanged candidate.'",
+        output="seq=14\nseq=15\n",
+    )
+    transcript["append"](
+        {"command": "synthetic gate", "deadline_s": 600, "interval_s": 60, "label": "Gate proof"},
+        tool="watch_start",
+        details={"id": "native-watch"},
+    )
+    uid, phase, _, _ = refresh(clean, transcript)
+    assert phase == "gating"
+    # Row fields match the independently frozen PI prerequisite: call-id, workflow id and
+    # recorded dispatch-entry timestamp. This is not a claim that the base parser emits it.
+    clean.execute(
+        "INSERT INTO ah.subagent_spawn(agent,spawn_uid,parent_session_id,spawned_at,requested_type,requested_type_source,launch_status,workflow_id,source_id,byte_offset) "
+        "SELECT 'pi',%s,t.session_id,t.started_at,'complex-worker','explicit','launched','native-run',t.source_id,t.byte_offset "
+        "FROM ah.tool_call t WHERE t.call_uid=%s",
+        (call_uid, call_uid),
+    )
+    loop_live.refresh(clean)
+    fields = clean.execute(
+        "SELECT active_lanes,tasks_admitted,tasks_landed,last_gate,last_judgement FROM ah.loops"
+    ).fetchone()
+    assert fields[0] == [
+        {
+            "lane": "BUILD",
+            "task": "TASK-1",
+            "title": "Repair synthetic gate",
+            "agent": "complex-worker",
+            "started_at": entry.isoformat(),
+        }
+    ]
+    assert fields[1:3] == (2, 0)
+    assert fields[3]["exit"] == 1
+    assert fields[4] == "Check the unchanged candidate."
+    # Truncated successful registrations cannot be discarded as if no watcher existed.
+    clean.execute("UPDATE ah.tool_io SET output_truncated=true WHERE tool_name='watch_start'")
+    loop_live.refresh(clean)
+    assert clean.execute("SELECT live_phase,tasks_admitted FROM ah.loops").fetchone() == (None, 2)
+    clean.execute("UPDATE ah.tool_io SET output_truncated=false WHERE tool_name='watch_start'")
+    loop_live.refresh(clean)
+    assert clean.execute("SELECT live_phase FROM ah.loops").fetchone()[0] == "gating"
+    at = transcript["at"] + timedelta(seconds=len(transcript["records"]) + 1)
+    transcript["records"].append(
+        {
+            "type": "custom_message",
+            "id": "terminal",
+            "timestamp": at.isoformat(),
+            "customType": "loop-watch",
+            "content": "WATCH native-watch (Gate proof): phase=failed exit_code=1 deadline_hit=false",
+            "details": {
+                "id": "native-watch",
+                "receipt": {
+                    "phase": "failed",
+                    "observations": 1,
+                    "last_observed_at": (at - timedelta(seconds=3)).isoformat(),
+                    "deadline": (at + timedelta(minutes=9)).isoformat(),
+                    "result": {"exit_code": 1, "deadline_hit": False, "signal": None},
+                    "pid": 123,
+                    "command": "synthetic " * 250,
+                    "interval_s": 60,
+                    "label": "Gate proof",
+                    "tail": [],
+                },
+            },
+        }
+    )
+    transcript["records"].append(
+        {
+            "type": "custom_message",
+            "id": "wake",
+            "timestamp": (at + timedelta(seconds=1)).isoformat(),
+            "customType": "loop-wake",
+            "content": "WAKE timer-one: Backstop",
+            "details": {"id": "timer-one", "reason": "Backstop"},
+        }
+    )
+    transcript["path"].write_text("".join(json.dumps(r) + "\n" for r in transcript["records"]))
+    assert refresh(clean, transcript)[1] == "working"
+    target = clean.execute(
+        "SELECT id,root_session_id,launch_ts,report_path FROM ah.loop_run WHERE launch_uid=%s", (uid,)
+    ).fetchone()
+    events = loop_live._events(clean, target[0], target[1], target[2], None, target[3])
+    assert any(e["ev"] == "wake" for e in events)
+    assert not any(e["ev"] == "heartbeat" for e in events)
+    assert any(e.get("op") == "stop" and e["at"] == at for e in events)
+    assert (
+        clean.execute("SELECT detail ? 'details' FROM ah.message WHERE event_uid LIKE '%%:terminal'").fetchone()[0]
+        is False
+    )
 
 
 @pytest.mark.skipif(not scratch_database(ADMIN_DSN), reason="disposable admin database DSN required for role proof")
