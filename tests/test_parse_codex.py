@@ -8,10 +8,11 @@ import shutil
 from pathlib import Path
 
 import pytest
+from test_structure_pg import DSN, conn, db  # noqa: F401 (existing disposable database fixtures)
 
 from agent_history.memstore import MemStore, run_file
-from agent_history.model import FileContext, SessionKey
-from agent_history.parse_codex import CodexParser
+from agent_history.model import FileContext, LinePos, PARSER_VERSION_CODEX, SessionKey
+from agent_history.parse_codex import CodexParser, RECENT_CALLS
 
 FIX = Path(__file__).parent / "fixtures" / "codex"
 P = "11111111-1111-4111-8111-111111111111"
@@ -240,6 +241,195 @@ def test_nullable_telemetry_resume_each_boundary(batch):
         end, saved = run_file(CodexParser, c, store, stop_after_lines=cut, batch_lines=batch)
         run_file(CodexParser, c, store, start=end, state=saved, line_base=cut, batch_lines=batch)
         assert snapshot(store) == snapshot(whole), cut
+
+
+# --- HookPrompt retention and recognised repeat outputs -----------------------------------------
+
+
+HOOK_REPEAT = "hook_repeat_outputs.jsonl"
+HOOK_THREAD = "88888888-8888-4888-8888-888888888888"
+
+
+def hook_repeat_records():
+    return [json.loads(line) for line in (FIX / HOOK_REPEAT).read_text().splitlines()]
+
+
+@pytest.mark.parametrize("ordinals", [True, False])
+def test_hookprompt_lossless_fragments_and_identity(tmp_path, ordinals):
+    records = hook_repeat_records()
+    if not ordinals:
+        for record in records:
+            record.pop("ordinal")
+    raw_lines = [(json.dumps(record, ensure_ascii=False) + "\n").encode() for record in records]
+    path = tmp_path / HOOK_REPEAT
+    path.write_bytes(b"".join(raw_lines))
+    store, _ = load(path.name, path=path)
+    hooks = by(store, "message", message_class="hook_output")
+    expected = [(0, "Synthetic hook output.\n"), (1, "  Second fragment Ω.  "),
+                (2, " \n\t"), (3, ""), (9, "Final fragment.")]
+    offset = sum(map(len, raw_lines[:2]))
+    uid = f"{HOOK_THREAD}:2" if ordinals else f"{HOOK_THREAD}:o{offset}"
+    assert [(row["event_uid"], row["text"]) for row in hooks[:5]] == [
+        (f"{uid}:{index}", text) for index, text in expected]
+    assert len(hooks) == 6
+    for row, (index, text) in zip(hooks, expected):
+        assert row["role"] == "system"
+        assert row["session"] == SessionKey("codex", HOOK_THREAD)
+        assert (row["byte_offset"], row["byte_length"], row["line_number"]) == (offset, len(raw_lines[2]), 3)
+        assert row["turn_key"] == "synthetic-turn"
+        assert row["detail"]["source"] == "HookPrompt"
+        assert row["detail"]["fragment_index"] == index
+    assert hooks[-1]["text"] == "Hook without item id."
+    assert not by(store, "message", message_class="human_prompt")
+    assert not by(store, "message", message_class="context_injection")
+    assert not [issue for issue in store.issues if issue.kind == "unknown_type"]
+    assert one(store, "session")["inherited_skipped"] == 1
+    assert one(store, "session")["first_human_at"] is None
+
+
+@pytest.mark.parametrize("fragments", [None, {}, "invalid", [], [None, {}, {"text": False}]])
+def test_hookprompt_invalid_fragments_do_not_fabricate_text(tmp_path, fragments):
+    records = hook_repeat_records()[:3]
+    records[2]["payload"]["item"]["fragments"] = fragments
+    store = load_records(tmp_path, records)
+    assert not store.rows("message")
+    assert not store.issues
+
+
+def test_recognised_repeat_outputs_preserve_io_and_first_outcome():
+    # Observe emitted rows as well as merged rows: identical repeat I/O must not be dropped.
+    parser = CodexParser(ctx(FIX / HOOK_REPEAT), {})
+    rows = []
+    offset = 0
+    for number, raw in enumerate((FIX / HOOK_REPEAT).read_bytes().splitlines(keepends=True), 1):
+        rows.extend(parser.line(json.loads(raw), LinePos(offset, len(raw), number)))
+        offset += len(raw)
+    rows.extend(parser.flush())
+    outputs = [row for row in rows if row.TABLE == "tool_io" and row.output_text is not None]
+    assert [(row.io_uid, row.output_text) for row in outputs] == [
+        ("synthetic-custom", "Synthetic first output."),
+        ("synthetic-custom", "Synthetic first output."),
+        ("synthetic-custom", "Script failed: synthetic repeat."),
+        ("synthetic-function", "aborted by user: synthetic first result"),
+        ("synthetic-function", "Synthetic function repeat.\nSecond output part."),
+        ("synthetic-unknown", "Unknown output still retained."),
+        ("synthetic-unknown", "Repeated unknown output still retained."),
+    ]
+    completions = [row for row in rows if row.TABLE == "tool_call" and row.ended_at is not None]
+    assert [(row.call_uid, row.outcome, row.duration_ms) for row in completions] == [
+        ("synthetic-custom", "ok", 1000), ("synthetic-function", "interrupted", 1000)]
+    issues = [row for row in rows if row.TABLE == "parse_issue" and row.kind == "orphan_output"]
+    assert [issue.line_number for issue in issues] == [13, 14]
+    store, state = load(HOOK_REPEAT)
+    assert one(store, "tool_io", io_uid="synthetic-custom")["output_text"] == "Script failed: synthetic repeat."
+    assert one(store, "tool_call", call_uid="synthetic-custom")["outcome"] == "ok"
+    assert one(store, "tool_call", call_uid="synthetic-function")["outcome"] == "interrupted"
+    assert state["calls"] == {}
+    assert state["rc"] == ["synthetic-custom", "synthetic-function"]
+
+
+@pytest.mark.parametrize("batch", [1, 2, 7])
+def test_hook_repeat_batch_and_serialised_resume_every_boundary(batch):
+    whole, state = load(HOOK_REPEAT)
+    # Parity alone could bless identical omissions; first prove the requested surface exists.
+    assert len(by(whole, "message", message_class="hook_output")) == 6
+    assert [issue.line_number for issue in whole.issues] == [13, 14]
+    parts, parts_state = load(HOOK_REPEAT, batch_lines=batch)
+    assert snapshot(parts) == snapshot(whole)
+    assert parts_state == state
+    c = ctx(FIX / HOOK_REPEAT)
+    for cut in range(1, len(hook_repeat_records())):
+        store = MemStore()
+        end, saved = run_file(CodexParser, c, store, stop_after_lines=cut, batch_lines=batch)
+        saved = json.loads(json.dumps(saved))
+        _, resumed = run_file(CodexParser, c, store, start=end, state=saved, line_base=cut, batch_lines=batch)
+        assert snapshot(store) == snapshot(whole), cut
+        assert resumed == state, cut
+
+
+def test_recognised_repeat_state_bound_and_evicted_outputs_remain_orphan(tmp_path):
+    records = hook_repeat_records()[:1]
+    for index in range(RECENT_CALLS + 2):
+        call_id = f"synthetic-bounded-{index}"
+        records.extend([
+            {"type": "response_item", "payload": {"type": "custom_tool_call", "call_id": call_id,
+                                                     "name": "exec", "input": "Synthetic input."}},
+            {"type": "response_item", "payload": {"type": "custom_tool_call_output", "call_id": call_id,
+                                                     "output": "Synthetic output."}},
+        ])
+    for call_id in ("synthetic-bounded-0", "synthetic-bounded-0", f"synthetic-bounded-{RECENT_CALLS + 1}"):
+        records.append({"type": "response_item", "payload": {"type": "custom_tool_call_output",
+                        "call_id": call_id, "output": "Synthetic repeat."}})
+    for ordinal, record in enumerate(records):
+        record.update(ordinal=ordinal, timestamp="2026-10-01T10:00:00Z")
+    store = load_records(tmp_path, records)
+    assert [issue.line_number for issue in store.issues] == [len(records) - 2, len(records) - 1]
+    _, state = load("telemetry.jsonl", path=tmp_path / "telemetry.jsonl", batch_lines=1)
+    assert state["rc"] == [f"synthetic-bounded-{index}" for index in range(2, RECENT_CALLS + 2)]
+    assert len(state["rc"]) == RECENT_CALLS
+    assert state["calls"] == {} and state["xc"] == {}
+
+
+def test_hook_repeat_parser_version_requires_retained_reparse():
+    assert PARSER_VERSION_CODEX == "10"
+
+
+@pytest.mark.pg
+@pytest.mark.skipif(not DSN or "agent_history_test" not in DSN,
+                    reason="AGENT_HISTORY_TEST_DSN (a *_test database) not set")
+@pytest.mark.parametrize("count", [10, 12, 103, 1003])
+@pytest.mark.parametrize("ordinals", [True, False])
+def test_hookprompt_catalogue_sequence_preserves_source_order(db, tmp_path, count, ordinals):  # noqa: F811
+    from agent_history import load as loader
+
+    records = hook_repeat_records()[:3]
+    fragments = [{"text": f"Synthetic fragment {index} Ω.\n"} for index in range(count)]
+    # Invalid entries still occupy their original positions. Valid empty/whitespace strings
+    # must survive both the writer and the public timeline, not just parser emission order.
+    for index in (2, 10, 100):
+        if index < count:
+            fragments[index] = {"text": None}
+    fragments[1] = {"text": " \n\t"}
+    if count > 11:
+        fragments[11] = {"text": ""}
+    records[2]["payload"]["item"]["fragments"] = fragments
+    if not ordinals:
+        for record in records:
+            record.pop("ordinal")
+    lines = [(json.dumps(record, ensure_ascii=False) + "\n").encode() for record in records]
+    hot, cold = tmp_path / "hot", tmp_path / "cold"
+    path = hot / "codex-local" / "sessions" / "synthetic-hook-order.jsonl"
+    path.parent.mkdir(parents=True)
+    cold.mkdir()
+    path.write_bytes(b"".join(lines[:2]))
+    first = loader.refresh(db, hot, cold, textfile=None, log=lambda *_: None)
+    assert first.errors == 0 and first.files_parsed == 1
+    with path.open("ab") as handle:
+        handle.write(lines[2])
+    resumed = loader.refresh(db, hot, cold, textfile=None, log=lambda *_: None)
+    assert resumed.errors == 0 and resumed.files_parsed == 1
+
+    # refresh uses the real Writer and production SEQ_SQL post-pass. The public catalogue
+    # function orders by stored seq, so a textual index tie-break (1,10,11,2) fails here.
+    timeline = db.execute(
+        "SELECT uid, text, seq FROM ah.session_events('codex', %s, '', 0, %s) "
+        "WHERE message_class = 'hook_output' ORDER BY seq", (HOOK_THREAD, count + 10)).fetchall()
+    expected = [(index, fragment["text"]) for index, fragment in enumerate(fragments)
+                if isinstance(fragment.get("text"), str)]
+    assert [text for _, text, _ in timeline] == [text for _, text in expected]
+    provenance = db.execute(
+        "SELECT (detail->>'fragment_index')::int, text, event_uid, byte_offset "
+        "FROM ah.message WHERE message_class = 'hook_output' ORDER BY seq").fetchall()
+    assert [(index, text) for index, text, _, _ in provenance] == expected
+    assert [uid for _, _, uid, _ in provenance] == [uid for uid, _, _ in timeline]
+    assert all(offset == sum(map(len, lines[:2])) for _, _, _, offset in provenance)
+    assert len({uid for uid, _, _ in timeline}) == len(expected)
+    assert all(seq is not None for _, _, seq in timeline)
+    again = loader.refresh(db, hot, cold, textfile=None, log=lambda *_: None)
+    assert again.errors == 0 and again.files_parsed == 0
+    assert db.execute(
+        "SELECT uid, text, seq FROM ah.session_events('codex', %s, '', 0, %s) "
+        "WHERE message_class = 'hook_output' ORDER BY seq", (HOOK_THREAD, count + 10)).fetchall() == timeline
 
 
 # --- session identity --------------------------------------------------------------------------

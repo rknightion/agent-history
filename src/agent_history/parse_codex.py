@@ -165,7 +165,7 @@ KNOWN_EVENT = {"token_count", "item_completed", "item_started", "task_started", 
                "thread_rolled_back"}
 KNOWN_ITEMS = {"Reasoning", "CommandExecution", "AgentMessage", "FileChange", "SubAgentActivity",
                "CollabAgentToolCall", "McpToolCall", "ContextCompaction", "UserMessage", "Extension",
-               "ImageView", "WebSearch"}
+               "ImageView", "WebSearch", "HookPrompt"}
 OP_ITEMS = {"CommandExecution", "McpToolCall", "FileChange", "Extension", "ImageView",
             "CollabAgentToolCall", "WebSearch"}
 
@@ -1448,6 +1448,9 @@ class CodexParser:
         call_id = as_str(p.get("call_id"))
         call = self.s["calls"].pop(call_id, None) if call_id else None
         if key is None or call is None:
+            # A recognised repeat still emits I/O, but cannot revise the first completion.
+            if key is not None and call_id in self.s["rc"]:
+                return []
             return [ParseIssueRow(pos.byte_offset, "orphan_output", pos.line_number, ptype)]
         output = p.get("output")
         first = _first_line(output)
@@ -1544,7 +1547,10 @@ class CodexParser:
             else:
                 STATS["touches_from_patch_input"] += 1
                 rows.extend(self._touches(call_id, touches, "apply_patch", ts, pos, turn_id, call_uid=call_id))
-        self._remember(call_id)
+        # Output alone is not ancestry evidence. Do not promote unknown (or evicted) ids
+        # into the recent-call cache and falsely recognise their next output.
+        if call is not None or call_id in self.s["rc"]:
+            self._remember(call_id)
         return rows
 
     def _io_model_call(self, ptype: str, p: dict[str, Any], ts: datetime, pos: LinePos, uid: str,
@@ -1825,6 +1831,26 @@ class CodexParser:
             parts = [b for b in content if isinstance(b, dict) and b.get("type") in {"local_image", "image"}]
             skill = any(isinstance(b, dict) and b.get("type") == "skill" for b in content)
             return self._prompt(text, images, turn_id, ts, pos, uid, raw, parts, skill, "UserMessage")
+        if itype == "HookPrompt":
+            key = self._key()
+            if key is None:
+                return []
+            fragments = item.get("fragments")
+            fragments = fragments if isinstance(fragments, list) else []
+            # Catalogue sequencing breaks same-position ties by textual event_uid. Pad to
+            # this source list's maximum index width, including invalid fragment positions,
+            # so lexical order preserves source order without imposing a fixed count limit.
+            width = len(str(max(len(fragments) - 1, 0)))
+            rows: list[Row] = []
+            for index, fragment in enumerate(fragments):
+                if not isinstance(fragment, dict) or not isinstance(fragment.get("text"), str):
+                    continue
+                rows.append(MessageRow(
+                    AGENT, f"{uid}:{index:0{width}d}", key, ts, "system", "hook_output", fragment["text"],
+                    pos.byte_offset, pos.byte_length, pos.line_number, turn_id,
+                    detail={"source": "HookPrompt", "fragment_index": index,
+                            "item_id": as_str(item.get("id")), "hook_run_id": as_str(fragment.get("hookRunId"))}))
+            return rows
         if itype == "SubAgentActivity":
             return self._activity(item, as_int(p.get("completed_at_ms")), ts, pos)
         if itype == "Reasoning":

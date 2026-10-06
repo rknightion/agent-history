@@ -1,0 +1,16 @@
+{"timestamp":"2026-10-01T10:00:00Z","type":"session_meta","ordinal":0,"payload":{"id":"88888888-8888-4888-8888-888888888888","cli_version":"0.156.0","source":"cli"}}
+{"timestamp":"2026-10-01T10:00:01Z","type":"event_msg","ordinal":1,"payload":{"type":"task_started","turn_id":"synthetic-turn"}}
+{"timestamp":"2026-10-01T10:00:02Z","type":"event_msg","ordinal":2,"payload":{"type":"item_completed","thread_id":"88888888-8888-4888-8888-888888888888","turn_id":"synthetic-turn","item":{"type":"HookPrompt","id":"hook-synthetic","fragments":[{"text":"Synthetic hook output.\n","hookRunId":"synthetic-hook"},{"text":"  Second fragment Ω.  "},{"text":" \n\t"},{"text":""},{"text":null},{"text":23},{},null,"invalid",{"text":"Final fragment."}]}}}
+{"timestamp":"2026-10-01T10:00:03Z","type":"event_msg","ordinal":3,"payload":{"type":"item_completed","thread_id":"99999999-9999-4999-8999-999999999999","item":{"type":"HookPrompt","id":"hook-foreign","fragments":[{"text":"Foreign hook must not be replayed."}]}}}
+{"timestamp":"2026-10-01T10:00:04Z","type":"event_msg","ordinal":4,"payload":{"type":"item_started","thread_id":"88888888-8888-4888-8888-888888888888","item":{"type":"HookPrompt","id":"hook-synthetic","fragments":[{"text":"Uncompleted hook must not duplicate output."}]}}}
+{"timestamp":"2026-10-01T10:00:05Z","type":"response_item","ordinal":5,"payload":{"type":"custom_tool_call","call_id":"synthetic-custom","name":"exec","input":"Synthetic tool input."}}
+{"timestamp":"2026-10-01T10:00:06Z","type":"response_item","ordinal":6,"payload":{"type":"custom_tool_call_output","call_id":"synthetic-custom","output":"Synthetic first output."}}
+{"timestamp":"2026-10-01T10:00:07Z","type":"response_item","ordinal":7,"payload":{"type":"custom_tool_call_output","call_id":"synthetic-custom","output":"Synthetic first output."}}
+{"timestamp":"2026-10-01T10:00:08Z","type":"response_item","ordinal":8,"payload":{"type":"custom_tool_call_output","call_id":"synthetic-custom","output":"Script failed: synthetic repeat."}}
+{"timestamp":"2026-10-01T10:00:09Z","type":"response_item","ordinal":9,"payload":{"type":"function_call","call_id":"synthetic-function","name":"synthetic","arguments":"{}"}}
+{"timestamp":"2026-10-01T10:00:10Z","type":"response_item","ordinal":10,"payload":{"type":"function_call_output","call_id":"synthetic-function","output":"aborted by user: synthetic first result"}}
+{"timestamp":"2026-10-01T10:00:11Z","type":"response_item","ordinal":11,"payload":{"type":"function_call_output","call_id":"synthetic-function","output":[{"type":"text","text":"Synthetic function repeat."},{"type":"text","text":"Second output part."}]}}
+{"timestamp":"2026-10-01T10:00:12Z","type":"response_item","ordinal":12,"payload":{"type":"custom_tool_call_output","call_id":"synthetic-unknown","output":"Unknown output still retained."}}
+{"timestamp":"2026-10-01T10:00:13Z","type":"response_item","ordinal":13,"payload":{"type":"custom_tool_call_output","call_id":"synthetic-unknown","output":"Repeated unknown output still retained."}}
+{"timestamp":"2026-10-01T10:00:14Z","type":"event_msg","ordinal":14,"payload":{"type":"item_completed","item":{"type":"HookPrompt","fragments":[{"text":"Hook without item id."}]}}}
+{"timestamp":"2026-10-01T10:00:15Z","type":"event_msg","ordinal":15,"payload":{"type":"task_complete","turn_id":"synthetic-turn"}}
