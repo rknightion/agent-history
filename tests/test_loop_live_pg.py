@@ -380,15 +380,16 @@ def test_spawn_and_append_exact_run_dedup_title_and_return(clean, transcript, li
     assert clean.execute("SELECT active_lanes FROM ah.loops").fetchone()[0] == []
 
 
-def test_native_batch_watch_and_frozen_parser_spawn_rows_at_catalogue_surface(clean, transcript, live_config):
-    # Default-async parsing is owned and independently proved upstream. Here its frozen
-    # canonical row interface is supplied explicitly; no parser patch or OS start is inferred.
+def test_native_batch_watch_and_parser_spawn_rows_at_catalogue_surface(clean, transcript, live_config):
+    # Native default-async evidence must cross the real parser/Writer boundary, not a seeded
+    # spawn row. The source contract requires matching UUIDs, not an arbitrary run label.
+    native_run = "22222222-2222-4222-8222-222222222222"
     n = len(transcript["records"])
     call_uid = f"call-{n}"
     transcript["append"](
         {"agent": "complex-worker", "task": "Lane: BUILD · Task: TASK-1 (Repair synthetic gate)"},
         tool="subagent",
-        details={"mode": "single", "runId": "native-run", "asyncId": "native-run", "results": []},
+        details={"mode": "single", "runId": native_run, "asyncId": native_run, "results": []},
     )
     # Preserve the distinction between message generation, entry dispatch and accepted result.
     entry = datetime.fromisoformat(transcript["records"][-2]["timestamp"])
@@ -412,15 +413,10 @@ def test_native_batch_watch_and_frozen_parser_spawn_rows_at_catalogue_surface(cl
     )
     uid, phase, _, _ = refresh(clean, transcript)
     assert phase == "gating"
-    # Row fields match the independently frozen PI prerequisite: call-id, workflow id and
-    # recorded dispatch-entry timestamp. This is not a claim that the base parser emits it.
-    clean.execute(
-        "INSERT INTO ah.subagent_spawn(agent,spawn_uid,parent_session_id,spawned_at,requested_type,requested_type_source,launch_status,workflow_id,source_id,byte_offset) "
-        "SELECT 'pi',%s,t.session_id,t.started_at,'complex-worker','explicit','launched','native-run',t.source_id,t.byte_offset "
-        "FROM ah.tool_call t WHERE t.call_uid=%s",
-        (call_uid, call_uid),
-    )
-    loop_live.refresh(clean)
+    assert clean.execute(
+        "SELECT spawned_at,workflow_id,requested_type,launch_status FROM ah.subagent_spawn WHERE spawn_uid=%s",
+        (call_uid,),
+    ).fetchone() == (entry, native_run, "complex-worker", "launched")
     fields = clean.execute(
         "SELECT active_lanes,tasks_admitted,tasks_landed,last_gate,last_judgement FROM ah.loops"
     ).fetchone()
@@ -430,7 +426,7 @@ def test_native_batch_watch_and_frozen_parser_spawn_rows_at_catalogue_surface(cl
             "task": "TASK-1",
             "title": "Repair synthetic gate",
             "agent": "complex-worker",
-            "started_at": entry.isoformat(),
+            "started_at": entry.isoformat(timespec="microseconds").replace("+00:00", "Z"),
         }
     ]
     assert fields[1:3] == (2, 0)
@@ -491,6 +487,104 @@ def test_native_batch_watch_and_frozen_parser_spawn_rows_at_catalogue_surface(cl
         clean.execute("SELECT detail ? 'details' FROM ah.message WHERE event_uid LIKE '%%:terminal'").fetchone()[0]
         is False
     )
+
+
+def test_real_collector_nulls_nonconforming_state_values_without_enrichment(
+    clean, transcript, live_config, monkeypatch
+):
+    def no_paid_calls(*args, **kwargs):
+        pytest.fail("structural collection attempted paid inference")
+
+    monkeypatch.setattr(loop_live, "request", no_paid_calls)
+    monkeypatch.setattr(loop_live, "drain_one", no_paid_calls)
+    transcript["state"]("dispatch", 'lane=one task=TASK-1 agent=complex-worker run=one \'title={"text":"invalid"}\'')
+    transcript["state"]("gate", "sha=synthetic scope=composed exit=2147483648")
+    uid, phase, lanes, error = refresh(clean, transcript)
+    assert phase == "working" and error is None
+    assert lanes[0]["title"] is None
+    gate = clean.execute("SELECT last_gate FROM ah.loops WHERE launch_uid=%s", (uid,)).fetchone()[0]
+    assert gate["exit"] is None
+    assert gate["sha"] == "synthetic" and gate["scope"] == "composed"
+    assert gate["at"].endswith("Z") and len(gate["at"]) == 27
+    assert clean.execute("SELECT count(*) FROM ah.loop_live_reservation").fetchone()[0] == 0
+    assert clean.execute("SELECT count(*) FROM ah.loop_live_cache").fetchone()[0] == 0
+    transcript["state"]("gate", "sha=synthetic scope=composed exit=0")
+    refresh(clean, transcript)
+    assert clean.execute("SELECT last_gate->'exit' FROM ah.loops").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("acceptance", ["valid", "failed", "conflicting"])
+def test_native_dispatch_requires_matching_acceptance_at_incremental_boundary(
+    clean, transcript, live_config, acceptance
+):
+    run = "33333333-3333-4333-8333-333333333333"
+    transcript["append"](
+        {"agent": "complex-worker", "task": "Lane: BUILD · Task: TASK-1 (Build synthetic candidate)"},
+        tool="subagent",
+        ok=acceptance != "failed",
+        details={
+            "mode": "single",
+            "runId": run,
+            "asyncId": run if acceptance != "conflicting" else "44444444-4444-4444-8444-444444444444",
+            "results": [],
+        },
+    )
+    result = transcript["records"].pop()
+    entry = datetime.fromisoformat(transcript["records"][-1]["timestamp"])
+    transcript["path"].write_text("".join(json.dumps(r) + "\n" for r in transcript["records"]))
+    # Fail-first causal boundary: a request alone cannot supply a timed/typed launched lane.
+    assert refresh(clean, transcript)[1:3] == ("preparing", [])
+    assert clean.execute("SELECT count(*) FROM ah.subagent_spawn").fetchone()[0] == 0
+    transcript["records"].append(result)
+    transcript["path"].write_text("".join(json.dumps(r) + "\n" for r in transcript["records"]))
+    _, phase, lanes, _ = refresh(clean, transcript)
+    if acceptance == "valid":
+        assert phase == "working"
+        assert lanes == [
+            {
+                "lane": "BUILD",
+                "task": "TASK-1",
+                "title": "Build synthetic candidate",
+                "agent": "complex-worker",
+                "started_at": entry.isoformat(timespec="microseconds").replace("+00:00", "Z"),
+            }
+        ]
+        assert clean.execute("SELECT spawned_at FROM ah.subagent_spawn").fetchone()[0] == entry
+    else:
+        assert phase == "preparing" and lanes == []
+        assert clean.execute("SELECT count(*) FROM ah.subagent_spawn").fetchone()[0] == 0
+    assert clean.execute("SELECT count(*) FROM ah.loop_live_reservation").fetchone()[0] == 0
+
+
+def test_explicit_heartbeat_payload_crosses_real_parser_and_projection(clean, transcript, live_config, monkeypatch):
+    # Historical heartbeats are not inferred. This independently exercises the explicit payload
+    # seam on a synthetic root whose timestamps are all recorded.
+    monkeypatch.setattr(loop_live, "load_config", lambda: Config(loop_live=LoopLive(enabled=False)))
+    transcript["state"]("dispatch", "lane=one agent=complex-worker run=one")
+    at = transcript["at"] + timedelta(minutes=60)
+    transcript["records"].append(
+        {
+            "type": "custom_message",
+            "id": "heartbeat",
+            "timestamp": at.isoformat(),
+            "customType": "loop-heartbeat",
+            "content": "Heartbeat",
+            "details": {"at": at.isoformat()},
+        }
+    )
+    transcript["path"].write_text("".join(json.dumps(r) + "\n" for r in transcript["records"]))
+    uid, _, _, _ = refresh(clean, transcript)
+    target = clean.execute(
+        "SELECT id,root_session_id,launch_ts,report_path FROM ah.loop_run WHERE launch_uid=%s", (uid,)
+    ).fetchone()
+    events = loop_live._events(clean, *target[:3], None, target[3])
+    assert [e for e in events if e["ev"] == "heartbeat"] == [{"ev": "heartbeat", "at": at}]
+    assert loop_live.project(events, at + timedelta(minutes=1))["live_phase"] == "working"
+    assert (
+        loop_live.project([e for e in events if e["ev"] != "heartbeat"], at + timedelta(minutes=1))["live_phase"]
+        == "waiting"
+    )
+    assert clean.execute("SELECT count(*) FROM ah.loop_live_reservation").fetchone()[0] == 0
 
 
 @pytest.mark.skipif(not scratch_database(ADMIN_DSN), reason="disposable admin database DSN required for role proof")

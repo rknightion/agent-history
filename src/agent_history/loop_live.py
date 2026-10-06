@@ -16,7 +16,7 @@ import re
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import PurePosixPath
 from typing import Any
@@ -121,6 +121,27 @@ STRUCTURED = (
 
 def _iso(value: datetime | None) -> str | None:
     return value.isoformat() if value else None
+
+
+def _live_text(value: Any, limit: int | None = None) -> str | None:
+    """Nullable JSONB text, matching the consumer's Unicode scalar/storage profile."""
+    if not isinstance(value, str) or limit is not None and len(value) > limit or "\x00" in value:
+        return None
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return None
+    return value
+
+
+def _live_timestamp(value: Any) -> str | None:
+    """Only recorded aware instants; canonical UTC with six fractional digits."""
+    if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
+        return None
+    try:
+        return value.astimezone(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+    except (ValueError, OverflowError):
+        return None
 
 
 def _timestamp(value: Any) -> datetime | None:
@@ -669,6 +690,18 @@ def project(events: list[dict], now: datetime, answers: dict[str, float] | None 
     heartbeat_at = None
     for e in events:
         ev = e["ev"]
+        if ev == "dispatch":
+            # Validate before using lane identity or agent role, not merely before JSONB write.
+            # A malformed key must never crash collection or assert a known empty lane list.
+            e = {**e, **{key: _live_text(e.get(key), 1000) for key in ("lane", "task", "title", "agent")}}
+        elif ev == "gate":
+            exit_code = e.get("exit")
+            e = {
+                **e,
+                "sha": _live_text(e.get("sha")),
+                "scope": _live_text(e.get("scope")),
+                "exit": exit_code if type(exit_code) is int and -2147483648 <= exit_code <= 2147483647 else None,
+            }
         if ev == "heartbeat":
             # Frozen maximum one root-activity heartbeat per five minutes, independent of calls.
             if heartbeat_at and (e["at"] - heartbeat_at).total_seconds() < 300:
@@ -678,12 +711,18 @@ def project(events: list[dict], now: datetime, answers: dict[str, float] | None 
         if ev == "open":
             opened = True
         elif ev == "dispatch":
-            key = e.get("run") or e.get("lane")
+            key = _live_text(e.get("run")) or e.get("lane")
             if key:
                 live[key] = e
+            else:
+                uncertain.append({"ev": "uncertain", "for_ev": "dispatch", "at": e["at"]})
             dispatches.append(e)
         elif ev == "return":
-            live.pop(e.get("run") or e.get("lane"), None)
+            key = _live_text(e.get("run")) or _live_text(e.get("lane"), 1000)
+            if key:
+                live.pop(key, None)
+            else:
+                uncertain.append({"ev": "uncertain", "for_ev": "return", "at": e["at"]})
         elif ev == "gate":
             gates.append(e)
             snapshots[ev] = e
@@ -754,19 +793,28 @@ def project(events: list[dict], now: datetime, answers: dict[str, float] | None 
     if events and (opened or dispatches or active_watch or state["close_recorded"]):
         fields["live_phase"] = hybrid_decide(state, answers or {})
     if dispatches or opened:
-        fields["active_lanes"] = [
-            {
-                "lane": e.get("lane"),
-                "task": e.get("task"),
-                "title": e.get("title"),
-                "agent": e.get("agent"),
-                "started_at": _iso(e["at"]),
-            }
-            for e in live.values()
-        ]
+        fields["active_lanes"] = (
+            [
+                {
+                    "lane": e.get("lane"),
+                    "task": e.get("task"),
+                    "title": e.get("title"),
+                    "agent": e.get("agent"),
+                    "started_at": _live_timestamp(e["at"]),
+                }
+                for e in live.values()
+            ]
+            if len(live) <= 64
+            else None
+        )
     if gates:
         e = gates[-1]
-        fields["last_gate"] = {"sha": e.get("sha"), "scope": e.get("scope"), "exit": e.get("exit"), "at": _iso(e["at"])}
+        fields["last_gate"] = {
+            "sha": e.get("sha"),
+            "scope": e.get("scope"),
+            "exit": e.get("exit"),
+            "at": _live_timestamp(e["at"]),
+        }
     if parks or opened:
         fields["parks_total"] = len(parks)
     if parks:

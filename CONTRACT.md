@@ -507,7 +507,17 @@ later. Existing relation grants are unchanged.
 Additive `ah.loops` fields project retained catalogue evidence from pi roots and linked
 relaunches: successful complete append calls to the recorded state target, structured watches
 and heartbeats, explicit subagent metadata and retained returns. Projection never opens a local
-state file or uses a local path lookup to supply content or identity.
+state file or uses a local path lookup to supply content or identity. Native pi single-agent
+launches use the matched, successfully accepted call-entry dispatch timestamp described under
+nullable transcript telemetry, not message generation, result completion or OS process timing.
+The existing parser and Writer supply these rows; projection does not manufacture a spawn.
+Accepted native `watch_start` results join terminal `loop-watch` observations by exact session
+and watch id, never by label or timing proximity. Their expiry bound is explicitly derived from
+call entry plus the recorded `deadline_s`, not a native process-start or deadline observation.
+A terminal hook without a captured accepted start cannot establish an active watch. Native
+`loop-wake` is activity, not heartbeat; only explicitly timestamped `loop-heartbeat` evidence
+establishes a heartbeat. Missing, truncated, failed, opaque or ambiguously attributable append
+or watch evidence leaves the affected structure unknown independently of enrichment.
 
 `live_phase` is nullable and uses preparing, working, reviewing, gating, landing, waiting or
 closing. `phase_since` is the observed transition time. The frozen hybrid combines deterministic
@@ -521,6 +531,28 @@ Nullable structure includes `active_lanes` (lane/task/title/agent/started_at), `
 (sha/scope/exit/at), `parks_total`, `last_park` (task/needs/reason), distinct `tasks_admitted` and
 `tasks_landed`, `last_judgement` (at most 500 characters), `last_judgement_at` and explicit
 `ops_state`. Unknown stays NULL; an observed open establishes known empty/zero values.
+
+The JSONB producer shape below matches the receiver's nullable member validation. Validation
+never coerces a number, boolean, array or object to text, truncates an overlong member or emits
+only a prefix of an oversized lane list. Source transcript content remains stored unredacted.
+All emitted objects carry every listed key, even when its value is JSON null; absent or explicitly
+null source members become JSON null, not empty text or zero. Unknown containers are SQL NULL.
+No unlisted members are emitted.
+
+| Field | Container and limits | Members |
+|---|---|---|
+| `active_lanes` | JSON array of at most 64 objects; the whole field is SQL NULL if the complete observed active set exceeds 64 or cannot be attributed. Never an object or an array containing non-objects. An observed open with no dispatches, or all observed dispatches returned, establishes `[]`; absence of evidence is NULL. | `lane`, `task`, `title`, `agent`: string of at most 1000 Unicode characters each, otherwise JSON null. `started_at`: UTC timestamp string as described below, otherwise JSON null. |
+| `last_gate` | One JSON object for the latest attributable gate observation, otherwise SQL NULL. Never an array or scalar. | `sha`, `scope`: string with no length or hash/enum format restriction, otherwise JSON null. `exit`: JSON integer in signed Int32 range (`-2147483648` to `2147483647`), otherwise JSON null; booleans, floats and numeric strings are not integers. `at`: UTC timestamp string as described below, otherwise JSON null. |
+
+Strings must be Unicode scalar text encodable as UTF-8 without NUL, matching JSONB and receiver
+storage. Empty strings are valid; limits count characters, not UTF-8 bytes. Timestamp members
+use the Gregorian RFC3339 microsecond UTC profile: `YYYY-MM-DDTHH:MM:SS.ffffffZ` with exactly
+six fractional digits. Recorded timezone-aware instants are converted to UTC without guessing a
+timezone, adding precision or consulting the indexer's clock. `started_at` is the observed dispatch
+time; `last_gate.at` is the observed gate-result time. An unknown or invalid timestamp remains
+JSON null. Canonical UTC output is accepted by the receiver's broader microsecond/offset profile
+and needs no consumer alignment change. Member nulls do not invalidate the remaining object;
+invalid members never reach `ah.loops` verbatim.
 
 `headline` is at most 120 characters; `summary` is at most 600 characters and two to four
 sentences. Generation time/model/error and `final_summary` accompany them. Failure retains the
