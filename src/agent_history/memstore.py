@@ -49,8 +49,6 @@ class MemStore:
         if existing is None:
             table[key] = dict(cols)
             return
-        if row.DEFAULT_POLICY == NOTHING:
-            return
         if row.TABLE == "record_type_seen":  # the loader adds counts across batches
             existing["count"] = (existing.get("count") or 0) + (cols.get("count") or 0)
             return
@@ -58,6 +56,8 @@ class MemStore:
             if name in row.KEY:
                 continue
             policy = row.POLICY.get(name, row.DEFAULT_POLICY)
+            if policy == NOTHING:
+                continue
             existing[name] = _merge(policy, existing.get(name), value)
 
     def rows(self, table: str) -> list[dict[str, Any]]:

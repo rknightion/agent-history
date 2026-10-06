@@ -13,6 +13,7 @@ from decimal import Decimal
 import pytest
 
 from agent_history import load
+from agent_history.memstore import MemStore
 from agent_history.model import (
     CostStateRow,
     FileContext,
@@ -72,7 +73,7 @@ CASES = [
     (
         TurnRow(KEY, "synthetic-turn", 0),
         {
-            "reasoning_summary": ("text", "synthetic reasoning\nfull text", "replacement reasoning"),
+            "reasoning_summary": ("text", "none", "detailed"),
             "trace_id": ("text", "synthetic-trace", "synthetic-trace-v2"),
             "root_turn_key": ("text", "synthetic-root", "synthetic-root-v2"),
             "origin_hint": ("text", "synthetic-origin", "synthetic-origin-v2"),
@@ -127,6 +128,58 @@ def writer(conn):
         yield load.Writer(conn)
     finally:
         conn.rollback()
+
+
+IMMUTABLE_CASES = [(row, spec) for row, spec in CASES if isinstance(row, (MessageRow, CostStateRow))]
+
+
+@pytest.mark.parametrize("row,spec", IMMUTABLE_CASES, ids=[row.TABLE for row, _ in IMMUTABLE_CASES])
+def test_immutable_telemetry_memstore_writer_parity(conn, writer, row, spec):
+    store = MemStore()
+    field, (_, first, latest) = next(iter(spec.items()))
+    if isinstance(row, MessageRow):
+        changed = replace(
+            row,
+            text="must not overwrite content",
+            role="user",
+            message_class="human_prompt",
+            model="synthetic-other-model",
+            detail={"source": "synthetic-replay"},
+        )
+    else:
+        changed = replace(
+            row,
+            total_cost_usd=99,
+            api_duration_ms=999,
+            total_duration_ms=999,
+            model_usage={"synthetic-other-model": {"costUSD": 99}},
+        )
+    changed = replace(
+        changed, session=SessionKey("pi", "synthetic-other-session"), ts=TS + timedelta(seconds=1), byte_offset=99
+    )
+    columns = tuple(row.columns())
+    sql_columns = tuple("session_id" if name == "session" else name for name in columns)
+    key_columns = writer.key_columns(type(row))
+    key_values = tuple(getattr(row, name) for name in row.KEY)
+    where = " AND ".join(f"{name}=%s" for name in key_columns)
+    # Check each boundary, including enrichment, replacement, false and repeated NULLs.
+    for observation in (row, first, latest, None, first, None):
+        incoming = row if observation is row else replace(changed, **{field: observation})
+        writer.write([incoming], 0, CTX)
+        store.upsert(incoming, CTX.rel_path)
+        if observation is row:
+            known = None
+        elif observation is not None:
+            known = observation
+        expected = {**row.columns(), field: known}
+        database = conn.execute(
+            f"SELECT {','.join(sql_columns)} FROM ah.{row.TABLE} WHERE {where}", key_values
+        ).fetchall()
+        expected_database = tuple(
+            writer.session_id(row.session) if name == "session" else expected[name] for name in columns
+        )
+        assert database == [expected_database]
+        assert store.rows(row.TABLE) == [expected]
 
 
 @pytest.mark.parametrize("row,spec", CASES, ids=[row.TABLE for row, _ in CASES])
