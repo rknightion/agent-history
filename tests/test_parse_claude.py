@@ -296,6 +296,233 @@ def test_injected_harness_text_is_searchable_only_outside_human_class_pg(tmp_pat
 
 
 
+TELEMETRY = FIX / "telemetry.jsonl"
+
+
+def _telemetry_records():
+    return [json.loads(line) for line in TELEMETRY.read_text().splitlines()]
+
+
+def _load_telemetry_records(tmp_path, records):
+    path = tmp_path / "telemetry.jsonl"
+    path.write_text("".join(json.dumps(record) + "\n" for record in records))
+    context = FileContext(str(path), "claude-test/telemetry.jsonl", "claude-test", "claude", "test", None, "main")
+    store = MemStore()
+    run_file(ClaudeParser, context, store, batch_lines=1)
+    return store
+
+
+@pytest.mark.parametrize("batch", [1, 2, 5000])
+def test_telemetry_streaming_response_and_parallel_causal_parent(batch):
+    store = load(TELEMETRY, batch_lines=batch)
+    stream = one(store, "llm_call", response_id="stream-response")
+    assert (stream["duration_ms"], stream["latency_basis"]) == (2005, "claude_parent_to_last_line")
+    assert stream["line_count"] == 2 and stream["output"] == 20
+    assert stream["stop_reason"] == "tool_use" and stream["turn_key"] == "telemetry-turn"
+    reply = one(store, "llm_call", response_id="reply-response")
+    # The referenced result A, not the later result B or unrelated attachment, starts this call.
+    assert (reply["duration_ms"], reply["latency_basis"]) == (8000, "claude_parent_to_last_line")
+    assert len(store.rows("llm_call")) == 2
+    for call_uid in ("parallel-a", "parallel-b"):
+        assert one(store, "tool_call", call_uid=call_uid)["outcome"] == "ok"
+    assert one(store, "message", event_uid="thinking-line:think:0")["text"] == "Synthetic reasoning retained in full."
+    assert one(store, "message", event_uid="text-line")["text"] == "Synthetic answer retained in full."
+    assert one(store, "tool_io", io_uid="parallel-a")["output_text"] == "Synthetic result A retained in full."
+    assert one(store, "turn")["origin"] == "human"  # turnOrigin does not reclassify the prompt.
+
+
+def test_telemetry_selected_fields_and_known_zero_false_empty():
+    store = load(TELEMETRY, batch_lines=1)
+    stream = one(store, "llm_call", response_id="stream-response")
+    assert stream["thinking_ms"] == 1500  # MAX, not the final line's 1000.
+    assert (stream["cache_miss_type"], stream["cache_missed_tokens"]) == ("messages_changed", 3_000_000_000)
+    assert stream["input_transform_types"] == ["thinking_dropped", "synthetic_transform"]
+    assert stream["advisor_model"] == "synthetic-advisor-latest"
+    assert stream["inference_geo"] == "synthetic-region-latest" and stream["iterations"] == 0
+    reply = one(store, "llm_call", response_id="reply-response")
+    assert reply["thinking_ms"] == 0 and reply["cache_missed_tokens"] == 0
+    assert reply["input_transform_types"] == [] and reply["iterations"] == 2
+    turn = one(store, "turn")
+    assert (turn["origin_hint"], turn["prompt_index"], turn["turn_index"]) == ("sdk", 0, 2)
+    assert (turn["pending_bg_agents"], turn["pending_workflows"]) == (0, 2)
+    assert turn["duration_ms"] == 13000 and turn["status"] == "complete"
+    assert one(store, "cost_state")["has_unknown_model_cost"] is False
+
+
+@pytest.mark.parametrize("cut", [1, 2, 3, 4, 6, 7])
+def test_telemetry_incremental_json_state_and_content_free(cut):
+    store = MemStore()
+    offset, state = run_file(ClaudeParser, ctx(TELEMETRY), store, stop_after_lines=cut)
+    state = json.loads(json.dumps(state))
+    assert "retained in full" not in json.dumps(state)
+    assert "transformation body" not in json.dumps(state)
+    run_file(ClaudeParser, ctx(TELEMETRY), store, start=offset, state=state, line_base=cut, batch_lines=1)
+    assert _comparable(store) == _comparable(load(TELEMETRY))
+
+
+@pytest.mark.parametrize("case", ["missing_parent", "unknown_parent", "missing_start", "invalid_start",
+                                  "missing_end", "invalid_end", "negative", "ambiguous_parent", "missing_id"])
+def test_telemetry_duration_requires_independent_authoritative_endpoints(tmp_path, case):
+    records = _telemetry_records()[:2]
+    parent, assistant = records
+    if case == "missing_parent":
+        del assistant["parentUuid"]
+    elif case == "unknown_parent":
+        assistant["parentUuid"] = "unseen-record"
+    elif case == "missing_start":
+        del parent["timestamp"]
+    elif case == "invalid_start":
+        parent["timestamp"] = "invalid"
+    elif case == "missing_end":
+        del assistant["timestamp"]
+    elif case == "invalid_end":
+        assistant["timestamp"] = "invalid"
+    elif case == "negative":
+        assistant["timestamp"] = "2026-10-01T09:59:59Z"
+    elif case == "ambiguous_parent":
+        duplicate = dict(parent, timestamp="2026-10-01T10:00:01Z")
+        records.insert(1, duplicate)
+    elif case == "missing_id":
+        del assistant["message"]["id"]
+    call = one(_load_telemetry_records(tmp_path, records), "llm_call")
+    assert call["duration_ms"] is None and call["latency_basis"] is None
+    assert call["thinking_ms"] == 1500  # Neither timing is substituted for the other.
+
+
+@pytest.mark.parametrize("value", [None, True, False, -1, 1.5, "12", {}, []])
+def test_telemetry_invalid_measurements_are_independently_null(tmp_path, value):
+    records = _telemetry_records()
+    for record in records:
+        if record["type"] == "assistant":
+            record["thinkingDurationMs"] = value
+            message = record["message"]
+            message["usage"]["iterations"] = value
+            message["usage"]["inference_geo"] = 12
+            message["diagnostics"] = {"cache_miss_reason": {"type": "synthetic-miss", "cache_missed_input_tokens": value}}
+            record["advisorModel"] = 12
+            message["input_transformations"] = [{"type": "valid"}, {"type": 12}]
+        elif record["type"] == "user":
+            record["turnPosition"] = {"promptIndex": value, "turnIndex": 0}
+        elif record["type"] == "system":
+            record["pendingBackgroundAgentCount"] = value
+            record["pendingWorkflowCount"] = 0
+        elif record["type"] == "cost-state":
+            record["hasUnknownModelCost"] = "false"
+    store = _load_telemetry_records(tmp_path, records)
+    for call in store.rows("llm_call"):
+        assert call["thinking_ms"] is None and call["cache_missed_tokens"] is None
+        assert call["cache_miss_type"] == "synthetic-miss"
+        assert call["advisor_model"] is None and call["inference_geo"] is None
+        assert call["input_transform_types"] is None
+        assert call["iterations"] == (0 if value == [] else None)
+        assert call["duration_ms"] is not None
+    turn = one(store, "turn")
+    assert turn["prompt_index"] is None and turn["turn_index"] == 0
+    assert turn["pending_bg_agents"] is None and turn["pending_workflows"] == 0
+    assert one(store, "cost_state")["has_unknown_model_cost"] is None
+
+
+def test_telemetry_absent_source_fields_never_inferred(main_store, tmp_path):
+    fields = ("thinking_ms", "cache_miss_type", "cache_missed_tokens", "input_transform_types",
+              "advisor_model", "inference_geo", "iterations")
+    assert all(call[field] is None for call in main_store.rows("llm_call") for field in fields)
+    fields = ("origin_hint", "prompt_index", "turn_index", "pending_bg_agents", "pending_workflows")
+    assert all(turn[field] is None for turn in main_store.rows("turn") for field in fields)
+    records = _telemetry_records()
+    for record in records:
+        record.pop("thinkingDurationMs", None)
+        record.pop("advisorModel", None)
+        record.pop("turnOrigin", None)
+        record.pop("turnPosition", None)
+        record.pop("pendingBackgroundAgentCount", None)
+        record.pop("pendingWorkflowCount", None)
+        record.pop("hasUnknownModelCost", None)
+        message = record.get("message", {})
+        message.pop("diagnostics", None)
+        message.pop("input_transformations", None)
+        message.get("usage", {}).pop("inference_geo", None)
+        message.get("usage", {}).pop("iterations", None)
+    absent = _load_telemetry_records(tmp_path, records)
+    assert one(absent, "cost_state")["has_unknown_model_cost"] is None
+    for call in absent.rows("llm_call"):
+        assert all(call[field] is None for field in ("thinking_ms", "cache_miss_type", "cache_missed_tokens",
+                                                     "input_transform_types", "advisor_model", "inference_geo", "iterations"))
+    turn = one(absent, "turn")
+    assert all(turn[field] is None for field in fields)
+
+
+def test_telemetry_latest_nonnull_enrichment_keeps_immutable_content(tmp_path):
+    records = _telemetry_records()[:2]
+    last = json.loads(json.dumps(records[1]))
+    last.update(uuid="enriched-line", parentUuid="thinking-line", timestamp="2026-10-01T10:00:02.001Z",
+                thinkingDurationMs=0, advisorModel="synthetic-latest")
+    message = last["message"]
+    message["usage"].update(inference_geo="synthetic-latest", iterations=[])
+    message["diagnostics"]["cache_miss_reason"].update(type="synthetic-latest", cache_missed_input_tokens=0)
+    message["input_transformations"] = []
+    empty = json.loads(json.dumps(last))
+    empty.update(uuid="absent-line", parentUuid="enriched-line", timestamp="2026-10-01T10:00:02.002Z")
+    empty.pop("thinkingDurationMs")
+    empty.pop("advisorModel")
+    for field in ("usage", "diagnostics", "input_transformations"):
+        empty["message"].pop(field)
+    records.extend([last, empty])
+    store = _load_telemetry_records(tmp_path, records)
+    call = one(store, "llm_call")
+    assert (call["duration_ms"], call["thinking_ms"]) == (2002, 1500)
+    assert (call["cache_miss_type"], call["cache_missed_tokens"]) == ("synthetic-latest", 0)
+    assert call["input_transform_types"] == [] and call["iterations"] == 0
+    assert call["advisor_model"] == call["inference_geo"] == "synthetic-latest"
+
+    # Replay the exact file offset: cost totals and message content keep their old immutability,
+    # but explicit false/zero turn telemetry can enrich the new seam alone.
+    path = tmp_path / "telemetry.jsonl"
+    context = FileContext(str(path), "claude-test/telemetry.jsonl", "claude-test", "claude", "test", None, "main")
+    first = _telemetry_records()
+    first[0]["turnPosition"] = {"promptIndex": 4, "turnIndex": 5}
+    first[-1]["hasUnknownModelCost"] = True
+    first[-1]["totalCostUSD"] = 7
+    path.write_text("".join(json.dumps(record) + "\n" for record in first))
+    replay = MemStore()
+    run_file(ClaudeParser, context, replay)
+    # Keep preceding bytes identical so the cost-state natural key stays the same.
+    first[-1]["hasUnknownModelCost"] = False
+    first[-1]["totalCostUSD"] = 9
+    path.write_text("".join(json.dumps(record) + "\n" for record in first))
+    run_file(ClaudeParser, context, replay)
+    assert one(replay, "cost_state")["has_unknown_model_cost"] is False
+    assert one(replay, "cost_state")["total_cost_usd"] == 7
+    first[0]["message"]["content"] = "Synthetic replacement that must not overwrite content."
+    first[0]["turnPosition"] = {"promptIndex": 0, "turnIndex": 0}
+    first[0]["turnOrigin"] = "peer"
+    path.write_text(json.dumps(first[0]) + "\n")
+    run_file(ClaudeParser, context, replay)
+    turn = one(replay, "turn")
+    assert (turn["origin_hint"], turn["prompt_index"], turn["turn_index"]) == ("peer", 0, 0)
+    assert turn["origin"] == "human"
+    assert one(replay, "message", event_uid="prompt")["text"] == "Synthetic telemetry request."
+
+
+@pytest.mark.parametrize("value", [2**31, 2**63])
+def test_telemetry_integer_overflow_is_null_not_a_loader_error(tmp_path, value):
+    records = _telemetry_records()[:2]
+    records[0]["turnPosition"] = {"promptIndex": value, "turnIndex": 0}
+    records[1]["thinkingDurationMs"] = value
+    records[1]["message"]["diagnostics"]["cache_miss_reason"]["cache_missed_input_tokens"] = value
+    store = _load_telemetry_records(tmp_path, records)
+    assert one(store, "turn")["prompt_index"] is None
+    call = one(store, "llm_call")
+    assert call["thinking_ms"] is None
+    assert call["cache_missed_tokens"] == (value if value < 2**63 else None)
+
+
+def test_telemetry_identical_parent_replay_is_not_ambiguous(tmp_path):
+    records = _telemetry_records()[:2]
+    records.insert(1, dict(records[0]))
+    call = one(_load_telemetry_records(tmp_path, records), "llm_call")
+    assert call["duration_ms"] == 2000
+
+
 def test_multi_line_message_usage_merges_to_last_line(main_store):
     call = one(main_store, "llm_call", response_id="msg_1")
     assert call["output"] == 40            # MAX over the three content-block lines

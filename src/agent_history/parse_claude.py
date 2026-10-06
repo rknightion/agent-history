@@ -184,6 +184,20 @@ def _strip_prefix(text: str) -> str:
     return text.lstrip()
 
 
+def _telemetry_int(value: Any, *, bigint: bool = False) -> int | None:
+    """Recorded non-negative integer, without coercion or SQL overflow."""
+    maximum = 2**63 - 1 if bigint else 2**31 - 1
+    return value if type(value) is int and 0 <= value <= maximum else None
+
+
+def _transform_types(value: Any) -> list[str] | None:
+    if not isinstance(value, list):
+        return None
+    if any(not isinstance(item, dict) or as_str(item.get("type")) is None for item in value):
+        return None
+    return [item["type"] for item in value]
+
+
 class ClaudeParser:
     def __init__(self, ctx: FileContext, state: dict[str, Any]) -> None:
         self.ctx = ctx
@@ -201,6 +215,8 @@ class ClaudeParser:
         s.setdefault("git_cmds", {})          # Bash tool_use id -> command's git ops (only when it has any)
         s.setdefault("spawns", {})            # tool_use id -> [kind, ts_iso] (Agent/Task/Workflow calls)
         s.setdefault("msg_lines", {})         # message.id -> line count (bounded LRU)
+        s.setdefault("record_ts", {})         # uuid -> explicit timestamp or NULL (bounded)
+        s.setdefault("response_parents", {})  # response id -> first line's causal parent uuid
         s.setdefault("last", {})              # change detectors: perm, mode, model, effort, rl:<kind>
         s.setdefault("perm_pending", None)    # [value, byte_offset] seen before any timestamp
         s.setdefault("first_offset", None)
@@ -430,7 +446,41 @@ class ClaudeParser:
         elif rtype not in KNOWN_TYPES:
             out.append(ParseIssueRow(byte_offset=pos.byte_offset, kind="unknown_type",
                                      line_number=pos.line_number, detail=f"{rtype[:60]}"))
+        # Only the record's own timestamp is evidence, never eff_ts inherited from a neighbour.
+        uuid = as_str(record.get("uuid"))
+        if uuid:
+            stamps = self.s["record_ts"]
+            stamp = ts.isoformat() if ts is not None else None
+            if uuid in stamps and stamps[uuid] != stamp:
+                stamp = None  # Conflicting/missing observations of this key are unattributable.
+            stamps[uuid] = stamp
+            self._bound_telemetry(stamps, 4 * STATE_KEYS_MAX)
         return out
+
+    @staticmethod
+    def _bound_telemetry(table: dict[str, Any], maximum: int) -> None:
+        # Bound at each insertion, not flush, so eviction is independent of batch size.
+        while len(table) > maximum:
+            del table[next(iter(table))]
+
+    def _call_duration(self, rec: dict[str, Any], msg: dict[str, Any]) -> int | None:
+        mid = as_str(msg.get("id"))
+        if mid is None:
+            return None  # A fallback line uuid cannot establish a streaming response identity.
+        parents = self.s["response_parents"]
+        if mid not in parents:
+            parents[mid] = as_str(rec.get("parentUuid"))
+            self._bound_telemetry(parents, STATE_KEYS_MAX)
+        parent = parents[mid]
+        start = parse_ts(self.s["record_ts"].get(parent)) if parent else None
+        end = parse_ts(rec.get("timestamp"))
+        content = msg.get("content")
+        if start is None or end is None or not isinstance(content, (str, list)) or not content:
+            return None
+        interval = end - start
+        if interval < timedelta(0):
+            return None
+        return _telemetry_int(interval // timedelta(milliseconds=1))
 
     def _session_fields(self, rec: dict[str, Any], ts: datetime | None, pos: LinePos,
                         out: list[Row]) -> None:
@@ -573,7 +623,9 @@ class ClaudeParser:
             lines_added=as_int(rec.get("totalLinesAdded")),
             lines_removed=as_int(rec.get("totalLinesRemoved")),
             model_usage=_numeric_only(mu) if isinstance(mu, dict) else None,
-            start_time=parse_ts(rec.get("startTime"))))
+            start_time=parse_ts(rec.get("startTime")),
+            has_unknown_model_cost=rec.get("hasUnknownModelCost")
+            if type(rec.get("hasUnknownModelCost")) is bool else None))
 
     # -- system -----------------------------------------------------------------------------
 
@@ -585,7 +637,9 @@ class ClaudeParser:
             if turn and ts is not None:
                 out.append(TurnRow(session=self.key, turn_key=turn, byte_offset=pos.byte_offset,
                                    completed_at=ts, duration_ms=as_int(rec.get("durationMs")),
-                                   message_count=as_int(rec.get("messageCount")), status="complete"))
+                                   message_count=as_int(rec.get("messageCount")), status="complete",
+                                   pending_bg_agents=_telemetry_int(rec.get("pendingBackgroundAgentCount")),
+                                   pending_workflows=_telemetry_int(rec.get("pendingWorkflowCount"))))
         elif sub == "compact_boundary" and ts is not None:
             meta = rec.get("compactMetadata") if isinstance(rec.get("compactMetadata"), dict) else {}
             out.append(CompactionRow(
@@ -997,6 +1051,12 @@ class ClaudeParser:
         if injections and not human:
             origin, strong = "meta", False
         self._start_or_join_turn(out, key, origin, strong, ts, pos, perm)
+        position = rec.get("turnPosition") if isinstance(rec.get("turnPosition"), dict) else {}
+        telemetry = {"origin_hint": as_str(rec.get("turnOrigin")),
+                     "prompt_index": _telemetry_int(position.get("promptIndex")),
+                     "turn_index": _telemetry_int(position.get("turnIndex"))}
+        if any(value is not None for value in telemetry.values()):
+            out.append(TurnRow(session=self.key, turn_key=key, byte_offset=pos.byte_offset, **telemetry))
         if cls and text:
             if human:
                 out.append(
@@ -1390,6 +1450,7 @@ class ClaudeParser:
 
     def _t_assistant(self, rec, pos, ts, sub, out):
         msg = rec.get("message") if isinstance(rec.get("message"), dict) else {}
+        duration = self._call_duration(rec, msg)
         uid = self._uid(rec, pos)
         if ts is None:
             return
@@ -1409,9 +1470,23 @@ class ClaudeParser:
                          stop_reason=as_str(msg.get("stop_reason")), effort=effort,
                          is_api_error=is_err, error_kind=as_str(rec.get("error")) if is_err else None,
                          api_error_status=as_int(rec.get("apiErrorStatus")),
-                         is_sidechain=bool(rec.get("isSidechain")), line_count=ml[mid])
+                         is_sidechain=bool(rec.get("isSidechain")), line_count=ml[mid],
+                         duration_ms=duration,
+                         latency_basis="claude_parent_to_last_line" if duration is not None else None,
+                         thinking_ms=_telemetry_int(rec.get("thinkingDurationMs")),
+                         advisor_model=as_str(rec.get("advisorModel")),
+                         input_transform_types=_transform_types(msg.get("input_transformations")))
+        diagnostics = msg.get("diagnostics") if isinstance(msg.get("diagnostics"), dict) else {}
+        miss = diagnostics.get("cache_miss_reason")
+        if isinstance(miss, dict):
+            row.cache_miss_type = as_str(miss.get("type"))
+            row.cache_missed_tokens = _telemetry_int(miss.get("cache_missed_input_tokens"), bigint=True)
         if usage:
             _fill_usage(row, usage)
+            row.inference_geo = as_str(usage.get("inference_geo"))
+            iterations = usage.get("iterations")
+            if isinstance(iterations, list) and all(isinstance(item, dict) for item in iterations):
+                row.iterations = _telemetry_int(len(iterations))
         out.append(row)
         if model and model != "<synthetic>":
             prev = self.s["last"].get("model")
