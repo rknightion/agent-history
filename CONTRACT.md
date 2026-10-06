@@ -163,6 +163,57 @@ Unknown before/after measurements are independent. Validly recorded zero is know
 invalid values and inferred summary-token estimates are not zero. Historical session-event rows
 require retained transcripts to be re-parsed or rebuilt after the parser version changes.
 
+### Nullable transcript telemetry
+
+Migration `033_nullable_telemetry.sql` adds the following optional seam in schema_version 1.
+Every column is nullable, with no default or backfill. Source transcripts remain authoritative:
+missing, invalid or unattributable evidence means NULL independently for each field. Validly
+recorded zero, false and empty arrays are known values, not absence. Applying the migration alone
+does not populate historical rows; the corresponding parser upgrade and a rebuild from retained
+transcripts are required. No live catalogue rebuild is implied by migration application.
+
+| Table | New columns and SQL types | Authoritative source and meaning |
+|---|---|---|
+| `ah.llm_call` | `duration_ms int`, `latency_basis text` | The observed per-call timestamp interval described below, never a turn duration or an inferred server duration. |
+| `ah.llm_call` | `cost_usd numeric` | A call's explicitly recorded USD usage cost (including pi assistant usage cost), not catalogue list-price accounting or an allocation from cumulative session cost. |
+| `ah.llm_call` | `thinking_ms int` | Explicit recorded thinking duration in milliseconds, not reasoning tokens converted to time. |
+| `ah.llm_call` | `raw_stop_reason text` | The provider/harness stop reason verbatim before any existing normalisation; `stop_reason` semantics are unchanged. |
+| `ah.llm_call` | `api text`, `provider text` | Explicit call API and provider identifiers in retained assistant/request metadata, not inferred from model names. |
+| `ah.llm_call` | `cache_miss_type text`, `cache_missed_tokens bigint` | Explicit per-call cache miss classification and token count in retained usage metadata, not uncached input used as a proxy. |
+| `ah.llm_call` | `input_transform_types text[]` | Recorded input transform type names in source order, not transform bodies or inferred transformations. |
+| `ah.llm_call` | `advisor_model text`, `inference_geo text` | Explicit advisor model and inference geography in retained call metadata, not the indexer's model or location. |
+| `ah.llm_call` | `iterations int`, `ttft_ms int`, `attempts int`, `processing_ms int` | Explicit call iteration count, time to first token in milliseconds, attempt count and processing time in milliseconds. No counts or timings are synthesised from neighbouring calls. |
+| `ah.cost_state` | `has_unknown_model_cost bool` | The explicit cumulative cost-state flag for unknown model cost (Claude cost telemetry), not absence of a catalogue price. |
+| `ah.message` | `phase text` | The explicitly recorded message phase (including Codex response-message phase), not a phase inferred from message class or position. |
+| `ah.turn` | `reasoning_summary text` | Full recorded turn reasoning summary text, unredacted; no generated summary or substitute assembled from reasoning messages. |
+| `ah.turn` | `trace_id text`, `root_turn_key text`, `origin_hint text` | Explicit trace, root-turn reference and origin hint from retained turn metadata; no identity guessed from timing, paths or the indexer's environment. Existing turn keys and `origin` are unchanged. |
+| `ah.turn` | `prompt_index int`, `turn_index int`, `pending_bg_agents int`, `pending_workflows int` | Explicit source indices and recorded pending-background-agent/workflow counts, not row ordinals or counts of indexed children. |
+| `ah.tool_call` | `deadline_hit bool` | Explicit deadline-hit result metadata; neither an inferred timeout nor a non-zero exit code. The existing `exit_code` column is unchanged. |
+| `ah.subagent_spawn` | `timeout_ms bigint`, `deadline_at timestamptz` | Explicit spawn timeout in milliseconds and recorded timezone-aware deadline, not computed from completion or a relative timeout. |
+| `ah.subagent_spawn` | `run_fanout_budget int`, `spawn_budget int`, `active_async_capacity int`, `lifecycle_status text` | Explicit retained spawn/run budget, capacity and lifecycle metadata; no inference from observed child counts or liveness. Existing launch/completion status policies are unchanged. |
+| `ah.tool_op` | `mcp_plugin_id text`, `mcp_read_only bool` | Explicit executed MCP-operation plugin identifier and read-only annotation (including Codex operation metadata), not classification from tool name or arguments. |
+
+`latency_basis` is one of these source-specific descriptions when a valid interval is available:
+
+- `pi_request_to_entry`: pi assistant message request/start timestamp to its enclosing retained
+  session-entry timestamp.
+- `claude_parent_to_last_line`: the causally referenced Claude parent record's timestamp to the
+  last observed assistant line for the same response id. Streaming lines do not create extra calls.
+- `codex_prev_boundary_to_usage`: the preceding recorded Codex call boundary to its attributable
+  usage record. This is a boundary-to-usage interval, not a measured provider processing time.
+
+An absent endpoint, ambiguous attribution or negative interval leaves both `duration_ms` and
+`latency_basis` NULL. These bases are not interchangeable performance measurements. A source with
+no applicable observed interval supplies no guessed basis. Explicit `ttft_ms`, `thinking_ms` and
+`processing_ms` remain independent of that interval.
+
+On natural-key conflict, `thinking_ms` takes the maximum non-NULL observation. All other new
+columns take the latest non-NULL observation in loader order, including false, zero and an empty
+array. NULL never erases a known value. Existing columns retain their previous policies: in
+particular, message content and cumulative cost-state rows remain immutable, while their new
+`phase` and `has_unknown_model_cost` fields alone can be enriched. No rename, content omission,
+redaction, new grant or change to existing list-price views is introduced.
+
 ## Structure, change feed and search
 
 - `ah.v_session_orchestration`: whether a session is a loop, wave or fan-out root, a lane, a poller,

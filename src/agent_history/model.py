@@ -23,6 +23,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, fields
 from datetime import datetime
+from decimal import Decimal
 from typing import Any, ClassVar, Iterable, Protocol
 
 # Merge policies for ON CONFLICT DO UPDATE, per non-key column.
@@ -142,6 +143,14 @@ class TurnRow(Row):
     collaboration_mode: str | None = None
     context_window: int | None = None
     message_count: int | None = None
+    reasoning_summary: str | None = None
+    trace_id: str | None = None
+    root_turn_key: str | None = None
+    origin_hint: str | None = None
+    prompt_index: int | None = None
+    turn_index: int | None = None
+    pending_bg_agents: int | None = None
+    pending_workflows: int | None = None
 
 
 MESSAGE_CLASSES = (
@@ -170,6 +179,7 @@ PROMPT_ORIGINS = ("typed", "pasted", "slash_command", "skill", "hook", "local_co
 class MessageRow(Row):
     TABLE: ClassVar[str] = "message"
     KEY: ClassVar[tuple[str, ...]] = ("agent", "event_uid")
+    POLICY: ClassVar[dict[str, str]] = {"phase": UPDATE}
     DEFAULT_POLICY: ClassVar[str] = NOTHING
     agent: str
     event_uid: str            # Claude line uuid | Codex "<thread>:<ordinal or byte_offset>"
@@ -188,6 +198,7 @@ class MessageRow(Row):
     detail: dict[str, Any] | None = None   # structure only, e.g. {"source": "nested_memory"},
                                            # {"redacted": true}, {"signature_only": true}
     raw_record_origin: str | None = None  # Claude top-level JSONL type; NULL for legacy/other agents
+    phase: str | None = None
 
 
 @dataclass
@@ -198,7 +209,7 @@ class LlmCallRow(Row):
         "session": KEEP, "turn_key": KEEP, "ts": MIN,
         "input_uncached": MAX, "cache_read": MAX, "cache_write_5m": MAX, "cache_write_1h": MAX,
         "output": MAX, "reasoning": MAX, "web_search_requests": MAX, "web_fetch_requests": MAX,
-        "line_count": MAX, "byte_offset": KEEP, "is_api_error": OR,
+        "line_count": MAX, "byte_offset": KEEP, "is_api_error": OR, "thinking_ms": MAX,
     }
     agent: str
     response_id: str
@@ -226,6 +237,22 @@ class LlmCallRow(Row):
     api_error_status: int | None = None
     is_sidechain: bool = False
     line_count: int | None = None
+    duration_ms: int | None = None
+    latency_basis: str | None = None
+    cost_usd: Decimal | float | None = None
+    thinking_ms: int | None = None
+    raw_stop_reason: str | None = None
+    api: str | None = None
+    provider: str | None = None
+    cache_miss_type: str | None = None
+    cache_missed_tokens: int | None = None
+    input_transform_types: list[str] | None = None
+    advisor_model: str | None = None
+    inference_geo: str | None = None
+    iterations: int | None = None
+    ttft_ms: int | None = None
+    attempts: int | None = None
+    processing_ms: int | None = None
 
 
 @dataclass
@@ -260,6 +287,7 @@ class ToolCallRow(Row):
     denial_kind: str | None = None
     interrupted: bool | None = None
     timed_out: bool | None = None
+    deadline_hit: bool | None = None
     background: bool | None = None
     attribution_skill: str | None = None
     attribution_plugin: str | None = None
@@ -292,6 +320,8 @@ class ToolOpRow(Row):
     file_count: int | None = None
     call_uid: str | None = None
     link_method: str | None = None
+    mcp_plugin_id: str | None = None
+    mcp_read_only: bool | None = None
 
 
 @dataclass
@@ -326,6 +356,12 @@ class SubagentSpawnRow(Row):
     reported_tool_uses: int | None = None
     reported_duration_ms: int | None = None
     workflow_id: str | None = None
+    timeout_ms: int | None = None
+    deadline_at: datetime | None = None
+    run_fanout_budget: int | None = None
+    spawn_budget: int | None = None
+    active_async_capacity: int | None = None
+    lifecycle_status: str | None = None
 
 
 @dataclass
@@ -467,6 +503,7 @@ class RateLimitRow(Row):
 class CostStateRow(Row):
     TABLE: ClassVar[str] = "cost_state"
     KEY: ClassVar[tuple[str, ...]] = ("agent", "event_uid")
+    POLICY: ClassVar[dict[str, str]] = {"has_unknown_model_cost": UPDATE}
     DEFAULT_POLICY: ClassVar[str] = NOTHING
     agent: str
     event_uid: str
@@ -482,6 +519,7 @@ class CostStateRow(Row):
     lines_removed: int | None = None
     model_usage: dict[str, Any] | None = None
     start_time: datetime | None = None
+    has_unknown_model_cost: bool | None = None
 
 
 @dataclass

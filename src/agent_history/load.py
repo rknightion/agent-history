@@ -388,14 +388,16 @@ class Writer:
         head = (f"INSERT INTO ah.{cls.TABLE} AS {cls.TABLE} ({','.join(columns)}) "
                 f"VALUES ({','.join(['%s'] * len(columns))}) ON CONFLICT ({','.join(key_columns)}) ")
         updates = []
-        if cls.DEFAULT_POLICY != NOTHING:
-            for column in columns:
-                if column in key_columns or column == "source_id":
-                    continue
-                field_name = "session" if column in {"session_id", "parent_session_id"} else column
-                if column in {"namespace", "profile"}:
-                    field_name = "session"   # KEEP: first observer's filter columns win
-                updates.append(policy_sql(cls.TABLE, column, cls.POLICY.get(field_name, cls.DEFAULT_POLICY)))
+        for column in columns:
+            if column in key_columns or column == "source_id":
+                continue
+            field_name = "session" if column in {"session_id", "parent_session_id"} else column
+            if column in {"namespace", "profile"}:
+                field_name = "session"   # KEEP: first observer's filter columns win
+            policy = cls.POLICY.get(field_name, cls.DEFAULT_POLICY)
+            # Immutable content rows may still enrich explicitly opted-in telemetry fields.
+            if policy != NOTHING:
+                updates.append(policy_sql(cls.TABLE, column, policy))
         sql = head + ("DO UPDATE SET " + ", ".join(updates) if updates else "DO NOTHING")
         self._sql[cache_key] = sql
         return sql

@@ -33,6 +33,7 @@ REPLAYED = (
     "029_loop_live.sql",
     "030_collector_mutation_audit.sql",
     "032_loop_state_counts.sql",
+    "033_nullable_telemetry.sql",
 )
 
 
