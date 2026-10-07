@@ -1718,6 +1718,477 @@
           }
         }
       },
+      "call_cache_miss": {
+        "kind": "Panel",
+        "spec": {
+          "data": {
+            "kind": "QueryGroup",
+            "spec": {
+              "queries": [
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "hidden": false,
+                    "query": {
+                      "datasource": {
+                        "name": "agent-history"
+                      },
+                      "group": "grafana-postgresql-datasource",
+                      "kind": "DataQuery",
+                      "spec": {
+                        "editorMode": "code",
+                        "format": "time_series",
+                        "rawQuery": true,
+                        "rawSql": "SELECT $__timeGroupAlias(l.ts, $bucket, NULL), l.agent || ' / ' || l.cache_miss_type AS metric, count(*) AS value FROM ah.llm_call l JOIN ah.session s ON s.id = l.session_id WHERE $__timeFilter(l.ts) AND ('__all__' IN ($namespace) OR s.namespace IN ($namespace)) AND ('__all__' IN ($agent) OR s.agent IN ($agent)) AND ('__all__' IN (${model:sqlstring}) OR coalesce(l.model, '(unrecorded)') IN (${model:sqlstring})) AND ('__all__' IN (${service_tier:sqlstring}) OR coalesce(l.service_tier, '(unrecorded)') IN (${service_tier:sqlstring})) AND ('__all__' IN (${effort:sqlstring}) OR coalesce(l.effort, '(unrecorded)') IN (${effort:sqlstring})) AND l.cache_miss_type IS NOT NULL GROUP BY 1,2 ORDER BY 1"
+                      },
+                      "version": "v0"
+                    },
+                    "refId": "A"
+                  }
+                }
+              ],
+              "queryOptions": {},
+              "transformations": []
+            }
+          },
+          "description": "Calls with an explicit cache_miss_type per bucket, split by agent and recorded type. Missing classifications are excluded, not inferred from uncached input. Uses the call telemetry filters.",
+          "id": 341,
+          "links": [],
+          "title": "Recorded cache misses by type",
+          "vizConfig": {
+            "group": "timeseries",
+            "kind": "VizConfig",
+            "spec": {
+              "fieldConfig": {
+                "defaults": {
+                  "color": {
+                    "mode": "palette-classic"
+                  },
+                  "custom": {
+                    "axisBorderShow": false,
+                    "axisCenteredZero": false,
+                    "axisColorMode": "text",
+                    "axisLabel": "",
+                    "axisPlacement": "auto",
+                    "barAlignment": 0,
+                    "drawStyle": "bars",
+                    "fillOpacity": 80,
+                    "gradientMode": "none",
+                    "hideFrom": {
+                      "legend": false,
+                      "tooltip": false,
+                      "viz": false
+                    },
+                    "insertNulls": false,
+                    "lineInterpolation": "smooth",
+                    "lineWidth": 1,
+                    "pointSize": 6,
+                    "scaleDistribution": {
+                      "type": "linear"
+                    },
+                    "showPoints": "never",
+                    "spanNulls": false,
+                    "stacking": {
+                      "group": "A",
+                      "mode": "normal"
+                    },
+                    "thresholdsStyle": {
+                      "mode": "off"
+                    }
+                  },
+                  "mappings": [],
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      {
+                        "color": "text",
+                        "value": null
+                      }
+                    ]
+                  },
+                  "unit": "short"
+                },
+                "overrides": []
+              },
+              "options": {
+                "legend": {
+                  "calcs": [
+                    "sum"
+                  ],
+                  "displayMode": "table",
+                  "placement": "bottom",
+                  "showLegend": true
+                },
+                "tooltip": {
+                  "hideZeros": false,
+                  "mode": "multi",
+                  "sort": "desc"
+                }
+              }
+            },
+            "version": "13.2.0"
+          }
+        }
+      },
+      "call_p50": {
+        "kind": "Panel",
+        "spec": {
+          "data": {
+            "kind": "QueryGroup",
+            "spec": {
+              "queries": [
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "hidden": false,
+                    "query": {
+                      "datasource": {
+                        "name": "agent-history"
+                      },
+                      "group": "grafana-postgresql-datasource",
+                      "kind": "DataQuery",
+                      "spec": {
+                        "editorMode": "code",
+                        "format": "table",
+                        "rawQuery": true,
+                        "rawSql": "SELECT l.agent AS agent, coalesce(l.model, '(unrecorded)') AS model, coalesce(l.service_tier, '(unrecorded)') AS service_tier, coalesce(l.effort, '(unrecorded)') AS effort, l.latency_basis, count(*) AS measured_calls, percentile_cont(0.5) WITHIN GROUP (ORDER BY l.duration_ms) AS p50_duration_ms, percentile_cont(0.5) WITHIN GROUP (ORDER BY l.output::double precision * 1000.0 / l.duration_ms) AS p50_output_tokens_per_second FROM ah.llm_call l JOIN ah.session s ON s.id = l.session_id WHERE $__timeFilter(l.ts) AND ('__all__' IN ($namespace) OR s.namespace IN ($namespace)) AND ('__all__' IN ($agent) OR s.agent IN ($agent)) AND ('__all__' IN (${model:sqlstring}) OR coalesce(l.model, '(unrecorded)') IN (${model:sqlstring})) AND ('__all__' IN (${service_tier:sqlstring}) OR coalesce(l.service_tier, '(unrecorded)') IN (${service_tier:sqlstring})) AND ('__all__' IN (${effort:sqlstring}) OR coalesce(l.effort, '(unrecorded)') IN (${effort:sqlstring})) AND l.duration_ms > 0 AND l.output IS NOT NULL AND l.latency_basis IS NOT NULL GROUP BY 1,2,3,4,5 ORDER BY 1,2,3,4,5"
+                      },
+                      "version": "v0"
+                    },
+                    "refId": "A"
+                  }
+                }
+              ],
+              "queryOptions": {},
+              "transformations": []
+            }
+          },
+          "description": "Output tokens / observed call interval in seconds, not measured provider generation speed. pi_request_to_entry is request to retained entry; claude_parent_to_last_line is an estimated parent to last streaming line interval; codex_prev_boundary_to_usage is an estimated boundary to usage interval. These bases are not interchangeable and are kept separate. Missing output or latency, unknown basis and zero-duration calls are excluded; recorded zero output is included. Filters: namespace, agent, model, service tier and effort. NULL tier/effort/model reads (unrecorded), never default.",
+          "id": 340,
+          "links": [],
+          "title": "Call interval and output throughput p50 (pi, Claude, Codex)",
+          "vizConfig": {
+            "group": "table",
+            "kind": "VizConfig",
+            "spec": {
+              "fieldConfig": {
+                "defaults": {
+                  "color": {
+                    "mode": "thresholds"
+                  },
+                  "custom": {
+                    "align": "auto",
+                    "cellOptions": {
+                      "type": "auto"
+                    },
+                    "filterable": true,
+                    "inspect": true
+                  },
+                  "mappings": [],
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      {
+                        "color": "text",
+                        "value": null
+                      }
+                    ]
+                  },
+                  "unit": "short"
+                },
+                "overrides": [
+                  {
+                    "matcher": {
+                      "id": "byName",
+                      "options": "p50_duration_ms"
+                    },
+                    "properties": [
+                      {
+                        "id": "unit",
+                        "value": "ms"
+                      }
+                    ]
+                  },
+                  {
+                    "matcher": {
+                      "id": "byName",
+                      "options": "p50_output_tokens_per_second"
+                    },
+                    "properties": [
+                      {
+                        "id": "unit",
+                        "value": "suffix:tokens/s"
+                      },
+                      {
+                        "id": "decimals",
+                        "value": 1
+                      }
+                    ]
+                  }
+                ]
+              },
+              "options": {
+                "cellHeight": "sm",
+                "footer": {
+                  "countRows": false,
+                  "fields": [],
+                  "reducer": [
+                    "sum"
+                  ],
+                  "show": false
+                },
+                "showHeader": true,
+                "sortBy": []
+              }
+            },
+            "version": "13.2.0"
+          }
+        }
+      },
+      "call_throughput": {
+        "kind": "Panel",
+        "spec": {
+          "data": {
+            "kind": "QueryGroup",
+            "spec": {
+              "queries": [
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "hidden": false,
+                    "query": {
+                      "datasource": {
+                        "name": "agent-history"
+                      },
+                      "group": "grafana-postgresql-datasource",
+                      "kind": "DataQuery",
+                      "spec": {
+                        "editorMode": "code",
+                        "format": "time_series",
+                        "rawQuery": true,
+                        "rawSql": "SELECT $__timeGroupAlias(l.ts, $bucket, NULL), concat_ws(' / ', l.agent, coalesce(l.model, '(unrecorded)'), coalesce(l.service_tier, '(unrecorded)'), coalesce(l.effort, '(unrecorded)'), l.latency_basis) AS metric, percentile_cont(0.5) WITHIN GROUP (ORDER BY l.output::double precision * 1000.0 / l.duration_ms) AS value FROM ah.llm_call l JOIN ah.session s ON s.id = l.session_id WHERE $__timeFilter(l.ts) AND ('__all__' IN ($namespace) OR s.namespace IN ($namespace)) AND ('__all__' IN ($agent) OR s.agent IN ($agent)) AND ('__all__' IN (${model:sqlstring}) OR coalesce(l.model, '(unrecorded)') IN (${model:sqlstring})) AND ('__all__' IN (${service_tier:sqlstring}) OR coalesce(l.service_tier, '(unrecorded)') IN (${service_tier:sqlstring})) AND ('__all__' IN (${effort:sqlstring}) OR coalesce(l.effort, '(unrecorded)') IN (${effort:sqlstring})) AND l.duration_ms > 0 AND l.output IS NOT NULL AND l.latency_basis IS NOT NULL GROUP BY 1,2 ORDER BY 1"
+                      },
+                      "version": "v0"
+                    },
+                    "refId": "A"
+                  }
+                }
+              ],
+              "queryOptions": {},
+              "transformations": []
+            }
+          },
+          "description": "Output tokens / observed call interval in seconds, not measured provider generation speed. pi_request_to_entry is request to retained entry; claude_parent_to_last_line is an estimated parent to last streaming line interval; codex_prev_boundary_to_usage is an estimated boundary to usage interval. These bases are not interchangeable and are kept separate. Missing output or latency, unknown basis and zero-duration calls are excluded; recorded zero output is included. Filters: namespace, agent, model, service tier and effort. NULL tier/effort/model reads (unrecorded), never default.",
+          "id": 339,
+          "links": [],
+          "title": "Observed output tokens/sec p50 by model, tier, effort and agent",
+          "vizConfig": {
+            "group": "timeseries",
+            "kind": "VizConfig",
+            "spec": {
+              "fieldConfig": {
+                "defaults": {
+                  "color": {
+                    "mode": "palette-classic"
+                  },
+                  "custom": {
+                    "axisBorderShow": false,
+                    "axisCenteredZero": false,
+                    "axisColorMode": "text",
+                    "axisLabel": "",
+                    "axisPlacement": "auto",
+                    "barAlignment": 0,
+                    "drawStyle": "line",
+                    "fillOpacity": 10,
+                    "gradientMode": "none",
+                    "hideFrom": {
+                      "legend": false,
+                      "tooltip": false,
+                      "viz": false
+                    },
+                    "insertNulls": false,
+                    "lineInterpolation": "smooth",
+                    "lineWidth": 2,
+                    "pointSize": 6,
+                    "scaleDistribution": {
+                      "type": "linear"
+                    },
+                    "showPoints": "never",
+                    "spanNulls": false,
+                    "stacking": {
+                      "group": "A",
+                      "mode": "none"
+                    },
+                    "thresholdsStyle": {
+                      "mode": "off"
+                    }
+                  },
+                  "decimals": 1,
+                  "mappings": [],
+                  "min": 0,
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      {
+                        "color": "text",
+                        "value": null
+                      }
+                    ]
+                  },
+                  "unit": "suffix:tokens/s"
+                },
+                "overrides": []
+              },
+              "options": {
+                "legend": {
+                  "calcs": [
+                    "lastNotNull"
+                  ],
+                  "displayMode": "table",
+                  "placement": "bottom",
+                  "showLegend": true
+                },
+                "tooltip": {
+                  "hideZeros": false,
+                  "mode": "multi",
+                  "sort": "desc"
+                }
+              }
+            },
+            "version": "13.2.0"
+          }
+        }
+      },
+      "call_unknown_cost": {
+        "kind": "Panel",
+        "spec": {
+          "data": {
+            "kind": "QueryGroup",
+            "spec": {
+              "queries": [
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "hidden": false,
+                    "query": {
+                      "datasource": {
+                        "name": "agent-history"
+                      },
+                      "group": "grafana-postgresql-datasource",
+                      "kind": "DataQuery",
+                      "spec": {
+                        "editorMode": "code",
+                        "format": "table",
+                        "rawQuery": true,
+                        "rawSql": "SELECT s.namespace, s.agent, s.session_uid, (CASE WHEN '$redact' = 'on' AND ah.project_of(s.cwd) !~ '^\\(' AND (ah.project_of(s.cwd) ~* '(__AH_PRIVATE_TERMS__)' OR NOT (CASE WHEN lower(regexp_replace(coalesce(ah.project_of(s.cwd), ''), '^(https?://)?(github\\.com/)?', '')) LIKE '%/%' THEN lower(regexp_replace(coalesce(ah.project_of(s.cwd), ''), '^(https?://)?(github\\.com/)?', '')) = ANY (ARRAY['brotek-solutions/ha-addons', 'rknightion/.github', 'rknightion/arcane', 'rknightion/autopi-ha', 'rknightion/backlog-publishing', 'rknightion/bumblebee-catalog', 'rknightion/bumblebee-intune', 'rknightion/cf2otel', 'rknightion/chatgpt-exporter', 'rknightion/claude-notifications-go', 'rknightion/codex-lb', 'rknightion/codexlb2otel', 'rknightion/core', 'rknightion/fleet-management-operator', 'rknightion/gcx', 'rknightion/genai-otel-bridge', 'rknightion/grafana-aio11y-demo', 'rknightion/grafana-cloud-org-insights', 'rknightion/grafana-cloud-reference-examples', 'rknightion/grafana-cloud-vending-machine', 'rknightion/graph2otel', 'rknightion/grottrack', 'rknightion/intune-assignments-manager', 'rknightion/intuneomator', 'rknightion/k8s-monitoring-helm', 'rknightion/meraki-dashboard-exporter', 'rknightion/meraki-dashboard-ha', 'rknightion/mq-exporter-dist', 'rknightion/openbao-plugin-secrets-github', 'rknightion/opentelemetry-demo', 'rknightion/opnsense2otel', 'rknightion/paperless-ngx-dedupe', 'rknightion/polylens2otel', 'rknightion/profilarr', 'rknightion/rfc6035-2otel', 'rknightion/sagemcom-f3896-py', 'rknightion/sf2loki', 'rknightion/synthkit', 'rknightion/tailscale2otel', 'rknightion/third-party-patcher', 'rknightion/transceiver-exporter', 'rknightion/unpoller']) ELSE lower(regexp_replace(coalesce(ah.project_of(s.cwd), ''), '^(https?://)?(github\\.com/)?', '')) = ANY (ARRAY['ha-addons', '.github', 'arcane', 'autopi-ha', 'backlog-publishing', 'bumblebee-catalog', 'bumblebee-intune', 'cf2otel', 'chatgpt-exporter', 'claude-notifications-go', 'codex-lb', 'codexlb2otel', 'core', 'fleet-management-operator', 'gcx', 'genai-otel-bridge', 'grafana-aio11y-demo', 'grafana-cloud-org-insights', 'grafana-cloud-reference-examples', 'grafana-cloud-vending-machine', 'graph2otel', 'grottrack', 'intune-assignments-manager', 'intuneomator', 'k8s-monitoring-helm', 'meraki-dashboard-exporter', 'meraki-dashboard-ha', 'mq-exporter-dist', 'openbao-plugin-secrets-github', 'opentelemetry-demo', 'opnsense2otel', 'paperless-ngx-dedupe', 'polylens2otel', 'profilarr', 'rfc6035-2otel', 'sagemcom-f3896-py', 'sf2loki', 'synthkit', 'tailscale2otel', 'third-party-patcher', 'transceiver-exporter', 'unpoller']) END)) THEN 'private repo' ELSE ah.project_of(s.cwd) END) AS project, true AS has_unknown_model_cost, max(c.ts) AS last_flagged_at FROM ah.cost_state c JOIN ah.session s ON s.id = c.session_id WHERE $__timeFilter(c.ts) AND ('__all__' IN ($namespace) OR s.namespace IN ($namespace)) AND ('__all__' IN ($agent) OR s.agent IN ($agent)) AND c.has_unknown_model_cost IS TRUE GROUP BY s.id ORDER BY last_flagged_at DESC"
+                      },
+                      "version": "v0"
+                    },
+                    "refId": "A"
+                  }
+                }
+              ],
+              "queryOptions": {},
+              "transformations": []
+            }
+          },
+          "description": "Sessions with at least one explicit true has_unknown_model_cost observation in the selected range. This is recorded cumulative cost-state evidence, not a missing catalogue price. False/NULL do not flag a session. Namespace and agent filters apply; call model/tier/effort filters do not apply to cumulative session cost states.",
+          "id": 342,
+          "links": [],
+          "title": "Sessions with recorded unknown-model cost",
+          "vizConfig": {
+            "group": "table",
+            "kind": "VizConfig",
+            "spec": {
+              "fieldConfig": {
+                "defaults": {
+                  "color": {
+                    "mode": "thresholds"
+                  },
+                  "custom": {
+                    "align": "auto",
+                    "cellOptions": {
+                      "type": "auto"
+                    },
+                    "filterable": true,
+                    "inspect": true
+                  },
+                  "mappings": [],
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      {
+                        "color": "text",
+                        "value": null
+                      }
+                    ]
+                  },
+                  "unit": "short"
+                },
+                "overrides": [
+                  {
+                    "matcher": {
+                      "id": "byName",
+                      "options": "session_uid"
+                    },
+                    "properties": [
+                      {
+                        "id": "links",
+                        "value": [
+                          {
+                            "title": "Open in Session drill-down",
+                            "url": "/d/agent-history/?var-session=${__value.raw}&${namespace:queryparam}&${agent:queryparam}&${__url_time_range}&dtab=Session-drill-down"
+                          }
+                        ]
+                      }
+                    ]
+                  },
+                  {
+                    "matcher": {
+                      "id": "byName",
+                      "options": "has_unknown_model_cost"
+                    },
+                    "properties": [
+                      {
+                        "id": "custom.cellOptions",
+                        "value": {
+                          "type": "color-text"
+                        }
+                      },
+                      {
+                        "id": "thresholds",
+                        "value": {
+                          "mode": "absolute",
+                          "steps": [
+                            {
+                              "color": "yellow",
+                              "value": null
+                            }
+                          ]
+                        }
+                      }
+                    ]
+                  }
+                ]
+              },
+              "options": {
+                "cellHeight": "sm",
+                "footer": {
+                  "countRows": false,
+                  "fields": [],
+                  "reducer": [
+                    "sum"
+                  ],
+                  "show": false
+                },
+                "showHeader": true,
+                "sortBy": []
+              }
+            },
+            "version": "13.2.0"
+          }
+        }
+      },
       "cf_changes": {
         "kind": "Panel",
         "spec": {
@@ -40390,6 +40861,71 @@
               },
               "title": "Agent types"
             }
+          },
+          {
+            "kind": "TabsLayoutTab",
+            "spec": {
+              "layout": {
+                "kind": "GridLayout",
+                "spec": {
+                  "items": [
+                    {
+                      "kind": "GridLayoutItem",
+                      "spec": {
+                        "element": {
+                          "kind": "ElementReference",
+                          "name": "call_throughput"
+                        },
+                        "height": 10,
+                        "width": 24,
+                        "x": 0,
+                        "y": 0
+                      }
+                    },
+                    {
+                      "kind": "GridLayoutItem",
+                      "spec": {
+                        "element": {
+                          "kind": "ElementReference",
+                          "name": "call_p50"
+                        },
+                        "height": 10,
+                        "width": 24,
+                        "x": 0,
+                        "y": 10
+                      }
+                    },
+                    {
+                      "kind": "GridLayoutItem",
+                      "spec": {
+                        "element": {
+                          "kind": "ElementReference",
+                          "name": "call_cache_miss"
+                        },
+                        "height": 9,
+                        "width": 24,
+                        "x": 0,
+                        "y": 20
+                      }
+                    },
+                    {
+                      "kind": "GridLayoutItem",
+                      "spec": {
+                        "element": {
+                          "kind": "ElementReference",
+                          "name": "call_unknown_cost"
+                        },
+                        "height": 9,
+                        "width": 24,
+                        "x": 0,
+                        "y": 29
+                      }
+                    }
+                  ]
+                }
+              },
+              "title": "Call telemetry"
+            }
           }
         ]
       }
@@ -40532,6 +41068,117 @@
             "version": "v0"
           },
           "refresh": "onDashboardLoad",
+          "regex": "",
+          "skipUrlSync": false,
+          "sort": "disabled"
+        }
+      },
+      {
+        "kind": "QueryVariable",
+        "spec": {
+          "allValue": "'__all__'",
+          "allowCustomValue": true,
+          "current": {
+            "text": "All",
+            "value": "$__all"
+          },
+          "definition": "SELECT DISTINCT coalesce(l.model, '(unrecorded)') AS model FROM ah.llm_call l JOIN ah.session s ON s.id = l.session_id WHERE $__timeFilter(l.ts) AND ('__all__' IN ($namespace) OR s.namespace IN ($namespace)) AND ('__all__' IN ($agent) OR s.agent IN ($agent)) ORDER BY 1",
+          "hide": "dontHide",
+          "includeAll": true,
+          "label": "Call model",
+          "multi": true,
+          "name": "model",
+          "options": [],
+          "query": {
+            "datasource": {
+              "name": "agent-history"
+            },
+            "group": "grafana-postgresql-datasource",
+            "kind": "DataQuery",
+            "spec": {
+              "editorMode": "code",
+              "format": "table",
+              "rawQuery": true,
+              "rawSql": "SELECT DISTINCT coalesce(l.model, '(unrecorded)') AS model FROM ah.llm_call l JOIN ah.session s ON s.id = l.session_id WHERE $__timeFilter(l.ts) AND ('__all__' IN ($namespace) OR s.namespace IN ($namespace)) AND ('__all__' IN ($agent) OR s.agent IN ($agent)) ORDER BY 1",
+              "refId": "model"
+            },
+            "version": "v0"
+          },
+          "refresh": "onTimeRangeChanged",
+          "regex": "",
+          "skipUrlSync": false,
+          "sort": "disabled"
+        }
+      },
+      {
+        "kind": "QueryVariable",
+        "spec": {
+          "allValue": "'__all__'",
+          "allowCustomValue": true,
+          "current": {
+            "text": "All",
+            "value": "$__all"
+          },
+          "definition": "SELECT DISTINCT coalesce(l.service_tier, '(unrecorded)') AS service_tier FROM ah.llm_call l JOIN ah.session s ON s.id = l.session_id WHERE $__timeFilter(l.ts) AND ('__all__' IN ($namespace) OR s.namespace IN ($namespace)) AND ('__all__' IN ($agent) OR s.agent IN ($agent)) ORDER BY 1",
+          "hide": "dontHide",
+          "includeAll": true,
+          "label": "Call service tier",
+          "multi": true,
+          "name": "service_tier",
+          "options": [],
+          "query": {
+            "datasource": {
+              "name": "agent-history"
+            },
+            "group": "grafana-postgresql-datasource",
+            "kind": "DataQuery",
+            "spec": {
+              "editorMode": "code",
+              "format": "table",
+              "rawQuery": true,
+              "rawSql": "SELECT DISTINCT coalesce(l.service_tier, '(unrecorded)') AS service_tier FROM ah.llm_call l JOIN ah.session s ON s.id = l.session_id WHERE $__timeFilter(l.ts) AND ('__all__' IN ($namespace) OR s.namespace IN ($namespace)) AND ('__all__' IN ($agent) OR s.agent IN ($agent)) ORDER BY 1",
+              "refId": "service_tier"
+            },
+            "version": "v0"
+          },
+          "refresh": "onTimeRangeChanged",
+          "regex": "",
+          "skipUrlSync": false,
+          "sort": "disabled"
+        }
+      },
+      {
+        "kind": "QueryVariable",
+        "spec": {
+          "allValue": "'__all__'",
+          "allowCustomValue": true,
+          "current": {
+            "text": "All",
+            "value": "$__all"
+          },
+          "definition": "SELECT DISTINCT coalesce(l.effort, '(unrecorded)') AS effort FROM ah.llm_call l JOIN ah.session s ON s.id = l.session_id WHERE $__timeFilter(l.ts) AND ('__all__' IN ($namespace) OR s.namespace IN ($namespace)) AND ('__all__' IN ($agent) OR s.agent IN ($agent)) ORDER BY 1",
+          "hide": "dontHide",
+          "includeAll": true,
+          "label": "Call effort",
+          "multi": true,
+          "name": "effort",
+          "options": [],
+          "query": {
+            "datasource": {
+              "name": "agent-history"
+            },
+            "group": "grafana-postgresql-datasource",
+            "kind": "DataQuery",
+            "spec": {
+              "editorMode": "code",
+              "format": "table",
+              "rawQuery": true,
+              "rawSql": "SELECT DISTINCT coalesce(l.effort, '(unrecorded)') AS effort FROM ah.llm_call l JOIN ah.session s ON s.id = l.session_id WHERE $__timeFilter(l.ts) AND ('__all__' IN ($namespace) OR s.namespace IN ($namespace)) AND ('__all__' IN ($agent) OR s.agent IN ($agent)) ORDER BY 1",
+              "refId": "effort"
+            },
+            "version": "v0"
+          },
+          "refresh": "onTimeRangeChanged",
           "regex": "",
           "skipUrlSync": false,
           "sort": "disabled"

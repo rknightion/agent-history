@@ -4623,6 +4623,107 @@ bargauge(
 )
 tab("Agent types", [(10, [("type_source", 18), ("type_unknown", 6)])])
 
+# ==========================================================================
+# TAB: Call telemetry (nullable transcript observations, not provider timings)
+# ==========================================================================
+CALL_MODEL = "coalesce(l.model, '(unrecorded)')"
+CALL_TIER = "coalesce(l.service_tier, '(unrecorded)')"
+CALL_EFFORT = "coalesce(l.effort, '(unrecorded)')"
+CALL_FILTER = " AND ".join(
+    f"('__all__' IN (${{{name}:sqlstring}}) OR {expr} IN (${{{name}:sqlstring}}))"
+    for name, expr in (("model", CALL_MODEL), ("service_tier", CALL_TIER), ("effort", CALL_EFFORT))
+)
+CALLS = f"{LLM} AND {CALL_FILTER}"
+TIMED_CALLS = f"{CALLS} AND l.duration_ms > 0 AND l.output IS NOT NULL AND l.latency_basis IS NOT NULL"
+OUTPUT_RATE = "l.output::double precision * 1000.0 / l.duration_ms"
+CALL_DIMENSIONS = (
+    f"l.agent AS agent, {CALL_MODEL} AS model, {CALL_TIER} AS service_tier, {CALL_EFFORT} AS effort, l.latency_basis"
+)
+CALL_TIMING_DESC = (
+    "Output tokens / observed call interval in seconds, not measured provider generation speed. "
+    "pi_request_to_entry is request to retained entry; claude_parent_to_last_line is an estimated "
+    "parent to last streaming line interval; codex_prev_boundary_to_usage is an estimated boundary "
+    "to usage interval. These bases are not interchangeable and are kept separate. "
+    "Missing output or latency, unknown basis and zero-duration calls are excluded; recorded zero output is included. "
+    "Filters: namespace, agent, model, service tier and effort. NULL tier/effort/model reads (unrecorded), never default."
+)
+timeseries(
+    "call_throughput",
+    "Observed output tokens/sec p50 by model, tier, effort and agent",
+    CALL_TIMING_DESC,
+    [
+        sql(
+            f"SELECT {BUCKET.format(col='l.ts')}, concat_ws(' / ', l.agent, {CALL_MODEL}, {CALL_TIER}, "
+            f"{CALL_EFFORT}, l.latency_basis) AS metric, "
+            f"percentile_cont(0.5) WITHIN GROUP (ORDER BY {OUTPUT_RATE}) AS value "
+            f"{TIMED_CALLS} GROUP BY 1,2 ORDER BY 1",
+            ts=True,
+        )
+    ],
+    unit="suffix:tokens/s",
+    decimals=1,
+    minv=0,
+    legend_mode="table",
+    calcs=["lastNotNull"],
+)
+table(
+    "call_p50",
+    "Call interval and output throughput p50 (pi, Claude, Codex)",
+    CALL_TIMING_DESC,
+    [
+        sql(
+            f"SELECT {CALL_DIMENSIONS}, count(*) AS measured_calls, "
+            "percentile_cont(0.5) WITHIN GROUP (ORDER BY l.duration_ms) AS p50_duration_ms, "
+            f"percentile_cont(0.5) WITHIN GROUP (ORDER BY {OUTPUT_RATE}) AS p50_output_tokens_per_second "
+            f"{TIMED_CALLS} GROUP BY 1,2,3,4,5 ORDER BY 1,2,3,4,5"
+        )
+    ],
+    cols=[col("p50_duration_ms", unit="ms"), col("p50_output_tokens_per_second", unit="suffix:tokens/s", decimals=1)],
+)
+bars(
+    "call_cache_miss",
+    "Recorded cache misses by type",
+    "Calls with an explicit cache_miss_type per bucket, split by agent and recorded type. "
+    "Missing classifications are excluded, not inferred from uncached input. Uses the call telemetry filters.",
+    [
+        sql(
+            f"SELECT {BUCKET.format(col='l.ts')}, l.agent || ' / ' || l.cache_miss_type AS metric, "
+            f"count(*) AS value {CALLS} AND l.cache_miss_type IS NOT NULL GROUP BY 1,2 ORDER BY 1",
+            ts=True,
+        )
+    ],
+    legend_mode="table",
+    calcs=["sum"],
+)
+table(
+    "call_unknown_cost",
+    "Sessions with recorded unknown-model cost",
+    "Sessions with at least one explicit true has_unknown_model_cost observation in the selected range. "
+    "This is recorded cumulative cost-state evidence, not a missing catalogue price. False/NULL do not flag a session. "
+    "Namespace and agent filters apply; call model/tier/effort filters do not apply to cumulative session cost states.",
+    [
+        sql(
+            f"SELECT s.namespace, s.agent, s.session_uid, {RP('ah.project_of(s.cwd)')} AS project, "
+            "true AS has_unknown_model_cost, max(c.ts) AS last_flagged_at "
+            f"FROM ah.cost_state c {JS.format(a='c')} WHERE $__timeFilter(c.ts) AND {NSAG('s')} "
+            "AND c.has_unknown_model_cost IS TRUE GROUP BY s.id ORDER BY last_flagged_at DESC"
+        )
+    ],
+    cols=[
+        col("session_uid", links=SESSION_LINK),
+        col("has_unknown_model_cost", text_colour=steps("yellow")),
+    ],
+)
+tab(
+    "Call telemetry",
+    [
+        (10, [("call_throughput", 24)]),
+        (10, [("call_p50", 24)]),
+        (9, [("call_cache_miss", 24)]),
+        (9, [("call_unknown_cost", 24)]),
+    ],
+)
+
 VARIABLES = [
     customvar("redact", "Redact", ["off", "on"], "off", hide="hideVariable"),
     sqlvar(
@@ -4631,6 +4732,9 @@ VARIABLES = [
         "SELECT DISTINCT namespace FROM ah.session WHERE namespace IS NOT NULL ORDER BY 1 LIMIT 100",
     ),
     sqlvar("agent", "Agent", "SELECT DISTINCT agent FROM ah.session ORDER BY 1"),
+    sqlvar("model", "Call model", f"SELECT DISTINCT {CALL_MODEL} AS model {LLM} ORDER BY 1"),
+    sqlvar("service_tier", "Call service tier", f"SELECT DISTINCT {CALL_TIER} AS service_tier {LLM} ORDER BY 1"),
+    sqlvar("effort", "Call effort", f"SELECT DISTINCT {CALL_EFFORT} AS effort {LLM} ORDER BY 1"),
     sqlvar(
         "repo",
         "Repo",
