@@ -479,8 +479,9 @@ def test_periodic_indexer_publishes_metrics_while_its_index_pass_fails_and_exits
         runs = decoded["agent_sessions_metrics_collection_runs_total"]["points"]
         assert list(runs.values()) == [1.0], repr(runs)  # exactly one collection in the refresh interval
         process.send_signal(signal.SIGTERM)
-        assert process.wait(timeout=30) == 143
+        assert process.wait(timeout=30) == 0  # a drain, not a kill: the worker stops cleanly
         stderr = process.stderr.read().decode()
+        assert "index drained" in stderr
         assert "index failed" in stderr  # the pass really failed while metrics published
         assert "metric collection disabled" not in stderr
     finally:

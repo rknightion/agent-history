@@ -8,6 +8,7 @@ There is deliberately no endpoint default, live configuration write or provider 
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import math
@@ -26,6 +27,7 @@ from psycopg.types.json import Jsonb
 
 from .common import _join_continuations
 from .config import ConfigError, LoopLive, load_config
+from .drain import Drain
 
 PHASES = ("preparing", "working", "reviewing", "gating", "landing", "waiting", "closing")
 DIGEST_BYTES = 12000
@@ -1528,8 +1530,12 @@ def refresh(conn: psycopg.Connection) -> None:
         )
 
 
-def main() -> None:
-    """Bounded queue drain, independently schedulable by the operator alongside the indexer."""
+def run_pass(stop=None) -> None:
+    """Bounded queue drain, independently schedulable by the operator alongside the indexer.
+
+    `stop` is a Drain: once it is requested no further job is claimed, and the job in flight
+    finishes its claim, provider call and apply before the pass returns.
+    """
     config = load_config()
     if not config.loop_live.enabled:
         return
@@ -1539,9 +1545,33 @@ def main() -> None:
     deadline = time.monotonic() + 60
     with psycopg.connect(dsn, autocommit=True, connect_timeout=5) as conn:
         for _ in range(20):
+            if stop is not None and stop.requested:
+                break
             if time.monotonic() >= deadline or not drain_one(conn, config.loop_live):
                 break
 
 
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(prog="python -m agent_history.loop_live")
+    parser.add_argument("--every", type=float, help="repeat the pass every N seconds (positive)")
+    args = parser.parse_args(argv)
+    if args.every is None:
+        run_pass()
+        return 0
+    if args.every <= 0:
+        parser.error("--every must be positive")
+    with Drain("loop-live") as drain:
+        while not drain.requested:
+            try:
+                run_pass(drain)
+                print("loop-live-pass-exit=0", flush=True)
+            except Exception as exc:
+                # Type only: a driver or provider message can quote a DSN or response body.
+                print(f"loop-live-pass-exit=1 ({type(exc).__name__})", flush=True)
+            drain.wait(args.every)
+        drain.drained()
+    return 0
+
+
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

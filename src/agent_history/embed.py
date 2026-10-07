@@ -32,6 +32,7 @@ from typing import Callable
 import psycopg
 
 from . import embed_telemetry, telemetry
+from .drain import stop_requested
 
 from .load import ADVISORY_LOCK
 
@@ -561,6 +562,8 @@ def run(conn: psycopg.Connection, provider: Provider, cap_tokens: int = 3_000_00
         used_today = int(row[0]) if row else 0
         conn.commit()
         while True:
+            if stop_requested():
+                break  # every earlier batch is committed; the rest waits for the next worker
             if cap_tokens and stats.tokens >= cap_tokens:
                 break
             if daily_cap and used_today + stats.tokens >= daily_cap:
@@ -620,7 +623,7 @@ def run(conn: psycopg.Connection, provider: Provider, cap_tokens: int = 3_000_00
                 f"failed={stats.failed_inputs} tokens~{stats.tokens}")
             if progressed == 0:
                 break
-        if gc_interval_hours:
+        if gc_interval_hours and not stop_requested():
             last = conn.execute("SELECT now(), (SELECT value FROM ah.meta WHERE key = 'embed_gc_at')").fetchone()
             conn.rollback()
             if gc_due(last[0], last[1], gc_interval_hours):

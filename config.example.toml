@@ -85,6 +85,10 @@ api_key_env = "OPENAI_API_KEY"
 # and TimeoutStopSec=5 (RuntimeMaxSec does not bound Type=oneshot services). Give this worker
 # its own timer; do not make structural collection depend on its success or completion.
 # A supervisor interruption leaves committed paid reservations uncertain, never refunded/retried.
+# A long-running container can instead run `python -m agent_history.loop_live --every 300`:
+# SIGTERM or SIGINT then stops admitting jobs, lets the job in flight finish and exits 0, so give
+# the stop a grace period longer than one whole job: its jev and summary requests at their
+# timeouts plus the database claim and apply.
 # A failed/slow provider keeps the previous summary and records an error. Inputs and outputs
 # are unredacted. The shared UTC daily reservation ceiling is fixed at USD 5 across both models.
 # Reservations use peak prices, a 5% fee allowance, the whole documented context ceiling and

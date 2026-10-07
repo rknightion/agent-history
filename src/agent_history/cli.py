@@ -8,7 +8,7 @@ the writer DSN: --dsn, else $AGENT_HISTORY_DSN, else `dsn` in the config file. R
 from __future__ import annotations
 
 import argparse
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import ExitStack, redirect_stderr, redirect_stdout
 import json
 import logging
 import os
@@ -19,6 +19,7 @@ from pathlib import Path
 
 from . import load, telemetry
 from .config import ConfigError, load_config
+from .drain import Drain
 
 SQL_DIR = Path(__file__).resolve().parent / "sql"
 
@@ -41,6 +42,8 @@ WORKER_COMMANDS = frozenset(
         "create-vector-index",
     }
 )
+# Commands that accept --every and drain on SIGTERM/SIGINT instead of dying mid-pass.
+PERIODIC = ("index", "embed", "journal-sync")
 _command: str | None = None  # the parsed subcommand of the current process, for run()
 
 
@@ -233,6 +236,7 @@ def main(argv: list[str] | None = None) -> int:
     col.add_argument("--rescan-days", type=int)
     journal = sub.add_parser("journal-sync", help="sync a read-only journal export view")
     journal.add_argument("--source-db", type=Path)
+    journal.add_argument("--every", type=float, help="repeat journal-sync every N seconds (positive)")
 
     args = parser.parse_args(argv)
     global _command
@@ -248,7 +252,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command not in workers:
         return _dispatch(args, parser, argv, reader_commands)
     with telemetry.lifecycle("agent-history-" + args.command):
-        if args.command in ("index", "embed") and args.every is not None:
+        if args.command in PERIODIC and args.every is not None:
             return _dispatch(args, parser, argv, reader_commands)
         with telemetry.pass_span(workers[args.command]) as span:
             result = _dispatch(args, parser, argv, reader_commands)
@@ -326,7 +330,7 @@ def _dispatch(args, parser, argv, reader_commands):
     from . import reader
 
     # Periodic workers reload config inside the suppressed single-shot iteration.
-    if args.command in ("index", "embed") and args.every is not None:
+    if args.command in PERIODIC and args.every is not None:
         if args.every <= 0:
             parser.error("--every must be positive")
         once = list(argv if argv is not None else sys.argv[1:])
@@ -354,7 +358,7 @@ def _dispatch(args, parser, argv, reader_commands):
                 return original_refresh(conn, *parameters, **call_kwargs)
 
             load.refresh = observed_refresh
-        else:
+        elif args.command == "embed":
             from . import embed
 
             original_embed_run = embed.run
@@ -369,12 +373,14 @@ def _dispatch(args, parser, argv, reader_commands):
                 return stats
 
             embed.run = observed_embed_run
+        stack = ExitStack()
         try:
             if args.command == "index":
                 # The periodic indexer also hosts the metric collectors, on their own thread and cadence,
                 # so a slow or failing index pass never stops metrics and a collector never fails a pass.
                 refresher = _start_collection(args, output)
-            while True:
+            drain = stack.enter_context(Drain(args.command))
+            while not drain.requested:
                 category = None
                 try:
                     # A bounded sink: discard routine nested output, including diagnostics
@@ -399,14 +405,17 @@ def _dispatch(args, parser, argv, reader_commands):
                     print(f"agent-history: {args.command} succeeded", file=sys.stderr)
                 # Ended iteration spans/logs reach OTLP before the idle interval.
                 telemetry.force_flush()
-                time.sleep(args.every)
+                drain.wait(args.every, sleep=time.sleep)
+            drain.drained()
+            return 0
         finally:
+            stack.close()
             if args.command == "index":
                 load.refresh = original_refresh
                 if refresher is not None:
                     refresher.stop()
                     refresher.collection.quiesce()
-            else:
+            elif args.command == "embed":
                 embed.run = original_embed_run
 
     try:

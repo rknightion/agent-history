@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import signal
 
 import pytest
 
@@ -18,6 +19,7 @@ pytestmark = pytest.mark.skipif(not DSN or "agent_history_test" not in DSN,
 psycopg = pytest.importorskip("psycopg")
 
 from agent_history import embed, load  # noqa: E402
+from agent_history.drain import Drain  # noqa: E402
 
 from test_loader_pg import build_tree, refresh  # noqa: E402
 
@@ -103,6 +105,26 @@ def test_embed_is_incremental_and_rebuild_costs_nothing(db):
     conn.commit()
     changed = run(conn, provider)
     assert changed.items == 1 and provider.inputs == 1
+
+
+def test_a_drain_request_stops_embed_after_the_committed_batch(db):
+    conn, _ = db
+    stopper = Drain("embed")
+
+    class StopAfterFirst(FakeProvider):
+        calls = 0
+
+        def embed(self, texts, kind="document"):
+            self.calls += 1
+            stopper._request(signal.SIGTERM, None)  # the stop arrives while this batch is in flight
+            return super().embed(texts, kind)
+
+    provider = StopAfterFirst()
+    with stopper:
+        stats = embed.run(conn, provider, cap_tokens=0, daily_cap=0, batch_items=1, log=lambda *_: None)
+    assert provider.calls == 1  # the in-flight batch finished; no batch after the stop reached the provider
+    assert stats.items >= 1 and stats.failed_inputs == 0
+    assert run(conn, FakeProvider()).items > 0  # the rest is still pending for the next worker
 
 
 def test_chunks_hold_offsets_not_text(db):

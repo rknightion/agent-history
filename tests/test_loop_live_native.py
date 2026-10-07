@@ -284,5 +284,5 @@ def test_independent_module_drainer_checks_job_limit_and_deadline_before_admissi
 
     monkeypatch.setattr(loop_live.psycopg, "connect", lambda dsn, **kw: Connection())
     monkeypatch.setattr(loop_live, "drain_one", lambda *_: calls.append(True) is None and stop != "empty")
-    loop_live.main()
+    loop_live.main([])
     assert len(calls) == (20 if stop == "jobs" else 1)
