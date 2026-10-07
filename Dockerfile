@@ -11,7 +11,7 @@ RUN python -c 'import sys; assert sys.version_info[:2] == (3, 14)' && \
     mkdir -p /state /var/lib/alloy/textfile-agent-history && \
     chown 10001:10001 /state /var/lib/alloy/textfile-agent-history
 
-FROM cgr.dev/chainguard/python:latest@sha256:b7af1ae90e2fcfb5c32be03908e74d32fdfd64156c2b7c535bd3e497e7846d84
+FROM cgr.dev/chainguard/python:latest@sha256:8c6e0d0a587455e8a8d145e20234d5ef5a531a1c052a7b9d76b155ccc7fcded2
 WORKDIR /app
 COPY --from=builder /opt/venv /opt/venv
 COPY --from=builder /app /app
