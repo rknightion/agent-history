@@ -132,6 +132,118 @@ def test_analytics_reapply_and_rebuild_preserve_live_relation_and_grant(clean, l
             admin.execute("DROP ROLE synthetic_loop_reader")
 
 
+@pytest.mark.parametrize(
+    "terminal",
+    [None, "completion_receipt", "next_launch", "wrong-goal", "before-launch", "before-open", "wrong-origin"],
+)
+def test_state_close_is_analytical_end_only(clean, tmp_path, terminal):
+    """Collected close beats root activity, but never changes receiver lifecycle semantics."""
+    import subprocess
+    import time
+
+    from agent_history import collect_git, collect_receipts
+
+    at = (datetime.now(timezone.utc) - timedelta(minutes=10)).replace(microsecond=0)
+    closed = at + timedelta(minutes=2)
+    last = at + timedelta(minutes=5)
+    goal = "a" * 64
+    source = tmp_path / "sessions"
+    project = source / "projects" / "synthetic-project"
+    project.mkdir(parents=True)
+    path = project / "11111111-1111-4111-8111-111111111111.jsonl"
+    launch = {
+        "type": "user",
+        "uuid": "synthetic-launch",
+        "sessionId": "synthetic-close-root",
+        "timestamp": at.isoformat(),
+        "cwd": "/tmp/synthetic-project",
+        "message": {
+            "role": "user",
+            "content": "You are the root. Write codex/report-synthetic-loop1.md.\n"
+            + "# Loop: example/project loop1 · Goal: "
+            + goal,
+        },
+    }
+    activity = {
+        **launch,
+        "uuid": "synthetic-activity",
+        "timestamp": last.isoformat(),
+        "message": {"role": "user", "content": "Continue the audit."},
+    }
+    if terminal == "next_launch":
+        activity["message"] = {"role": "user", "content": "You are the root. Write codex/report-synthetic-loop2.md."}
+    path.write_text(json.dumps(launch) + "\n" + json.dumps(activity) + "\n")
+    sources = {"claude-test": source}
+    assert load.refresh(clean, sources=sources, textfile=None, log=lambda *_: None).errors == 0
+    repo = tmp_path / "reconciled"
+    (repo / "codex").mkdir(parents=True)
+    subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "remote", "add", "origin", "https://example.invalid/example/project.git"], check=True
+    )
+    events = [
+        {
+            "v": 1,
+            "seq": 1,
+            "ts": at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "by": "root",
+            "ev": "open",
+            "goal_sha256": goal,
+            "tier": "routine",
+            "root": "llm",
+            "root_model": "synthetic",
+            "envelope": [],
+        },
+        {"v": 1, "seq": 2, "ts": closed.strftime("%Y-%m-%dT%H:%M:%SZ"), "by": "root", "ev": "close"},
+    ]
+    if terminal == "wrong-goal":
+        events[0]["goal_sha256"] = "e" * 64
+    elif terminal == "before-launch":
+        events[0]["ts"] = (at - timedelta(seconds=60)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        events[1]["ts"] = (at - timedelta(seconds=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    elif terminal == "before-open":
+        events.reverse()
+        for seq, event in enumerate(events, 1):
+            event["seq"] = seq
+    elif terminal == "wrong-origin":
+        subprocess.run(
+            ["git", "-C", str(repo), "remote", "set-url", "origin", "https://example.invalid/example/other.git"],
+            check=True,
+        )
+    state = repo / "codex/state-synthetic-loop1.jsonl"
+    state.write_text("".join(json.dumps(event) + "\n" for event in events))
+    collector = collect_git.Collector(clean, False, time.monotonic() + 60)
+    collect_receipts.collect(collector, [repo], "synthetic-one")
+    assert collector.errors == []
+    receipt_at = closed + timedelta(seconds=30)
+    if terminal == "completion_receipt":
+        clean.execute(
+            "INSERT INTO ah.loop_receipt (machine, kind, path, content, receipt_mtime, target_exists) "
+            "VALUES ('synthetic-one', 'notified', '/tmp/synthetic-project/codex/report-synthetic-loop1.md', "
+            "'request synthetic', %s, true)",
+            (receipt_at,),
+        )
+    clean.commit()
+    assert load.post_passes(clean)["dirty_sessions"] == 0
+    expected = {
+        None: (closed, "state_close"),
+        "completion_receipt": (receipt_at, "completion_receipt"),
+        "next_launch": (last, "next_launch"),
+        "wrong-goal": (last, "root_last_event"),
+        "before-launch": (last, "root_last_event"),
+        "before-open": (last, "root_last_event"),
+        "wrong-origin": (last, "root_last_event"),
+    }[terminal]
+    assert clean.execute("SELECT end_ts, end_evidence FROM ah.loop_run WHERE loop_number = 1").fetchone() == expected
+    lifecycle = ("finished", expected[0]) if terminal in ("completion_receipt", "next_launch") else ("running", None)
+    assert clean.execute("SELECT status, end_ts FROM ah.loops WHERE loop = 'loop1'").fetchone() == lifecycle
+    clean.commit()
+    # Retagging/rebuild must reapply the same collected evidence without finishing the receiver.
+    assert load.rebuild(clean, sources=sources, textfile=None, log=lambda *_: None).errors == 0
+    assert clean.execute("SELECT end_ts, end_evidence FROM ah.loop_run WHERE loop_number = 1").fetchone() == expected
+    assert clean.execute("SELECT status, end_ts FROM ah.loops WHERE loop = 'loop1'").fetchone() == lifecycle
+
+
 def test_xreview_does_not_link_a_codex_exec_session_to_a_loop(clean):
     start, end = "2026-09-20 12:00:00+00", "2026-09-20 12:10:00+00"
     root_id = clean.execute(

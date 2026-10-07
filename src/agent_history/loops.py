@@ -9,7 +9,9 @@ never reads launch or report files (they may live on another machine), so:
   an existing run, but never supply identity or terminal evidence;
 - a loop is finished by a wave-notify completion receipt collected into ah.loop_receipt, else
   by the next launch in the same root session; the root session's last event is only a fallback
-  timestamp. Transcript text and shell commands are never interpreted for completion or identity.
+  timestamp. An exactly attributed collected state close can replace that analytical fallback,
+  without establishing lifecycle completion. Transcript text and shell commands are never
+  interpreted for completion or identity.
 """
 
 from __future__ import annotations
@@ -942,6 +944,9 @@ def state_progress(content: str) -> tuple[str, datetime, list[dict[str, Any]]] |
             opened = (goal, at)
         elif ev == "dispatch" and string(event, "task") and string(event, "lane"):
             events.append({**event, "at": at})
+        elif ev == "close" and opened is not None:
+            # A close preceding the open in frozen sequence order cannot end its launch.
+            events.append({**event, "at": at})
         elif ev in ("accept", "land"):
             if not string(event, "task") or ("lane" in event and not string(event, "lane")):
                 return None
@@ -996,7 +1001,8 @@ def _refresh_state_counts(conn: psycopg.Connection) -> None:
     """Exact origin/loop/open-goal joins work even when reconciled paths differ from transcripts.
 
     A valid snapshot overrides legacy report and backlog projections. Unresolved true acceptance
-    leaves only the accepted count unknown. State bytes never supply identity, lifecycle or phase.
+    leaves only the accepted count unknown. A close supplies analytical end evidence only, never
+    identity, lifecycle completion or phase. Receipt and replacement-launch ends retain precedence.
     """
     rows = conn.execute("""
         SELECT launch_uid, lower(repo), loop, goal_sha256, launch_ts,
@@ -1029,7 +1035,8 @@ def _refresh_state_counts(conn: psycopg.Connection) -> None:
             if digest != goal:
                 continue
             attributed = [
-                candidate for candidate, earliest, cutoff in windows[(repo, label, goal)]
+                candidate
+                for candidate, earliest, cutoff in windows[(repo, label, goal)]
                 if opened >= earliest and (cutoff is None or opened < cutoff)
             ]
             if attributed != [uid]:
@@ -1051,6 +1058,20 @@ def _refresh_state_counts(conn: psycopg.Connection) -> None:
                 "AND (lanes_accepted, tasks_done) IS DISTINCT FROM (%s, %s)",
                 (accepted, landed, uid, accepted, landed),
             )
+            closes = [
+                event["at"]
+                for opened, events in cohorts
+                for event in events
+                if event["ev"] == "close" and event["at"] >= opened
+            ]
+            if closes:
+                # Keep this out of FINISHED_EVIDENCE: receiver lifecycle is receipt/launch based.
+                # Machine copies cannot inflate or move the earliest observed analytical close.
+                conn.execute(
+                    "UPDATE ah.loop_run SET end_ts = %s, end_evidence = 'state_close' "
+                    "WHERE launch_uid = %s AND end_evidence IN ('root_last_event', 'state_close')",
+                    (min(closes), uid),
+                )
 
 
 def _tag_root(conn: psycopg.Connection, root_id: int) -> int:
