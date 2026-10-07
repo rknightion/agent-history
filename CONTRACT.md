@@ -477,7 +477,8 @@ anchored no-follow descriptors. File or directory links and replaced input ident
 Snapshots join only to already observed `repo`, `loop` and `goal_sha256`: origin matches repo
 case-insensitively, the explicit filename loop label matches, and a valid frozen-v1
 `open.goal_sha256` matches. Local copy paths need not equal transcript paths. State contents do
-not establish identity, completion, live phase or root activity. The open must lie at most 120
+not establish identity, completion or lifecycle root activity. Explicit valid root heartbeat
+records can supply live-phase activity through the exact attribution below, independently of counts. The open must lie at most 120
 seconds before launch and before the next launch of that identity. An open attributable to more
 than one same-identity launch, including overlapping skew windows or equal timestamps, supplies
 no state override; proximity never chooses a root. Count events lie at or after launch and before the next
@@ -515,9 +516,15 @@ Accepted native `watch_start` results join terminal `loop-watch` observations by
 and watch id, never by label or timing proximity. Their expiry bound is explicitly derived from
 call entry plus the recorded `deadline_s`, not a native process-start or deadline observation.
 A terminal hook without a captured accepted start cannot establish an active watch. Native
-`loop-wake` is activity, not heartbeat; only explicitly timestamped `loop-heartbeat` evidence
-establishes a heartbeat. Missing, truncated, failed, opaque or ambiguously attributable append
-or watch evidence leaves the affected structure unknown independently of enrichment.
+`loop-wake` is activity, not heartbeat. Heartbeats come from explicitly timestamped native
+`loop-heartbeat` evidence or collected `ah.loop_state` records with `ev=heartbeat` and a valid
+UTC activity `at`. State heartbeats reuse the exact origin, filename loop and frozen open-goal
+attribution described above; activity and append-observation times must both belong to that
+launch window. Duplicate machine copies do not inflate heartbeat activity. A heartbeat-only
+root can receive a live phase without inventing lanes, open structure or known counts.
+Missing, truncated, failed, opaque or ambiguously attributable append or watch evidence leaves
+the affected structure unknown independently of enrichment. Projection still uses only collected
+bytes, not a local state-file lookup, and lifecycle root activity and completion are unchanged.
 
 `live_phase` is nullable and uses preparing, working, reviewing, gating, landing, waiting or
 closing. `phase_since` is the observed transition time. The frozen hybrid combines deterministic
@@ -621,7 +628,8 @@ The collector writes `task_prefix`, `backlog_task`, `backlog_done_event`, `backl
 `git_commit_file`, `ci_run`, `installed_feature`, `permission_log` and `loop_receipt`. Git subjects, tracker titles, labels and project values,
 file paths, repository slugs, workflow names and installed-feature names are stored verbatim.
 The collector also writes `loop_state`: complete unredacted JSONL snapshots, including judgement
-text, protected like transcripts. They supply progress counts only, not identity or completion.
+text, protected like transcripts. They supply progress counts and explicitly attributed root
+heartbeat activity for live phase, never identity or lifecycle completion.
 Author emails are compared to configured identities but only `author_is_owner` is stored.
 Permission logs contribute timestamps, line hashes, tool names, command verbs, classifier reasons
 and sub-agent flags, never command arguments or target text. Loop receipts contribute the receipt

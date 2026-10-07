@@ -798,7 +798,7 @@ def project(events: list[dict], now: datetime, answers: dict[str, float] | None 
         "park_events_so_far": len(parks) if parks or opened else None,
         "watch_active": active_watch,
     }
-    if events and (opened or dispatches or active_watch or state["close_recorded"]):
+    if events and (opened or dispatches or active_watch or heartbeat_at is not None or state["close_recorded"]):
         fields["live_phase"] = hybrid_decide(state, answers or {})
     if dispatches or opened:
         fields["active_lanes"] = (
@@ -1309,6 +1309,19 @@ def _events(
         )
     )
     events.extend(watch_events(watch_records, hooks, start, end))
+    # The root-only producer appends heartbeats directly to state JSONL, not the pi
+    # transcript. Consume collected bytes through the existing exact identity/open join.
+    # Native watch/heartbeat evidence above remains readable for older retained logs.
+    from .loops import state_cohorts
+
+    uid = conn.execute("SELECT launch_uid FROM ah.loop_run WHERE id=%s", (loop_id,)).fetchone()[0]
+    heartbeats = {
+        e["at"]
+        for _, cohort in state_cohorts(conn, uid).get(uid, [])
+        for e in cohort
+        if e["ev"] == "heartbeat" and e["at"] >= start and (end is None or e["at"] < end and e["_observed_at"] < end)
+    }
+    events.extend({"ev": "heartbeat", "at": at} for at in sorted(heartbeats))
     recorded_runs = {e.get("run") for e in events if e["ev"] == "dispatch"}
     aliases = {}
     for uid, workflow, at, agent, lane, completed, status, raw in conn.execute(

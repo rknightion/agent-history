@@ -18,7 +18,7 @@ pytestmark = pytest.mark.skipif(
 
 psycopg = pytest.importorskip("psycopg")
 
-from agent_history import load, loops  # noqa: E402
+from agent_history import load, loop_live, loops  # noqa: E402
 
 
 @pytest.fixture(scope="module")
@@ -70,6 +70,106 @@ def launched(clean, tmp_path):
     load.post_passes(clean)
     clean.commit()
     return sources
+
+
+@pytest.mark.parametrize(
+    "case", ["heartbeat", "duplicate-copy", "older", "wrong-goal", "wrong-origin", "no-identity", "ambiguous-open"]
+)
+def test_authoritative_collected_root_heartbeat_phase(clean, tmp_path, case):
+    """Index only a pi launch, collect state JSONL, then read the real live projection."""
+    import subprocess
+    import time
+
+    from agent_history import collect_git, collect_receipts
+    from test_loop_live_native import heartbeat_log
+
+    started = datetime.now(timezone.utc) - timedelta(hours=2)
+    activity = datetime.now(timezone.utc) - timedelta(minutes=1)
+    goal = "a" * 64
+    source = tmp_path / "pi"
+    path = source / "sessions" / "-synthetic-" / "synthetic.jsonl"
+    path.parent.mkdir(parents=True)
+    records = [
+        {
+            "type": "session",
+            "id": "synthetic-heartbeat-root",
+            "version": 3,
+            "timestamp": started.isoformat(),
+            "cwd": "/tmp/synthetic",
+        },
+        {
+            "type": "message",
+            "id": "launch",
+            "timestamp": started.isoformat(),
+            "message": {
+                "role": "user",
+                "content": "You are the root. Write codex/report-synthetic-loop1.md."
+                + ("" if case == "no-identity" else "\n# Loop: example/project loop1 · Goal: " + goal),
+            },
+        },
+    ]
+    if case == "ambiguous-open":
+        records.append(
+            {**records[1], "id": "second-launch", "timestamp": (started + timedelta(seconds=60)).isoformat()}
+        )
+    path.write_text("".join(json.dumps(row) + "\n" for row in records))
+    sources = {"pi-test": source}
+    assert load.refresh(clean, sources=sources, textfile=None, log=lambda *_: None).errors == 0
+    assert clean.execute("SELECT live_phase FROM ah.loops").fetchall() == [(None,)] * (len(records) - 1)
+    assert clean.execute("SELECT count(*) FROM ah.tool_call").fetchone() == (0,)
+    assert clean.execute("SELECT count(*) FROM ah.subagent_spawn").fetchone() == (0,)
+    clean.commit()
+
+    repo = tmp_path / "reconciled"
+    (repo / "codex").mkdir(parents=True)
+    subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True, timeout=10)
+    origin = "other/project" if case == "wrong-origin" else "example/project"
+    subprocess.run(
+        ["git", "-C", str(repo), "remote", "add", "origin", "https://example.invalid/" + origin + ".git"],
+        check=True,
+        timeout=10,
+    )
+    rows = [
+        json.loads(line)
+        for line in heartbeat_log(activity.isoformat().replace("+00:00", "Z"), heartbeat=case != "older").splitlines()
+    ]
+    rows[0]["ts"] = started.strftime("%Y-%m-%dT%H:%M:%SZ")
+    if case == "wrong-goal":
+        rows[0]["goal_sha256"] = "b" * 64
+    if len(rows) > 1:
+        # CLI framing is append time; activity's independent milliseconds must survive.
+        rows[1]["ts"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    (repo / "codex/state-synthetic-loop1.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows))
+    for machine in ["synthetic-one", "synthetic-two"] if case == "duplicate-copy" else ["synthetic-one"]:
+        collector = collect_git.Collector(clean, False, time.monotonic() + 60)
+        collect_receipts.collect(collector, [repo], machine)
+        assert collector.errors == []
+    clean.commit()
+    assert load.post_passes(clean)["dirty_sessions"] == 0
+    expected = "preparing" if case in ("heartbeat", "duplicate-copy") else None
+    assert clean.execute("SELECT live_phase FROM ah.loops ORDER BY launch_ts").fetchall() == [(expected,)] * (
+        len(records) - 1
+    )
+    target = clean.execute(
+        "SELECT id,root_session_id,launch_ts,NULL,report_path FROM ah.loop_run ORDER BY launch_ts LIMIT 1"
+    ).fetchone()
+    events = loop_live._events(clean, *target)
+    if expected:
+        assert [(e["ev"], e["at"]) for e in events] == [("heartbeat", activity)]
+        # Collector state does not manufacture open/dispatch, terminal status or root activity.
+        assert clean.execute("SELECT active_lanes,tasks_admitted,status FROM ah.loops").fetchone() == (
+            None,
+            None,
+            "running",
+        )
+        assert clean.execute("SELECT last_event_at FROM ah.session").fetchone() == (started,)
+    else:
+        assert events == []
+    clean.commit()
+    assert load.rebuild(clean, sources=sources, textfile=None, log=lambda *_: None).errors == 0
+    assert clean.execute("SELECT live_phase FROM ah.loops ORDER BY launch_ts").fetchall() == [(expected,)] * (
+        len(records) - 1
+    )
 
 
 def test_live_loop_report_write_is_not_terminal_but_next_launch_is(clean, launched):

@@ -878,7 +878,7 @@ def _refresh_tasks_done(conn: psycopg.Connection) -> None:
 
 
 def state_progress(content: str) -> tuple[str, datetime, list[dict[str, Any]]] | None:
-    """Read frozen v1 JSONL framing and count evidence, never a return's landed claim.
+    """Read frozen v1 framing, count evidence and explicitly recorded root heartbeats.
 
     Preserve source bytes in the collector. A torn JSON object has no event and is ignored, as
     by loop-state check. Other invalid framing or malformed count evidence leaves counts unknown.
@@ -942,6 +942,19 @@ def state_progress(content: str) -> tuple[str, datetime, list[dict[str, Any]]] |
             ):
                 return None
             opened = (goal, at)
+        elif ev == "heartbeat":
+            activity = event.get("at")
+            # loop-state framing ts is append observation time. Root activity is the
+            # separate UTC at member, preserving the producer's subsecond precision.
+            if not isinstance(activity, str) or not re.fullmatch(
+                r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,6})?Z", activity
+            ):
+                continue
+            try:
+                activity_at = datetime.fromisoformat(activity.replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            events.append({**event, "at": activity_at, "_observed_at": at})
         elif ev == "dispatch" and string(event, "task") and string(event, "lane"):
             events.append({**event, "at": at})
         elif ev == "close" and opened is not None:
@@ -997,28 +1010,36 @@ def _state_event_counts(cohorts: list[tuple[datetime, list[dict[str, Any]]]]) ->
     return (None if unresolved else len(accepted)), len(landed)
 
 
-def _refresh_state_counts(conn: psycopg.Connection) -> None:
-    """Exact origin/loop/open-goal joins work even when reconciled paths differ from transcripts.
+def state_cohorts(
+    conn: psycopg.Connection, launch_uid: str | None = None
+) -> dict[str, list[tuple[datetime, list[dict[str, Any]]]]]:
+    """Existing exact origin/loop/open-goal attribution, shared by counts and heartbeats.
 
-    A valid snapshot overrides legacy report and backlog projections. Unresolved true acceptance
-    leaves only the accepted count unknown. A close supplies analytical end evidence only, never
-    identity, lifecycle completion or phase. Receipt and replacement-launch ends retain precedence.
+    Identity must already be observed. Local paths, proximity and collector mtimes do not
+    select a root. Compute competing launch windows before selecting an optional target.
     """
-    rows = conn.execute("""
+    rows = conn.execute(
+        """
         SELECT launch_uid, lower(repo), loop, goal_sha256, launch_ts,
                lead(launch_ts) OVER (
                    PARTITION BY lower(repo), loop, goal_sha256 ORDER BY launch_ts, launch_uid
                ) AS following,
                count(*) OVER (PARTITION BY lower(repo), loop, goal_sha256, launch_ts) > 1 AS tied
         FROM ah.loops WHERE repo IS NOT NULL AND loop IS NOT NULL AND goal_sha256 IS NOT NULL
-    """).fetchall()
+          AND (%s::text IS NULL OR (lower(repo), loop, goal_sha256) = (
+              SELECT lower(repo), loop, goal_sha256 FROM ah.loops WHERE launch_uid = %s
+          ))
+        """,
+        (launch_uid, launch_uid),
+    ).fetchall()
     windows = {}
     for uid, repo, label, goal, started, following, _ in rows:
         if started is not None:
             windows.setdefault((repo, label, goal), []).append((uid, started - START_SKEW, following))
     snapshots = {}
+    result = {}
     for uid, repo, label, goal, started, following, tied in rows:
-        if tied or started is None:
+        if tied or started is None or launch_uid is not None and uid != launch_uid:
             continue
         key = (repo, label)
         if key not in snapshots:
@@ -1047,31 +1068,48 @@ def _refresh_state_counts(conn: psycopg.Connection) -> None:
                     [
                         event
                         for event in events
-                        if event["at"] >= started and (not following or event["at"] < following)
+                        if event["at"] >= started
+                        and (not following or event["at"] < following)
+                        and (
+                            event["ev"] != "heartbeat"
+                            or event["_observed_at"] >= started
+                            and (not following or event["_observed_at"] < following)
+                        )
                     ],
                 )
             )
         if cohorts:
-            accepted, landed = _state_event_counts(cohorts)
+            result[uid] = cohorts
+    return result
+
+
+def _refresh_state_counts(conn: psycopg.Connection) -> None:
+    """Preserve exact count attribution and analytical-close semantics.
+
+    Unresolved true acceptance leaves only the accepted count unknown. A state close does
+    not establish lifecycle completion or phase; receipt/replacement ends keep precedence.
+    """
+    for uid, cohorts in state_cohorts(conn).items():
+        accepted, landed = _state_event_counts(cohorts)
+        conn.execute(
+            "UPDATE ah.loops SET lanes_accepted = %s, tasks_done = %s WHERE launch_uid = %s "
+            "AND (lanes_accepted, tasks_done) IS DISTINCT FROM (%s, %s)",
+            (accepted, landed, uid, accepted, landed),
+        )
+        closes = [
+            event["at"]
+            for opened, events in cohorts
+            for event in events
+            if event["ev"] == "close" and event["at"] >= opened
+        ]
+        if closes:
+            # Keep this out of FINISHED_EVIDENCE: receiver lifecycle is receipt/launch based.
+            # Machine copies cannot inflate or move the earliest observed analytical close.
             conn.execute(
-                "UPDATE ah.loops SET lanes_accepted = %s, tasks_done = %s WHERE launch_uid = %s "
-                "AND (lanes_accepted, tasks_done) IS DISTINCT FROM (%s, %s)",
-                (accepted, landed, uid, accepted, landed),
+                "UPDATE ah.loop_run SET end_ts = %s, end_evidence = 'state_close' "
+                "WHERE launch_uid = %s AND end_evidence IN ('root_last_event', 'state_close')",
+                (min(closes), uid),
             )
-            closes = [
-                event["at"]
-                for opened, events in cohorts
-                for event in events
-                if event["ev"] == "close" and event["at"] >= opened
-            ]
-            if closes:
-                # Keep this out of FINISHED_EVIDENCE: receiver lifecycle is receipt/launch based.
-                # Machine copies cannot inflate or move the earliest observed analytical close.
-                conn.execute(
-                    "UPDATE ah.loop_run SET end_ts = %s, end_evidence = 'state_close' "
-                    "WHERE launch_uid = %s AND end_evidence IN ('root_last_event', 'state_close')",
-                    (min(closes), uid),
-                )
 
 
 def _tag_root(conn: psycopg.Connection, root_id: int) -> int:

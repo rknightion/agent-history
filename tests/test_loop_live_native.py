@@ -1,10 +1,11 @@
 """Synthetic analogues of retained native command and watcher shapes, not source content."""
 
+import json
 from datetime import timedelta
 
 import pytest
 
-from agent_history import loop_live
+from agent_history import loop_live, loops
 from agent_history.config import Config, LoopLive, parse_config
 from test_loop_live import AT, event
 
@@ -195,6 +196,62 @@ def test_frozen_explicit_heartbeat_at_is_not_a_claim_of_historical_native_heartb
         (7, AT + timedelta(seconds=10), "Heartbeat", {"source": "loop-heartbeat", "details": {"at": AT.isoformat()}})
     ]
     assert loop_live.watch_events([], hooks, AT, None) == [event("heartbeat")]
+
+
+def heartbeat_log(at=AT, heartbeat=True):
+    rows = [
+        {
+            "v": 1,
+            "seq": 1,
+            "ts": AT.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "by": "root",
+            "ev": "open",
+            "goal_sha256": "a" * 64,
+            "tier": "guarded",
+            "root": "llm",
+            "root_model": "synthetic",
+            "envelope": [],
+        }
+    ]
+    if heartbeat:
+        rows.append(
+            {
+                "v": 1,
+                "seq": 2,
+                # Append observation is not root activity time.
+                "ts": (AT + timedelta(hours=3)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "by": "ext",
+                "ev": "heartbeat",
+                "at": at,
+            }
+        )
+    return "".join(json.dumps(row) + "\n" for row in rows)
+
+
+def test_state_heartbeat_only_root_has_live_phase_without_invented_structure():
+    recorded = AT + timedelta(hours=2, milliseconds=123)
+    parsed = loops.state_progress(heartbeat_log(recorded.isoformat().replace("+00:00", "Z")))
+    assert parsed is not None
+    beats = [e for e in parsed[2] if e["ev"] == "heartbeat"]
+    assert len(beats) == 1 and beats[0]["at"] == recorded
+    state = loop_live.project(beats, recorded + timedelta(minutes=1))
+    assert state["live_phase"] == "preparing"
+    assert state["evidence_at"] == recorded.isoformat()
+    assert state["active_lanes"] is None
+    assert state["tasks_admitted"] is None
+    stale_lane = [event("dispatch", lane="one", agent="worker")]
+    assert loop_live.project(stale_lane, recorded)["live_phase"] == "waiting"
+    assert loop_live.project(stale_lane + beats, recorded)["live_phase"] == "working"
+
+
+@pytest.mark.parametrize("at", [None, 1, True, "invalid", "2026-01-01T00:00:00", "2026-01-01T00:00:00+00:00"])
+def test_invalid_state_heartbeat_does_not_supply_activity_or_change_counts(at):
+    parsed = loops.state_progress(heartbeat_log(at))
+    assert parsed is not None  # Invalid heartbeat alone must not invalidate older count evidence.
+    assert not any(e["ev"] == "heartbeat" for e in parsed[2])
+    assert loop_live.project(parsed[2], AT)["live_phase"] is None
+    older = loops.state_progress(heartbeat_log(heartbeat=False))
+    assert older is not None and older[2] == []
 
 
 def test_file_binding_requires_sanitised_selector_and_uses_existing_consumer(tmp_path, monkeypatch):
