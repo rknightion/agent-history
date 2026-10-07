@@ -3,6 +3,7 @@
 import json
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
 
@@ -116,6 +117,92 @@ def test_summary_validation_and_no_special_secret_scrubbing():
     ):
         with pytest.raises(ValueError):
             loop_live.validate_summary(invalid)
+
+
+def summary_fixture(name):
+    """Public synthetic provider replies; usage is simulated, not tokenised transcript text."""
+    return json.loads((Path(__file__).parent / "fixtures" / "loop_live" / f"summary_{name}.json").read_text())
+
+
+def test_summary_length_is_not_visible_success():
+    truncated = summary_fixture("length")
+    assert truncated["choices"][0]["message"]["content"] == ""
+    assert truncated["usage"]["completion_tokens"] == loop_live.OUTPUT_LIMIT == 2048
+    assert truncated["usage"]["completion_tokens_details"]["reasoning_tokens"] == 2048
+    with pytest.raises(ValueError, match="^incomplete_summary$"):
+        loop_live.summary_answer(truncated)
+    visible = summary_fixture("visible")
+    assert loop_live.summary_answer(visible) == {
+        "headline": "Gate in progress",
+        "summary": "The root is checking the candidate. The gate result is still pending.",
+    }
+    # Even fully formed visible JSON is not a successful completed reply when cut short.
+    visible["choices"][0]["finish_reason"] = "length"
+    with pytest.raises(ValueError, match="^incomplete_summary$"):
+        loop_live.summary_answer(visible)
+
+
+@pytest.mark.parametrize("content", ["", " ", None, "{}"])
+def test_stop_without_visible_summary_is_not_success(content):
+    response = summary_fixture("visible")
+    response["choices"][0]["message"]["content"] = content
+    with pytest.raises(ValueError, match="^invalid_summary_shape$"):
+        loop_live.summary_answer(response)
+
+
+@pytest.mark.parametrize("reasoning", ["off", "low", "high", "max"])
+def test_summary_wire_keeps_effort_and_limits_reasoning_instructions(monkeypatch, reasoning):
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    from threading import Thread
+
+    from agent_history.config import LoopLive
+
+    captured = []
+    reply = json.dumps(summary_fixture("visible")).encode()
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.connection.settimeout(5)
+            captured.append(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(reply)))
+            self.end_headers()
+            self.wfile.write(reply)
+
+        def log_message(self, *_):
+            pass
+
+    monkeypatch.setenv("SYNTHETIC_LOOP_TOKEN", "synthetic")
+    state = loop_live.digest(loop_live.project([event("open")], AT))
+    with HTTPServer(("127.0.0.1", 0), Handler) as server:
+        server.timeout = 5
+        worker = Thread(target=server.handle_request)
+        worker.start()
+        try:
+            config = LoopLive(
+                enabled=True,
+                summary_url=f"http://127.0.0.1:{server.server_port}/compat/chat/completions",
+                api_key_env="SYNTHETIC_LOOP_TOKEN",
+                reasoning=reasoning,
+            )
+            response = loop_live.request(config, "summary", state)
+            assert loop_live.summary_answer(response)["headline"] == "Gate in progress"
+        finally:
+            worker.join(timeout=6)
+        assert not worker.is_alive()
+    body = captured[0]
+    assert body["model"] == loop_live.SUMMARY_MODEL
+    assert body["max_tokens"] == 2048
+    assert body["response_format"] == {"type": "json_object"}
+    assert body["thinking"] == {"type": "disabled" if reasoning == "off" else "enabled"}
+    assert body.get("reasoning_effort") == (None if reasoning == "off" else reasoning)
+    instructions = body["messages"][0]["content"]
+    assert "2048 generated tokens including reasoning" in instructions
+    assert "at most 512 tokens for reasoning" in instructions
+    assert "remaining 1536 tokens for the visible JSON" in instructions
+    assert json.loads(body["messages"][1]["content"]) == state
+    assert loop_live.DAILY_CAP == Decimal("5")
+    assert loop_live.reservation("summary") == Decimal("0.332881920")
 
 
 def test_destructive_proof_guard_checks_database_not_another_dsn_component():

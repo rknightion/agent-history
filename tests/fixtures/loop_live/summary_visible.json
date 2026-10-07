@@ -1,0 +1,21 @@
+{
+  "id": "synthetic-summary-visible",
+  "model": "deepseek/deepseek-flash",
+  "choices": [
+    {
+      "index": 0,
+      "finish_reason": "stop",
+      "message": {
+        "role": "assistant",
+        "content": "{\"headline\":\"Gate in progress\",\"summary\":\"The root is checking the candidate. The gate result is still pending.\"}",
+        "reasoning_content": "The structured phase is gating. Describe the observed watch and pending result without inferring success."
+      }
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 1000,
+    "completion_tokens": 640,
+    "total_tokens": 1640,
+    "completion_tokens_details": {"reasoning_tokens": 512}
+  }
+}

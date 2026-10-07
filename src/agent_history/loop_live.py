@@ -97,7 +97,15 @@ WHOLE_PHASE_QUESTION = {
     },
     "criteria": PHASE_CRITERIA,
 }
+# The provider's documented max_tokens includes reasoning and visible content, with no
+# separate hard reasoning-token control. Give HIGH effort an explicit short reasoning target
+# without lowering the operator's effort or increasing the paid ceiling. This is prompt
+# guidance, not a provider-enforced split; length/empty replies still fail validation.
 SUMMARY_INSTRUCTIONS = (
+    f"The entire response is limited to {OUTPUT_LIMIT} generated tokens including reasoning. "
+    "Use at most 512 tokens for reasoning, then stop reasoning and use the remaining 1536 tokens for the visible JSON. "
+    "This is a short factual summary, not a planning or phase-classification task. "
+    "Do not reanalyse historical events or reconsider the authoritative structured phase. "
     "Return JSON with exactly headline and summary strings. Headline must be at most 120 characters; "
     "summary must contain 2 to 4 sentences totalling at most 600 characters. Describe this coding "
     "loop's observed current activity and remaining obstacles in plain British English. "

@@ -1,0 +1,21 @@
+{
+  "id": "synthetic-summary-length",
+  "model": "deepseek/deepseek-flash",
+  "choices": [
+    {
+      "index": 0,
+      "finish_reason": "length",
+      "message": {
+        "role": "assistant",
+        "content": "",
+        "reasoning_content": "Synthetic reasoning continued analysing the observed gate until the entire completion allowance was exhausted. No visible JSON was produced."
+      }
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 1000,
+    "completion_tokens": 2048,
+    "total_tokens": 3048,
+    "completion_tokens_details": {"reasoning_tokens": 2048}
+  }
+}
