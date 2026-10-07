@@ -16,6 +16,7 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 import tomllib
 from contextlib import contextmanager
@@ -1507,6 +1508,8 @@ def main(argv: list[str] | None = None, dsn=None) -> int:
 @contextmanager
 def _collector_alarm():
     """Own the hard deadline only during collection, without leaking it to callers."""
+    if threading.current_thread() is not threading.main_thread():
+        raise ValueError("collector deadline requires the main thread")
     previous_handler = signal.getsignal(signal.SIGALRM)
     saved_at = time.monotonic()
     remaining, interval = signal.setitimer(signal.ITIMER_REAL, 0)
