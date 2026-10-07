@@ -34,6 +34,8 @@ Turns (pi has no turn records)
   loop_watch, loop-wake -> loop_wake, loop-continuation -> loop_continuation, subagent-notify and
   subagent-incremental-child-notify -> task_notification, else unknown. An assistant message while
   idle with no pending trigger continues the current turn (pi's automatic retry after an error).
+  The exact pi-subagents parent wake user text following a pending task notification is a
+  task_notification_summary, not a human prompt; it preserves that notification's pending turn.
 
 Messages (event_uid "<session uid>:<entry id>[:suffix]")
   system messages -> system_prompt (sections joined), user -> human_prompt | queued_prompt (main) or
@@ -96,8 +98,8 @@ from .model import (ArtifactRow, AttachmentRow, CompactionRow, ContinuationRow, 
 from .parse_claude import _diff_counts, _nlines
 
 AGENT = "pi"
-# Re-parse retained sessions to enrich nullable recorded call, tool and spawn telemetry.
-PARSER_VERSION = "9"
+# Re-parse retained sessions to exclude pi-subagents parent wakes from human turns.
+PARSER_VERSION = "10"
 # Artifact metadata replay is independent of the session parser version.
 ARTIFACT_PARSER_VERSION = "6-links1"
 # Resolved agent-file names are evidence, including custom agents and route suffixes such as -low.
@@ -528,6 +530,14 @@ class PiParser:
     def _user(self, m: dict[str, Any], eid: str, uid: str, ts: datetime, pos: LinePos) -> list[Row]:
         rows: list[Row] = []
         text = _text(m.get("content"))
+        pending = self.s["pend"]
+        # pi-subagents 0.76.1 appends a notice, then sends this user-role wake so pi runs prompt
+        # setup. The extension source is not persisted. Require the pending notice as provenance;
+        # literal mentions, mixed human text and image prompts must remain genuine user input.
+        if (not self.sub and text == "Subagent updates above." and not _images(m.get("content"))
+                and pending is not None and pending["o"] == "task_notification"):
+            return self._custom_message({"customType": "subagent-parent-wake", "content": m.get("content")},
+                                        eid, uid, ts, pos)
         self.s["users"] += 1
         human, injections = split_prompt_injections(text) if not self.sub else (text, [])
         idle = self.s["cur"] is None or not self.s["busy"]
