@@ -34,6 +34,8 @@ REPLAYED = (
     "030_collector_mutation_audit.sql",
     "032_loop_state_counts.sql",
     "033_nullable_telemetry.sql",
+    # The schema-only baseline has no table-local autovacuum reloptions.
+    "034_backlog_autovacuum.sql",
 )
 
 
