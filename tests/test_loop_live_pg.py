@@ -432,10 +432,10 @@ def test_native_batch_watch_and_parser_spawn_rows_at_catalogue_surface(clean, tr
     assert fields[1:3] == (2, 0)
     assert fields[3]["exit"] == 1
     assert fields[4] == "Check the unchanged candidate."
-    # Truncated successful registrations cannot be discarded as if no watcher existed.
+    # A truncated registration is not proof of an active watcher, so the phase stays structural rather than gating.
     clean.execute("UPDATE ah.tool_io SET output_truncated=true WHERE tool_name='watch_start'")
     loop_live.refresh(clean)
-    assert clean.execute("SELECT live_phase,tasks_admitted FROM ah.loops").fetchone() == (None, 2)
+    assert clean.execute("SELECT live_phase,tasks_admitted FROM ah.loops").fetchone() == ("working", 2)
     clean.execute("UPDATE ah.tool_io SET output_truncated=false WHERE tool_name='watch_start'")
     loop_live.refresh(clean)
     assert clean.execute("SELECT live_phase FROM ah.loops").fetchone()[0] == "gating"

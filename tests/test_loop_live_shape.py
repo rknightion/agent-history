@@ -246,7 +246,8 @@ def test_projection_lane_container_limit_is_not_a_truncated_list(count):
 def test_projection_unkeyed_dispatch_does_not_claim_known_empty_lanes():
     state = loop_live.project([event("open"), event("dispatch", lane=[], run={})], AT)
     assert state["active_lanes"] is None
-    assert state["live_phase"] is None
+    # Uncertainty nulls the counts it affects, never the observed phase.
+    assert state["live_phase"] == "working"
 
 
 def test_projection_timestamps_are_utc_microseconds_not_local_spelling():

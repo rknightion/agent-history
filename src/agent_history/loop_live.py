@@ -864,12 +864,6 @@ def project(events: list[dict], now: datetime, answers: dict[str, float] | None 
 
         if any((e.get("for_ev") is None or e.get("for_ev") in kinds) and not before_known(e) for e in uncertain):
             fields[key] = None
-    if (
-        any(e.get("for_ev") in (None, "dispatch", "return", "close", "watch") for e in uncertain)
-        and not active_watch
-        and not state["close_recorded"]
-    ):
-        fields["live_phase"] = None
     # The classifier's alias must not turn an uncertain cumulative count back into exact zero.
     state["park_events_so_far"] = fields["parks_total"]
     fields["phase_input"] = state

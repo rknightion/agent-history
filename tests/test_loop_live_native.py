@@ -244,6 +244,26 @@ def test_state_heartbeat_only_root_has_live_phase_without_invented_structure():
     assert loop_live.project(stale_lane + beats, recorded)["live_phase"] == "working"
 
 
+@pytest.mark.parametrize("dispatched", [False, True])
+def test_state_heartbeat_phase_survives_unscoped_uncertainty_without_watch(dispatched):
+    recorded = AT + timedelta(hours=2)
+    parsed = loops.state_progress(heartbeat_log(recorded.isoformat().replace("+00:00", "Z")))
+    assert parsed is not None
+    beats = [e for e in parsed[2] if e["ev"] == "heartbeat"]
+    uncertain = loop_live.append_events("python3 -c 'print(1)'", "/tmp/synthetic", REPORT, recorded, "1\n")
+    assert any(e["ev"] == "uncertain" and e.get("for_ev") is None for e in uncertain)
+    events = ([event("dispatch", lane="one", agent="worker")] if dispatched else []) + beats + uncertain
+    state = loop_live.project(events, recorded + timedelta(minutes=1))
+    assert state["live_phase"] == ("working" if dispatched else "preparing")
+    assert state["evidence_at"] == recorded.isoformat()
+    assert not state["phase_input"]["watch_active"]
+    assert state["active_lanes"] is None
+    assert state["parks_total"] is None
+    assert state["phase_input"]["park_events_so_far"] is None
+    assert state["tasks_admitted"] is None
+    assert state["tasks_landed"] is None
+
+
 @pytest.mark.parametrize("at", [None, 1, True, "invalid", "2026-01-01T00:00:00", "2026-01-01T00:00:00+00:00"])
 def test_invalid_state_heartbeat_does_not_supply_activity_or_change_counts(at):
     parsed = loops.state_progress(heartbeat_log(at))
