@@ -236,11 +236,13 @@ separate service and neither includes nor links its code.
 `[git].repos` as explicit checkout paths and `[identities].git_owners` as allowed `host/owner`
 strings. Unlisted owners, forks and unknown fork status are skipped. The collector fetches the
 remote default branch before reading git objects; it never edits the checkout or its tracker.
-Independently of that classification, it records, for every configured repository, the [fan-out protocol](https://github.com/rknightion/fan-out-protocol)'s wave-notify receipt files (`codex/report-*.md.notified`
-and `codex/goal-*.md.started`) as metadata in `ah.loop_receipt`, which finish a loop and carry its
+Independently of that classification, it records, for every configured repository, the [fan-out protocol](https://github.com/rknightion/fan-out-protocol)'s wave-notify receipt files (`codex/report-*.md.posted`,
+the older `codex/report-*.md.notified` and `codex/goal-*.md.started`) as metadata in `ah.loop_receipt`, which finish a loop and carry its
 exact identity (CONTRACT.md, "Live loop lifecycle"). Run it once on each machine after upgrading so
 existing receipts are collected; `ah_ingest` needs `SELECT, INSERT, UPDATE` on that table, granted by
-migration 025 when the role already exists. GitHub CI requires an authenticated `gh` CLI. A failed Actions request is reported against its
+migration 025 when the role already exists. Apply migration 035 (the indexer applies it on its next
+pass) before upgrading a collector: an older catalogue rejects `posted` rows, and that repository's
+receipt step then fails for the run. GitHub CI requires an authenticated `gh` CLI. A failed Actions request is reported against its
 repository and does not create a CI observation or prevent collection of other repositories.
 
 `[collector].homes` maps feature/permission-log home paths to namespace names. Feature locations

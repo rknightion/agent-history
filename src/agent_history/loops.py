@@ -40,8 +40,13 @@ FENCE_LINE_END = re.compile(r"```[ \t]*\r?$", re.M)
 UNPARSED = object()
 LANE_STATUS_V2 = ("complete", "partial", "blocked", "failed")
 CAMPAIGN = re.compile(r"^report-(.*?)-(?:loop|wave)\d+\.md$")
-# wave-notify completion receipt: `sha256:<64 hex> request <id>`, or the legacy `request <id>`.
-COMPLETION = re.compile(r"(?:sha256:([0-9a-f]{64}) )?request \S+\n?")
+# wave-notify completion receipts by kind. `.notified` (no longer written): `sha256:<64 hex> request
+# <id>`, or the legacy `request <id>`. `.posted`, written once the receiver accepted the report:
+# `sha256:<64 hex> receiver <JSON object>`, always with a digest.
+COMPLETION = {
+    "notified": re.compile(r"(?:sha256:([0-9a-f]{64}) )?request \S+\n?"),
+    "posted": re.compile(r"sha256:([0-9a-f]{64}) receiver \{[^\n]*\}\n?"),
+}
 # wave-notify start receipt: `<owner>/<repo>#loop<N>#<goal sha256>`.
 # The identity a completion receipt's report first line carries (the repo name in it is never used).
 HEADER_IDENTITY = re.compile(r"# Loop: [A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)? (loop[0-9]+) · Goal: ([0-9a-f]{64})")
@@ -421,7 +426,8 @@ COMPLETION_SQL = """
         FROM ah.loop_run l
         WHERE l.launch_ts IS NOT NULL AND l.report_path IS NOT NULL
           AND {scope}
-          AND EXISTS (SELECT 1 FROM ah.loop_receipt r WHERE r.kind = 'notified' AND r.path = l.report_path)
+          AND EXISTS (SELECT 1 FROM ah.loop_receipt r
+                      WHERE r.kind IN ('notified', 'posted') AND r.path = l.report_path)
     ), windows AS (
         SELECT s.launch_uid,
                lead(s.launch_ts) OVER (PARTITION BY s.report_path ORDER BY s.launch_ts, s.launch_uid) AS following,
@@ -429,11 +435,11 @@ COMPLETION_SQL = """
         FROM ah.loop_run s
         WHERE s.launch_ts IS NOT NULL AND s.report_path IN (SELECT report_path FROM cand)
     )
-    SELECT c.launch_uid, c.loop_number, c.naming, r.receipt_mtime, r.content,
+    SELECT c.launch_uid, c.loop_number, c.naming, r.kind, r.receipt_mtime, r.content,
            r.target_exists, r.target_sha256, r.target_line1, r.repo_origin
     FROM cand c
     JOIN windows w USING (launch_uid)
-    JOIN ah.loop_receipt r ON r.kind = 'notified' AND r.path = c.report_path
+    JOIN ah.loop_receipt r ON r.kind IN ('notified', 'posted') AND r.path = c.report_path
     WHERE NOT w.tied
       AND r.receipt_mtime >= c.launch_ts
       AND (w.following IS NULL OR r.receipt_mtime < w.following)
@@ -455,7 +461,8 @@ def _valid_completions(conn: psycopg.Connection, uid: str | None = None) -> dict
     A receipt is valid when it names the launch's exact report path inside the launch's window (at or
     after launch, before the next launch of that report path, no lane of the loop starting after
     it) and, when it carries a digest, the collected report exists, matches it, and its first line
-    names the launch's loop number. A legacy receipt is valid on the exact path alone.
+    names the launch's loop number. A legacy `notified` receipt is valid on the exact path alone; a
+    `posted` receipt always carries a digest and is checked the same way as a digest `notified` one.
     """
     if uid is None:
         scope, params = "NOT COALESCE(l.end_evidence = ANY(%s), false)", (list(FINISHED_EVIDENCE),)
@@ -463,8 +470,8 @@ def _valid_completions(conn: psycopg.Connection, uid: str | None = None) -> dict
         scope, params = "l.launch_uid = %s", (uid,)
     found: dict[str, list[tuple]] = {}
     for row in conn.execute(COMPLETION_SQL.format(scope=scope), params):
-        uid_, number, naming, when, content, exists, digest, line1, origin = row
-        match = COMPLETION.fullmatch(content)
+        uid_, number, naming, kind, when, content, exists, digest, line1, origin = row
+        match = COMPLETION[kind].fullmatch(content)
         if not match:
             continue
         if match[1]:
@@ -559,7 +566,7 @@ def _completion_identity(conn: psycopg.Connection, uid: str, label: str | None) 
     Only a launch finished by a receipt qualifies; a running loop has none. repo is the receipt's
     checkout origin, never the name in the report header. loop and goal digest come from the
     receipt's report first line, which must name the launch's own loop label. Only a digest receipt
-    binds that line to the notified bytes; a legacy receipt, or one without an origin or a usable
+    binds that line to the posted or notified bytes; a legacy receipt, or one without an origin or a usable
     header, or naming another loop, contributes nothing. Valid receipts that
     disagree with one another make the result unknown.
     """

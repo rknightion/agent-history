@@ -106,15 +106,21 @@ class World:
         self.conn.commit()
         return self.base + timedelta(seconds=at)
 
-    def notified(self, number=1, *, content=None, **kw):
-        """A v2 receipt whose target is a well-formed report for `number` unless overridden."""
+    def notified(self, number=1, *, content=None, kind="notified", **kw):
+        """A v2 receipt whose target is a well-formed report for `number` unless overridden.
+
+        `kind="posted"` is the receiver receipt wave-notify writes in place of `.notified`.
+        """
         header = kw.pop("line1", f"# Loop: example/repo loop{number} · Goal: {GOAL}")
         sha = kw.pop("sha", "c" * 64)
-        content = content if content is not None else f"sha256:{sha} request req-1\n"
+        if content is None:
+            content = (
+                f"sha256:{sha} request req-1\n"
+                if kind == "notified"
+                else f'sha256:{sha} receiver {{"id": "example/repo#loop{number}#{GOAL}", "revision": "1"}}\n'
+            )
         cwd = kw.pop("cwd", REPO)
-        return self.receipt(
-            "notified", self.report(number, cwd), content, sha=kw.pop("target_sha", sha), line1=header, **kw
-        )
+        return self.receipt(kind, self.report(number, cwd), content, sha=kw.pop("target_sha", sha), line1=header, **kw)
 
     def refresh(self):
         load.post_passes(self.conn)
@@ -237,6 +243,41 @@ def test_receipt_that_does_not_match_its_report_is_running(world, case, kw):
     world.notified(**kw)
     world.refresh()
     assert world.loop()[0] == "running", case
+
+
+def test_posted_receipt_finishes_and_identifies_like_a_notified_one(world):
+    world.launch()
+    when = world.notified(kind="posted", origin="example/repo")
+    world.refresh()
+    assert world.loop() == ("finished", when, "completion_receipt")
+    assert world.identity() == ("example/repo", "loop1", GOAL)
+
+
+@pytest.mark.parametrize(
+    "case, kw",
+    [
+        ("sha mismatch", {"target_sha": "d" * 64}),
+        ("other loop number", {"line1": f"# Loop: example/repo loop2 · Goal: {GOAL}"}),
+        ("report missing", {"exists": False}),
+        # A receiver receipt always carries a digest: it never counts on the exact path alone.
+        ("no digest", {"content": 'receiver {"id": "r", "revision": "1"}\n'}),
+        ("notified wording", {"content": f"sha256:{'c' * 64} request req-1\n"}),
+    ],
+)
+def test_posted_receipt_that_does_not_match_its_report_is_running(world, case, kw):
+    world.launch()
+    world.notified(kind="posted", **kw)
+    world.refresh()
+    assert world.loop()[0] == "running", case
+
+
+def test_posted_and_notified_receipts_together_take_the_earliest(world):
+    world.launch()
+    when = world.notified(at=100, origin="example/repo")
+    world.notified(kind="posted", at=200, origin="example/repo")
+    world.refresh()
+    assert world.loop() == ("finished", when, "completion_receipt")
+    assert world.identity() == ("example/repo", "loop1", GOAL)
 
 
 def test_legacy_receipt_counts_on_exact_path_alone(world):
@@ -604,8 +645,11 @@ def test_collector_ships_exact_receipts_and_metadata_only(clean, tmp_path):
     goal = repo / "codex/goal-synthetic-loop1.md"
     goal.write_text(f"{body} goal\n")
     (repo / "codex/report-synthetic-loop1.md.notified").write_text("request req-1\n")
+    posted = f'sha256:{"c" * 64} receiver {{"id": "r", "revision": "1"}}\n'
+    (repo / "codex/report-synthetic-loop1.md.posted").write_text(posted)
     (repo / "codex/goal-synthetic-loop1.md.started").write_text(f"example/repo#loop1#{GOAL}\n")
     (repo / "codex/report-synthetic-loop1.md.tmp.notified").write_text("request req-tmp\n")
+    (repo / "codex/report-synthetic-loop1.md.tmp.posted").write_text(posted)
     (repo / "codex/goal-synthetic-loop1.md.tmp.started").write_text("request req-tmp\n")
     (repo / "codex/other.md.notified").write_text("request req-other\n")
     collector = run_collector(clean, [repo])
@@ -620,6 +664,16 @@ def test_collector_ships_exact_receipts_and_metadata_only(clean, tmp_path):
             "notified",
             str(report),
             "request req-1\n",
+            True,
+            True,
+            f"# Loop: example/repo loop1 · Goal: {GOAL}",
+            "example/repo",
+        ),
+        (
+            "mac-a",
+            "posted",
+            str(report),
+            posted,
             True,
             True,
             f"# Loop: example/repo loop1 · Goal: {GOAL}",

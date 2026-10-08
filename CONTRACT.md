@@ -306,10 +306,13 @@ fallback `root_last_event` end timestamp is terminal evidence. No heartbeat or p
 
 Migration `025_loop_receipts.sql` adds the collector table `ah.loop_receipt`, primary key
 `(machine, kind, path)`, indexed on `(kind, path)`. The hourly collector reads, for every configured
-repository, the exact files `codex/report-*.md.notified` and `codex/goal-*.md.started` that the
-wave-notify tool writes beside a report or goal only after a successful, non-degraded send or an
-accepted start. A `.tmp.notified` name is not a receipt. A row holds `kind` (`notified` or
-`started`), the absolute `path` of the receipt's target (the report or the goal), the receipt text
+repository, the exact files `codex/report-*.md.posted`, `codex/report-*.md.notified` and
+`codex/goal-*.md.started` that the wave-notify tool writes beside a report or goal only after the
+receiver accepted the report (`.posted`), a successful, non-degraded send (`.notified`) or an
+accepted start (`.started`). Current
+wave-notify writes `.posted` and no longer writes `.notified`; both remain collected and both are
+completion receipts. A `.tmp.notified` or `.tmp.posted` name is not a receipt. A row holds `kind`
+(`posted`, `notified` or `started`; migration `035_loop_receipt_posted.sql` adds `posted`), the absolute `path` of the receipt's target (the report or the goal), the receipt text
 `content`, its mtime `receipt_mtime`, whether the target exists (`target_exists`, true also when it exists but could not be read, in which
 case the hash and line are NULL), `target_sha256`
 and, for reports only, `target_line1` (stored only when it is a loop header line, else NULL; the read of
@@ -320,8 +323,8 @@ identically. The collector role needs `SELECT, INSERT, UPDATE` on it, which the 
 `ah_ingest` when that role exists at migration time (otherwise provision it with the other
 collector tables), and never `DELETE`; readers of `ah.loop_run` receive `SELECT`.
 
-A launch is finished with `end_evidence = 'completion_receipt'` when a `notified` receipt exists
-for its exact report path and
+A launch is finished with `end_evidence = 'completion_receipt'` when a `posted` or `notified`
+receipt exists for its exact report path and
 
 - its mtime is at or after `launch_ts` and before the next launch of the same report path
   (launches of one report path with equal `launch_ts` leave it unfinished; launches of other
@@ -330,7 +333,9 @@ for its exact report path and
 - if the content is `sha256:<64 hex> request <id>`, the report existed when collected, the digest
   equals `target_sha256` and `target_line1` is a loop header naming the launch's loop number (a
   digest receipt whose report is missing does not finish the loop); a legacy `request <id>`
-  receipt counts on the exact path alone.
+  receipt counts on the exact path alone;
+- a `posted` receipt's content must be `sha256:<64 hex> receiver <JSON object>` on one line, and
+  is checked exactly as a digest `notified` receipt is. It never counts on the path alone.
 
 `end_ts` is the earliest qualifying receipt mtime across machines. Only launches that have a
 receipt and are not already finished are examined. A root that pings before moving its report into

@@ -1,8 +1,9 @@
 """wave-notify receipt files of configured repositories, as metadata for ah.loop_receipt.
 
-wave-notify writes `<report>.notified` beside a loop report after a successful, non-degraded
-completion notification, and `<goal>.started` beside a goal file after the receiver accepted the
-start. Only the exact receipt names are read (a `.tmp.notified` name is not a receipt). The
+wave-notify writes `<report>.posted` beside a loop report after the receiver accepted the closeout
+(older versions wrote `<report>.notified` after a successful, non-degraded completion notification;
+both are collected), and `<goal>.started` beside a goal file after the receiver accepted the start.
+Only the exact receipt names are read (a `.tmp.notified` or `.tmp.posted` name is not a receipt). The
 collector ships the receipt text and metadata about its target, never a report or goal body, and
 treats every configured repository identically whatever context it belongs to.
 """
@@ -34,11 +35,14 @@ COLS = [
 ]
 KEY = ["machine", "kind", "path"]
 # (glob under codex/, suffix, kind): the target is the receipt path minus the suffix. The globs end
-# in `.md.<suffix>`, so a `.tmp.notified` name is never a receipt.
+# in `.md.<suffix>`, so a `.tmp.notified` or `.tmp.posted` name is never a receipt.
 SOURCES = (
     ("report-*.md.notified", ".notified", "notified"),
+    ("report-*.md.posted", ".posted", "posted"),
     ("goal-*.md.started", ".started", "started"),
 )
+# Completion receipt kinds: the target is a loop report, whose first line is kept when it is a header.
+REPORT_KINDS = ("notified", "posted")
 MAX_RECEIPT_BYTES = 4096
 MAX_LINE1_BYTES = 4096
 MAX_STATE_BYTES = 16 * 1024 * 1024
@@ -136,7 +140,7 @@ def _receipt(path: Path, kind: str, suffix: str, machine: str, origin: str | Non
         raise ValueError("oversized receipt")
     target = path.with_name(path.name.removesuffix(suffix))
     try:
-        exists, digest, line1 = _target(target, kind == "notified")
+        exists, digest, line1 = _target(target, kind in REPORT_KINDS)
     except Changed:
         raise
     except OSError:

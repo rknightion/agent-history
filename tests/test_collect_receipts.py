@@ -18,6 +18,8 @@ def test_main_dry_run_counts_receipts_of_configured_repositories(tmp_path, monke
     (repo / "codex").mkdir(parents=True)
     subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
     (repo / "codex/report-synthetic-loop1.md.notified").write_text("request req-1\n")
+    # wave-notify's current completion receipt; the older `.notified` one stays collected.
+    (repo / "codex/report-synthetic-loop2.md.posted").write_text("sha256:" + "c" * 64 + ' receiver {"id": "r"}\n')
     (repo / "codex/goal-synthetic-loop1.md.started").write_text("example/repo#loop1#" + "a" * 64 + "\n")
     state = repo / "codex/state-synthetic-loop1.jsonl"
     state.write_text(state_log())
@@ -44,7 +46,7 @@ def test_main_dry_run_counts_receipts_of_configured_repositories(tmp_path, monke
     else:
         assert len(summary["errors"]) == 1
         assert summary["errors"][0]["step"] == "loop_state"
-    assert summary["tables"]["loop_receipt"] == {"rows": 2}
+    assert summary["tables"]["loop_receipt"] == {"rows": 3}
     assert summary["tables"]["loop_state"] == {"rows": 1 if state_source == "regular" else 0}
 
 

@@ -36,6 +36,8 @@ REPLAYED = (
     "033_nullable_telemetry.sql",
     # The schema-only baseline has no table-local autovacuum reloptions.
     "034_backlog_autovacuum.sql",
+    # 025 creates the receipt table on fresh init, so its widened kind check must replay too.
+    "035_loop_receipt_posted.sql",
 )
 
 
