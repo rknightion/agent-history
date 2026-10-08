@@ -138,7 +138,7 @@ from typing import Any, Iterable
 
 from .common import (BOUNDED_STATE_SECONDS, artifact_kind, as_bool, as_int, as_str, cmd_verb, ssh_target,
                      git_event_extras, git_ops_from_command, git_from_output, json_size, linked_paths, mcp_split, parse_ts, prompt_origin,
-                     sha256_text, split_prompt_injections, text_blocks)
+                     has_human_provenance, sha256_text, split_legacy_peer_injections, split_prompt_injections, text_blocks)
 from .model import (ArtifactRow, AttachmentRow, CompactionRow, ContinuationRow, FileContext, FileTouchRow,
                     GitEventRow, LinePos, LlmCallRow, MessageRow, ParseIssueRow, RateLimitRow, RecordTypeRow,
                     Row, SessionEventRow, SessionKey, SessionRow, SubagentSpawnRow, ToolCallRow, ToolIoRow,
@@ -548,7 +548,8 @@ class CodexParser:
         elif rtype == "response_item":
             rows.extend(self._response_item(ptype, payload, ts, pos, uid))
         elif rtype == "event_msg":
-            rows.extend(self._event(ptype, payload, item, itype, ts, pos, uid))
+            rows.extend(self._event(ptype, payload, item, itype, ts, pos, uid,
+                                    human_provenance=has_human_provenance(record, payload)))
         elif rtype == "token_usage_record":
             rows.extend(self._token_record(payload, ts, pos, uid))
         elif rtype == "compacted":
@@ -983,6 +984,7 @@ class CodexParser:
         parts: list[dict[str, Any]] | None = None,
         skill: bool = False,
         source: str = "user_message",
+        legacy_peer: bool = False,
     ) -> list[Row]:
         key = self._key()
         turn_id = turn_id or self.s.get("cur")
@@ -1014,7 +1016,10 @@ class CodexParser:
                     )
                 )
             return rows + attachments
-        human, injections = split_prompt_injections(text)
+        peer_split = split_legacy_peer_injections(raw if isinstance(raw, str) else text) if legacy_peer else None
+        human, injections = peer_split if peer_split is not None else split_prompt_injections(text)
+        if peer_split is not None and turn_id:
+            self._turn(turn_id, ts)["peer"] = True
         for n, (cls, tag, body, start, stop) in enumerate(injections):
             event_uid = uid if not human and n == 0 else f"{uid}:injection:{n}"
             rows.append(
@@ -1749,7 +1754,7 @@ class CodexParser:
     # --- event_msg ----------------------------------------------------------------------------
 
     def _event(self, ptype: str, p: dict[str, Any], item: dict[str, Any] | None, itype: str,
-               ts: datetime | None, pos: LinePos, uid: str) -> list[Row]:
+               ts: datetime | None, pos: LinePos, uid: str, *, human_provenance: bool = False) -> list[Row]:
         key = self._key()
         if key is None:
             return []
@@ -1770,7 +1775,8 @@ class CodexParser:
             for k, part_type, field in (("images", "image", "image_url"), ("local_images", "local_image", "path")):
                 for value in p.get(k) if isinstance(p.get(k), list) else []:
                     parts.append(value if isinstance(value, dict) else {"type": part_type, field: value})
-            return self._prompt(text, images, None, ts, pos, uid, as_str(p.get("message")), parts)
+            return self._prompt(text, images, None, ts, pos, uid, as_str(p.get("message")), parts,
+                                legacy_peer=not human_provenance and not has_human_provenance(p))
         if ptype == "item_completed" and item is not None:
             return self._item(item, itype, p, ts, pos, uid)
         if ptype == "sub_agent_activity":

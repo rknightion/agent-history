@@ -118,7 +118,7 @@ from typing import Any, Iterable
 
 from .common import (BOUNDED_STATE_SECONDS, as_bool, as_int, as_str, artifact_kind, cmd_verb, ssh_target,
                      git_ops_from_command, git_event_extras, git_from_output, json_size, key_set, linked_paths, mcp_split, parse_ts,
-                     prompt_origin, sha256_text, split_prompt_injections, text_blocks)
+                     prompt_origin, sha256_text, split_legacy_peer_injections, split_prompt_injections, text_blocks)
 from .model import (ArtifactRow, AttachmentRow, CompactionRow, ContinuationRow, CostStateRow,
                     FileContext, FileTouchRow, GitEventRow, HookEventRow, LinePos, LlmCallRow,
                     MessageRow, ParseIssueRow, RateLimitRow, RecordTypeRow, Row, SessionEventRow,
@@ -1059,7 +1059,9 @@ class ClaudeParser:
         self.s["first_user_seen"] = True
         key = pid or f"u:{uid}"
         prompt = cls in ("human_prompt", "queued_prompt")
-        human, injections = split_prompt_injections(text) if prompt else (text, [])
+        peer_split = split_legacy_peer_injections(text_blocks(content, {"text"}, strip=False), rec) if prompt else None
+        human, injections = peer_split if peer_split is not None else (
+            split_prompt_injections(text) if prompt else (text, []))
         if injections and not human:
             origin, strong = "meta", False
         self._start_or_join_turn(out, key, origin, strong, ts, pos, perm)

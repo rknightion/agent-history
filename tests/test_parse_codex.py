@@ -8,6 +8,7 @@ import shutil
 from pathlib import Path
 
 import pytest
+from test_common import MALFORMED_PEER_ATTRIBUTES
 from test_structure_pg import DSN, conn, db  # noqa: F401 (existing disposable database fixtures)
 
 from agent_history.memstore import MemStore, run_file
@@ -69,6 +70,82 @@ def load_records(tmp_path, records):
     path = tmp_path / "telemetry.jsonl"
     path.write_text("".join(json.dumps(record) + "\n" for record in records))
     return load(path.name, path=path, batch_lines=1)[0]
+
+
+@pytest.mark.parametrize("safety", [0, 1])
+@pytest.mark.parametrize("batch", [1, 3])
+@pytest.mark.parametrize("mixed", [False, True])
+@pytest.mark.parametrize("unicode_attributes", [False, True])
+def test_legacy_peer_envelope_lossless_public_boundary(tmp_path, safety, batch, mixed, unicode_attributes):
+    from test_common import assert_legacy_peer_rows, legacy_peer_envelope
+
+    envelope = legacy_peer_envelope(safety, batch)
+    if unicode_attributes:
+        for n in range(batch):
+            envelope = envelope.replace(
+                f'teammate_id="synthetic-peer-{n}" color="blue" summary="Synthetic update"',
+                f"summary=\"teammate_id='decoy'\" color='blue' teammate_id='synthetic-\u00e9\U0001f680-{n}'")
+    text = " \n" + envelope + ("\n\nHuman follow-up: keep my request.\n " if mixed else "\n ")
+    at = "2026-10-01T10:00:00Z"
+    records = [{"type": "session_meta", "timestamp": at, "payload": {"id": P, "source": "cli"}},
+               {"type": "event_msg", "timestamp": at,
+                "payload": {"type": "user_message", "message": text, "local_images": [], "text_elements": []}}]
+    store = load_records(tmp_path, records)
+    human = " \n\n\nHuman follow-up: keep my request.\n " if mixed else ""
+    assert_legacy_peer_rows(store, "codex", text, human)
+    assert (one(store, "session")["first_human_at"] is not None) == mixed
+    uid = f"{P}:o{len((json.dumps(records[0]) + chr(10)).encode())}"
+    assert one(store, "message", message_class="agent_message")["event_uid"] == (
+        uid + ":injection:0" if mixed else uid)
+
+
+@pytest.mark.parametrize("case", ["fenced", "quoted", "mention", "incomplete", "unknown-safety",
+                                  "origin", "typed", "top-origin", "top-typed"])
+def test_legacy_peer_counterexamples_stay_human(tmp_path, case):
+    from test_common import legacy_peer_envelope
+
+    text = legacy_peer_envelope()
+    if case == "fenced":
+        text = "```text\n" + text + "\n```"
+    elif case == "quoted":
+        text = "\n".join("> " + line for line in text.splitlines())
+    elif case == "mention":
+        text = "Discuss permission laundering and Another Claude session sent a message: as literal words."
+    elif case == "incomplete":
+        text = text.replace("</teammate-message>", "")
+    elif case == "unknown-safety":
+        text = text[:text.index("\n\nThis came")] + "\n\nHuman discussion of permission laundering."
+    at = "2026-10-01T10:00:00Z"
+    record = {"type": "event_msg", "timestamp": at,
+              "payload": {"type": "user_message", "message": text, "local_images": [], "text_elements": []}}
+    target = record if case.startswith("top-") else record["payload"]
+    if case.endswith("origin"):
+        target["origin"] = {"kind": "human"}
+    elif case.endswith("typed"):
+        target["promptSource"] = "typed"
+    store = load_records(tmp_path, [{"type": "session_meta", "timestamp": at,
+                                   "payload": {"id": P, "source": "cli"}}, record])
+    assert [(m["message_class"], m["text"]) for m in store.rows("message")] == [("human_prompt", text)]
+
+
+@pytest.mark.parametrize("attributes", MALFORMED_PEER_ATTRIBUTES)
+def test_legacy_peer_malformed_direct_id_stays_human_public_boundary(tmp_path, attributes):
+    from test_common import legacy_peer_envelope
+
+    text = legacy_peer_envelope().replace(
+        'teammate_id="synthetic-peer-0" color="blue" summary="Synthetic update"', attributes)
+    text = "Human example: caf\u00e9 \U0001f680.\n" + text + "\nHuman follow-up."
+    at = "2026-10-01T10:00:00Z"
+    records = [{"type": "session_meta", "timestamp": at, "payload": {"id": P, "source": "cli"}},
+               {"type": "event_msg", "timestamp": at,
+                "payload": {"type": "user_message", "message": text, "local_images": [], "text_elements": []}}]
+    store = load_records(tmp_path, records)
+    message = one(store, "message")
+    uid = f"{P}:o{len((json.dumps(records[0]) + chr(10)).encode())}"
+    assert (message["message_class"], message["text"], message["event_uid"], message["agent"]) == (
+        "human_prompt", text, uid, "codex")
+    assert message["session"].agent == "codex"
+    assert message["prompt_origin"] == "typed"
 
 
 def test_nullable_telemetry_real_parser_surface():

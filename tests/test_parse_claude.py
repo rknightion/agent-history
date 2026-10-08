@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
+from test_common import MALFORMED_PEER_ATTRIBUTES
 
 from agent_history.memstore import MemStore, run_file
 from agent_history.model import FileContext, LinePos, LlmCallRow, SessionKey
@@ -48,6 +49,87 @@ def one(store: MemStore, table: str, **match):
     rows = by(store, table, **match)
     assert len(rows) == 1, (table, match, len(rows))
     return rows[0]
+
+
+@pytest.mark.parametrize("safety", [0, 1])
+@pytest.mark.parametrize("batch", [1, 3])
+@pytest.mark.parametrize("mixed", [False, True])
+@pytest.mark.parametrize("unicode_attributes", [False, True])
+def test_legacy_peer_envelope_lossless_public_boundary(tmp_path, safety, batch, mixed, unicode_attributes):
+    from test_common import assert_legacy_peer_rows, legacy_peer_envelope
+
+    envelope = legacy_peer_envelope(safety, batch)
+    if unicode_attributes:
+        for n in range(batch):
+            envelope = envelope.replace(
+                f'teammate_id="synthetic-peer-{n}" color="blue" summary="Synthetic update"',
+                f"summary=\"teammate_id='decoy'\" color='blue' teammate_id='synthetic-\u00e9\U0001f680-{n}'")
+    text = " \n" + envelope + ("\n\nHuman follow-up: keep my request.\n " if mixed else "\n ")
+    # Mirrors historical user-record metadata; no origin/promptSource/isMeta is invented.
+    record = {"type": "user", "sessionId": SID, "uuid": "synthetic-peer-event",
+              "timestamp": "2026-10-01T10:00:00Z", "isSidechain": False,
+              "userType": "external", "entrypoint": "cli",
+              "message": {"role": "user", "content": [{"type": "text", "text": text}]}}
+    path = tmp_path / "peer.jsonl"
+    path.write_text(json.dumps(record) + "\n")
+    store = MemStore()
+    run_file(ClaudeParser, FileContext(str(path), "claude-test/projects/peer.jsonl", "claude-test",
+                                      "claude", "test", None, "main"), store, batch_lines=1)
+    human = " \n\n\nHuman follow-up: keep my request.\n " if mixed else ""
+    assert_legacy_peer_rows(store, "claude", text, human)
+    peer = one(store, "message", message_class="agent_message")
+    assert peer["event_uid"] == ("synthetic-peer-event:injection:0" if mixed else "synthetic-peer-event")
+    assert (one(store, "session")["first_human_at"] is not None) == mixed
+
+
+@pytest.mark.parametrize("case", ["fenced", "quoted", "mention", "incomplete", "unknown-safety", "origin", "typed"])
+def test_legacy_peer_counterexamples_stay_human(tmp_path, case):
+    from test_common import legacy_peer_envelope
+
+    text = legacy_peer_envelope()
+    if case == "fenced":
+        text = "```text\n" + text + "\n```"
+    elif case == "quoted":
+        text = "\n".join("> " + line for line in text.splitlines())
+    elif case == "mention":
+        text = "Discuss permission laundering and Another Claude session sent a message: as literal words."
+    elif case == "incomplete":
+        text = text.replace("</teammate-message>", "")
+    elif case == "unknown-safety":
+        text = text[:text.index("\n\nThis came")] + "\n\nHuman discussion of permission laundering."
+    record = {"type": "user", "sessionId": SID, "uuid": "synthetic-human-event",
+              "timestamp": "2026-10-01T10:00:00Z", "message": {"role": "user", "content": text}}
+    if case == "origin":
+        record["origin"] = {"kind": "human"}
+    elif case == "typed":
+        record["promptSource"] = "typed"
+    path = tmp_path / "human.jsonl"
+    path.write_text(json.dumps(record) + "\n")
+    store = MemStore()
+    run_file(ClaudeParser, FileContext(str(path), "claude-test/projects/human.jsonl", "claude-test",
+                                      "claude", "test", None, "main"), store, batch_lines=1)
+    assert [(m["message_class"], m["text"]) for m in store.rows("message")] == [("human_prompt", text)]
+
+
+@pytest.mark.parametrize("attributes", MALFORMED_PEER_ATTRIBUTES)
+def test_legacy_peer_malformed_direct_id_stays_human_public_boundary(tmp_path, attributes):
+    from test_common import legacy_peer_envelope
+
+    text = legacy_peer_envelope().replace(
+        'teammate_id="synthetic-peer-0" color="blue" summary="Synthetic update"', attributes)
+    text = "Human example: caf\u00e9 \U0001f680.\n" + text + "\nHuman follow-up."
+    record = {"type": "user", "sessionId": SID, "uuid": "synthetic-id-boundary",
+              "timestamp": "2026-10-01T10:00:00Z", "message": {"role": "user", "content": text}}
+    path = tmp_path / "id-boundary.jsonl"
+    path.write_text(json.dumps(record) + "\n")
+    store = MemStore()
+    run_file(ClaudeParser, FileContext(str(path), "claude-test/projects/id-boundary.jsonl", "claude-test",
+                                      "claude", "test", None, "main"), store, batch_lines=1)
+    message = one(store, "message")
+    assert (message["message_class"], message["text"], message["event_uid"], message["agent"]) == (
+        "human_prompt", text, "synthetic-id-boundary", "claude")
+    assert message["session"].agent == "claude"
+    assert message["prompt_origin"] == "typed"
 
 
 @pytest.fixture(scope="module")
