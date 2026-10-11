@@ -3,6 +3,7 @@
   "extends": ["config:recommended", "helpers:pinGitHubActionDigests"],
   "packageRules": [
     {
+      "description": "Continue proposing Python image updates, but require manual review: code CI alone does not prove the ABI. Verify Dockerfile builds for linux/amd64 and linux/arm64 with the unchanged Python assertion and scan policy before merging.",
       "matchDatasources": ["docker"],
       "matchPackageNames": ["cgr.dev/chainguard/python"],
       "automerge": false
