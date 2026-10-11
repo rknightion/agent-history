@@ -101,6 +101,78 @@ def test_lineage_of_nested_children():
                             "path": f"{ROOT_UID}/{MAPPER_DIR}/run-0/{WORKER_DIR}/run-1"}
 
 
+@pytest.mark.parametrize("layout", ["legacy", "direct", "nested"])
+@pytest.mark.parametrize("parent_file,expected_uid", [
+    ("/tmp/synthetic/sessions/slug/2026-10-07T00-00-00-000Z_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa.jsonl",
+     "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
+    ("../../foreign/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb.jsonl",
+     "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"),
+    ("/tmp/synthetic/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/session.jsonl", None),
+    ("/tmp/synthetic/malformed.jsonl", None),
+    ("/tmp/synthetic/2026-10-07T00-00-00-000Z_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaX.jsonl", None),
+    ("", None), (None, None), (123, None), (True, None), ([], None), ({"path": "session.jsonl"}, None),
+])
+def test_child_header_parent_preference_and_directory_fallback(tmp_path, monkeypatch, layout, parent_file, expected_uid):
+    # Synthetic v3 header shape emitted by pi-subagents 0.77: parentSession is a file path.
+    # The header parent deliberately differs from the directory root, not an echo of it.
+    import builtins
+    import io
+    import os
+
+    child_uid = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+    tail = {"legacy": f"{MAPPER_DIR}/run-0", "direct": MAPPER_DIR,
+            "nested": f"{MAPPER_DIR}/run-0/session/{WORKER_DIR}/run-1"}[layout]
+    depth = 2 if layout == "nested" else 1
+    agent_path = f"{ROOT_UID}/{tail.replace('/session/', '/')}"
+    path = tmp_path / "session.jsonl"
+    path.write_text(json.dumps({"type": "session", "version": 3, "id": child_uid,
+                               "timestamp": "2026-10-07T00:00:00Z", "cwd": "/tmp/synthetic",
+                               "parentSession": parent_file}) + "\n")
+    ctx = FileContext(str(path), f"pi-test/sessions/slug/{ASYNC_ROOT}/{tail}/session.jsonl",
+                      "pi-test", "pi", "test", None, "subagent")
+    store = MemStore()
+
+    def guard(opener):
+        def open_input_only(file, *args, **kwargs):
+            assert str(file) == str(path), "Header paths must never be dereferenced"
+            return opener(file, *args, **kwargs)
+        return open_input_only
+
+    with monkeypatch.context() as patch:
+        for module in (builtins, io, os):
+            patch.setattr(module, "open", guard(module.open))
+        run_file(PiParser, ctx, store, batch_lines=1)
+    session = one(store, "session", session=SessionKey("pi", child_uid, ""))
+    assert session["parent_session_uid"] == (expected_uid or (ROOT_UID if depth == 1 else None))
+    # Root and layout remain independent directory evidence, even when the direct parent disagrees.
+    assert session["root_session_uid"] == ROOT_UID
+    assert session["spawn_depth"] == depth
+    assert session["agent_path"] == agent_path
+    assert session["spawn_kind"] == "pi_subagent" and session["is_subagent"] is True
+    assert session["forked_from_uid"] is None
+    assert store.rows("session_continuation") == []
+
+
+@pytest.mark.parametrize("parent_file,expected_uid", [
+    ("/tmp/synthetic/2026-10-07T00-00-00-000Z_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa.jsonl",
+     "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
+    ("/tmp/synthetic/session.jsonl", "session"),
+])
+def test_main_header_fork_semantics_unchanged(tmp_path, parent_file, expected_uid):
+    path = tmp_path / "fork.jsonl"
+    path.write_text(json.dumps({"type": "session", "version": 3, "id": ROOT_UID,
+                               "timestamp": "2026-10-07T00:00:00Z", "parentSession": parent_file}) + "\n")
+    ctx = FileContext(str(path), "pi-test/sessions/slug/fork.jsonl", "pi-test", "pi", "test", None, "main")
+    store = MemStore()
+    run_file(PiParser, ctx, store)
+    session = store.rows("session")[0]
+    assert session["forked_from_uid"] == expected_uid
+    assert session["parent_session_uid"] is None and session["root_session_uid"] is None
+    assert session["agent_path"] is None and session["spawn_depth"] is None
+    continuation = store.rows("session_continuation")[0]
+    assert continuation["parent_uid"] == expected_uid and continuation["kind"] == "fork"
+
+
 def test_async_launch_types_and_artifact_links_are_structural(tmp_path):
     root_uid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
     runs = ("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", "cccccccc-cccc-4ccc-8ccc-cccccccccccc")

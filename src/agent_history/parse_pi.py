@@ -15,10 +15,13 @@ Files (load.file_role)
 
 Session identity
   SessionKey('pi', <header id>, ''). The header (`type: session`) is the first line; records before
-  it are ignored with one `missing_session_header` issue. A child learns its lineage from its path
-  only: root_session_uid = the id after the last `_` of the root base name (equal to the root's
-  header id), parent_session_uid = the root for a first-level child (nested parents resolve in SQL
-  through agent_path), agent_path = "<root uid>/<run dir>/run-<i>[/<run dir>/run-<j>...]",
+  it are ignored with one `missing_session_header` issue. A child's direct parent_session_uid
+  prefers the UUID suffix of the header parentSession basename, without opening that path.
+  An unusable header falls back to the directory root for a first-level child (nested parents
+  resolve in SQL through agent_path). Independently, directory evidence supplies root_session_uid
+  (the id after the last `_` of the root base name), spawn_depth and
+  agent_path = "<root uid>/<run dir>/run-<i>[/<run dir>/run-<j>...]".
+  A conflicting header can therefore produce mixed parent/root provenance, not a coherent family;
   spawn_kind 'pi_subagent'. A display name is never evidence of agent type; an exactly linked
   parent spawn supplies the child type in the loader post-pass.
   The run dir is NOT the child's pi-subagents runId (5cfcc8f2... ran in 35c8deaf... in the fixture).
@@ -98,7 +101,7 @@ from .model import (ArtifactRow, AttachmentRow, CompactionRow, ContinuationRow, 
 from .parse_claude import _diff_counts, _nlines
 
 AGENT = "pi"
-# Re-parse retained sessions to exclude pi-subagents parent wakes from human turns.
+# Re-parse retained children to prefer usable parentSession headers for their direct parent.
 PARSER_VERSION = "10"
 # Artifact metadata replay is independent of the session parser version.
 ARTIFACT_PARSER_VERSION = "6-links1"
@@ -464,12 +467,17 @@ class PiParser:
         depth = lin.get("depth")
         parent_file = as_str(record.get("parentSession"))
         parent_uid = parent_file.rsplit("/", 1)[-1].removesuffix(".jsonl").rsplit("_", 1)[-1] if parent_file else None
+        # Child parentSession is an untrusted path, not a file to read. Fixed basenames and
+        # malformed values must not suppress the existing directory/SQL parent fallback.
+        # Main-session fork extraction intentionally retains its existing semantics.
+        if self.sub and (parent_uid is None or not re.fullmatch(UUID, parent_uid)):
+            parent_uid = None
         if ts is not None:
             self._seen(ts)
         rows: list[Row] = [SessionRow(
             session=key, byte_offset=pos.byte_offset, is_subagent=self.sub,
             root_session_uid=lin.get("root") if self.sub else None,
-            parent_session_uid=lin.get("root") if self.sub and depth == 1 else None,
+            parent_session_uid=(parent_uid or (lin.get("root") if depth == 1 else None)) if self.sub else None,
             spawn_kind="pi_subagent" if self.sub else None, spawn_depth=depth if self.sub else None,
             agent_path=lin.get("path"), forked_from_uid=parent_uid if not self.sub else None,
             cwd=s["cwd"], entrypoint="pi",
