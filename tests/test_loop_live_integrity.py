@@ -116,6 +116,67 @@ def test_only_causally_later_snapshot_resolves_equal_timestamp_uncertainty(match
     assert state["tasks_admitted"] is None  # latest snapshot never repairs a cumulative total
 
 
+@pytest.mark.parametrize(
+    "command,kwargs",
+    [
+        ("/bin/cat > /tmp/synthetic/codex/state-synthetic-loop1.jsonl", {}),
+        ("/bin/cat /tmp/synthetic/source.py > /tmp/synthetic/codex/state-synthetic-loop1.jsonl", {}),
+        ("/bin/cat $(opaque_writer)", {}),
+        ("/bin/cat /tmp/synthetic/source.py; opaque_writer", {}),
+        ("env cat /tmp/synthetic/source.py", {}),
+        ("READER=/usr/bin/cat opaque_writer", {}),
+        ("/tmp/synthetic/cat /tmp/synthetic/source.py", {}),
+        ("python3 -c 'print(1)'", {}),
+        ("git diff --output=/tmp/synthetic/codex/state-synthetic-loop1.jsonl", {}),
+        ("git -c alias.read='!opaque_writer' read", {}),
+        ("rg --pre opaque_writer phase /tmp/synthetic", {}),
+        ("find /tmp/synthetic -exec opaque_writer ';'", {}),
+        ("/bin/cat /tmp/synthetic/source.py", {"input_truncated": True}),
+    ],
+)
+def test_read_lookalikes_and_incomplete_commands_still_poison_heartbeat_phase(command, kwargs):
+    uncertainties = loop_live.append_events(command, "/tmp/synthetic", REPORT, AT, "synthetic output", **kwargs)
+    state = loop_live.project([event("open"), event("heartbeat", 120)] + uncertainties, event("heartbeat", 121)["at"])
+    assert state["live_phase"] is None
+    assert state["tasks_admitted"] is None
+
+
+@pytest.mark.parametrize("ev", ["dispatch", "return", "close", "watch"])
+def test_unproven_state_writer_remains_phase_unknown_with_readers_and_heartbeat(ev):
+    # The final reader's shell success cannot prove the earlier writer succeeded.
+    command = append(ev, "lane=one") + "; /bin/cat /tmp/synthetic/source.py"
+    uncertainties = observed(command, "synthetic output")
+    assert any(e.get("for_ev") == ev for e in uncertainties)
+    state = loop_live.project([event("open"), event("heartbeat", 120)] + uncertainties, event("heartbeat", 121)["at"])
+    assert state["live_phase"] is None
+
+
+def test_real_reader_shell_output_never_becomes_state_writer_proof():
+    command = "/bin/pwd; /bin/ls -d /tmp; /usr/bin/wc -c /dev/null"
+    uncertainties = observed(command, shell_output(command))
+    state = loop_live.project([event("heartbeat")] + uncertainties, AT)
+    assert state["live_phase"] == "preparing"
+    assert state["tasks_admitted"] is None
+
+
+@pytest.mark.parametrize("command", ["cat", "head", "tail", "wc", "ls", "pwd", "grep", "git rev-parse HEAD"])
+def test_bare_reader_names_do_not_prove_executable_identity(command):
+    state = loop_live.project([event("heartbeat")] + observed(command, "synthetic output"), AT)
+    assert state["live_phase"] is None
+
+
+def test_bare_reader_can_execute_a_shell_override():
+    command = "cat() { printf 'synthetic writer ran\\n'; }; cat /dev/null"
+    output = shell_output(command)
+    assert output == "synthetic writer ran\n"
+    assert loop_live.project([event("heartbeat")] + observed(command, output), AT)["live_phase"] is None
+
+
+def test_unsourced_uncertainty_never_gets_read_only_phase_trust():
+    state = loop_live.project([event("open"), event("heartbeat"), event("uncertain")], AT)
+    assert state["live_phase"] is None
+
+
 def test_echoed_append_mention_remains_data_not_an_opaque_executable_wrapper():
     events = observed("echo '" + append("admit", "task=TASK-1") + "'", "seq=1\n")
     assert events == []

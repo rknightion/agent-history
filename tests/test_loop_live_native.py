@@ -8,6 +8,9 @@ import pytest
 from agent_history import loop_live, loops
 from agent_history.config import Config, LoopLive, parse_config
 from test_loop_live import AT, event
+from test_loop_live_pg import DSN, fake_infer, refresh, scratch_database
+from test_loop_live_pg import clean as clean
+from test_loop_live_pg import transcript as transcript
 
 REPORT = "/tmp/synthetic/codex/report-synthetic-loop1.md"
 TARGET = "codex/state-synthetic-loop1.jsonl"
@@ -228,6 +231,95 @@ def heartbeat_log(at=AT, heartbeat=True):
     return "".join(json.dumps(row) + "\n" for row in rows)
 
 
+@pytest.mark.parametrize("agent,phase", [(None, "preparing"), ("complex-worker", "working"), ("reviewer", "reviewing")])
+def test_root_read_only_uncertainty_does_not_erase_heartbeat_phase(agent, phase):
+    # Mixed root commands retain unscoped structural uncertainty, even long after the call.
+    # Collected heartbeats are explicit activity, not a reason to trust an opaque writer.
+    command = "/usr/bin/git rev-parse HEAD; /bin/cat /tmp/synthetic/candidate.patch; /usr/bin/grep -n phase /tmp/synthetic/source.py"
+    uncertainties = loop_live.append_events(command, "/tmp/synthetic", REPORT, AT, "synthetic output")
+    assert uncertainties and all(e["ev"] == "uncertain" and "for_ev" not in e for e in uncertainties)
+    recorded = AT + timedelta(hours=2)
+    parsed = loops.state_progress(heartbeat_log(recorded.isoformat().replace("+00:00", "Z")))
+    assert parsed is not None
+    beats = [e for e in parsed[2] if e["ev"] == "heartbeat"]
+    events = [event("open")] + uncertainties + beats
+    if agent:
+        events.append(event("dispatch", lane="one", agent=agent))
+    state = loop_live.project(events, recorded + timedelta(minutes=1))
+    assert state["live_phase"] == phase
+    assert state["evidence_at"] == recorded.isoformat()
+    assert state["tasks_admitted"] is None  # Phase safety never repairs structural completeness.
+    assert state["active_lanes"] is None
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "/bin/cat /tmp/synthetic/source.py",
+        "/usr/bin/head -n 20 /tmp/synthetic/source.py",
+        "/usr/bin/tail -n 20 /tmp/synthetic/source.py",
+        "/usr/bin/wc -l /tmp/synthetic/source.py",
+        "/bin/ls -la /tmp/synthetic",
+        "/bin/pwd",
+        "/usr/bin/grep -n 'loop-state append' /tmp/synthetic/source.py",
+        "/usr/bin/git rev-parse --verify HEAD",
+    ],
+)
+def test_literal_system_readers_preserve_public_phase(command):
+    uncertainties = loop_live.append_events(command, "/tmp/synthetic", REPORT, AT, "synthetic output")
+    assert uncertainties and all(e["ev"] == "uncertain" for e in uncertainties)
+    assert loop_live.project([event("heartbeat")] + uncertainties, AT)["live_phase"] == "preparing"
+
+
+@pytest.mark.skipif(not scratch_database(DSN), reason="disposable agent_history_test database required")
+@pytest.mark.parametrize("ambiguous_writer", [False, True])
+def test_root_mixed_readers_and_heartbeat_cross_real_loader_projection(
+    clean, transcript, monkeypatch, ambiguous_writer
+):
+    monkeypatch.setattr(loop_live, "load_config", lambda: Config(loop_live=LoopLive(enabled=False)))
+    transcript["state"]("dispatch", "lane=one task=TASK-1 agent=complex-worker")
+    transcript["append"](
+        "/usr/bin/git rev-parse HEAD; /bin/cat /tmp/synthetic/candidate.patch; /usr/bin/grep -n phase /tmp/synthetic/source.py"
+    )
+    if ambiguous_writer:
+        transcript["append"](append("return", "lane=one"), ok=False, output="synthetic failure")
+    at = transcript["at"] + timedelta(seconds=60)
+    transcript["records"].append(
+        {
+            "type": "custom_message",
+            "id": "synthetic-heartbeat",
+            "timestamp": at.isoformat(),
+            "customType": "loop-heartbeat",
+            "content": "Heartbeat",
+            "details": {"at": at.isoformat()},
+        }
+    )
+    transcript["path"].write_text("".join(json.dumps(row) + "\n" for row in transcript["records"]))
+    _, phase, lanes, _ = refresh(clean, transcript)
+    assert phase == (None if ambiguous_writer else "working")
+    assert lanes is None  # Read-only phase proof does not repair structural uncertainty.
+    assert clean.execute("SELECT tasks_admitted,tasks_landed,parks_total FROM ah.loops").fetchone() == (
+        None,
+        None,
+        None,
+    )
+    # A valid retained classifier response must not repair missing writer evidence.
+    target = clean.execute("SELECT id,root_session_id,launch_ts,NULL,report_path FROM ah.loop_run").fetchone()
+    now = clean.execute("SELECT transaction_timestamp()").fetchone()[0]
+    projected = loop_live.project(loop_live._events(clean, *target), now)
+    key = loop_live.digest_key(projected)
+    from psycopg.types.json import Jsonb
+
+    clean.execute(
+        "INSERT INTO ah.loop_live_cache (launch_uid,digest_sha256,kind,response,model,requested_at) "
+        "SELECT launch_uid,%s,'jev',%s,%s,transaction_timestamp() FROM ah.loop_run",
+        (key, Jsonb(fake_infer(None, "jev", {})), loop_live.JEV_MODEL),
+    )
+    _, cached_phase, _, _ = refresh(clean, transcript)
+    assert clean.execute("SELECT jev_phase FROM ah.loops").fetchone()[0] == "waiting"
+    assert cached_phase == (None if ambiguous_writer else "working")
+
+
 def test_state_heartbeat_only_root_has_live_phase_without_invented_structure():
     recorded = AT + timedelta(hours=2, milliseconds=123)
     parsed = loops.state_progress(heartbeat_log(recorded.isoformat().replace("+00:00", "Z")))
@@ -245,7 +337,7 @@ def test_state_heartbeat_only_root_has_live_phase_without_invented_structure():
 
 
 @pytest.mark.parametrize("dispatched", [False, True])
-def test_state_heartbeat_phase_survives_unscoped_uncertainty_without_watch(dispatched):
+def test_state_heartbeat_cannot_prove_phase_after_an_opaque_possible_writer(dispatched):
     recorded = AT + timedelta(hours=2)
     parsed = loops.state_progress(heartbeat_log(recorded.isoformat().replace("+00:00", "Z")))
     assert parsed is not None
@@ -254,7 +346,8 @@ def test_state_heartbeat_phase_survives_unscoped_uncertainty_without_watch(dispa
     assert any(e["ev"] == "uncertain" and e.get("for_ev") is None for e in uncertain)
     events = ([event("dispatch", lane="one", agent="worker")] if dispatched else []) + beats + uncertain
     state = loop_live.project(events, recorded + timedelta(minutes=1))
-    assert state["live_phase"] == ("working" if dispatched else "preparing")
+    # A recent heartbeat establishes activity, not the absence of lane-state mutations.
+    assert state["live_phase"] is None
     assert state["evidence_at"] == recorded.isoformat()
     assert not state["phase_input"]["watch_active"]
     assert state["active_lanes"] is None

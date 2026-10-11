@@ -484,6 +484,24 @@ def _command_properties(args: list[str], literals: list[bool]) -> tuple[str, boo
     return "opaque", returns, False
 
 
+def _phase_read_only(args: list[str], literals: list[bool]) -> bool:
+    """Narrow non-writer proof, not append, receipt, cwd or count-completeness evidence.
+
+    Only direct literal system paths qualify, bypassing shell-function and PATH overrides.
+    Bare names, redirections, expansions, assignments, wrappers and unsupported grammar remain
+    opaque. Do not generalise this to git's other inspection verbs: configuration, pagers,
+    external diff and textconv can execute writers.
+    """
+    if not args or not all(literals):
+        return False
+    name = PurePosixPath(args[0]).name
+    if args[0] not in {f"/bin/{name}", f"/usr/bin/{name}"}:
+        return False
+    if name in {"cat", "head", "tail", "wc", "ls", "pwd", "grep"}:
+        return True
+    return name == "git" and args[1:2] == ["rev-parse"]
+
+
 def append_events(
     command: str,
     cwd: str | None,
@@ -558,7 +576,10 @@ def append_events(
                     events.append(uncertainty)
             receipt_index += 1
         elif kind == "opaque":
-            events.append({"ev": "uncertain", "at": at})
+            uncertainty = {"ev": "uncertain", "at": at}
+            if _phase_read_only(args, literals):
+                uncertainty["_phase_read_only"] = True
+            events.append(uncertainty)
         if not preserves_cwd:
             cwd = None
         if call_uid is not None:
@@ -581,7 +602,9 @@ def watch_events(records: list[tuple], hooks: list[tuple], start: datetime, end:
         args, value = _json(raw), _json(result)
         if not isinstance(args, dict) or not isinstance(value, dict) or at is None or accepted_at is None:
             if name == "watch_start" and accepted_at is not None:
-                events.append({"ev": "uncertain", "for_ev": "watch", "at": accepted_at})
+                # Missing native receipt metadata cannot establish gating, but unlike an
+                # opaque shell writer it does not invalidate observed lane activity.
+                events.append({"ev": "uncertain", "for_ev": "watch", "at": accepted_at, "_phase_observed": True})
             continue
         uid = value.get("id")
         if not isinstance(uid, str) or not uid:
@@ -725,7 +748,7 @@ def project(events: list[dict], now: datetime, answers: dict[str, float] | None 
             if key:
                 live[key] = e
             else:
-                uncertain.append({"ev": "uncertain", "for_ev": "dispatch", "at": e["at"]})
+                uncertain.append({"ev": "uncertain", "for_ev": "dispatch", "at": e["at"], "_phase_observed": True})
             dispatches.append(e)
         elif ev == "return":
             key = _live_text(e.get("run")) or _live_text(e.get("lane"), 1000)
@@ -864,6 +887,18 @@ def project(events: list[dict], now: datetime, answers: dict[str, float] | None 
 
         if any((e.get("for_ev") is None or e.get("for_ev") in kinds) and not before_known(e) for e in uncertain):
             fields[key] = None
+    # Literal readers and observed native activity preserve phase, not structural
+    # completeness. A heartbeat cannot prove an opaque shell writer left lanes intact.
+    if (
+        any(
+            (e.get("for_ev") in {"dispatch", "return", "close", "watch"} and e.get("_phase_observed") is not True)
+            or (e.get("for_ev") is None and e.get("_phase_read_only") is not True)
+            for e in uncertain
+        )
+        and not active_watch
+        and not state["close_recorded"]
+    ):
+        fields["live_phase"] = None
     # The classifier's alias must not turn an uncertain cumulative count back into exact zero.
     state["park_events_so_far"] = fields["parks_total"]
     fields["phase_input"] = state
@@ -1432,7 +1467,9 @@ def refresh(conn: psycopg.Connection) -> None:
         if jev:
             try:
                 nouls, jev_phase, probs = jev_answers(jev[0])
-                state["live_phase"] = hybrid_decide(state["phase_input"], nouls)
+                # Inference refines an observed phase; it cannot repair missing writer evidence.
+                if state["live_phase"] is not None:
+                    state["live_phase"] = hybrid_decide(state["phase_input"], nouls)
             except ValueError as exc:
                 cache_error = str(exc)
                 jev = None
