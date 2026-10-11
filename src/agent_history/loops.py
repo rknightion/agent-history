@@ -1034,6 +1034,11 @@ def state_progress(content: str) -> tuple[str, datetime, list[dict[str, Any]]] |
     Preserve source bytes in the collector. A torn JSON object has no event and is ignored, as
     by loop-state check. Other invalid framing or malformed count evidence leaves counts unknown.
     """
+    return _read_state_progress(content)
+
+
+def _read_state_progress(content: str, *, identity_only: bool = False):
+    """Share full validation with the prefix identity used only to invalidate bad copies."""
 
     def unique(pairs):
         result = {}
@@ -1089,6 +1094,9 @@ def state_progress(content: str) -> tuple[str, datetime, list[dict[str, Any]]] |
             if opened is not None or not isinstance(goal, str) or not re.fullmatch(r"[0-9a-f]{64}", goal):
                 return None
             opened = (goal, at)
+            if identity_only:
+                # The entire prefix through this open is valid. Never expose prefix counts.
+                return (*opened, [])
         elif ev == "heartbeat":
             activity = event.get("at")
             # loop-state framing ts is append observation time. Root activity is the
@@ -1102,11 +1110,11 @@ def state_progress(content: str) -> tuple[str, datetime, list[dict[str, Any]]] |
             except ValueError:
                 continue
             events.append({**event, "at": activity_at, "_observed_at": at})
-        elif ev in ("dispatch", "accept", "land"):
+        elif ev in ("dispatch", "accept", "land", "admit", "park"):
             events.append({**event, "at": at})
-        elif ev in ("admit", "park", "close"):
+        elif ev == "close":
             # Neither a pre-open close nor a worker/daemon observation establishes an end.
-            if opened is not None and (ev != "close" or event["by"] in ("root", "dispatcher")):
+            if opened is not None and event["by"] in ("root", "dispatcher"):
                 events.append({**event, "at": at})
     return (*opened, events) if opened else None
 
@@ -1190,10 +1198,9 @@ def state_cohorts(
                 if parsed is not None:
                     snapshots[key].append(parsed)
                     continue
-                # A complete valid first open can attribute a later-invalid snapshot. Do not
-                # silently use a stale valid machine copy as proof of complete zero outcomes.
-                first = next((line for line in content.splitlines() if line.strip()), "")
-                prefix = state_progress(first)
+                # A valid prefix through the first open can attribute a later-invalid snapshot.
+                # Do not silently use a stale valid machine copy as complete outcome proof.
+                prefix = _read_state_progress(content, identity_only=True)
                 if prefix is not None:
                     digest, opened, _ = prefix
                     snapshots[key].append((digest, opened, [{"ev": "invalid", "seq": 0, "at": opened}]))
