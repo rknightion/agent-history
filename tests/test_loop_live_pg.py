@@ -199,9 +199,9 @@ def test_real_collector_structure_summary_history_and_failed_call(clean, transcr
     assert clean.execute(
         "SELECT tasks_admitted,tasks_landed,parks_total,last_gate,last_park FROM ah.loops"
     ).fetchone() == (
-        1,
-        0,
-        1,
+        None,
+        None,
+        None,
         {
             "sha": "synthetic",
             "scope": "composed",
@@ -248,8 +248,8 @@ def test_real_collector_structure_summary_history_and_failed_call(clean, transcr
         (psycopg.types.json.Jsonb(fake_infer(live_config, "jev", {})),),
     )
     clean.commit()
-    # Failed appends do not prove an event or an exact zero. A subsequent receipt for the
-    # same task resolves this distinct-task uncertainty, without counting the failed call.
+    # Failed and successful captured appends alike cannot supply publication totals
+    # without a complete collected state snapshot.
     transcript["state"]("land", "task=TASK-1", ok=False)
     refresh(clean, transcript)
     assert clean.execute("SELECT tasks_landed FROM ah.loops").fetchone()[0] is None
@@ -264,7 +264,7 @@ def test_real_collector_structure_summary_history_and_failed_call(clean, transcr
         assert loop_live.drain_one(worker, live_config, fail)
     refresh(clean, transcript)
     assert clean.execute("SELECT tasks_landed,headline,summary_error FROM ah.loops").fetchone() == (
-        1,
+        None,
         "Work in progress",
         "timeout",
     )
@@ -302,7 +302,8 @@ def test_slow_worker_does_not_hold_collector_and_close_is_once(clean, transcript
             before = time.monotonic()
             refresh(clean, transcript)
             assert time.monotonic() - before < 5
-            assert clean.execute("SELECT parks_total FROM ah.loops").fetchone()[0] == 1
+            # Captured append calls can establish phase, but not complete state-log totals.
+            assert clean.execute("SELECT parks_total FROM ah.loops").fetchone()[0] is None
             clean.commit()
         finally:
             release.set()
@@ -429,13 +430,13 @@ def test_native_batch_watch_and_parser_spawn_rows_at_catalogue_surface(clean, tr
             "started_at": entry.isoformat(timespec="microseconds").replace("+00:00", "Z"),
         }
     ]
-    assert fields[1:3] == (2, 0)
+    assert fields[1:3] == (None, None)  # no collected complete state snapshot
     assert fields[3]["exit"] == 1
     assert fields[4] == "Check the unchanged candidate."
     # A truncated registration is not proof of an active watcher, so the phase stays structural rather than gating.
     clean.execute("UPDATE ah.tool_io SET output_truncated=true WHERE tool_name='watch_start'")
     loop_live.refresh(clean)
-    assert clean.execute("SELECT live_phase,tasks_admitted FROM ah.loops").fetchone() == ("working", 2)
+    assert clean.execute("SELECT live_phase,tasks_admitted FROM ah.loops").fetchone() == ("working", None)
     clean.execute("UPDATE ah.tool_io SET output_truncated=false WHERE tool_name='watch_start'")
     loop_live.refresh(clean)
     assert clean.execute("SELECT live_phase FROM ah.loops").fetchone()[0] == "gating"

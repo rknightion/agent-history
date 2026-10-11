@@ -156,10 +156,11 @@ def test_authoritative_collected_root_heartbeat_phase(clean, tmp_path, case):
     events = loop_live._events(clean, *target)
     if expected:
         assert [(e["ev"], e["at"]) for e in events] == [("heartbeat", activity)]
-        # Collector state does not manufacture open/dispatch, terminal status or root activity.
+        # The valid collected open establishes zero admits, not transcript lane structure
+        # or root activity. A heartbeat is not a terminal close.
         assert clean.execute("SELECT active_lanes,tasks_admitted,status FROM ah.loops").fetchone() == (
             None,
-            None,
+            0,
             "running",
         )
         assert clean.execute("SELECT last_event_at FROM ah.session").fetchone() == (started,)
@@ -236,8 +237,8 @@ def test_analytics_reapply_and_rebuild_preserve_live_relation_and_grant(clean, l
     "terminal",
     [None, "completion_receipt", "next_launch", "wrong-goal", "before-launch", "before-open", "wrong-origin"],
 )
-def test_state_close_is_analytical_end_only(clean, tmp_path, terminal):
-    """Collected close beats root activity, but never changes receiver lifecycle semantics."""
+def test_state_close_is_attributed_lifecycle_evidence(clean, tmp_path, terminal):
+    """Valid collected close finishes the lifecycle; wrong attribution cannot finish it."""
     import subprocess
     import time
 
@@ -294,7 +295,14 @@ def test_state_close_is_analytical_end_only(clean, tmp_path, terminal):
             "root_model": "synthetic",
             "envelope": [],
         },
-        {"v": 1, "seq": 2, "ts": closed.strftime("%Y-%m-%dT%H:%M:%SZ"), "by": "root", "ev": "close"},
+        {
+            "v": 1,
+            "seq": 2,
+            "ts": closed.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "by": "root",
+            "ev": "close",
+            "reason": "owner-stop",
+        },
     ]
     if terminal == "wrong-goal":
         events[0]["goal_sha256"] = "e" * 64
@@ -335,10 +343,12 @@ def test_state_close_is_analytical_end_only(clean, tmp_path, terminal):
         "wrong-origin": (last, "root_last_event"),
     }[terminal]
     assert clean.execute("SELECT end_ts, end_evidence FROM ah.loop_run WHERE loop_number = 1").fetchone() == expected
-    lifecycle = ("finished", expected[0]) if terminal in ("completion_receipt", "next_launch") else ("running", None)
+    lifecycle = (
+        ("finished", expected[0]) if terminal in (None, "completion_receipt", "next_launch") else ("running", None)
+    )
     assert clean.execute("SELECT status, end_ts FROM ah.loops WHERE loop = 'loop1'").fetchone() == lifecycle
     clean.commit()
-    # Retagging/rebuild must reapply the same collected evidence without finishing the receiver.
+    # Retagging/rebuild must reapply the same exactly attributed lifecycle evidence.
     assert load.rebuild(clean, sources=sources, textfile=None, log=lambda *_: None).errors == 0
     assert clean.execute("SELECT end_ts, end_evidence FROM ah.loop_run WHERE loop_number = 1").fetchone() == expected
     assert clean.execute("SELECT status, end_ts FROM ah.loops WHERE loop = 'loop1'").fetchone() == lifecycle
@@ -472,18 +482,27 @@ def test_collected_state_counts_distinct_accepted_lanes_and_landed_tasks(clean, 
                 event["accepted"] = False
 
     dispatches = [
-        {"ev": "dispatch", "task": "TASK-1", "lane": "one"},
-        {"ev": "dispatch", "task": "TASK-1", "lane": "one"},  # retry/copy is still one lane
-        {"ev": "dispatch", "task": "TASK-2", "lane": "three"},
-        {"ev": "dispatch", "task": "TASK-3", "lane": "three"},
+        {"ev": "dispatch", "task": "TASK-1", "lane": "one", "agent": "worker", "run": "one", "base": "base"},
+        {"ev": "dispatch", "task": "TASK-1", "lane": "one", "agent": "worker", "run": "one-retry", "base": "base"},
+        {"ev": "dispatch", "task": "TASK-2", "lane": "three", "agent": "worker", "run": "three-2", "base": "base"},
+        {"ev": "dispatch", "task": "TASK-3", "lane": "three", "agent": "worker", "run": "three-3", "base": "base"},
     ]
     if case == "future":
         events.append(dispatches.pop())  # a later dispatch cannot identify an earlier accept
     elif case == "different-task":
         dispatches[-1]["task"] = "TASK-3-other"  # exact task keys, not aliases
     elif case in ("mixed", "explicit-overrides"):
-        dispatches.append({"ev": "dispatch", "task": "TASK-3", "lane": "reviewer"})
-        dispatches.append({"ev": "return", "lane": "reviewer", "status": "complete"})
+        dispatches.append(
+            {
+                "ev": "dispatch",
+                "task": "TASK-3",
+                "lane": "reviewer",
+                "agent": "reviewer",
+                "run": "review",
+                "base": "base",
+            }
+        )
+        dispatches.append({"ev": "return", "lane": "reviewer", "run": "review", "status": "complete"})
     if case != "missing":
         events[1:1] = dispatches
     framed = [

@@ -9,8 +9,8 @@ never reads launch or report files (they may live on another machine), so:
   an existing run, but never supply identity or terminal evidence;
 - a loop is finished by a wave-notify completion receipt collected into ah.loop_receipt, else
   by the next launch in the same root session; the root session's last event is only a fallback
-  timestamp. An exactly attributed collected state close can replace that analytical fallback,
-  without establishing lifecycle completion. Transcript text and shell commands are never
+  timestamp. An exactly attributed valid collected state close can replace that analytical fallback
+  and establish lifecycle completion. Transcript text and shell commands are never
   interpreted for completion or identity.
 """
 
@@ -723,9 +723,8 @@ def _refresh_identity(conn: psycopg.Connection, finished: Sequence[str] = ()) ->
         )
         if lane_counts is not None:  # the latest captured report's Data, NULL when it has no exact count
             conn.execute(
-                "UPDATE ah.loops SET lanes_accepted = %s, lanes_reported = %s WHERE launch_uid = %s "
-                "AND (lanes_accepted, lanes_reported) IS DISTINCT FROM (%s, %s)",
-                (*lane_counts, uid, *lane_counts),
+                "UPDATE ah.loops SET lanes_reported = %s WHERE launch_uid = %s AND lanes_reported IS DISTINCT FROM %s",
+                (lane_counts[1], uid, lane_counts[1]),
             )
     if initial:
         conn.execute(
@@ -884,6 +883,151 @@ def _refresh_tasks_done(conn: psycopg.Connection) -> None:
     """)
 
 
+# Frozen loop-state v1 validate_event schema, from public bin/loop-state.
+# Source SHA-256: f44713f19942be7296feb377c79c6e9db4310c0796a0f4869dcd5ecadba00561.
+# No runtime checkout/CLI dependency. Retained framing also requires real timestamps,
+# an exact goal hash and one open. Invalid heartbeat activity is independently unknown.
+_STATE_TIER = ("routine", "guarded")
+_STATE_SCHEMA = {
+    "open": (
+        {
+            "goal_sha256": "str",
+            "tier": _STATE_TIER,
+            "root": ("llm", "dispatcher"),
+            "root_model": "str",
+            "envelope": "strlist",
+        },
+        {},
+    ),
+    "admit": (
+        {"task": "str", "source": ("envelope", "loop-created"), "owned": "owned", "accept": "str"},
+        {"tier": _STATE_TIER, "surfaces": "strlist"},
+    ),
+    "dispatch": (
+        {"lane": "str", "task": "str", "agent": "str", "run": "str", "base": "str"},
+        {
+            "deadline": "str",
+            "model": "str",
+            "effort": "str",
+            "surface": "str",
+            "tier": _STATE_TIER,
+            "tasks": "strlist",
+            "kind": ("work", "gate", "triage", "review"),
+            "recovery_of": "str",
+        },
+    ),
+    "return": (
+        {"lane": "str", "run": "str", "status": ("complete", "partial", "blocked", "failed")},
+        {
+            "sha": "str?",
+            "landed": "bool",
+            "check": "str",
+            "exit": "int?",
+            "ci": "str?",
+            "coderabbit": "coderabbit",
+            "base": "str",
+            "questions": "strlist",
+        },
+    ),
+    "gate": (
+        {"scope": ("lane", "composed"), "sha": "str", "cmd": "str", "exit": "int?"},
+        {"lane": "str", "base": "str"},
+    ),
+    "accept": ({"task": "str", "accepted": "bool", "reason": "str"}, {"lane": "str"}),
+    "park": (
+        {
+            "task": "str",
+            "reason": "str",
+            "needs": ("owner", "authority", "evidence-later", "dependency", "defect", "budget"),
+        },
+        {"lane": "str", "until": "str"},
+    ),
+    "land": (
+        {"task": "str", "sha": "str", "gate": "str", "mode": ("after-green", "pre-green")},
+        {"lane": "str", "ci": "str"},
+    ),
+    "revert": (
+        {"sha": "str", "reverted_by": "str", "reason": ("ci-red", "ci-timeout", "composed-red", "root-decision")},
+        {"task": "str"},
+    ),
+    "watch": ({"op": ("start", "stop"), "what": "str", "deadline": "str"}, {}),
+    "heartbeat": ({"at": "str"}, {}),
+    "judgement": ({"text": "str"}, {"task": "str", "lane": "str"}),
+    "close": ({"reason": ("nothing-admissible", "owner-stop", "blocked", "budget")}, {}),
+}
+
+
+def _state_value_valid(kind, value) -> bool:
+    if isinstance(kind, tuple):
+        return isinstance(value, str) and value in kind
+    if kind.endswith("?"):
+        return value is None or _state_value_valid(kind[:-1], value)
+    if kind == "str":
+        return isinstance(value, str) and bool(value)
+    if kind == "int":
+        return type(value) is int
+    if kind == "bool":
+        return type(value) is bool
+    if kind == "strlist":
+        return isinstance(value, list) and all(isinstance(item, str) for item in value)
+    if kind == "owned":
+        return _state_value_valid("str", value) or _state_value_valid("strlist", value)
+    if kind == "coderabbit":
+        return value is None or (
+            isinstance(value, dict)
+            and type(value.get("ran")) is bool
+            and type(value.get("major")) is int
+            and type(value.get("unreviewed")) is int
+        )
+    return False
+
+
+def _state_body_valid(event) -> bool:
+    schema = _STATE_SCHEMA.get(event["ev"])
+    if schema is None:
+        return False
+    required, optional = schema
+    if set(event) - required.keys() - optional.keys() - {"ev", "v", "seq", "ts", "by"}:
+        return False
+    # An invalid/missing heartbeat at does not erase independent complete count evidence.
+    if event["ev"] == "heartbeat":
+        return True
+    if any(key not in event or not _state_value_valid(kind, event[key]) for key, kind in required.items()):
+        return False
+    if any(key in event and not _state_value_valid(kind, event[key]) for key, kind in optional.items()):
+        return False
+    if event["ev"] == "judgement":
+        try:
+            return len(event["text"].encode("utf-8")) <= 4096
+        except UnicodeEncodeError:
+            return False
+    return True
+
+
+class _StateEvents(list):
+    """Projected observations with a complete pre-filter framed-event fingerprint ledger."""
+
+    def __init__(self, events=(), *, ledger=None):
+        super().__init__(events)
+        self.ledger = {} if ledger is None else ledger
+
+
+def _state_conflicts(cohorts) -> set[str]:
+    """Event kinds involved in disagreement at the same frozen open/sequence position."""
+    observed = {}
+    conflicts = set()
+    for opened, events in cohorts:
+        ledger = getattr(events, "ledger", None)
+        if ledger is None:
+            ledger = {e["seq"]: (e["ev"], json.dumps(e, sort_keys=True, default=str)) for e in events}
+        for seq, value in ledger.items():
+            copies = observed.setdefault((opened, seq), set())
+            copies.add(value)
+            if len(copies) > 1:
+                conflicts.update(kind for kind, _ in copies)
+    return conflicts
+
+
 def state_progress(content: str) -> tuple[str, datetime, list[dict[str, Any]]] | None:
     """Read frozen v1 framing, count evidence and explicitly recorded root heartbeats.
 
@@ -902,7 +1046,7 @@ def state_progress(content: str) -> tuple[str, datetime, list[dict[str, Any]]] |
     def string(event, key):
         return isinstance(event.get(key), str) and bool(event[key])
 
-    events = []
+    events = _StateEvents()
     opened = None
     previous = 0
     for raw in content.splitlines():
@@ -935,18 +1079,14 @@ def state_progress(content: str) -> tuple[str, datetime, list[dict[str, Any]]] |
             return None
         previous = seq
         ev = event["ev"]
+        if not _state_body_valid(event):
+            return None
+        # Capture every frame, including return, open, non-root close and invalid
+        # heartbeat activity, before any projection, actor or launch-window filter.
+        events.ledger[seq] = (ev, json.dumps(event, sort_keys=True))
         if ev == "open":
             goal = event.get("goal_sha256")
-            if (
-                opened is not None
-                or not isinstance(goal, str)
-                or not re.fullmatch(r"[0-9a-f]{64}", goal)
-                or event.get("tier") not in ("routine", "guarded")
-                or event.get("root") not in ("llm", "dispatcher")
-                or not string(event, "root_model")
-                or not isinstance(event.get("envelope"), list)
-                or not all(isinstance(task, str) for task in event["envelope"])
-            ):
+            if opened is not None or not isinstance(goal, str) or not re.fullmatch(r"[0-9a-f]{64}", goal):
                 return None
             opened = (goal, at)
         elif ev == "heartbeat":
@@ -962,42 +1102,33 @@ def state_progress(content: str) -> tuple[str, datetime, list[dict[str, Any]]] |
             except ValueError:
                 continue
             events.append({**event, "at": activity_at, "_observed_at": at})
-        elif ev == "dispatch" and string(event, "task") and string(event, "lane"):
+        elif ev in ("dispatch", "accept", "land"):
             events.append({**event, "at": at})
-        elif ev == "close" and opened is not None:
-            # A close preceding the open in frozen sequence order cannot end its launch.
-            events.append({**event, "at": at})
-        elif ev in ("accept", "land"):
-            if not string(event, "task") or ("lane" in event and not string(event, "lane")):
-                return None
-            if ev == "accept":
-                if type(event.get("accepted")) is not bool or not string(event, "reason"):
-                    return None
-            elif (
-                not string(event, "sha")
-                or not string(event, "gate")
-                or event.get("mode") not in ("after-green", "pre-green")
-            ):
-                return None
-            events.append({**event, "at": at})
+        elif ev in ("admit", "park", "close"):
+            # Neither a pre-open close nor a worker/daemon observation establishes an end.
+            if opened is not None and (ev != "close" or event["by"] in ("root", "dispatcher")):
+                events.append({**event, "at": at})
     return (*opened, events) if opened else None
 
 
-def _state_event_counts(cohorts: list[tuple[datetime, list[dict[str, Any]]]]) -> tuple[int | None, int]:
+def _state_event_counts(cohorts: list[tuple[datetime, list[dict[str, Any]]]]) -> tuple[int | None, int | None]:
     """Correlate exact tasks using preceding recorded dispatches, never return status or role.
 
     Copies sharing an open timestamp share the same frozen sequence. Union their dispatch evidence
     before resolving accepts so identical copies deduplicate and conflicting copies stay ambiguous.
     Different opens do not supply each other's sequence ordering.
     """
+    if any(e["ev"] == "invalid" for _, events in cohorts for e in events):
+        return None, None
     dispatches: dict[datetime, dict[str, dict[int, set[str]]]] = {}
     for opened, events in cohorts:
         for event in events:
             if event["ev"] == "dispatch":
                 task_dispatches = dispatches.setdefault(opened, {}).setdefault(event["task"], {})
                 task_dispatches.setdefault(event["seq"], set()).add(event["lane"])
+    conflicts = _state_conflicts(cohorts)
     accepted, landed = set(), set()
-    unresolved = False
+    unresolved = bool(conflicts & {"open", "accept", "dispatch"})
     for opened, events in cohorts:
         for event in events:
             if event["ev"] == "accept" and event["accepted"] is True:
@@ -1014,7 +1145,7 @@ def _state_event_counts(cohorts: list[tuple[datetime, list[dict[str, Any]]]]) ->
                     unresolved = True
             elif event["ev"] == "land":
                 landed.add(event["task"])
-    return (None if unresolved else len(accepted)), len(landed)
+    return (None if unresolved else len(accepted)), (None if conflicts & {"open", "land"} else len(landed))
 
 
 def state_cohorts(
@@ -1050,14 +1181,22 @@ def state_cohorts(
             continue
         key = (repo, label)
         if key not in snapshots:
-            snapshots[key] = [
-                parsed
-                for (content,) in conn.execute(
-                    "SELECT content FROM ah.loop_state WHERE lower(repo_origin) = %s AND loop = %s",
-                    key,
-                )
-                if (parsed := state_progress(content)) is not None
-            ]
+            snapshots[key] = []
+            for (content,) in conn.execute(
+                "SELECT content FROM ah.loop_state WHERE lower(repo_origin) = %s AND loop = %s",
+                key,
+            ):
+                parsed = state_progress(content)
+                if parsed is not None:
+                    snapshots[key].append(parsed)
+                    continue
+                # A complete valid first open can attribute a later-invalid snapshot. Do not
+                # silently use a stale valid machine copy as proof of complete zero outcomes.
+                first = next((line for line in content.splitlines() if line.strip()), "")
+                prefix = state_progress(first)
+                if prefix is not None:
+                    digest, opened, _ = prefix
+                    snapshots[key].append((digest, opened, [{"ev": "invalid", "seq": 0, "at": opened}]))
         cohorts = []
         for digest, opened, events in snapshots[key]:
             if digest != goal:
@@ -1072,17 +1211,20 @@ def state_cohorts(
             cohorts.append(
                 (
                     opened,
-                    [
-                        event
-                        for event in events
-                        if event["at"] >= started
-                        and (not following or event["at"] < following)
-                        and (
-                            event["ev"] != "heartbeat"
-                            or event["_observed_at"] >= started
-                            and (not following or event["_observed_at"] < following)
-                        )
-                    ],
+                    _StateEvents(
+                        [
+                            event
+                            for event in events
+                            if (event["ev"] == "invalid" or event["at"] >= started)
+                            and (not following or event["at"] < following)
+                            and (
+                                event["ev"] != "heartbeat"
+                                or event["_observed_at"] >= started
+                                and (not following or event["_observed_at"] < following)
+                            )
+                        ],
+                        ledger=getattr(events, "ledger", {}),
+                    ),
                 )
             )
         if cohorts:
@@ -1090,32 +1232,82 @@ def state_cohorts(
     return result
 
 
-def _refresh_state_counts(conn: psycopg.Connection) -> None:
-    """Preserve exact count attribution and analytical-close semantics.
+TRACKER_ID = re.compile(r"[A-Za-z][A-Za-z0-9]*-[0-9]+(?:\.[0-9]+)*")
 
-    Unresolved true acceptance leaves only the accepted count unknown. A state close does
-    not establish lifecycle completion or phase; receipt/replacement ends keep precedence.
+
+def state_outcomes(cohorts: list[tuple[datetime, list[dict[str, Any]]]]) -> tuple[int | None, int | None, int | None]:
+    """Explicit tracker admission/publication and cumulative parks, not the digest's live fold.
+
+    Sequence and open timestamp identify an event across machine snapshots. Repeated parks at
+    different sequence positions count separately. Conflicting observations of a relevant event
+    leave that outcome unknown rather than selecting a newer machine or adding both copies.
     """
-    for uid, cohorts in state_cohorts(conn).items():
+    if not cohorts or any(e["ev"] == "invalid" for _, events in cohorts for e in events):
+        return None, None, None
+    conflicts = _state_conflicts(cohorts)
+    result = []
+    for kind in ("admit", "land", "park"):
+        if kind in conflicts or "open" in conflicts:
+            result.append(None)
+        elif kind == "park":
+            result.append(len({(opened, e["seq"]) for opened, events in cohorts for e in events if e["ev"] == kind}))
+        else:
+            tasks = {
+                event["task"]
+                for _, events in cohorts
+                for event in events
+                if event["ev"] == kind
+                and TRACKER_ID.fullmatch(event["task"])
+                and (kind != "land" or event["by"] in ("root", "dispatcher"))
+            }
+            result.append(len(tasks))
+    return tuple(result)
+
+
+def _refresh_state_counts(conn: psycopg.Connection) -> None:
+    """Project qualified state outcomes on every pass, even closed collector-only updates.
+
+    Missing evidence is NULL, never a report/transcript fallback. Lifecycle is refreshed before
+    this function, so loss or invalidation of a state snapshot cannot retain a guessed close.
+    """
+    qualified = state_cohorts(conn)
+    conn.execute(
+        "UPDATE ah.loops SET lanes_accepted=NULL,tasks_admitted=NULL,tasks_landed=NULL,parks_total=NULL "
+        "WHERE NOT (launch_uid = ANY(%s)) AND "
+        "(lanes_accepted IS NOT NULL OR tasks_admitted IS NOT NULL OR tasks_landed IS NOT NULL OR parks_total IS NOT NULL)",
+        (list(qualified),),
+    )
+    for uid, cohorts in qualified.items():
         accepted, landed = _state_event_counts(cohorts)
+        admitted, published, parks = state_outcomes(cohorts)
         conn.execute(
-            "UPDATE ah.loops SET lanes_accepted = %s, tasks_done = %s WHERE launch_uid = %s "
-            "AND (lanes_accepted, tasks_done) IS DISTINCT FROM (%s, %s)",
-            (accepted, landed, uid, accepted, landed),
+            "UPDATE ah.loops SET lanes_accepted=%s,tasks_admitted=%s,tasks_landed=%s,parks_total=%s "
+            "WHERE launch_uid=%s",
+            (accepted, admitted, published, parks, uid),
         )
-        closes = [
-            event["at"]
-            for opened, events in cohorts
-            for event in events
-            if event["ev"] == "close" and event["at"] >= opened
-        ]
-        if closes:
-            # Keep this out of FINISHED_EVIDENCE: receiver lifecycle is receipt/launch based.
-            # Machine copies cannot inflate or move the earliest observed analytical close.
+        if landed is not None:  # Preserve the separate legacy Done-flip fallback on invalid state.
+            conn.execute("UPDATE ah.loops SET tasks_done=%s WHERE launch_uid=%s", (landed, uid))
+        # All copies must agree at shared sequence positions before a close is terminal.
+        closes = []
+        for opened, events in cohorts:
+            for event in events:
+                if event["ev"] == "close" and event["at"] >= opened:
+                    closes.append(event["at"])
+        if (
+            closes
+            and not any(e["ev"] == "invalid" for _, events in cohorts for e in events)
+            and not _state_conflicts(cohorts)
+        ):
+            closed = min(closes)
             conn.execute(
-                "UPDATE ah.loop_run SET end_ts = %s, end_evidence = 'state_close' "
-                "WHERE launch_uid = %s AND end_evidence IN ('root_last_event', 'state_close')",
-                (min(closes), uid),
+                "UPDATE ah.loop_run SET end_ts=%s,end_evidence='state_close' "
+                "WHERE launch_uid=%s AND end_evidence IN ('root_last_event','state_close')",
+                (closed, uid),
+            )
+            conn.execute(
+                "UPDATE ah.loops SET status='finished',end_ts=CASE WHEN status='finished' THEN end_ts ELSE %s END "
+                "WHERE launch_uid=%s",
+                (closed, uid),
             )
 
 

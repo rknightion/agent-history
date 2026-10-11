@@ -1442,7 +1442,14 @@ def refresh(conn: psycopg.Connection) -> None:
             "ORDER BY close_requested DESC,COALESCE(finished_at,queued_at),launch_uid LIMIT 128"
         )
     ]
-    for uid in dict.fromkeys(historical + sorted(active) + completed):
+    state_closes = [
+        row[0]
+        for row in conn.execute(
+            "SELECT l.launch_uid FROM ah.loops l JOIN ah.loop_run r USING(launch_uid) "
+            "WHERE l.status='finished' AND r.end_evidence='state_close' AND l.live_phase IS DISTINCT FROM 'closing'"
+        )
+    ]
+    for uid in dict.fromkeys(historical + sorted(active) + completed + state_closes):
         # Capture a completion identity before any cache read. A later worker commit must remain
         # unapplied for the next refresh, even if this pass is the finished root's last selection.
         observed_job = conn.execute(
@@ -1458,6 +1465,19 @@ def refresh(conn: psycopg.Connection) -> None:
         if not target or not target[4]:
             continue
         state = project(_events(conn, *target[:5]), now)
+        # Outcome totals are complete collected-state evidence, not captured shell appends.
+        # Overlay before both queue digest and SQL write: phase refresh must not erase them.
+        outcomes = conn.execute(
+            "SELECT tasks_admitted,tasks_landed,parks_total,r.end_evidence FROM ah.loops l "
+            "JOIN ah.loop_run r USING(launch_uid) WHERE l.launch_uid=%s",
+            (uid,),
+        ).fetchone()
+        for field, value in zip(("tasks_admitted", "tasks_landed", "parks_total"), outcomes[:3]):
+            state[field] = value
+        state["phase_input"]["park_events_so_far"] = state["parks_total"]
+        if target[5] == "finished" and outcomes[3] == "state_close":
+            state["close_recorded"] = state["phase_input"]["close_recorded"] = True
+            state["live_phase"] = "closing"
         key = digest_key(state, config.reasoning)
         jev = conn.execute(
             "SELECT response FROM ah.loop_live_cache WHERE launch_uid=%s AND digest_sha256=%s AND kind='jev' AND error IS NULL",

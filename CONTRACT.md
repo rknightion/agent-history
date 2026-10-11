@@ -281,12 +281,14 @@ cursor; grants and collector tables retain their existing rebuild guarantees.
 
 The receiver seam also includes `status text`, `launch_ts timestamptz`, `end_ts timestamptz`:
 
-- `running`: no qualifying completion receipt or replacement-launch evidence (a report write alone
-  is not evidence), and the root's last recorded activity
+- `running`: no qualifying completion receipt, replacement-launch or attributed state-close
+  evidence (a report write alone is not evidence), and the root's last recorded activity
   (or launch, if later) is within 24 hours of refresh. `end_ts` is NULL.
 - `finished`: a valid completion receipt exists for the launch (`end_evidence =
-  'completion_receipt'`, below), or the next recognised launch in the same root replaces it
-  (`next_launch`). `end_ts` is that evidence timestamp. This is an observed end, not a claim of
+  'completion_receipt'`, below), the next recognised launch in the same root replaces it
+  (`next_launch`), or a valid complete collected state snapshot supplies an exactly attributed
+  root/dispatcher `close` as described under retained state-log outcomes. `end_ts` is that
+  evidence timestamp; existing receipt/replacement evidence keeps precedence over state close. This is an observed end, not a claim of
   success or a parsed report outcome. A transcript write of the report is not terminal evidence
   and no transcript or shell-command text is interpreted to decide an end. `report_write` is
   retained only as the value on rows tagged before receipts existed.
@@ -346,8 +348,8 @@ to the loop that starts after the receipt blocks the finish whenever the loop is
 a loop is re-evaluated only when its root or one of its sessions is re-indexed, so a late lane not
 yet indexed, or a root that sends the notification and carries on, leaves it finished. Re-tagging a
 root or a rebuild drops `report_write` evidence for good (rows already carrying it stay finished
-until then), so a loop with no receipt, which includes every loop that predates receipts, then reads
-running or stale, never finished, unless a receipt exists for it.
+until then), so a loop with no receipt then reads running or stale unless replacement-launch
+or valid exactly attributed state-close evidence establishes its end.
 
 A `started` receipt at the exact goal path of a launch (`loop_run.goal_path`) supplies `repo`,
 `loop` and `goal_sha256` when its content is exactly `<owner>/<repo>#loop<N>#<goal sha256>` (`owner/repo`
@@ -431,11 +433,11 @@ Migration `026_loop_planner_signals.sql` adds the collector tables `ah.backlog_d
   has not yet finished that repo's first Done scan (`ah.backlog_done_scan`). Recomputed on every
   refresh because collector rows can arrive after a loop finishes. Qualifying retained state
   evidence supersedes this legacy fallback as described below.
-- `lanes_accepted bigint` and `lanes_reported bigint`: lanes with `status` exactly `accepted`, and
-  all lanes, in the `lanes` list of the latest captured report's `## Data`, read under the identity
-  rules above. NULL when no report was captured, its Data is absent, invalid or names another
-  identity, or has no `lanes` list. `lanes_total` is unchanged: indexed lane sessions. Qualifying
-  retained state evidence supersedes this legacy accepted-count fallback as described below.
+- `lanes_reported bigint`: all lanes in the `lanes` list of the latest captured report's
+  `## Data`, read under the identity rules above. NULL when no report was captured, its Data is
+  absent, invalid or names another identity, or has no `lanes` list. `lanes_total` is unchanged: indexed lane sessions.
+  `lanes_accepted` now requires qualifying retained state evidence as described below; report
+  Data supplies only `lanes_reported`, never a fallback accepted outcome.
 
 `ah.lane.return_status` and `lane_return` come from the last `lane-return` fenced block in the lane's final
 message. A v2 block (`"v"` the JSON integer 2, with `lane` and `status` in
@@ -482,7 +484,8 @@ anchored no-follow descriptors. File or directory links and replaced input ident
 Snapshots join only to already observed `repo`, `loop` and `goal_sha256`: origin matches repo
 case-insensitively, the explicit filename loop label matches, and a valid frozen-v1
 `open.goal_sha256` matches. Local copy paths need not equal transcript paths. State contents do
-not establish identity, completion or lifecycle root activity. Explicit valid root heartbeat
+not establish identity or lifecycle root activity. A valid attributed root/dispatcher close can
+establish completion under the outcome rules below. Explicit valid root heartbeat
 records can supply live-phase activity through the exact attribution below, independently of counts. The open must lie at most 120
 seconds before launch and before the next launch of that identity. An open attributable to more
 than one same-identity launch, including overlapping skew windows or equal timestamps, supplies
@@ -500,9 +503,66 @@ earlier true event. `tasks_done` counts distinct non-empty `task` values on `ev=
 return's `landed` claim. Duplicate events and machine copies do not inflate counts. A valid open
 without true acceptance or land events establishes zero for the respective count. Invalid framing
 supplies no state override; torn non-events are ignored while original bytes remain stored.
-Without qualifying state evidence, existing report accepted counts and collected Done-flip task
-counts remain fallbacks, never substitutes for ambiguous observed acceptance. `lanes_reported`,
-`lanes_total` and `tasks_landed` are unchanged.
+Without qualifying state evidence, `lanes_accepted` is NULL. Collected Done-flip task counts remain
+a fallback only for the separate legacy `tasks_done` field, never for state-only outcome columns.
+`lanes_reported` and `lanes_total` are unchanged.
+
+#### State-only outcome normalization
+
+Existing nullable `tasks_admitted`, `tasks_landed`, `parks_total` and `lanes_accepted` columns
+project complete qualified v1 state snapshots on every successful refresh, including closed loops
+and collector-only passes. There is no new column, default, schema replacement or grant. Projection
+uses the same exact origin, filename loop, frozen open-goal and launch-window attribution above.
+No report, transcript append, return claim or local-file lookup is an outcome fallback. Missing,
+invalid or ambiguously attributed state evidence leaves these numeric columns NULL, independently
+of legacy transcript structure or progress telemetry. A qualifying valid open establishes known
+zero, including when its envelope names tasks but no admit occurred.
+
+- `tasks_admitted`: distinct exact tracker IDs on explicit valid `admit` events. Envelope entries,
+  dispatches, accepts and parks do not admit tasks.
+- `tasks_landed`: distinct exact tracker IDs on explicit valid `land` events recorded by `root`
+  or `dispatcher`. A worker return's `landed` claim is not publication proof. Duplicate lands do
+  not add tasks; later `revert` does not erase historical publication.
+- `parks_total`: cumulative valid `park` events, including operational aliases. Two parks of the
+  same task at different sequence positions are two events. Machine snapshots of the same
+  frozen event are one observation, never two parks.
+- `lanes_accepted`: the cumulative distinct true-accept lane attribution above, unchanged by later
+  rejection. Ambiguous task-only acceptance leaves this field NULL independently of the others.
+
+Tracker IDs match `[A-Za-z][A-Za-z0-9]*-[0-9]+(?:\.[0-9]+)*`, including subtasks; comparisons retain
+exact spelling. All other task values are operational aliases, retained in collected bytes but
+excluded from admitted/landed tracker totals. Parks and lane attribution still observe aliases.
+These counts normalize the canonical state log's events, not its live recovery fold's final task
+state; accepting, rejecting, reverting or replaying a return cannot rewrite historical events.
+
+A `close` requires a canonical reason (`nothing-admissible`, `owner-stop`, `blocked` or `budget`),
+valid framing, an earlier frozen open and attribution to exactly one launch. Only `root` or
+`dispatcher` observations establish this end. `status` becomes the existing enum `finished`, not
+an inferred success/partial/blocked outcome. With no existing receipt/replacement end,
+`end_evidence` is `state_close` and `end_ts` is the earliest qualifying close across machine copies.
+Shared sequence positions must agree before a close is terminal. A torn close, conflicting copies,
+wrong identity or overlapping open attribution cannot finish a launch. Lifecycle re-evaluation
+starts from existing transcript/receipt evidence each pass, so a removed or invalidated state
+snapshot cannot retain a state-only finish. Identity and root activity remain unchanged.
+
+Every complete framed event is validated against the frozen public `bin/loop-state` v1
+`validate_event` schema before observations are extracted. Its source SHA-256 is
+`f44713f19942be7296feb377c79c6e9db4310c0796a0f4869dcd5ecadba00561`; the catalogue contains a local
+frozen validator, with no runtime dependency on that CLI or a checkout. Unknown events, unknown
+members, missing required members and invalid types invalidate the snapshot, including unprojected
+return, gate, watch and judgement events. Invalid heartbeat activity alone retains its established
+independent unknown-activity policy; it supplies no activity and cannot erase independent counts.
+Torn non-events remain ignored.
+
+A complete framed-event fingerprint ledger is retained before projection, actor and launch-window
+filters. Frozen `(open timestamp, seq)` identifies repeated snapshots; every shared position must
+agree for terminal proof, including returns and non-root closes. Conflicting observations involving
+an outcome event leave that count NULL rather than choosing a machine by mtime. Same-position
+true/false accepts are contradictory copies and leave acceptance NULL, not a chronological rejection
+of an earlier true accept. Dispatch conflicts also withhold acceptance attribution; unrelated counts
+remain independent. A conflicting open withholds every outcome. Phase refresh uses these projected totals before producing its digest and cannot
+overwrite them with incomplete transcript evidence. A state-only close is structurally closing;
+historical projection does not itself authorise a paid call.
 
 The migration copies existing receipt SELECT grants to the new table and grants only SELECT,
 INSERT and UPDATE to existing `ah_ingest`. Provision these privileges if that role is created
@@ -528,8 +588,10 @@ attribution described above; activity and append-observation times must both bel
 launch window. Duplicate machine copies do not inflate heartbeat activity. A heartbeat-only
 root can receive a live phase without inventing lanes, open structure or known counts.
 Missing, truncated, failed, opaque or ambiguously attributable append or watch evidence leaves
-the affected structure unknown independently of enrichment. Projection still uses only collected
-bytes, not a local state-file lookup, and lifecycle root activity and completion are unchanged.
+the affected transcript structure unknown independently of enrichment. Outcome totals use the
+complete collected-state normalization above, independently of this transcript structure.
+Projection still uses only collected bytes, not a local state-file lookup; lifecycle root activity
+is unchanged and completion follows the exactly attributed close rule above.
 
 `live_phase` is nullable and uses preparing, working, reviewing, gating, landing, waiting or
 closing. `phase_since` is the observed transition time. The frozen hybrid combines deterministic
@@ -540,9 +602,10 @@ phase decision. Jev results are accepted only when their authoritative returned 
 `jev-1.13.0`, never an inferred alias or a request-field echo.
 
 Nullable structure includes `active_lanes` (lane/task/title/agent/started_at), `last_gate`
-(sha/scope/exit/at), `parks_total`, `last_park` (task/needs/reason), distinct `tasks_admitted` and
-`tasks_landed`, `last_judgement` (at most 500 characters), `last_judgement_at` and explicit
-`ops_state`. Unknown stays NULL; an observed open establishes known empty/zero values.
+(sha/scope/exit/at), `last_park` (task/needs/reason), `last_judgement` (at most 500 characters),
+`last_judgement_at` and explicit `ops_state`. Unknown stays NULL; an observed transcript open
+establishes known empty structure. `parks_total`, `tasks_admitted` and `tasks_landed` instead
+require a qualifying collected open and valid events under the state-only outcome rules above.
 
 The JSONB producer shape below matches the receiver's nullable member validation. Validation
 never coerces a number, boolean, array or object to text, truncates an overlong member or emits
@@ -611,8 +674,9 @@ No existing reader grant or SELECT is widened. Consumers use additive `ah.loops`
 the existing grant. Migration 029 revokes inherited/default reader and PUBLIC privileges on only
 `loop_live_job`, `loop_live_cache`, `loop_live_budget` and `loop_live_reservation`; existing loops,
 history and other table grants stay unchanged. Paid tables have no
-loop/session foreign keys, so derived-data rebuild cannot cascade into them. Existing identity,
-lifecycle, collector-key and paid-embedding-cache contracts are unchanged.
+loop/session foreign keys, so derived-data rebuild cannot cascade into them. Identity,
+collector-key and paid-embedding-cache contracts are unchanged. Lifecycle uses the additional
+exactly attributed collected-state close evidence above.
 
 ## Efficiency classifier
 
@@ -634,7 +698,8 @@ The collector writes `task_prefix`, `backlog_task`, `backlog_done_event`, `backl
 file paths, repository slugs, workflow names and installed-feature names are stored verbatim.
 The collector also writes `loop_state`: complete unredacted JSONL snapshots, including judgement
 text, protected like transcripts. They supply progress counts and explicitly attributed root
-heartbeat activity for live phase, never identity or lifecycle completion.
+heartbeat activity for live phase and exactly attributed valid close evidence for completion,
+never identity or inferred lifecycle root activity.
 Author emails are compared to configured identities but only `author_is_owner` is stored.
 Permission logs contribute timestamps, line hashes, tool names, command verbs, classifier reasons
 and sub-agent flags, never command arguments or target text. Loop receipts contribute the receipt

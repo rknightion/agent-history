@@ -281,7 +281,8 @@ def test_report_data_lanes_give_accepted_and_reported_counts(clean, tmp_path):
         ],
     }
     record_report(clean, f"# Loop: example/project loop1 · Goal: {GOAL}\n\n## Data\n```json\n{json.dumps(data)}\n```\n")
-    assert lane_counts(clean) == (2, 4)
+    # Report lanes still establish reported count, never the state-only accepted outcome.
+    assert lane_counts(clean) == (None, 4)
 
 
 def test_report_data_without_lanes_leaves_counts_unknown(clean, tmp_path):
