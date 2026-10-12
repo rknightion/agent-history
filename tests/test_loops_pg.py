@@ -387,6 +387,117 @@ def test_xreview_does_not_link_a_codex_exec_session_to_a_loop(clean):
         clean.rollback()
 
 
+@pytest.mark.parametrize("state", ["closed", "empty-closed", "open", "absent", "invalid", "conflicting-close"])
+def test_tasks_done_closed_state_root_tracker_precedence(clean, tmp_path, state):
+    """Legacy Done flips lose precedence only to a valid attributed closed state log."""
+    import subprocess
+    import time
+
+    from agent_history import collect_git, collect_receipts
+
+    at = (datetime.now(timezone.utc) - timedelta(minutes=10)).replace(microsecond=0)
+    goal = "a" * 64
+    source = tmp_path / "sessions"
+    project = source / "projects" / "synthetic-project"
+    project.mkdir(parents=True)
+    path = project / "11111111-1111-4111-8111-111111111111.jsonl"
+    path.write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "uuid": "synthetic-launch",
+                "sessionId": "synthetic-done-root",
+                "timestamp": at.isoformat(),
+                "cwd": "/tmp/synthetic-project",
+                "message": {
+                    "role": "user",
+                    "content": "You are the root. Write codex/report-synthetic-loop1.md.\n"
+                    + "# Loop: example/done-precedence loop1 · Goal: "
+                    + goal,
+                },
+            }
+        )
+        + "\n"
+    )
+    sources = {"claude-test": source}
+    assert load.refresh(clean, sources=sources, textfile=None, log=lambda *_: None).errors == 0
+    repo_slug = "github.com/example/done-precedence"
+    clean.execute("DELETE FROM ah.backlog_done_event WHERE repo_slug=%s", (repo_slug,))
+    clean.execute("DELETE FROM ah.backlog_done_scan WHERE repo_slug=%s", (repo_slug,))
+    clean.execute("INSERT INTO ah.backlog_done_scan (repo_slug,widened_at) VALUES (%s,now())", (repo_slug,))
+    for n, task in enumerate(["TASK-9", "TASK-10", "TASK-11", "TASK-9", "TASK-12"]):
+        clean.execute(
+            "INSERT INTO ah.backlog_done_event (repo_slug,task_key,sha,done_at,from_status) VALUES (%s,%s,%s,%s,%s)",
+            (repo_slug, task, str(n) * 40, at + timedelta(seconds=-1 if task == "TASK-12" else n + 1), "In Progress"),
+        )
+    clean.commit()
+    repo = tmp_path / "reconciled"
+    (repo / "codex").mkdir(parents=True)
+    subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True, timeout=10)
+    subprocess.run(
+        ["git", "-C", str(repo), "remote", "add", "origin", "https://example.invalid/example/done-precedence.git"],
+        check=True,
+        timeout=10,
+    )
+    events = [
+        {"ev": "open", "goal_sha256": goal, "tier": "guarded", "root": "llm", "root_model": "synthetic", "envelope": []}
+    ]
+    if state != "empty-closed":
+        for actor, task in [
+            ("root", "TASK-1"),
+            ("root", "TASK-1"),
+            ("dispatcher", "TASK-2.1"),
+            ("root", "operational-alias"),
+            ("ext", "TASK-3"),
+            ("daemon", "TASK-4"),
+        ]:
+            events.append(
+                {"ev": "land", "by": actor, "task": task, "sha": "b" * 40, "gate": "green", "mode": "after-green"}
+            )
+    if state != "open":
+        events.append({"ev": "close", "reason": "owner-stop"})
+    framed = [
+        {"v": 1, "seq": n, "ts": (at + timedelta(seconds=n)).strftime("%Y-%m-%dT%H:%M:%SZ"), "by": "root", **event}
+        for n, event in enumerate(events, 1)
+    ]
+    if state == "invalid":
+        framed[-1]["reason"] = "unrecognised"
+    state_path = repo / "codex/state-synthetic-loop1.jsonl"
+    if state != "absent":
+        state_path.write_text("".join(json.dumps(event) + "\n" for event in framed))
+    try:
+        for machine in ("synthetic-one", "synthetic-two"):
+            if state == "conflicting-close" and machine == "synthetic-two":
+                framed[-1]["reason"] = "budget"
+                state_path.write_text("".join(json.dumps(event) + "\n" for event in framed))
+            collector = collect_git.Collector(clean, False, time.monotonic() + 60)
+            collect_receipts.collect(collector, [repo], machine)
+            assert collector.errors == []
+        clean.commit()
+        expected = {"closed": 2, "empty-closed": 0}.get(state, 3)
+        for rebuild in (False, True):
+            if rebuild:
+                assert load.rebuild(clean, sources=sources, textfile=None, log=lambda *_: None).errors == 0
+            else:
+                assert load.post_passes(clean)["dirty_sessions"] == 0
+            assert clean.execute("SELECT tasks_done FROM ah.loops").fetchone() == (expected,)
+            clean.commit()
+        # Removing a previously qualifying snapshot restores the collected Done-flip source.
+        clean.execute("DELETE FROM ah.loop_state")
+        clean.commit()
+        load.post_passes(clean)
+        assert clean.execute("SELECT tasks_done FROM ah.loops").fetchone() == (3,)
+        clean.execute("DELETE FROM ah.backlog_done_scan WHERE repo_slug=%s", (repo_slug,))
+        clean.commit()
+        load.post_passes(clean)
+        assert clean.execute("SELECT tasks_done FROM ah.loops").fetchone() == (None,)
+    finally:
+        clean.rollback()
+        clean.execute("DELETE FROM ah.backlog_done_event WHERE repo_slug=%s", (repo_slug,))
+        clean.execute("DELETE FROM ah.backlog_done_scan WHERE repo_slug=%s", (repo_slug,))
+        clean.commit()
+
+
 @pytest.mark.parametrize(
     ("case", "expected"),
     [
@@ -518,7 +629,7 @@ def test_collected_state_counts_distinct_accepted_lanes_and_landed_tasks(clean, 
     load.post_passes(clean)
     initial = (None, None) if case == "overlapping-launches" else (0, 0)
     assert (
-        clean.execute("SELECT lanes_accepted, tasks_done FROM ah.loops ORDER BY launch_ts").fetchall()
+        clean.execute("SELECT lanes_accepted, tasks_landed FROM ah.loops ORDER BY launch_ts").fetchall()
         == [initial] * copies
     )
     clean.commit()
@@ -540,14 +651,14 @@ def test_collected_state_counts_distinct_accepted_lanes_and_landed_tasks(clean, 
     clean.commit()
     assert load.post_passes(clean)["dirty_sessions"] == 0
     assert (
-        clean.execute("SELECT lanes_accepted, tasks_done FROM ah.loops ORDER BY launch_ts").fetchall()
+        clean.execute("SELECT lanes_accepted, tasks_landed FROM ah.loops ORDER BY launch_ts").fetchall()
         == [expected] * copies
     )
     clean.commit()
     # Collector evidence must survive a content rebuild, and no duplicate machine inflates it.
     assert load.rebuild(clean, sources=sources, textfile=None, log=lambda *_: None).errors == 0
     assert (
-        clean.execute("SELECT lanes_accepted, tasks_done FROM ah.loops ORDER BY launch_ts").fetchall()
+        clean.execute("SELECT lanes_accepted, tasks_landed FROM ah.loops ORDER BY launch_ts").fetchall()
         == [expected] * copies
     )
     clean.execute("DELETE FROM ah.loop_state")

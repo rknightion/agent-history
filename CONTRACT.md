@@ -499,13 +499,16 @@ qualifying cohort; never choose a worker over a reviewer, use timing proximity o
 return. Any unresolved true acceptance leaves `lanes_accepted` NULL, independently of known
 landed-task counts. False and string-shaped booleans and return statuses do not add lanes. This
 counts observed acceptance events, not final acceptance state: later rejection does not erase an
-earlier true event. `tasks_done` counts distinct non-empty `task` values on `ev=land`, never a
-return's `landed` claim. Duplicate events and machine copies do not inflate counts. A valid open
-without true acceptance or land events establishes zero for the respective count. Invalid framing
-supplies no state override; torn non-events are ignored while original bytes remain stored.
-Without qualifying state evidence, `lanes_accepted` is NULL. Collected Done-flip task counts remain
-a fallback only for the separate legacy `tasks_done` field, never for state-only outcome columns.
-`lanes_reported` and `lanes_total` are unchanged.
+earlier true event. A valid open without true acceptance establishes zero for `lanes_accepted`.
+The separate legacy `tasks_done` override requires a valid attributed closed state log, with
+root/dispatcher close authority and agreement across machine copies. It counts distinct exact
+tracker IDs on root/dispatcher `ev=land` events using the `tasks_landed` projection, never alias
+lands, worker observations or a return's `landed` claim. A qualifying closed log with no such lands
+establishes zero; duplicate events and machine copies do not inflate counts. Otherwise collected
+Done-flip task counts remain the unchanged fallback. See `docs/loop-counts.md` for precedence.
+Invalid framing supplies no state override; torn non-events are ignored while original bytes remain
+stored. Without qualifying state evidence, `lanes_accepted` is NULL. No state-only outcome column
+takes the Done-flip fallback. `lanes_reported` and `lanes_total` are unchanged.
 
 #### State-only outcome normalization
 

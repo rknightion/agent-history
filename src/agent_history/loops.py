@@ -1285,15 +1285,13 @@ def _refresh_state_counts(conn: psycopg.Connection) -> None:
         (list(qualified),),
     )
     for uid, cohorts in qualified.items():
-        accepted, landed = _state_event_counts(cohorts)
+        accepted, _ = _state_event_counts(cohorts)
         admitted, published, parks = state_outcomes(cohorts)
         conn.execute(
             "UPDATE ah.loops SET lanes_accepted=%s,tasks_admitted=%s,tasks_landed=%s,parks_total=%s "
             "WHERE launch_uid=%s",
             (accepted, admitted, published, parks, uid),
         )
-        if landed is not None:  # Preserve the separate legacy Done-flip fallback on invalid state.
-            conn.execute("UPDATE ah.loops SET tasks_done=%s WHERE launch_uid=%s", (landed, uid))
         # All copies must agree at shared sequence positions before a close is terminal.
         closes = []
         for opened, events in cohorts:
@@ -1305,6 +1303,10 @@ def _refresh_state_counts(conn: psycopg.Connection) -> None:
             and not any(e["ev"] == "invalid" for _, events in cohorts for e in events)
             and not _state_conflicts(cohorts)
         ):
+            # Only a valid closed log supersedes the separately recomputed Done-flip fallback.
+            # Share exact tracker/root publication semantics with tasks_landed, not alias lands
+            # or worker observations. Receipt/replacement lifecycle precedence is independent.
+            conn.execute("UPDATE ah.loops SET tasks_done=%s WHERE launch_uid=%s", (published, uid))
             closed = min(closes)
             conn.execute(
                 "UPDATE ah.loop_run SET end_ts=%s,end_evidence='state_close' "

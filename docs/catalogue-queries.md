@@ -1,5 +1,8 @@
 # Catalogue comparison queries
 
+For loop task counts and the closed-state/Done-flip source precedence, see
+[Loop task count precedence](loop-counts.md).
+
 These PostgreSQL queries are single read-only SELECT statements for an `ah_reader`
 connection. They require migration `033_nullable_telemetry.sql` and the current
 analytics functions. They return metadata, not transcript text. Protect their output:
