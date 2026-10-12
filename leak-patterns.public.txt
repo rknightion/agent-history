@@ -8,7 +8,7 @@ cgnat	re:\b100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.\d{1,3}\.\d{1,3}\b
 tailnet-host	re:\.ts\.net\b
 home-path	re:/[U]sers/[^/\s]+/
 home-slug	re:-Users-[a-z]+-
-email	re:\b[a-z0-9._%+-]+@(?!(?:users\.)?noreply\.github\.com\b|github\.com\b|(?:[a-z0-9-]+\.)*example(?:\.(?:com|org|net))?(?![a-z0-9.-]))[a-z0-9-]+(?:\.[a-z0-9-]+)*\.[a-z]{2,}\b
+email	re:\b(?!noreply@anthropic\.com(?![a-z0-9-]|\.[a-z0-9]))[a-z0-9._%+-]+@(?!(?:users\.)?noreply\.github\.com\b|github\.com\b|(?:[a-z0-9-]+\.)*example(?:\.(?:com|org|net))?(?![a-z0-9.-]))[a-z0-9-]+(?:\.[a-z0-9-]+)*\.[a-z]{2,}\b
 grafana-tenant-id	re:\b(?:tenant|stack|instance)[_ -]?(?:id)?["']?\s*[:=]\s*["']?\d{5,9}\b
 credential-tree	re:\bcredentials/[a-z0-9._-]+/
 secrets-dir	re:(?:^|[\s"'/])\.secrets/
