@@ -307,6 +307,127 @@ class GitModes(LeakScanTestCase):
         self.repo.git("add", "-A")
         self.repo.git("commit", "-q", "-m", "init")
 
+    def linked_worktree(self):
+        worktree = self.tmp / "Zebracorp Holdings"
+        self.repo.git("worktree", "add", "-q", "--detach", str(worktree))
+        return worktree
+
+    def test_linked_worktree_metadata_is_not_source(self):
+        worktree = self.linked_worktree()
+        self.assertIn("Zebracorp-Holdings", (worktree / ".git").read_text())
+        self.assertClean(self.repo.scan("--path", str(worktree)))
+
+    def test_linked_worktree_path_alias_is_not_source(self):
+        alias = self.tmp / "alias"
+        alias.symlink_to(self.tmp, target_is_directory=True)
+        worktree = alias / "Zebracorp Holdings"
+        self.repo.git("worktree", "add", "-q", "--detach", str(worktree))
+        admin = Path((worktree / ".git").read_text().removeprefix("gitdir: ").strip())
+        (admin / "gitdir").write_text(str(worktree / ".git") + "\n")
+        self.assertClean(self.repo.scan("--path", str(worktree)))
+
+    def test_verified_relative_linked_worktree_pointer_is_not_source(self):
+        worktree = self.linked_worktree()
+        control = worktree / ".git"
+        admin = Path(control.read_text().removeprefix("gitdir: ").strip())
+        before = self.repo.git("-C", str(worktree), "rev-parse", "HEAD")
+        control.write_text("gitdir: " + os.path.relpath(admin, worktree.resolve()) + "\n")
+        self.assertEqual(self.repo.git("-C", str(worktree), "rev-parse", "HEAD"), before)
+        self.assertClean(self.repo.scan("--path", str(worktree)))
+
+    def test_linked_worktree_tracked_and_untracked_source_still_fail(self):
+        worktree = self.linked_worktree()
+        pointer = (worktree / ".git").read_text()
+        for name, tracked in (("tracked.txt", True), ("untracked.txt", False)):
+            with self.subTest(tracked=tracked):
+                path = worktree / name
+                path.write_text(pointer)
+                if tracked:
+                    self.repo.git("-C", str(worktree), "add", name)
+                self.assertHit(self.repo.scan("--path", str(worktree)), f"{name}:1: customer#1")
+                path.unlink()
+
+    def test_linked_worktree_tracked_and_untracked_secrets_still_fail(self):
+        worktree = self.linked_worktree()
+        for name, tracked in (("tracked.cfg", True), ("untracked.cfg", False)):
+            with self.subTest(tracked=tracked):
+                path = worktree / name
+                path.write_text(f"gateway {private_ip()}\n")
+                if tracked:
+                    self.repo.git("-C", str(worktree), "add", name)
+                self.assertHit(self.repo.scan("--path", str(worktree)), f"{name}:1: rfc1918")
+                path.unlink()
+
+    def test_linked_worktree_source_names_still_fail(self):
+        worktree = self.linked_worktree()
+        for name, tracked in (("Zebracorp-Holdings-tracked", True),
+                              ("Zebracorp-Holdings-untracked", False)):
+            with self.subTest(tracked=tracked):
+                path = worktree / name
+                path.write_text("clean\n")
+                if tracked:
+                    self.repo.git("-C", str(worktree), "add", name)
+                self.assertHit(self.repo.scan("--path", str(worktree)), f"{name}:name: customer#1")
+                path.unlink()
+
+    def test_git_control_files_fail_closed_unless_registered(self):
+        worktree = self.linked_worktree()
+        control = worktree / ".git"
+        original = control.read_text()
+        admin = Path(original.removeprefix("gitdir: ").strip())
+        backlink = admin / "gitdir"
+        cases = ("Zebracorp Holdings\n", original + "Zebracorp Holdings\n",
+                 "gitdir: " + str(self.tmp) + "\n", original.rstrip("\n"),
+                 "gitdir: ../repo/.git/worktrees/unregistered\n",
+                 original.replace("gitdir: ", "gitdir:\t"), original + "\n")
+        for content in cases:
+            with self.subTest(content=content):
+                control.write_text(content)
+                proc = self.repo.scan("--path", str(worktree))
+                self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+                self.assertNotIn("Zebracorp", proc.stdout + proc.stderr)
+        control.write_text(original)
+        backlink.write_text(str(self.tmp / "other" / ".git") + "\n")
+        self.assertEqual(self.repo.scan("--path", str(worktree)).returncode, 2)
+
+    def test_linked_worktree_admin_controls_fail_closed(self):
+        worktree = self.linked_worktree()
+        admin = Path((worktree / ".git").read_text().removeprefix("gitdir: ").strip())
+        common = admin / "commondir"
+        original = common.read_bytes()
+        common.write_bytes(b"../..\nextra\n")
+        self.assertEqual(self.repo.scan("--path", str(worktree)).returncode, 2)
+        common.write_bytes(original)
+        for name in ("commondir", "gitdir", "HEAD"):
+            with self.subTest(name=name):
+                control = admin / name
+                saved = self.tmp / name
+                saved.write_bytes(control.read_bytes())
+                control.unlink()
+                control.symlink_to(saved)
+                self.assertEqual(self.repo.scan("--path", str(worktree)).returncode, 2)
+                control.unlink()
+                control.write_bytes(saved.read_bytes())
+
+    def test_symlink_git_directory_is_not_exempt(self):
+        nested = self.repo.root / "nested"
+        nested.mkdir()
+        (nested / ".git").symlink_to(self.repo.root / ".git", target_is_directory=True)
+        self.assertEqual(self.repo.scan("--path", ".").returncode, 2)
+
+    def test_symlink_git_control_file_is_not_exempt(self):
+        worktree = self.linked_worktree()
+        control = worktree / ".git"
+        saved = self.tmp / "control"
+        saved.write_bytes(control.read_bytes())
+        control.unlink()
+        control.symlink_to(saved)
+        self.assertEqual(self.repo.scan("--path", str(worktree)).returncode, 2)
+
+    def test_nested_git_file_is_not_blanket_exempt(self):
+        self.repo.write("nested/.git", "Zebracorp Holdings\n")
+        self.assertEqual(self.repo.scan("--path", ".").returncode, 2)
+
     def test_history_finds_content_removed_later(self):
         self.repo.write("old.txt", "Zebracorp Holdings\n")
         self.repo.git("add", "old.txt")

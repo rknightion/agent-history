@@ -286,15 +286,65 @@ def read_blobs(top: Path, specs: list[str]) -> list[bytes]:
     return blobs
 
 
+def validate_worktree_control(path: Path) -> None:
+    """Admit only a linked worktree pointer with matching Git-owned backlinks."""
+    error = ScanError("invalid linked worktree control metadata")
+    try:
+        if path.is_symlink():
+            raise error
+        raw = path.read_bytes()
+        # Git writes exactly one line. No comments, extra payload or alternate syntax.
+        if not raw.startswith(b"gitdir: ") or not raw.endswith(b"\n") or raw.count(b"\n") != 1:
+            raise error
+        value = raw[8:-1].decode("utf-8")
+        if not value or any(ord(ch) < 32 for ch in value):
+            raise error
+        pointer = Path(value)
+        target = path.parent / pointer
+        if target.is_symlink():
+            raise error
+        admin = target.resolve(strict=True)
+        if any((admin / name).is_symlink() for name in ("commondir", "gitdir", "HEAD")):
+            raise error
+        if not admin.is_dir() or admin.parent.name != "worktrees":
+            raise error
+        common = admin.parent.parent
+        if (admin / "commondir").read_bytes() != b"../..\n":
+            raise error
+        backlink = (admin / "gitdir").read_bytes().decode("utf-8")
+        if not backlink.endswith("\n") or backlink.count("\n") != 1:
+            raise error
+        destination = Path(backlink[:-1])
+        # Git preserves the spelling of the worktree path (e.g. a system temp-dir
+        # alias), while --path is resolved before walking. Compare filesystem identity.
+        if (not destination.is_absolute() or destination.is_symlink()
+                or any(ord(ch) < 32 for ch in backlink[:-1])
+                or destination.resolve(strict=True) != path.resolve(strict=True)):
+            raise error
+        if not (common / "objects").is_dir() or not (common / "HEAD").is_file():
+            raise error
+        top = git_toplevel(path.parent).resolve()
+        actual = Path(git(["rev-parse", "--absolute-git-dir"], path.parent).decode().strip()).resolve()
+        if top != path.parent.resolve() or actual != admin:
+            raise error
+    except (OSError, UnicodeError, ScanError, ValueError):
+        raise error from None
+
+
 def scan_path(scanner: Scanner, target: Path) -> str:
     if not target.is_dir():
         raise ScanError("--path must name a directory")
     count = 0
     for dirpath, dirnames, filenames in os.walk(target):
+        if ".git" in dirnames and (Path(dirpath) / ".git").is_symlink():
+            raise ScanError("invalid linked worktree control metadata")
         dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIRS)
         for name in sorted(filenames):
             path = Path(dirpath) / name
             rel = path.relative_to(target).as_posix()
+            if name == ".git":
+                validate_worktree_control(path)
+                continue
             if path.is_symlink():
                 scanner.scan_name(rel)
                 scanner.scan_text(rel, os.readlink(path))
