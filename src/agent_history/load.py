@@ -722,28 +722,6 @@ LINK_SQL = [
       AND c.root_session_uid <> c.session_uid
       AND r.agent = 'codex' AND r.session_uid = c.root_session_uid AND r.agent_id = ''
     """,
-    # pi: parent and root by header id from the child's path (parse_pi.lineage); a nested child's
-    # parent is the session whose agent_path is its own minus the last run dir.
-    """
-    UPDATE ah.session c SET parent_session_id = p.id
-    FROM ah.session p
-    WHERE c.agent = 'pi' AND c.parent_session_id IS NULL AND c.parent_session_uid IS NOT NULL
-      AND p.agent = 'pi' AND p.session_uid = c.parent_session_uid AND p.agent_id = ''
-    """,
-    """
-    UPDATE ah.session c SET parent_session_id = p.id
-    FROM ah.session p
-    WHERE c.agent = 'pi' AND c.parent_session_id IS NULL AND c.parent_session_uid IS NULL
-      AND c.spawn_depth > 1 AND c.agent_path IS NOT NULL
-      AND p.agent = 'pi' AND p.agent_path = regexp_replace(c.agent_path, '/[^/]+(/run-[0-9]+)?$', '')
-    """,
-    """
-    UPDATE ah.session c SET root_session_id = r.id
-    FROM ah.session r
-    WHERE c.agent = 'pi' AND c.root_session_id IS NULL AND c.root_session_uid IS NOT NULL
-      AND c.root_session_uid <> c.session_uid
-      AND r.agent = 'pi' AND r.session_uid = c.root_session_uid AND r.agent_id = ''
-    """,
     # Top-level sessions are their own root.
     """
     UPDATE ah.session c SET root_session_id = c.id
@@ -779,7 +757,8 @@ LINK_SQL = [
     FROM ah.session p, ah.session c
     WHERE s.child_session_id IS NULL AND s.agent = 'pi' AND s.child_task_name IS NOT NULL
       AND p.id = s.parent_session_id
-      AND c.agent = 'pi' AND c.agent_path = COALESCE(p.agent_path, p.session_uid) || '/' || s.child_task_name
+      AND c.agent = 'pi' AND c.parent_session_id = p.id
+      AND c.agent_path = COALESCE(p.agent_path, p.session_uid) || '/' || s.child_task_name
     """,
     # Pi artifact copies pair run id with the child's API response id. The response is indexed
     # only in the real child session, so this is an exact link even when notifications truncate
@@ -841,6 +820,7 @@ LINK_SQL = [
            parent_session_id = s.parent_session_id
     FROM ah.subagent_spawn s
     WHERE s.child_session_id = c.id
+      AND (c.agent <> 'pi' OR c.parent_session_id = s.parent_session_id)
       AND (s.spawn_uid = c.parent_call_uid OR
            (c.parent_call_uid IS NULL AND
             (SELECT count(*) FROM ah.subagent_spawn o WHERE o.child_session_id = c.id) = 1))
@@ -882,7 +862,7 @@ LINK_SQL = [
     """
     WITH RECURSIVE chain AS (
         SELECT c.id, c.parent_session_id, 1 AS depth FROM ah.session c
-        WHERE c.parent_session_id IS NOT NULL AND c.spawn_depth IS NULL
+        WHERE c.agent <> 'pi' AND c.parent_session_id IS NOT NULL AND c.spawn_depth IS NULL
         UNION ALL
         SELECT chain.id, p.parent_session_id, chain.depth + 1 FROM chain JOIN ah.session p ON p.id = chain.parent_session_id
         WHERE p.parent_session_id IS NOT NULL AND p.parent_session_id <> p.id AND chain.depth < 16
@@ -891,6 +871,101 @@ LINK_SQL = [
     FROM (SELECT id, max(depth) AS depth FROM chain GROUP BY id) d WHERE s.id = d.id
     """,
 ]
+
+def _link_pi_lineage(conn: psycopg.Connection) -> None:
+    """Resolve the parser's existing SessionRow lineage seam, without opening header paths.
+
+    Run even without dirty transcripts, so a catalogue indexed by an older loader converges on
+    what a fresh index produces without any reparse: parent arrivals repair parent/root/depth,
+    and a spawn link (with the call, type and parent the child copied from it) that disagrees with
+    the child's resolved parent is retracted. agent_path remains recorded location evidence, not
+    a second family. Changed children enter the ordinary post-pass queue so loop/lane projections
+    see the repair.
+    """
+    conn.execute("""
+        WITH wanted AS (
+            SELECT c.id, CASE WHEN c.parent_session_uid IS NOT NULL THEN (
+                SELECT p.id FROM ah.session p
+                WHERE p.agent='pi' AND p.agent_id='' AND p.session_uid=c.parent_session_uid
+                  AND p.id<>c.id AND NOT p.is_stub
+            ) ELSE (
+                SELECT min(p.id) FROM ah.session p
+                WHERE p.agent='pi' AND NOT p.is_stub AND p.id<>c.id
+                  AND p.agent_path=regexp_replace(c.agent_path, '/[^/]+(/run-[0-9]+)?$', '')
+                HAVING count(*)=1
+            ) END AS parent_id
+            FROM ah.session c WHERE c.agent='pi' AND c.is_subagent AND NOT c.is_stub
+        ), changed AS (
+            UPDATE ah.session c SET parent_session_id=w.parent_id
+            FROM wanted w WHERE c.id=w.id AND c.parent_session_id IS DISTINCT FROM w.parent_id
+            RETURNING c.id
+        ) INSERT INTO dirty_now SELECT id FROM changed ON CONFLICT DO NOTHING
+    """)
+    # A pi spawn only links to a child of its own parent. Retract older links that name another
+    # parent, and clear what the child copied from them: the pi parser never sets agent_type, so
+    # parent_call_uid, agent_type and its source on a pi subagent come only from a linked spawn.
+    # Any remaining valid link re-derives them in the ordinary link statements.
+    conn.execute("""
+        WITH stale AS (
+            UPDATE ah.subagent_spawn s SET child_session_id = NULL
+            FROM ah.session c
+            WHERE s.agent='pi' AND s.child_session_id=c.id AND c.agent='pi' AND c.is_subagent
+              AND NOT c.is_stub AND c.parent_session_id IS DISTINCT FROM s.parent_session_id
+            RETURNING c.id AS child_id, s.parent_session_id AS spawn_parent_id
+        ), cleared AS (
+            UPDATE ah.session c SET parent_call_uid=NULL, agent_type=NULL, agent_type_source=NULL
+            FROM (SELECT DISTINCT child_id FROM stale) d WHERE c.id=d.child_id
+              AND (c.parent_call_uid IS NOT NULL OR c.agent_type IS NOT NULL OR c.agent_type_source IS NOT NULL)
+            RETURNING c.id
+        )
+        INSERT INTO dirty_now SELECT child_id FROM stale
+        UNION SELECT spawn_parent_id FROM stale WHERE spawn_parent_id IS NOT NULL
+        UNION SELECT id FROM cleared
+        ON CONFLICT DO NOTHING
+    """)
+    conn.execute("""
+        -- Walk subagent rows only: the first non-subagent row reached is the end of the family,
+        -- whatever parent a stale row gives it. Reported depth never exceeds the 16-edge bound.
+        WITH RECURSIVE chain AS (
+            SELECT c.id AS child_id, c.id AS current_id, ARRAY[c.id] AS seen, 0 AS depth
+            FROM ah.session c WHERE c.agent='pi' AND c.is_subagent AND NOT c.is_stub
+            UNION ALL
+            SELECT chain.child_id, p.id, chain.seen || p.id, chain.depth+1
+            FROM chain JOIN ah.session c ON c.id=chain.current_id
+            JOIN ah.session p ON p.id=c.parent_session_id AND p.agent='pi' AND NOT p.is_stub
+            WHERE c.is_subagent AND chain.depth<16 AND NOT p.id=ANY(chain.seen)
+        ), terminal AS (
+            SELECT chain.child_id, c.session_uid AS root_uid,
+                   CASE WHEN c.loop_link_method='relaunch' THEN c.root_session_id ELSE c.id END AS root_id,
+                   chain.depth
+            FROM chain JOIN ah.session c ON c.id=chain.current_id
+            WHERE NOT c.is_subagent AND c.parent_session_uid IS NULL
+              AND (c.root_session_uid IS NULL OR c.root_session_uid=c.session_uid)
+            UNION ALL
+            SELECT chain.child_id, split_part(c.agent_path, '/', 1), r.id, chain.depth+c.spawn_depth
+            FROM chain JOIN ah.session c ON c.id=chain.current_id
+            LEFT JOIN ah.session r ON r.agent='pi' AND r.agent_id=''
+              AND r.session_uid=split_part(c.agent_path, '/', 1) AND NOT r.is_stub AND NOT r.is_subagent
+            WHERE c.is_subagent AND c.parent_session_id IS NULL AND c.agent_path IS NOT NULL
+              AND c.spawn_depth IS NOT NULL
+              AND (c.parent_session_uid IS NULL OR
+                   (c.parent_session_uid=split_part(c.agent_path, '/', 1) AND c.spawn_depth=1))
+              AND c.session_uid<>split_part(c.agent_path, '/', 1)
+              AND NOT EXISTS (SELECT 1 FROM ah.session p WHERE p.agent='pi' AND p.agent_id=''
+                  AND p.session_uid=split_part(c.agent_path, '/', 1) AND p.is_subagent)
+        ), wanted AS (
+            SELECT c.id, t.root_uid, t.root_id, CASE WHEN t.depth > 16 THEN 16 ELSE t.depth END AS depth
+            FROM ah.session c LEFT JOIN terminal t ON t.child_id=c.id
+            WHERE c.agent='pi' AND c.is_subagent AND NOT c.is_stub
+        ), changed AS (
+            UPDATE ah.session c SET root_session_uid=w.root_uid, root_session_id=w.root_id, spawn_depth=w.depth
+            FROM wanted w WHERE c.id=w.id AND
+              (c.root_session_uid, c.root_session_id, c.spawn_depth) IS DISTINCT FROM
+              (w.root_uid, w.root_id, w.depth)
+            RETURNING c.id
+        ) INSERT INTO dirty_now SELECT id FROM changed ON CONFLICT DO NOTHING
+    """)
+
 
 ROLLUP_SQL = """
 INSERT INTO ah.session_rollup AS r (session_id, computed_at, turns_human, turns_other, messages, llm_calls,
@@ -1042,6 +1117,9 @@ def post_passes(conn: psycopg.Connection, refresh_id: int | None = None) -> dict
         # Repair historical loop/lane projections in bounded transactional batches.
         loops.enqueue_backfill(conn)
         loops.retract_unproven_relaunches(conn)
+        # Retract disproven relaunch projections before resolving physical lineage; valid
+        # relaunch roots retain their existing orchestration-root projection in the chain.
+        _link_pi_lineage(conn)
         dirty = conn.execute("SELECT count(*) FROM dirty_now").fetchone()[0]
         result["dirty_sessions"] = dirty
         if not dirty:

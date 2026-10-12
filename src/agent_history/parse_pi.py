@@ -18,11 +18,12 @@ Session identity
   it are ignored with one `missing_session_header` issue. A child's direct parent_session_uid
   prefers the UUID suffix of the header parentSession basename, without opening that path.
   An unusable header falls back to the directory root for a first-level child (nested parents
-  resolve in SQL through agent_path). Independently, directory evidence supplies root_session_uid
-  (the id after the last `_` of the root base name), spawn_depth and
-  agent_path = "<root uid>/<run dir>/run-<i>[/<run dir>/run-<j>...]".
-  A conflicting header can therefore produce mixed parent/root provenance, not a coherent family;
-  spawn_kind 'pi_subagent'. A display name is never evidence of agent type; an exactly linked
+  resolve in SQL through agent_path). Directory evidence supplies root_session_uid and spawn_depth
+  only without a usable header, or when a first-level header agrees with that root. Otherwise
+  root and depth remain unknown until the loader resolves the recorded parent's ancestry.
+  agent_path = "<path root uid>/<run dir>/run-<i>[/<run dir>/run-<j>...]" preserves path evidence,
+  not an independently asserted family; spawn_kind 'pi_subagent'. A display name is never
+  evidence of agent type; an exactly linked
   parent spawn supplies the child type in the loader post-pass.
   The run dir is NOT the child's pi-subagents runId (5cfcc8f2... ran in 35c8deaf... in the fixture).
   An archived artifact transcript pairs the runId with the child's API responseId. Free-text
@@ -101,7 +102,10 @@ from .model import (ArtifactRow, AttachmentRow, CompactionRow, ContinuationRow, 
 from .parse_claude import _diff_counts, _nlines
 
 AGENT = "pi"
-# Re-parse retained children to prefer usable parentSession headers for their direct parent.
+# Not bumped for lineage: rows indexed by earlier v10 code are repaired in place. The loader's pi
+# lineage post-pass recomputes parent, root and depth for every non-stub subagent on each refresh,
+# and retracts spawn links (plus the call, type and parent copied from them) that disagree with
+# the resolved parent. Neither step reads transcript content, so no reparse is needed.
 PARSER_VERSION = "10"
 # Artifact metadata replay is independent of the session parser version.
 ARTIFACT_PARSER_VERSION = "6-links1"
@@ -472,13 +476,16 @@ class PiParser:
         # Main-session fork extraction intentionally retains its existing semantics.
         if self.sub and (parent_uid is None or not re.fullmatch(UUID, parent_uid)):
             parent_uid = None
+        # A usable direct parent does not establish that parent's root or depth. The directory
+        # can agree for a first-level child; every other header family waits for catalogue rows.
+        path_family = parent_uid is None or (depth == 1 and parent_uid == lin.get("root"))
         if ts is not None:
             self._seen(ts)
         rows: list[Row] = [SessionRow(
             session=key, byte_offset=pos.byte_offset, is_subagent=self.sub,
-            root_session_uid=lin.get("root") if self.sub else None,
+            root_session_uid=lin.get("root") if self.sub and path_family else None,
             parent_session_uid=(parent_uid or (lin.get("root") if depth == 1 else None)) if self.sub else None,
-            spawn_kind="pi_subagent" if self.sub else None, spawn_depth=depth if self.sub else None,
+            spawn_kind="pi_subagent" if self.sub else None, spawn_depth=depth if self.sub and path_family else None,
             agent_path=lin.get("path"), forked_from_uid=parent_uid if not self.sub else None,
             cwd=s["cwd"], entrypoint="pi",
             first_event_at=ts, last_event_at=ts)]

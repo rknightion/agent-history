@@ -107,6 +107,7 @@ def test_lineage_of_nested_children():
      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
     ("../../foreign/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb.jsonl",
      "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"),
+    (f"/tmp/synthetic/{ASYNC_ROOT}.jsonl", ROOT_UID),
     ("/tmp/synthetic/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/session.jsonl", None),
     ("/tmp/synthetic/malformed.jsonl", None),
     ("/tmp/synthetic/2026-10-07T00-00-00-000Z_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaX.jsonl", None),
@@ -144,9 +145,10 @@ def test_child_header_parent_preference_and_directory_fallback(tmp_path, monkeyp
         run_file(PiParser, ctx, store, batch_lines=1)
     session = one(store, "session", session=SessionKey("pi", child_uid, ""))
     assert session["parent_session_uid"] == (expected_uid or (ROOT_UID if depth == 1 else None))
-    # Root and layout remain independent directory evidence, even when the direct parent disagrees.
-    assert session["root_session_uid"] == ROOT_UID
-    assert session["spawn_depth"] == depth
+    # A direct parent establishes no independent family: retain layout as path evidence only.
+    path_family = expected_uid is None or (depth == 1 and expected_uid == ROOT_UID)
+    assert session["root_session_uid"] == (ROOT_UID if path_family else None)
+    assert session["spawn_depth"] == (depth if path_family else None)
     assert session["agent_path"] == agent_path
     assert session["spawn_kind"] == "pi_subagent" and session["is_subagent"] is True
     assert session["forked_from_uid"] is None
