@@ -107,3 +107,14 @@ def test_invalid_heartbeat_activity_retains_ledger_without_activity():
     assert parsed is not None and parsed[2] == []
     assert parsed[2].ledger[2][0] == "heartbeat"
     assert loops.state_outcomes([(parsed[1], parsed[2])]) == (0, 0, 0)
+
+
+def test_return_artifact_is_optional_typed_and_fingerprinted():
+    body = {**BODIES[2], "artifact": "/fixture/full return.md"}
+    parsed = loops.state_progress(encoded(framed(body)))
+    assert parsed is not None
+    assert '"artifact": "/fixture/full return.md"' in parsed[2].ledger[2][1]
+    assert loops.state_outcomes([(parsed[1], parsed[2])]) == (0, 0, 0)
+    for invalid in (None, "", "relative.md", "/nul" + chr(0), 1, True, [], {}):
+        assert loops.state_progress(encoded(framed({**body, "artifact": invalid}))) is None
+    assert loops.state_progress(encoded(framed({**body, "unknown": "member"}))) is None

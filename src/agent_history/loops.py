@@ -884,7 +884,8 @@ def _refresh_tasks_done(conn: psycopg.Connection) -> None:
 
 
 # Frozen loop-state v1 validate_event schema, from public bin/loop-state.
-# Source SHA-256: f44713f19942be7296feb377c79c6e9db4310c0796a0f4869dcd5ecadba00561.
+# Frozen base source SHA-256: f44713f19942be7296feb377c79c6e9db4310c0796a0f4869dcd5ecadba00561.
+# The optional return artifact path is additive; every other v1 field remains strict.
 # No runtime checkout/CLI dependency. Retained framing also requires real timestamps,
 # an exact goal hash and one open. Invalid heartbeat activity is independently unknown.
 _STATE_TIER = ("routine", "guarded")
@@ -927,6 +928,7 @@ _STATE_SCHEMA = {
             "coderabbit": "coderabbit",
             "base": "str",
             "questions": "strlist",
+            "artifact": "artifact",
         },
     ),
     "gate": (
@@ -962,6 +964,8 @@ def _state_value_valid(kind, value) -> bool:
         return isinstance(value, str) and value in kind
     if kind.endswith("?"):
         return value is None or _state_value_valid(kind[:-1], value)
+    if kind == "artifact":
+        return isinstance(value, str) and value.startswith("/") and "\x00" not in value
     if kind == "str":
         return isinstance(value, str) and bool(value)
     if kind == "int":

@@ -580,7 +580,13 @@ snapshot cannot retain a state-only finish. Identity and root activity remain un
 Every complete framed event is validated against the frozen public `bin/loop-state` v1
 `validate_event` schema before observations are extracted. Its source SHA-256 is
 `f44713f19942be7296feb377c79c6e9db4310c0796a0f4869dcd5ecadba00561`; the catalogue contains a local
-frozen validator, with no runtime dependency on that CLI or a checkout. Unknown events, unknown
+frozen validator, with no runtime dependency on that CLI or a checkout. The additive optional
+`return.artifact` field extends that baseline: it must be a nonempty absolute POSIX path without
+NUL and is retained as event metadata, never dereferenced. Existing logs without it remain valid.
+The producer supplies the resolved native package artifact path from correlated completion
+metadata, not lane-authored text. It names package-normalized output, not raw provider bytes.
+Compatible readers must be deployed before producers emit the field. All thirteen event types
+retain their existing validation. Unknown events, unknown
 members, missing required members and invalid types invalidate the snapshot, including unprojected
 return, gate, watch and judgement events. Invalid heartbeat activity alone retains its established
 independent unknown-activity policy; it supplies no activity and cannot erase independent counts.
