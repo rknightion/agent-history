@@ -97,15 +97,16 @@ from .common import (BOUNDED_STATE_SECONDS, artifact_kind, as_int, as_str, cmd_v
                      split_prompt_injections, ssh_target)
 from .model import (ArtifactRow, AttachmentRow, CompactionRow, ContinuationRow, FileContext, FileTouchRow,
                     GitEventRow, LinePos, LlmCallRow, MessageRow, ParseIssueRow, RecordTypeRow, Row,
-                    PiRunResponseRow, SessionEventRow, SessionKey, SessionRow, SubagentSpawnRow, ToolCallRow,
+                    PiRunResponseRow, RequestProgressRow, RequestRecoveryRow, RequestIncidentRow,
+                    SessionEventRow, SessionKey, SessionRow, SubagentSpawnRow, ToolCallRow,
                     ToolIoRow, TurnRow)
 from .parse_claude import _diff_counts, _nlines
 
 AGENT = "pi"
-# Not bumped for lineage: rows indexed by earlier v10 code are repaired in place. The loader's pi
-# lineage post-pass recomputes parent, root and depth for every non-stub subagent on each refresh,
-# and retracts spawn links (plus the call, type and parent copied from them) that disagree with
-# the resolved parent. Neither step reads transcript content, so no reparse is needed.
+# Additive progress/recovery rows do not change existing v10 content or parser state. Ingest
+# new/changed JSONL and independent checkpoints without invalidating indexed sessions. Unchanged
+# historical sources remain without telemetry; no backfill or rebuild is implied. Lineage remains
+# independently repairable by the existing metadata-only post-pass.
 PARSER_VERSION = "10"
 # Artifact metadata replay is independent of the session parser version.
 ARTIFACT_PARSER_VERSION = "6-links1"
@@ -136,6 +137,115 @@ ERROR_KIND_RE = re.compile(r"^([a-z][a-z0-9_]{2,63}):")
 ERROR_STATUS_RE = re.compile(r"\((\d{3})\)")
 ERROR_FAMILY_RE = re.compile(r"\b(cyber_policy|server_is_overloaded|stream_incomplete|upstream_request_timeout)\b")
 SPAWN_BUDGET_KEYS = ("runFanoutBudget", "spawnBudget", "activeAsyncCapacity")
+PROGRESS_PARSER_VERSION = "1"
+PROGRESS_SESSION = re.compile(r"[A-Za-z0-9._-]{1,128}")
+PROGRESS_IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}")
+RECOVERY_CODES = {"stream_incomplete", "previous_response_owner_unavailable", "bridge_previous_response_not_found",
+                  "continuity_recovery_required", "native_websocket_backpressure", "invalid_api_key",
+                  "insufficient_quota", "context_length_exceeded", "unrecognized"}
+RECOVERY_REASONS = {"episode-expired", "protected-request", "tool-execution-observed", "hosted-or-unknown-output",
+                    "partial-output-not-replayable", "non-retryable-upstream", "unclassified-failure",
+                    "interrupted-local-response", "unstarted-request", "native-compaction", "bounded-empty-output"}
+
+
+def _progress_count(value: Any) -> int | None:
+    # Node numbers cannot represent integers above this bound exactly. Never coerce or truncate.
+    return value if type(value) is int and 0 <= value <= 2**53 - 1 else None
+
+
+def _progress_identifier(value: Any) -> str | None:
+    return value if isinstance(value, str) and PROGRESS_IDENTIFIER.fullmatch(value) else None
+
+
+def _enum(value: Any, allowed: set[str]) -> str | None:
+    return value if isinstance(value, str) and value in allowed else None
+
+
+def _uuid(value: Any) -> str | None:
+    return value if isinstance(value, str) and re.fullmatch(UUID, value) else None
+
+
+def progress_row(data: Any, session: SessionKey, pos: LinePos, *, response_id: str | None = None,
+                 effort: str | None = None) -> RequestProgressRow | None:
+    """Consume only the named v1 scalar fields, never retain arbitrary JSON or stream content.
+
+    Used for both live replacements and the final assistant envelope. No neighbour timestamp,
+    ordinal correlation, encrypted byte count, token estimate or attempt inference is allowed.
+    """
+    if not isinstance(data, dict) or type(data.get("v")) is not int or data["v"] != 1:
+        return None
+    if data.get("session") != session.session_uid or not PROGRESS_SESSION.fullmatch(session.session_uid):
+        return None
+    request = _uuid(data.get("request"))
+    start = _recorded_epoch_ms(_progress_count(data.get("startedAt")))
+    written = _recorded_epoch_ms(_progress_count(data.get("writtenAt")))
+    state = _enum(data.get("state"), {"active", "ended", "abandoned"})
+    if not request or start is None or written is None or written < start or state is None:
+        return None
+    def endpoint(value: Any) -> datetime | None:
+        timestamp = _recorded_epoch_ms(_progress_count(value))
+        return timestamp if timestamp is not None and start <= timestamp <= written else None
+    end = endpoint(data.get("endedAt"))
+    if (state == "active" and data.get("endedAt") is not None) or (state != "active" and end is None):
+        return None
+    def activity(value: Any) -> datetime | None:
+        timestamp = endpoint(value)
+        return timestamp if timestamp is not None and timestamp <= (end or written) else None
+    fields: dict[str, Any] = {}
+    for source, target in (("reasoning", "reasoning"), ("text", "text"), ("toolCalls", "tool_calls")):
+        group = data.get(source) if isinstance(data.get(source), dict) else {}
+        for name in ("started", "deltas", "completed"):
+            fields[f"{target}_{name}"] = _progress_count(group.get(name))
+        first, last = activity(group.get("firstAt")), activity(group.get("lastAt"))
+        if first is not None and last is not None and first > last:
+            first = last = None
+        fields[f"{target}_first_at"], fields[f"{target}_last_at"] = first, last
+    for source, target in (("firstResponseAt", "first_response_at"), ("firstModelEventAt", "first_model_event_at"),
+                           ("lastModelEventAt", "last_model_event_at"), ("lastProviderEventAt", "last_provider_event_at"),
+                           ("lastKeepaliveAt", "last_keepalive_at")):
+        fields[target] = activity(data.get(source))
+    first, last = fields["first_model_event_at"], fields["last_model_event_at"]
+    if first is not None and last is not None and first > last:
+        fields["first_model_event_at"] = fields["last_model_event_at"] = None
+    api = _progress_identifier(data.get("api"))
+    recognised_keepalive = api in {"openai-responses", "azure-openai-responses", "openai-codex-responses",
+                                   "anthropic-messages"}
+    if not recognised_keepalive:
+        fields["last_keepalive_at"] = None
+    age = _progress_count(data.get("ageMs"))
+    expected_age = ((end or written) - start) // timedelta(milliseconds=1)
+    return RequestProgressRow(session, request, pos.byte_offset, start, written, state,
+                              ended_at=end, response_id=response_id,
+                              turn_ordinal=_recorded_int(data.get("turn")), pid=_recorded_int(data.get("pid")),
+                              provider=_progress_identifier(data.get("provider")), model=_progress_identifier(data.get("model")),
+                              api=api, effort=_enum(effort, {"off", "minimal", "low", "medium", "high", "xhigh", "max"}),
+                              stop_reason=_enum(data.get("stopReason"), {"stop", "toolUse", "length", "error", "aborted"}),
+                              age_ms=age if age == expected_age else None,
+                              provider_responses=_progress_count(data.get("providerResponses")),
+                              provider_request_id=_progress_identifier(data.get("providerRequestId")),
+                              model_events=_progress_count(data.get("modelEvents")),
+                              provider_events=_progress_count(data.get("providerEvents")),
+                              keepalives=_progress_count(data.get("keepalives")) if recognised_keepalive else None, **fields)
+
+
+def recovery_row(data: Any, session: SessionKey, response_id: str, observed: datetime | None,
+                 pos: LinePos) -> RequestRecoveryRow | None:
+    if not isinstance(data, dict) or observed is None:
+        return None
+    # The landed recovery shape is unversioned. An explicitly versioned future shape is unsupported.
+    if "v" in data:
+        return None
+    reason = _enum(data.get("reason"), RECOVERY_REASONS)
+    status = _recorded_int(data.get("status"))
+    flags = {target: data.get(source) if type(data.get(source)) is bool else None
+             for source, target in (("outputObserved", "output_observed"), ("requestPortable", "request_portable"),
+                                    ("toolsExecuted", "tools_executed"))}
+    return RequestRecoveryRow(session, response_id, observed, pos.byte_offset,
+                              attempt_uid=_uuid(data.get("attemptId")), code=_enum(data.get("code"), RECOVERY_CODES),
+                              status=status if status is not None and 100 <= status <= 599 else None,
+                              disposition=_enum(data.get("disposition"), {"stop", "retry", "unchanged"}), reason=reason,
+                              timeout_source="recovery-episode" if reason == "episode-expired" else None, **flags)
+
 
 
 def _recorded_int(value: Any, *, signed: bool = False, bits: int = 32) -> int | None:
@@ -642,6 +752,21 @@ class PiParser:
             detail["details"] = record["details"]
         if text:
             rows.append(self._msg(uid, ts, "user", cls, text, pos, turn, detail=detail))
+        recorded_at = _recorded_iso(record.get("timestamp"))
+        details = record.get("details") if isinstance(record.get("details"), dict) else {}
+        if ctype == "loop-request-incident" and recorded_at is not None:
+            kind = _enum(details.get("kind"), {"wall-clock", "empty-length"})
+            if kind is not None:
+                rows.append(RequestIncidentRow(self._key(), uid, recorded_at, pos.byte_offset, kind,
+                                               "loop-request-incident.details",
+                                               timeout_source="request-wall-clock-ceiling" if kind == "wall-clock" else None,
+                                               follow_up_count=_recorded_int(details.get("attempt")),
+                                               exhausted=details.get("exhausted") if type(details.get("exhausted")) is bool else None,
+                                               elapsed_ms=_progress_count(details.get("elapsedMs"))))
+        elif ctype == "loop-recovery-exhausted" and recorded_at is not None:
+            rows.append(RequestIncidentRow(self._key(), uid, recorded_at, pos.byte_offset, "episode-exhausted",
+                                           "loop-recovery-exhausted.details", timeout_source="recovery-episode",
+                                           exhausted=True, episode_limit_ms=_recorded_int(details.get("episodeMs"))))
         if ctype.startswith("subagent-") and text:
             rows.extend(self._notify(ctype, text, turn, ts, pos))
         return rows
@@ -661,6 +786,10 @@ class PiParser:
         stop = as_str(m.get("stopReason"))
         self.s["busy"] = stop not in TERMINAL
         response_id = as_str(m.get("responseId")) or f"pi:{uid}"
+        progressed = progress_row(m.get("loopPiProgress"), self._key(), pos, response_id=response_id,
+                                  effort=as_str(m.get("thinkingLevel")) or self.s["effort"])
+        recovered = recovery_row(m.get("loopPiRecovery"), self._key(), response_id, entry_ts, pos)
+        rows.extend(row for row in (progressed, recovered) if row is not None)
         rows.extend(self._usage_row(m.get("usage"), response_id, model, stop, ts, pos, turn,
                                     error=as_str(m.get("errorMessage")) if stop == "error" else None,
                                     message=m, entry_ts=entry_ts))

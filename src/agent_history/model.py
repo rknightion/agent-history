@@ -256,6 +256,115 @@ class LlmCallRow(Row):
 
 
 @dataclass
+class RequestProgressRow(Row):
+    """Content-free v1 observations. Loader orders snapshots by the producer's written_at.
+
+    A request UUID is independent of recovery attempt/header ids and the per-process ordinal.
+    Counts are stream events/items/deltas, never tokens. All durations/limits ending _ms are
+    milliseconds; all times are observed local epoch milliseconds converted to UTC. No liveness
+    is inferred from snapshot freshness. Unsupported measurements stay independently NULL.
+    """
+    TABLE: ClassVar[str] = "request_progress"
+    KEY: ClassVar[tuple[str, ...]] = ("session", "request_uid")
+    session: SessionKey
+    request_uid: str
+    byte_offset: int
+    started_at: datetime
+    written_at: datetime
+    state: str
+    producer_version: int = 1
+    provenance: str = "loopPiProgress.v1"
+    ended_at: datetime | None = None
+    response_id: str | None = None
+    turn_ordinal: int | None = None
+    pid: int | None = None
+    provider: str | None = None
+    model: str | None = None
+    api: str | None = None
+    effort: str | None = None
+    stop_reason: str | None = None
+    age_ms: int | None = None
+    provider_responses: int | None = None
+    first_response_at: datetime | None = None
+    provider_request_id: str | None = None
+    model_events: int | None = None
+    first_model_event_at: datetime | None = None
+    last_model_event_at: datetime | None = None
+    reasoning_started: int | None = None
+    reasoning_deltas: int | None = None
+    reasoning_completed: int | None = None
+    reasoning_first_at: datetime | None = None
+    reasoning_last_at: datetime | None = None
+    text_started: int | None = None
+    text_deltas: int | None = None
+    text_completed: int | None = None
+    text_first_at: datetime | None = None
+    text_last_at: datetime | None = None
+    tool_calls_started: int | None = None
+    tool_calls_deltas: int | None = None
+    tool_calls_completed: int | None = None
+    tool_calls_first_at: datetime | None = None
+    tool_calls_last_at: datetime | None = None
+    provider_events: int | None = None
+    last_provider_event_at: datetime | None = None
+    keepalives: int | None = None
+    last_keepalive_at: datetime | None = None
+
+
+@dataclass
+class RequestRecoveryRow(Row):
+    """Recorded assistant recovery metadata; no progress UUID is inferred from attempt_uid.
+
+    Join to progress only through a response_id recorded on that same assistant envelope.
+    The current producer records no episode start/end, attempt count or budget on this metadata.
+    """
+    TABLE: ClassVar[str] = "request_recovery"
+    KEY: ClassVar[tuple[str, ...]] = ("session", "response_id")
+    session: SessionKey
+    response_id: str
+    observed_at: datetime
+    byte_offset: int
+    provenance: str = "loopPiRecovery"
+    attempt_uid: str | None = None
+    code: str | None = None
+    status: int | None = None
+    disposition: str | None = None
+    reason: str | None = None
+    output_observed: bool | None = None
+    request_portable: bool | None = None
+    tools_executed: bool | None = None
+    timeout_source: str | None = None
+    episode_limit_ms: int | None = None
+    attempt_count: int | None = None
+
+
+@dataclass
+class RequestIncidentRow(Row):
+    """Explicit custom-message incident, NOT attributed to a nearby request.
+
+    follow_up_count is the recorded consecutive incident count, not a provider attempt count.
+    Bounds absent from structured transcript details remain NULL, regardless of producer defaults.
+    """
+    TABLE: ClassVar[str] = "request_incident"
+    KEY: ClassVar[tuple[str, ...]] = ("session", "event_uid")
+    session: SessionKey
+    event_uid: str
+    observed_at: datetime
+    byte_offset: int
+    kind: str
+    provenance: str
+    request_uid: str | None = None
+    timeout_source: str | None = None
+    follow_up_count: int | None = None
+    exhausted: bool | None = None
+    elapsed_ms: int | None = None
+    wall_clock_limit_ms: int | None = None
+    follow_up_limit: int | None = None
+    output_token_limit: int | None = None
+    episode_limit_ms: int | None = None
+
+
+@dataclass
 class ToolCallRow(Row):
     """Call and result halves may arrive separately; both upsert the same (agent, call_uid)."""
     TABLE: ClassVar[str] = "tool_call"
@@ -651,7 +760,8 @@ class RecordTypeRow(Row):
 
 
 ALL_ROWS: tuple[type[Row], ...] = (
-    SessionRow, TurnRow, MessageRow, LlmCallRow, ToolCallRow, ToolOpRow, SubagentSpawnRow,
+    SessionRow, TurnRow, MessageRow, LlmCallRow, RequestProgressRow, RequestRecoveryRow, RequestIncidentRow,
+    ToolCallRow, ToolOpRow, SubagentSpawnRow,
     HookEventRow, CompactionRow, GitEventRow, ArtifactRow, SessionEventRow, RateLimitRow,
     CostStateRow, ToolIoRow, AttachmentRow, FileTouchRow, ContinuationRow, ParseIssueRow, RecordTypeRow,
 )

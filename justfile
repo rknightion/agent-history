@@ -78,6 +78,45 @@ pg-test:
     AGENT_HISTORY_CONFIG=/dev/null/absent \
         uv run --locked --group dev python -m pytest -q -rs tests
 
+# Read-only natural-key readback after deployment. Supply the exact candidate schema_hash, not
+# a moving installed version; AGENT_HISTORY_READER_DSN stays in the environment, never argv.
+# Output contains IDs and scalar telemetry only. Producer v1 is not proof of a producer build SHA.
+[group('verify')]
+[positional-arguments]
+verify-request-progress-catalogue namespace session request expected_schema_hash:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export AH_VERIFY_NAMESPACE="$1" AH_VERIFY_SESSION="$2"
+    export AH_VERIFY_REQUEST="$3" AH_VERIFY_SCHEMA="$4"
+    uv run --locked --group dev python - <<'PY'
+    import json
+    import os
+    import re
+    import psycopg
+    from agent_history.parse_pi import PARSER_VERSION
+    expected = os.environ['AH_VERIFY_SCHEMA']
+    if not re.fullmatch('[0-9a-f]{64}', expected):
+        raise SystemExit('expected_schema_hash must be an exact 64-character lowercase digest')
+    with psycopg.connect(os.environ['AGENT_HISTORY_READER_DSN'], connect_timeout=5) as conn:
+        conn.execute('SET TRANSACTION READ ONLY')
+        conn.execute("SET LOCAL statement_timeout='60s'")
+        metadata = dict(conn.execute("SELECT key,value FROM ah.meta WHERE key IN ('schema_hash','parser_version_pi')"))
+        if metadata.get('schema_hash') != expected or metadata.get('parser_version_pi') != PARSER_VERSION:
+            raise SystemExit('exact catalogue schema/parser version mismatch')
+        row = conn.execute('SELECT p.request_uid,p.producer_version,p.provenance,p.state,p.started_at,p.ended_at,'
+                           'p.written_at,p.last_model_event_at,p.last_provider_event_at,p.last_keepalive_at,'
+                           'p.model_events,p.reasoning_completed,p.reasoning_deltas,p.provider_events,p.keepalives,'
+                           'p.response_id,r.attempt_uid,r.code,r.disposition,r.reason '
+                           'FROM ah.request_progress p JOIN ah.session s ON s.id=p.session_id '
+                           'LEFT JOIN ah.request_recovery r ON r.session_id=p.session_id AND r.response_id=p.response_id '
+                           'WHERE p.namespace=%s AND s.agent=\'pi\' AND s.session_uid=%s AND s.agent_id=\'\' '
+                           'AND p.request_uid=%s AND p.producer_version=1 LIMIT 1',
+                           (os.environ['AH_VERIFY_NAMESPACE'],os.environ['AH_VERIFY_SESSION'],os.environ['AH_VERIFY_REQUEST'])).fetchone()
+        if row is None:
+            raise SystemExit('no matching natural request evidence; deployment/transport not proved')
+        print(json.dumps({'schema_hash':expected,'parser_version_pi':PARSER_VERSION,'request_evidence':row},default=str))
+    PY
+
 # Verify the generated fresh-init migration ledger against the classified migrations
 [group('check')]
 baseline-ledger-check:

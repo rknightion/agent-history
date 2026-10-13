@@ -38,6 +38,7 @@ REPLAYED = (
     "034_backlog_autovacuum.sql",
     # 025 creates the receipt table on fresh init, so its widened kind check must replay too.
     "035_loop_receipt_posted.sql",
+    "036_request_progress.sql",
 )
 
 

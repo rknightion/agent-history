@@ -51,6 +51,9 @@ def namespace_details(namespace: str) -> tuple[str, str, str | None]:
 
 def file_role(agent: str, parts: tuple[str, ...]) -> str | None:
     """Role of a transcript path relative to its namespace directory, or None to skip it."""
+    if agent == "pi" and len(parts) == 2 and parts[0] == "progress" and parts[1].endswith(".json"):
+        from .parse_pi import PROGRESS_SESSION
+        return "pi_progress" if PROGRESS_SESSION.fullmatch(parts[1][:-5]) else None
     if not parts or not parts[-1].endswith(".jsonl") or "_history" in parts:
         return None
     if agent == "codex":
@@ -81,6 +84,8 @@ def file_role(agent: str, parts: tuple[str, ...]) -> str | None:
 def logical_uid(agent: str, role: str, parts: tuple[str, ...]) -> str | None:
     stem = parts[-1].removesuffix(".jsonl")
     if agent == "pi":
+        if role == "pi_progress":
+            return parts[-1].removesuffix(".json")
         if role == "pi_artifact":
             return None
         from .parse_pi import lineage
@@ -143,7 +148,7 @@ def inventory(hot: Path | None, cold: Path | None, namespaces: Iterable[str] | N
             for dirpath, dirnames, filenames in os.walk(base):
                 dirnames[:] = [d for d in dirnames if not d.startswith(".") and d != "_history"]
                 for name in filenames:
-                    if not name.endswith(".jsonl"):
+                    if not name.endswith((".jsonl", ".json")):
                         continue
                     path = Path(dirpath) / name
                     if path.is_symlink():
@@ -176,7 +181,7 @@ def inventory_map(sources: dict[str, Path], *, strict: bool = False) -> dict[str
             continue
         agent, profile, machine = namespace_details(namespace)
         tops = {"claude": ("projects",), "codex": ("sessions", "archived_sessions"),
-                "pi": ("sessions",)}[agent]
+                "pi": ("sessions", "progress")}[agent]
         for top in tops:
             start = base / top
             if strict:
@@ -195,7 +200,7 @@ def inventory_map(sources: dict[str, Path], *, strict: bool = False) -> dict[str
             for dirpath, dirnames, filenames in os.walk(start, onerror=walk_error):
                 dirnames[:] = sorted(d for d in dirnames if not d.startswith(".") and d != "_history")
                 for name in sorted(filenames):
-                    if not name.endswith(".jsonl"):
+                    if not name.endswith((".jsonl", ".json")):
                         continue
                     path = Path(dirpath) / name
                     if path.is_symlink():
@@ -398,7 +403,50 @@ class Writer:
             # Immutable content rows may still enrich explicitly opted-in telemetry fields.
             if policy != NOTHING:
                 updates.append(policy_sql(cls.TABLE, column, policy))
-        sql = head + ("DO UPDATE SET " + ", ".join(updates) if updates else "DO NOTHING")
+        if cls in (model.RequestProgressRow, model.RequestRecoveryRow, model.RequestIncidentRow):
+            stamp = "written_at" if cls is model.RequestProgressRow else "observed_at"
+            immutable = {"started_at", "producer_version", "provenance", "namespace"}
+            envelope = ({"response_id", "effort", "pid", "turn_ordinal", "provider", "model", "api"}
+                        if cls is model.RequestProgressRow else set())
+            accept = f"EXCLUDED.{stamp}>{cls.TABLE}.{stamp}"
+            guard = ""
+            if cls is model.RequestProgressRow:
+                # Millisecond stamps can tie at completion. Select the entire snapshot once:
+                # terminal beats active at a tie, and an accepted terminal is immutable.
+                # Envelope identity/effort enrichment is independent of activity acceptance.
+                accept = ("request_progress.state='active' AND "
+                          "(EXCLUDED.written_at>request_progress.written_at OR "
+                          "(EXCLUDED.written_at=request_progress.written_at AND EXCLUDED.state<>'active')) "
+                          "AND (EXCLUDED.ended_at IS NULL OR EXCLUDED.ended_at>=request_progress.written_at)")
+                cumulative = {"model_events", "provider_events", "provider_responses", "keepalives"}
+                cumulative.update(f"{group}_{kind}" for group in ("reasoning", "text", "tool_calls")
+                                  for kind in ("started", "deltas", "completed"))
+                cumulative.update({"last_model_event_at", "last_provider_event_at", "last_keepalive_at",
+                                   "reasoning_last_at", "text_last_at", "tool_calls_last_at"})
+                for column in sorted(cumulative):
+                    accept += (f" AND (EXCLUDED.{column} IS NULL OR request_progress.{column} IS NULL "
+                               f"OR EXCLUDED.{column}>=request_progress.{column})")
+                guard = (" WHERE request_progress.started_at=EXCLUDED.started_at "
+                         "AND (request_progress.response_id IS NULL OR EXCLUDED.response_id IS NULL "
+                         "OR request_progress.response_id=EXCLUDED.response_id)")
+                for column in ("pid", "turn_ordinal", "provider", "model", "api"):
+                    guard += (f" AND (EXCLUDED.{column} IS NULL OR request_progress.{column} IS NULL "
+                              f"OR EXCLUDED.{column}=request_progress.{column})")
+            updates = []
+            for column in columns:
+                if column in key_columns or column in {"source_id", "byte_offset"} or column in immutable:
+                    continue
+                old, new = f"{cls.TABLE}.{column}", f"EXCLUDED.{column}"
+                if column in envelope:
+                    updates.append(f"{column}=COALESCE({old},{new})")
+                else:
+                    # Never manufacture a mixed-version activity observation by filling NULLs
+                    # from another snapshot. Unsupported fields in the accepted snapshot stay NULL.
+                    value = new if cls is model.RequestProgressRow else f"COALESCE({new},{old})"
+                    updates.append(f"{column}=CASE WHEN {accept} THEN {value} ELSE {old} END")
+            sql = head + "DO UPDATE SET " + ", ".join(updates) + guard
+        else:
+            sql = head + ("DO UPDATE SET " + ", ".join(updates) if updates else "DO NOTHING")
         self._sql[cache_key] = sql
         return sql
 
@@ -446,6 +494,8 @@ class Writer:
                 if out.get("text") is not None:
                     out["text"] = clean_text(out["text"])
                     out["text_sha256"] = hashlib.sha256(out["text"].encode()).hexdigest()
+                out["namespace"] = ctx.namespace
+            if isinstance(row, (model.RequestProgressRow, model.RequestRecoveryRow, model.RequestIncidentRow)):
                 out["namespace"] = ctx.namespace
             if isinstance(row, ParseIssueRow) and out.get("detail"):
                 out["detail"] = str(out["detail"])[:120]
@@ -587,6 +637,9 @@ def purge_source(conn: psycopg.Connection, source_id: int) -> None:
 
 def _process_source(conn: psycopg.Connection, writer: Writer, entry: SourceEntry,
                     existing: dict[str, Any] | None, stats: RunStats) -> None:
+    if entry.role == "pi_progress":
+        _process_progress_source(conn, writer, entry, stats)
+        return
     path = entry.path
     try:
         stat = path.stat()
@@ -693,6 +746,61 @@ def _process_source(conn: psycopg.Connection, writer: Writer, entry: SourceEntry
         conn.execute("UPDATE ah.source_file SET status='indexed', parser_version=%s, indexed_at=now() WHERE id=%s",
                      (parser_version, source_id))
         conn.commit()
+
+
+def _process_progress_source(conn: psycopg.Connection, writer: Writer, entry: SourceEntry, stats: RunStats) -> None:
+    """Bounded, no-follow replacement ingestion. Never purge earlier requests on file replacement.
+
+    Checkpoint freshness is not model/transport activity or process liveness. Lost checkpoints do
+    not delete observed history. Archive delivery is external: only explicitly supplied files are
+    read, never a lookup in a different home. The source hash describes the exact opened snapshot.
+    """
+    import stat as stat_module
+    from .parse_pi import PROGRESS_PARSER_VERSION, progress_row
+    try:
+        fd = os.open(entry.path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, "rb") as handle:
+            before = os.fstat(handle.fileno())
+            if not stat_module.S_ISREG(before.st_mode) or before.st_size > 32768:
+                return
+            raw = handle.read(32769)
+            after = os.fstat(handle.fileno())
+        if len(raw) > 32768 or (before.st_ino, before.st_size, before.st_mtime_ns) != (
+                after.st_ino, after.st_size, after.st_mtime_ns):
+            return
+        data = json.loads(raw)
+    except (OSError, ValueError, UnicodeDecodeError):
+        return
+    session = SessionKey("pi", entry.logical_uid or "")
+    row = progress_row(data, session, LinePos(0, len(raw), 1))
+    if row is None:
+        return
+    ctx = FileContext(str(entry.path), entry.rel_path, entry.namespace, entry.agent, entry.profile,
+                      entry.machine, entry.role)
+    with conn.transaction():
+        source_id = conn.execute(
+            "INSERT INTO ah.source_file (rel_path, namespace, agent, profile, machine, file_role, logical_uid, "
+            "tier, available_hot, available_cold, size_bytes, mtime_ns, parser_version, indexed_offset, "
+            "line_count, head_sha256, status, indexed_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,1,%s,'indexed',now()) "
+            "ON CONFLICT (rel_path) DO UPDATE SET size_bytes=EXCLUDED.size_bytes, mtime_ns=EXCLUDED.mtime_ns, "
+            "head_sha256=EXCLUDED.head_sha256, indexed_offset=EXCLUDED.indexed_offset, indexed_at=now(), "
+            "tier=EXCLUDED.tier, available_hot=EXCLUDED.available_hot, available_cold=EXCLUDED.available_cold, "
+            "status='indexed' RETURNING id",
+            (entry.rel_path, entry.namespace, entry.agent, entry.profile, entry.machine, entry.role,
+             entry.logical_uid, entry.tier, entry.hot is not None, entry.cold is not None, len(raw), after.st_mtime_ns,
+             PROGRESS_PARSER_VERSION, len(raw), hashlib.sha256(raw).hexdigest())).fetchone()[0]
+        touched = writer.write([row], source_id, ctx)
+        for sid in touched:
+            # A checkpoint can precede the session file. Identify its stub without fabricating
+            # any first/last event or human activity timestamp.
+            conn.execute("UPDATE ah.session SET namespace=COALESCE(namespace,%s), profile=COALESCE(profile,%s), "
+                         "machine=COALESCE(machine,%s) WHERE id=%s", (entry.namespace, entry.profile, entry.machine, sid))
+            conn.execute("INSERT INTO ah.dirty_session (session_id) VALUES (%s) ON CONFLICT DO NOTHING", (sid,))
+    conn.commit()
+    stats.files_parsed += 1
+    stats.lines += 1
+    stats.bytes += len(raw)
+    stats.rows += 1
 
 
 # --- post passes -------------------------------------------------------------------------------
@@ -1261,11 +1369,25 @@ def schema_sources() -> list[Path]:
     return [f for f in files if f.exists()]
 
 
+def request_progress_code_hash() -> str:
+    """Exact seam implementation identity, available in an installed package without Git.
+
+    Stored by the writer, not inferred from a client checkout or a package version alias.
+    Combined with SQL hashes this supports exact-version readback without reading content.
+    """
+    digest = hashlib.sha256()
+    for name in ("model.py", "parse_pi.py", "load.py"):
+        digest.update(name.encode() + b"\0" + (PACKAGE_DIR / name).read_bytes())
+    return digest.hexdigest()
+
+
 def schema_hash() -> str:
     digest = hashlib.sha256()
     for path in schema_sources():
         digest.update(path.name.encode() + b"\0" + path.read_bytes())
-    digest.update(f"{SCHEMA_VERSION}:{model.PARSER_VERSION_CLAUDE}:{model.PARSER_VERSION_CODEX}".encode())
+    from .parse_pi import PARSER_VERSION as PI_PARSER_VERSION
+    digest.update(f"{SCHEMA_VERSION}:{model.PARSER_VERSION_CLAUDE}:{model.PARSER_VERSION_CODEX}:{PI_PARSER_VERSION}".encode())
+    digest.update(request_progress_code_hash().encode())
     return digest.hexdigest()
 
 
@@ -1276,6 +1398,7 @@ def apply_schema(conn: psycopg.Connection, force: bool = False) -> bool:
     The baseline is the squashed schema, applied only to a database without schema `ah`.
     Migrations after it are numbered and recorded in ah.meta as `migration:<file>`.
     """
+    from .parse_pi import PARSER_VERSION as PI_PARSER_VERSION
     wanted = schema_hash()
     if not force:
         try:
@@ -1307,6 +1430,8 @@ def apply_schema(conn: psycopg.Connection, force: bool = False) -> bool:
         for key, value in (("schema_version", SCHEMA_VERSION),
                            ("parser_version_claude", model.PARSER_VERSION_CLAUDE),
                            ("parser_version_codex", model.PARSER_VERSION_CODEX),
+                           ("parser_version_pi", PI_PARSER_VERSION),
+                           ("request_progress_code_hash", request_progress_code_hash()),
                            ("schema_hash", wanted)):
             conn.execute("INSERT INTO ah.meta VALUES (%s,%s) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
                          (key, value))
@@ -1485,7 +1610,9 @@ def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
-DATA_TABLES = ("loops", "lane", "loop_run", "session_rollup", "dirty_session", "parse_issue", "record_type_seen", "cost_state",
+# Progress observations survive source rewrites (multiple independent sources can observe a
+# request), but remain derived data and are explicitly truncated on a full rebuild.
+DATA_TABLES = ("request_progress", "request_recovery", "request_incident", "loops", "lane", "loop_run", "session_rollup", "dirty_session", "parse_issue", "record_type_seen", "cost_state",
                "pi_run_response", "rate_limit_sample", "session_event", "artifact", "git_event", "compaction", "hook_event",
                "subagent_spawn", "tool_op", "tool_call", "llm_call", "message", "turn", "tool_io", "attachment",
                "file_touch", "session_continuation", "session_embedding", "session", "repo", "source_file")

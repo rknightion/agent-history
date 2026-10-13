@@ -4,6 +4,58 @@
 
 SET search_path = ah, public;
 
+-- Bounded content-free diagnostics: at most 512 rows from each indexed evidence stream.
+-- This is a sampled window, not an exhaustive total. NULL model/effort/transport for incidents
+-- means the producer records no stable request correlation. Never attribute them by proximity.
+-- "Silent" means zero model events as of written_at, NOT dead process, stopped model or no SSE.
+-- heartbeat_only distinguishes observed keepalives from model reasoning items/visible deltas.
+-- Unavailable counters remain NULL; returned zero requires an observed supported measurement.
+CREATE OR REPLACE FUNCTION ah.request_progress_diagnostics(p_namespace text, p_since timestamptz,
+                                                          p_limit integer DEFAULT 100)
+RETURNS TABLE(model text, effort text, transport text, requests bigint, reasoning_items numeric,
+              reasoning_deltas numeric, model_events numeric, heartbeat_only_requests bigint,
+              silent_requests bigint, ceilings bigint, empty_length_stops bigint,
+              recovery_refusals bigint, upstream_failures bigint)
+LANGUAGE sql STABLE AS $$
+    WITH p AS MATERIALIZED (
+        SELECT * FROM ah.request_progress WHERE namespace=p_namespace AND started_at>=p_since
+        ORDER BY started_at DESC, session_id, request_uid LIMIT 512
+    ), r AS MATERIALIZED (
+        SELECT * FROM ah.request_recovery WHERE namespace=p_namespace AND observed_at>=p_since
+        ORDER BY observed_at DESC, session_id, response_id LIMIT 512
+    ), i AS MATERIALIZED (
+        SELECT kind FROM ah.request_incident WHERE namespace=p_namespace AND observed_at>=p_since
+        ORDER BY observed_at DESC, session_id, event_uid LIMIT 512
+    ), samples AS (
+        SELECT p.model, p.effort, p.api AS transport, 1::bigint AS requests,
+               p.reasoning_completed::numeric AS reasoning_items, p.reasoning_deltas::numeric,
+               p.model_events::numeric,
+               CASE WHEN p.model_events IS NULL OR p.keepalives IS NULL THEN NULL
+                    WHEN p.model_events=0 AND p.keepalives>0 THEN 1 ELSE 0 END::bigint AS heartbeat_only,
+               CASE WHEN p.model_events IS NULL THEN NULL WHEN p.model_events=0 THEN 1 ELSE 0 END::bigint AS silent,
+               0::bigint AS ceiling, 0::bigint AS empty_length,
+               CASE WHEN r.disposition IS NULL THEN NULL WHEN r.disposition='stop' THEN 1 ELSE 0 END::bigint AS refusal,
+               CASE WHEN r.code IS NULL THEN NULL ELSE 1 END::bigint AS upstream_failure
+        FROM p LEFT JOIN r ON r.session_id=p.session_id AND r.response_id=p.response_id
+        UNION ALL
+        SELECT l.model, l.effort, l.api, 0, NULL, NULL, NULL, NULL, NULL, 0, 0,
+               CASE WHEN r.disposition IS NULL THEN NULL WHEN r.disposition='stop' THEN 1 ELSE 0 END,
+               CASE WHEN r.code IS NULL THEN NULL ELSE 1 END
+        FROM r LEFT JOIN ah.llm_call l ON l.agent='pi' AND l.session_id=r.session_id AND l.response_id=r.response_id
+        WHERE NOT EXISTS (SELECT 1 FROM p WHERE p.session_id=r.session_id AND p.response_id=r.response_id)
+        UNION ALL
+        SELECT NULL, NULL, NULL, 0, NULL, NULL, NULL, NULL, NULL,
+               CASE WHEN kind='wall-clock' THEN 1 ELSE 0 END,
+               CASE WHEN kind='empty-length' THEN 1 ELSE 0 END, NULL, NULL FROM i
+    )
+    SELECT model, effort, transport, sum(requests)::bigint, sum(reasoning_items), sum(reasoning_deltas),
+           sum(model_events), sum(heartbeat_only)::bigint, sum(silent)::bigint, sum(ceiling)::bigint,
+           sum(empty_length)::bigint, sum(refusal)::bigint, sum(upstream_failure)::bigint
+    FROM samples GROUP BY model, effort, transport
+    ORDER BY model NULLS FIRST, effort NULLS FIRST, transport NULLS FIRST
+    LIMIT greatest(0, least(coalesce(p_limit,100),100))
+$$;
+
 -- Local checkout root of a path or cwd: a Codex/Claude worktree, a ~/repos/<name> checkout, or an
 -- agent home under the user's home directory (macOS /Users or Linux /home). NULL when none applies.
 CREATE OR REPLACE FUNCTION ah.repo_root(p text)

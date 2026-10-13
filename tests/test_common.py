@@ -31,7 +31,7 @@ def test_legacy_transport_templates_match_private_shape_hashes():
     ]
 
 
-def test_parser_versions_stay_frozen_for_source_only_candidate():
+def test_parser_versions_match_progress_ingestion_contract():
     from agent_history.model import PARSER_VERSION_CLAUDE, PARSER_VERSION_CODEX
     from agent_history.parse_pi import ARTIFACT_PARSER_VERSION, PARSER_VERSION
 
