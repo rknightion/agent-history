@@ -65,6 +65,35 @@ model and input hash) and the collector tables (`git_commit`, `git_commit_file`,
 `backlog_task`, `backlog_done_event`, `backlog_done_scan`, `collector_mutation_audit`, `task_prefix`,
 `installed_feature`, `permission_log`, `loop_receipt`, `loop_state`, `session_summary`, `session_topic`).
 
+### Rebuild reader boundary
+
+Before a destructive rebuild, the operator must stop admission and drain every consumer's whole
+logical read. This includes admitted jobs, buffered transcript pages and parent-pagination cursors,
+not just active SQL statements or database connections. Stop all consumer processes and prevent
+automatic restart throughout the transition. Resume with fresh processes only after the complete
+rebuild succeeds. Existing requests carry no generation expectation, so the catalogue cannot detect
+an old admission or cursor reused after completion. Draining is an operational precondition, not a
+boolean claim the loader can independently verify.
+
+`ah.v_session_state` preserves its existing columns but hides all rows while
+`ah.meta.rebuild_in_progress` is present. The existing five-argument `ah.session_events` preserves
+its arguments and result columns, and raises SQLSTATE `55000` while marked, including for missing
+sessions and empty pages. A marker has no age expiry. This prevents incomplete projections from
+invalidating cached owner state and prevents transcript pages from reporting a partial successful
+completion. These guards do not fence arbitrary direct table reads or every search function.
+
+Rebuild freezes a strictly readable inventory before destructive preparation and verifies that
+every retained transcript/artifact produced its source row before reopening. Optional progress
+sidecars keep their existing bounded validation/skip behaviour. The current SQL guards are applied
+before the marker commits atomically with destructive preparation. The outer writer lock remains held
+through source loading, post-passes, retained-summary relinking and BM25 index creation. Only their
+complete success removes the marker. `chunks_reset_at` records both destructive chunk reset
+and successful completion, preserving the paid-cache garbage-collection grace period. Source errors, a lock-held
+load, post-pass/relink/index failure or an exception retain the fence. A pre-destructive refusal
+leaves the existing generation and any existing marker unchanged. Incremental indexing or manual
+index creation never clears a failed rebuild's marker: correct the failure, keep consumers stopped,
+and run a complete source-preserving rebuild. Never remove the marker to reopen a partial load.
+
 ## Namespaces and contexts
 
 Each source is a namespace `<agent>-<profile>` (`claude-local`, `codex-client`, `pi-lab`). Every

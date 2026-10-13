@@ -164,7 +164,8 @@ SELECT s.id AS session_id, s.agent, s.session_uid, s.agent_id, s.namespace, s.fi
 FROM ah.session s
 LEFT JOIN ah.session_rollup r ON r.session_id = s.id
 LEFT JOIN ah.session c ON c.id = s.continued_from_session_id
-WHERE NOT s.is_stub;
+WHERE NOT s.is_stub
+  AND NOT EXISTS (SELECT 1 FROM ah.meta WHERE key = 'rebuild_in_progress');
 
 -- A session's full ordered timeline with content (messages, tool calls with their I/O, ops).
 CREATE OR REPLACE FUNCTION ah.session_events(p_agent text, p_session_uid text, p_agent_id text DEFAULT '',
@@ -172,7 +173,12 @@ CREATE OR REPLACE FUNCTION ah.session_events(p_agent text, p_session_uid text, p
 RETURNS TABLE (seq bigint, kind text, uid text, ts timestamptz, message_class text, role text,
                prompt_origin text, tool_name text, text text, input_text text, output_text text,
                stdout_text text, stderr_text text, error_class text, error_excerpt text)
-LANGUAGE sql STABLE AS $$
+LANGUAGE plpgsql STABLE AS $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM ah.meta WHERE key = 'rebuild_in_progress') THEN
+        RAISE EXCEPTION 'catalogue rebuild in progress' USING ERRCODE = '55000';
+    END IF;
+    RETURN QUERY
     WITH s AS (SELECT id FROM ah.session WHERE agent = p_agent AND session_uid = p_session_uid
                AND agent_id = COALESCE(p_agent_id, ''))
     SELECT * FROM (
@@ -193,6 +199,7 @@ LANGUAGE sql STABLE AS $$
         WHERE o.session_id = s.id AND o.seq > after_seq
     ) x (seq, kind, uid, ts, message_class, role, prompt_origin, tool_name, text, input_text, output_text,
          stdout_text, stderr_text, error_class, error_excerpt)
-    ORDER BY seq
-    LIMIT lim
+    ORDER BY x.seq
+    LIMIT lim;
+END
 $$;

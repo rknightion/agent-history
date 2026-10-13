@@ -134,8 +134,31 @@ def list_namespaces(*roots: Path | None) -> list[str]:
     return sorted(names)
 
 
-def inventory(hot: Path | None, cold: Path | None, namespaces: Iterable[str] | None = None) -> dict[str, SourceEntry]:
+def inventory(hot: Path | None, cold: Path | None, namespaces: Iterable[str] | None = None,
+              *, strict: bool = False) -> dict[str, SourceEntry]:
     result: dict[str, SourceEntry] = {}
+    if strict:
+        selected = set(namespaces) if namespaces else None
+        for tier, root in (("cold", cold), ("hot", hot)):
+            if root is None:
+                continue
+            try:
+                with os.scandir(root) as children:
+                    mapped = {child.name: Path(child.path) for child in children
+                              if child.name.startswith(("claude-", "codex-", "pi-"))
+                              and (selected is None or child.name in selected)
+                              and not child.is_symlink() and child.is_dir()}
+            except FileNotFoundError:
+                if tier == "hot":  # A cold-backed deployment may have no optional hot tree.
+                    continue
+                raise
+            for rel, entry in inventory_map(mapped, strict=True).items():
+                source_path = entry.path
+                if rel not in result:
+                    result[rel] = entry
+                    entry.hot, entry.cold = None, None
+                setattr(result[rel], tier, source_path)
+        return result
     selected = list(namespaces) if namespaces else list_namespaces(hot, cold)
     for tier, root in (("cold", cold), ("hot", hot)):
         if root is None or not root.is_dir():
@@ -1639,7 +1662,9 @@ def rebuild(conn: psycopg.Connection, hot: Path | None = HOT_ROOT, cold: Path | 
             cold_sources: dict[str, Path] | None = None) -> RunStats:
     """Empty every derived table and re-index from JSONL (parser upgrades, breaking fixes).
 
-    Readers see a partial catalogue until it finishes. With the archive layout it refuses unless
+    The reader fence stays closed until the complete load, relink and indexes succeed.
+    Operators must drain whole logical consumer reads before starting (see CONTRACT.md).
+    With the archive layout it refuses unless
     the cold archive is mounted with fresh receipts, so a rebuild can never silently drop cold-only
     history. Source maps optionally union cold directories, preferring hot copies, and refuse
     before mutation if protected namespaces have unreadable cold trees or missing transcripts.
@@ -1656,6 +1681,8 @@ def rebuild(conn: psycopg.Connection, hot: Path | None = HOT_ROOT, cold: Path | 
     if not try_lock(conn):
         raise SystemExit("rebuild refused: another index run holds the lock")
     try:
+        if sources is None and not cold_tier_ok(cold):
+            raise SystemExit("rebuild refused: cold archive missing or receipts older than 48 h")
         # A writer may have added protected paths after the read-only preflight.
         # Re-inventory and validate the current catalogue while holding its lock,
         # before dropping indexes, updating rows, or truncating any table.
@@ -1665,6 +1692,25 @@ def rebuild(conn: psycopg.Connection, hot: Path | None = HOT_ROOT, cold: Path | 
             if failures:
                 raise SystemExit('rebuild refused: ' + '; '.join(failures))
             conn.commit()
+        # Freeze a readable source inventory before removing any catalogue content.
+        # Optional missing hot tiers may use their protected cold source.
+        if sources is not None:
+            hot_sources = {n: p for n, p in sources.items()
+                           if p.exists() or n not in (cold_sources or {})}
+            strict_hot = inventory_map(hot_sources, strict=True)
+            if source_entries is None:
+                source_entries = strict_hot
+            else:
+                for rel, entry in strict_hot.items():
+                    if rel in source_entries:
+                        entry.cold = source_entries[rel].cold
+                    source_entries[rel] = entry
+        else:
+            source_entries = inventory(hot, cold, strict=True)
+        # Deploying this package must install its SQL guard before the destructive commit,
+        # even when the periodic indexer has not yet applied the new analytics hash.
+        apply_schema(conn)
+        conn.commit()
         with conn.transaction():
             for index in POST_LOAD_INDEXES:
                 conn.execute(f"DROP INDEX IF EXISTS ah.{index}")
@@ -1690,27 +1736,38 @@ def rebuild(conn: psycopg.Connection, hot: Path | None = HOT_ROOT, cold: Path | 
             conn.execute("INSERT INTO ah.change_log (refresh_id, agent, session_uid, agent_id, kind) "
                          "VALUES (%s, '*', '*', '', 'rebuild')", (marker,))
             finish_refresh(conn, marker, True)
-    finally:
-        unlock(conn)
-    try:
+        # Keep the outer session lock through refresh and finalisation. refresh takes its own
+        # re-entrant lock on this connection and releases only that nested acquisition.
         stats = refresh(conn, hot, cold, None, None, textfile, log, kind="rebuild",
                         sources=sources, source_entries=source_entries)
+        if stats.lock_held:
+            raise SystemExit("rebuild incomplete: another run holds the lock; reader fence retained")
+        if stats.errors:
+            return stats  # Failed source loads must not advertise a complete generation.
+        # A path may disappear after inventory. process_source can skip a failed stat,
+        # so verify that each retained transcript/artifact produced its source row.
+        # Progress sidecars are optional bounded observations and may validly be skipped.
+        expected = {rel for rel, entry in source_entries.items() if entry.role != "pi_progress"}
+        loaded = {row[0] for row in conn.execute("SELECT rel_path FROM ah.source_file")}
+        conn.commit()
+        missing = expected - loaded
+        if missing:
+            stats.errors += len(missing)
+            log(json.dumps({"rebuild_incomplete_sources": len(missing)}))
+            return stats
         with conn.transaction():
             for table, agent_col, agent_id_col in (("session_summary", "agent", "agent_id"),
                                                     ("session_topic", "session_agent", "session_agent_id")):
                 conn.execute(f"UPDATE ah.{table} j SET session_id = s.id FROM ah.session s "
                              f"WHERE j.{agent_col} = s.agent AND j.session_uid = s.session_uid "
                              f"AND j.{agent_id_col} = s.agent_id AND j.session_id IS DISTINCT FROM s.id")
-        if not try_lock(conn):
-            raise SystemExit("rebuild: another run holds the lock, BM25 indexes NOT created; "
-                             "run `agent-history create-indexes`")
-        try:
-            create_post_load_indexes(conn)
-        finally:
-            unlock(conn)
+        create_post_load_indexes(conn)
+        # Publish availability only after every source and all derived projections succeeded.
+        # An exception anywhere above keeps the already-committed fence, without an age expiry.
+        with conn.transaction():
+            conn.execute("INSERT INTO ah.meta (key, value) VALUES ('chunks_reset_at', now()::text) "
+                         "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value")
+            conn.execute("DELETE FROM ah.meta WHERE key = 'rebuild_in_progress'")
+        return stats
     finally:
-        conn.execute("INSERT INTO ah.meta (key, value) VALUES ('chunks_reset_at', now()::text) "
-                     "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value")
-        conn.execute("DELETE FROM ah.meta WHERE key = 'rebuild_in_progress'")
-        conn.commit()
-    return stats
+        unlock(conn)

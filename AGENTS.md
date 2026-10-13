@@ -76,6 +76,19 @@ recorded or replayed on fresh init. Migration 020 is pre-recorded without its op
 existing catalogues keep their own ledger. A schema change is a new numbered file in
 `src/agent_history/sql/migrations/`, additive in schema_version 1.
 
+## Rebuild safety
+
+A destructive rebuild requires an enforced full consumer drain: stop new admissions, let admitted
+logical reads finish, stop all consumer processes and prevent automatic restart until successful
+completion. Buffered Events pages and Parents cursors must not survive into a replacement
+catalogue. Existing consumer requests carry no generation expectation. A marker-only SQL fence
+cannot make undrained cross-generation readers safe; follow CONTRACT.md's operational boundary.
+
+The rebuild marker has no age expiry and must remain on every incomplete load or finalisation
+failure. Never clear it by hand or claim that creating indexes or a later incremental pass proves
+source completeness. Reader-fence tests need disposable real PostgreSQL; keep synthetic app-boundary
+proofs outside this public tree when they import private consumers.
+
 ## Writing
 
 British English. No em dashes, en dashes or double hyphens as punctuation in prose, commit
