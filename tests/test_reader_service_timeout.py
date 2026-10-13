@@ -1,10 +1,11 @@
 """Connection policy at the reader's real libpq/process boundary."""
 
+import json
 import os
+import signal
 import socket
 import subprocess
 import sys
-import threading
 import time
 
 import pytest
@@ -21,74 +22,122 @@ def service_environment(tmp_path):
     return env
 
 
-def test_unresponsive_service_resolution_is_bounded_and_does_not_disclose_password(tmp_path):
-    # A TCP endpoint which never replies is deterministic, unlike an unroutable address.
-    # The listening socket keeps the connection queued without completing the PG handshake.
+def service_handshake_probe(tmp_path, service_timeout=None, environment_timeout=None, startup_delay=0):
+    # Trace the real resolver child, without replacing its command or libpq call.
+    probe = """
+import json, subprocess, time
+from agent_history import reader
+
+def event(name, **fields):
+    print(json.dumps(dict(event=name, at=time.monotonic(), **fields)), flush=True)
+
+class TracedProcess(subprocess.Popen):
+    def __init__(self, *args, **kwargs):
+        event('child-launch')
+        super().__init__(*args, **kwargs)
+        event('child-started', pid=self.pid)
+
+    def __exit__(self, *args):
+        result = super().__exit__(*args)
+        event('child-reaped', pid=self.pid, returncode=self.returncode)
+        return result
+
+reader.subprocess.Popen = TracedProcess
+event('reader-ready')
+time.sleep(STARTUP_DELAY)
+reader.load_env()
+""".replace("STARTUP_DELAY", repr(startup_delay))
+    password = "synthetic-" + "password"
+    trace = []
     with socket.socket() as endpoint:
         endpoint.bind(("127.0.0.1", 0))
         endpoint.listen()
+        endpoint.settimeout(8)
         env = service_environment(tmp_path)
-        password = "synthetic-" + "password"
+        policy = f"connect_timeout={service_timeout}\n" if service_timeout is not None else ""
         (tmp_path / "service.conf").write_text(
             f"[synthetic]\nhost=127.0.0.1\nport={endpoint.getsockname()[1]}\n"
-            f"dbname=synthetic\nuser=reader\npassword={password}\nsslmode=disable\n"
+            f"dbname=synthetic\nuser=reader\npassword={password}\n"
+            f"sslmode=disable\ngssencmode=disable\n{policy}"
         )
         env["AGENT_HISTORY_READER_DSN"] = "service=synthetic"
-        start = time.monotonic()
-        result = subprocess.run(
-            [sys.executable, "-c", "from agent_history.reader import load_env; load_env()"],
+        if environment_timeout is not None:
+            env["PGCONNECT_TIMEOUT"] = environment_timeout
+        trace.append({"event": "outer-launch", "at": time.monotonic()})
+        with subprocess.Popen(
+            [sys.executable, "-c", probe],
             env=env,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=8,
-        )
-        assert time.monotonic() - start < 8
-        assert result.returncode != 0
-        assert result.stderr.strip() == "agent-history: cannot resolve reader service connection"
-        assert password not in result.stdout + result.stderr
+            start_new_session=True,
+        ) as process:
+            try:
+                with endpoint.accept()[0] as client:
+                    client.settimeout(8)
+
+                    def read_exact(size):
+                        data = bytearray()
+                        while len(data) < size:
+                            chunk = client.recv(size - len(data))
+                            assert chunk, "resolver closed before sending its startup packet"
+                            data.extend(chunk)
+                        return data
+
+                    size = int.from_bytes(read_exact(4), "big")
+                    assert 8 <= size <= 65536
+                    read_exact(size - 4)
+                    trace.append({"event": "handshake-received", "at": time.monotonic()})
+                    if service_timeout in (None, "2"):
+                        # No server response can cause this exit. EOF proves libpq
+                        # abandoned the connection, independently of parent scheduling.
+                        client.settimeout(3.5 if service_timeout == "2" else 8)
+                        assert client.recv(1) == b""
+                        trace.append({"event": "timeout-eof", "at": time.monotonic()})
+                    else:
+                        # Start at the actual handshake, not before two Python imports.
+                        # A service-file long/unlimited policy must outlive PGCONNECT_TIMEOUT=2.
+                        client.settimeout(3.5)
+                        with pytest.raises(TimeoutError):
+                            client.recv(1)
+                        trace.append({"event": "server-reject", "at": time.monotonic()})
+                        client.sendall(b"invalid")
+                        client.settimeout(8)
+                        assert client.recv(1) == b""
+                stdout, stderr = process.communicate(timeout=8)
+                trace.append({"event": "outer-reaped", "at": time.monotonic()})
+            except BaseException:
+                # Bound failure cleanup too, even if the outer process exited
+                # unexpectedly and left its unlimited resolver child alive.
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.communicate(timeout=8)
+                raise
+        trace.extend(json.loads(line) for line in stdout.splitlines())
+    trace.sort(key=lambda item: item["at"])
+    print(json.dumps({"service_timeout": service_timeout, "startup_delay": startup_delay, "trace": trace}))
+    assert process.returncode != 0
+    assert stderr.strip() == "agent-history: cannot resolve reader service connection"
+    assert password not in stdout + stderr
+    events = [item["event"] for item in trace]
+    assert events.index("child-launch") < events.index("handshake-received")
+    assert events.index("child-reaped") < events.index("outer-reaped")
+    child = next(item for item in trace if item["event"] == "child-reaped")
+    assert child["returncode"] != 0
 
 
-@pytest.mark.parametrize("service_timeout,environment_timeout", [("2", "37"), ("37", "2"), ("0", "2")])
-def test_service_file_timeout_controls_delayed_handshake(tmp_path, service_timeout, environment_timeout):
-    with socket.socket() as endpoint:
-        endpoint.bind(("127.0.0.1", 0))
-        endpoint.listen()
-        endpoint.settimeout(6)
-        env = service_environment(tmp_path)
-        (tmp_path / "service.conf").write_text(
-            f"[synthetic]\nhost=127.0.0.1\nport={endpoint.getsockname()[1]}\n"
-            f"dbname=synthetic\nuser=reader\nsslmode=disable\nconnect_timeout={service_timeout}\n"
-        )
-        env.update(AGENT_HISTORY_READER_DSN="service=synthetic", PGCONNECT_TIMEOUT=environment_timeout)
+def test_unresponsive_service_resolution_is_bounded_and_does_not_disclose_password(tmp_path):
+    service_handshake_probe(tmp_path)
 
-        def delay_response():
-            with endpoint.accept()[0] as client:
-                time.sleep(3.5)
-                # Reject the handshake after the environment timeout, but before
-                # the deliberately long (or unlimited) service-file deadline.
-                client.sendall(b"invalid")
 
-        server = threading.Thread(target=delay_response)
-        server.start()
-        try:
-            start = time.monotonic()
-            result = subprocess.run(
-                [sys.executable, "-c", "from agent_history.reader import load_env; load_env()"],
-                env=env,
-                capture_output=True,
-                text=True,
-                timeout=6,
-            )
-            elapsed = time.monotonic() - start
-        finally:
-            server.join(timeout=7)
-        assert not server.is_alive()
-        assert result.returncode != 0
-        assert result.stderr.strip() == "agent-history: cannot resolve reader service connection"
-        if service_timeout == "2":
-            assert elapsed < 3.5
-        else:
-            assert elapsed >= 3.5
+@pytest.mark.parametrize(
+    "service_timeout,environment_timeout,startup_delay",
+    [("2", "37", 0), ("2", "37", 2), ("37", "2", 0), ("0", "2", 0)],
+)
+def test_service_file_timeout_controls_delayed_handshake(tmp_path, service_timeout, environment_timeout, startup_delay):
+    service_handshake_probe(tmp_path, service_timeout, environment_timeout, startup_delay)
 
 
 @pytest.mark.parametrize("source", ["dsn", "service", "environment"])
