@@ -21,9 +21,11 @@ INSERT INTO model_pricing (model, effective_from, input_per_mtok, cached_input_p
     ('claude-opus-5',            '2000-01-01',  5.00, 0.50,   6.25, 10.00, 25.00, 'anthropic pricing 2026-09-25'),
     ('claude-opus-4-8',          '2000-01-01',  5.00, 0.50,   6.25, 10.00, 25.00, 'anthropic pricing 2026-09-25'),
     ('claude-opus-4-7',          '2000-01-01',  5.00, 0.50,   6.25, 10.00, 25.00, 'anthropic pricing 2026-09-25'),
+    ('claude-sonnet-5-5',        '2000-01-01',  2.00, 0.10,   2.50, 4.00, 10.00, 'anthropic pricing 2026-10-14 (cache read cut to 0.10 on 2026-10-07)'),
     ('claude-sonnet-5',          '2000-01-01',  2.00, 0.20,   2.50, 4.00, 10.00, 'anthropic pricing 2026-09-25'),
     ('claude-sonnet-4-6',        '2000-01-01',  3.00, 0.30,   3.75, 6.00, 15.00, 'anthropic pricing 2026-09-25'),
     ('claude-fable-5-1',         '2000-01-01', 10.00, 0.25,  12.50, 20.00, 50.00, 'anthropic pricing 2026-09-25'),
     ('claude-fable-5',           '2000-01-01', 10.00, 1.00,  12.50, 20.00, 50.00, 'anthropic pricing 2026-09-25'),
+    ('claude-haiku-5-5',         '2000-01-01',  0.10, 0.01,  0.125, 0.20,  0.50, 'anthropic pricing 2026-10-14 (prompts up to 100k tokens; longer prompts cost 5x)'),
     ('claude-haiku-4-5-20251001','2000-01-01',  1.00, 0.10,   1.25, 2.00,  5.00, 'anthropic pricing 2026-09-25 (Haiku 4.5)')
 ON CONFLICT (model, effective_from) DO NOTHING;
