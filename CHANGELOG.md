@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.5.0](https://github.com/rknightion/agent-history/compare/v0.4.0...v0.5.0) (2026-10-16)
+
+
+### Features
+
+* **usage:** unknown instead of false-zero usage, LiteLLM spend-log fill and v3 loop counts ([90e177f](https://github.com/rknightion/agent-history/commit/90e177f26435cb76e85caed244eb3a0d7ee45753))
+
+
+### Bug Fixes
+
+* **loops:** live v3 status, owner turns and every lane return ([1ba8d36](https://github.com/rknightion/agent-history/commit/1ba8d36c4fed30395514ae44b1f19ccb1d6e5682))
+* **pi:** resolve a nested child's parent session from its header path ([a057f74](https://github.com/rknightion/agent-history/commit/a057f74a1d4a65f72abcd865528ffb597d01af67))
+
 ## [0.4.0](https://github.com/rknightion/agent-history/compare/v0.3.0...v0.4.0) (2026-10-16)
 
 
