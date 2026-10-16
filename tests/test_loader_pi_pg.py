@@ -598,3 +598,35 @@ def test_pi_header_path_parent_resolves_when_the_parent_file_arrives_later(clean
     refresh()
     assert parent_uid(child) == lane
     clean.rollback()
+
+
+def test_pi_parser_upgrade_reparses_each_file_and_equals_a_fresh_index(clean, tmp_path):  # noqa: F811
+    hot, cold = build(tmp_path)
+    assert load.refresh(clean, hot, cold, textfile=None, log=lambda *_: None).errors == 0
+    tables = ("llm_call", "message", "turn", "tool_call")
+    fresh = [clean.execute(f"SELECT count(*) FROM ah.{t}").fetchone()[0] for t in tables]
+    pi_files = clean.execute("SELECT count(*) FROM ah.source_file WHERE agent='pi' "
+                             "AND file_role IN ('main','subagent')").fetchone()[0]
+    # Indexed under an older pi parser: an upgrade reparses each session and lane file.
+    clean.execute("UPDATE ah.source_file SET parser_version='older' WHERE agent='pi' AND file_role IN ('main','subagent')")
+    clean.commit()
+    stats = load.refresh(clean, hot, cold, textfile=None, log=lambda *_: None)
+    assert stats.errors == 0 and stats.files_rewritten == pi_files
+    assert [clean.execute(f"SELECT count(*) FROM ah.{t}").fetchone()[0] for t in tables] == fresh
+    assert clean.execute("SELECT count(*) FROM ah.source_file WHERE agent='pi' AND file_role IN ('main','subagent') "
+                         "AND (parser_version='older' OR status<>'indexed')").fetchone()[0] == 0
+    assert clean.execute("SELECT count(*) FROM ah.parse_issue WHERE kind='parser_reparsed'").fetchone()[0] == pi_files
+    clean.rollback()
+
+
+def test_pi_parser_upgrade_keeps_rows_when_the_source_cannot_be_read(clean, tmp_path, monkeypatch):  # noqa: F811
+    hot, cold = build(tmp_path)
+    assert load.refresh(clean, hot, cold, textfile=None, log=lambda *_: None).errors == 0
+    before = clean.execute("SELECT count(*) FROM ah.message").fetchone()[0]
+    clean.execute("UPDATE ah.source_file SET parser_version='older' WHERE agent='pi' AND file_role IN ('main','subagent')")
+    clean.commit()
+    monkeypatch.setattr(load, "_readable_through", lambda *_: False)
+    stats = load.refresh(clean, hot, cold, textfile=None, log=lambda *_: None)
+    assert stats.files_rewritten == 0 and stats.errors > 0
+    assert clean.execute("SELECT count(*) FROM ah.message").fetchone()[0] == before
+    clean.rollback()

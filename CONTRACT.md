@@ -160,6 +160,12 @@ an unambiguously complete reserved wrapper inherit its outer class without defin
 Recognisers do not guess away provenance; stored content is retained losslessly. Updated parser versions require retained transcripts to be re-parsed or rebuilt before
 historical search and class counts reflect this boundary.
 
+A pi session or lane file indexed under an older pi parser version is purged and reparsed from
+byte zero on the next refresh (`parse_issue` kind `parser_reparsed`), once the whole file reads back.
+pi artifact files replay from version `6` to `6-links1` in place, and pi progress files are outside
+this check. Any other indexed file whose parser version changed is refused (`status = 'error'`, kind
+`parser_upgraded`) until `agent-history rebuild`.
+
 - `message.prompt_origin` on prompts: `typed`, `pasted`, `slash_command`, `skill`, `local_command`,
   `launch_message` (a loop root's launch prompt) or `agent_message`.
 - `ah.tool_io`: one row per call (`kind = 'call'`) and per Codex executed operation (`kind = 'op'`),

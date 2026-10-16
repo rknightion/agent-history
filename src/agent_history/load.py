@@ -314,6 +314,21 @@ def checkpoints(path: Path, offset: int) -> tuple[int, str, str]:
     return start, file_digest(path, start, offset), file_digest(path, 0, min(offset, CHECKPOINT_BYTES))
 
 
+def _readable_through(path: Path, size: int) -> bool:
+    """Whether every byte up to `size` can be read now (a precondition before purging a source)."""
+    try:
+        with open(path, "rb") as f:
+            remaining = size
+            while remaining > 0:
+                chunk = f.read(min(remaining, 1 << 20))
+                if not chunk:
+                    return False
+                remaining -= len(chunk)
+        return True
+    except OSError:
+        return False
+
+
 def prefix_verified(row: dict[str, Any], path: Path) -> bool:
     offset = row["indexed_offset"]
     if not offset:
@@ -618,6 +633,10 @@ class RunStats:
     lock_held: bool = False
 
 
+AGENT_PI = "pi"
+# pi transcript roles whose rows the source owns outright, so a parser upgrade reparses them per file.
+PI_REPARSE_ROLES = ("main", "subagent")
+
 OWNED_TABLES = ("message", "llm_call", "tool_call", "tool_op", "subagent_spawn", "pi_run_response", "hook_event", "compaction",
                 "git_event", "artifact", "session_event", "rate_limit_sample", "cost_state", "turn", "parse_issue",
                 "tool_io", "attachment", "file_touch", "session_continuation")
@@ -690,6 +709,21 @@ def _process_source(conn: psycopg.Connection, writer: Writer, entry: SourceEntry
             # Additive metadata-only replay: PiArtifactParser emits no session/content rows. KEEP
             # fills only the previously unknown agent name, without replacing known evidence.
             offset = 0
+        if existing["parser_version"] != parser_version and offset and entry.agent == AGENT_PI \
+                and entry.role in PI_REPARSE_ROLES and _readable_through(path, stat.st_size):
+            # A pi session or lane file owns all its rows: drop them and reparse from zero under the
+            # new parser, as for a rewritten source. Session rows keep their identity. The whole file
+            # is read first, so an unreadable source keeps its rows and is refused below instead.
+            stats.files_rewritten += 1
+            with conn.transaction():
+                purge_source(conn, source_id)
+                conn.execute(
+                    "INSERT INTO ah.parse_issue (source_id, byte_offset, kind, detail) VALUES (%s,-1,'parser_reparsed',%s) "
+                    "ON CONFLICT (source_id, byte_offset, kind) DO UPDATE SET detail = EXCLUDED.detail, created_at = now()",
+                    (source_id, f"{existing['parser_version']}->{parser_version}"))
+            conn.commit()
+            offset = 0
+            existing = {**existing, "indexed_offset": 0, "parser_version": parser_version, "status": "pending"}
         if existing["parser_version"] != parser_version and offset:
             # Reparsing in place cannot correct DO NOTHING / KEEP rows: a parser upgrade needs
             # `agent-history rebuild`. Refuse, loudly, rather than mix parser versions.
@@ -1548,13 +1582,13 @@ def refresh(conn: psycopg.Connection, hot: Path | None = HOT_ROOT, cold: Path | 
         for entry in order:
             if limit_files is not None and stats.files_parsed >= limit_files:
                 break
-            previous = existing.get(entry.rel_path)
-            if entry.role == "pi_artifact" and previous and previous["parser_version"] == "6":
+            prior = existing.get(entry.rel_path)
+            if entry.role == "pi_artifact" and prior and prior["parser_version"] == "6":
                 if artifact_replays >= 128:
                     continue
                 artifact_replays += 1
             stats.files_seen += 1
-            process_source(conn, writer, entry, previous, stats)
+            process_source(conn, writer, entry, prior, stats)
             if len(writer.session_ids) > 200_000:
                 writer.session_ids.clear()
         if cold_ok and not namespaces:
