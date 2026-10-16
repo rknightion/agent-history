@@ -154,11 +154,14 @@ LEFT JOIN ah.session_rollup r ON r.session_id = s.id
 WHERE root.root_session_id = root.id AND NOT root.is_stub
 GROUP BY root.id;
 
--- One row per loop run. Lineage and heuristic sessions count whole (they were tagged by start time
+-- One row per loop run. status is the lifecycle in ah.loops (running, waiting, paused, stale or finished),
+-- falling back to the launch-resolution status only while no lifecycle row exists; end_ts and end_evidence
+-- keep their provenance, so a running loop shows its last observed root event there.
+-- Lineage and heuristic sessions count whole (they were tagged by start time
 -- inside the loop window); the root session only contributes activity inside [launch_ts, end_ts],
 -- because one root session can host several loops.
 CREATE OR REPLACE VIEW ah.v_loop_summary AS
-SELECT l.id AS loop_run_id, l.status, l.repo_slug, l.campaign_slug, l.loop_number, l.mode,
+SELECT l.id AS loop_run_id, COALESCE(live.status, l.status) AS status, l.repo_slug, l.campaign_slug, l.loop_number, l.mode,
        l.report_path, l.launch_ts, l.end_ts, l.end_evidence, l.budget_s,
        EXTRACT(EPOCH FROM (l.end_ts - l.launch_ts))::bigint AS wall_s,
        root.agent AS root_agent, root.namespace, root.session_uid AS root_session_uid,
@@ -188,6 +191,7 @@ SELECT l.id AS loop_run_id, l.status, l.repo_slug, l.campaign_slug, l.loop_numbe
        -- Priced at model_pricing: root activity inside the window plus member sessions whole.
        COALESCE(rw.priced_cost_usd, 0) + COALESCE(m.priced_cost_usd, 0) AS priced_cost_usd
 FROM ah.loop_run l
+LEFT JOIN ah.loops live ON live.launch_uid = l.launch_uid
 LEFT JOIN ah.session root ON root.id = l.root_session_id
 LEFT JOIN LATERAL (
     SELECT count(*) AS sessions, count(*) FILTER (WHERE s.loop_link_method = 'heuristic') AS heuristic_sessions,
@@ -206,8 +210,11 @@ LEFT JOIN LATERAL (
     WHERE s.loop_run_id = l.id AND s.id <> l.root_session_id) m ON true
 LEFT JOIN LATERAL (
     -- Human prompts, not turn starts: a turn record can start seconds before its prompt is logged.
+    -- A lane hand-back or message relayed into the root is an agent message, not an owner turn.
     SELECT (SELECT count(*) FROM ah.message mm WHERE mm.session_id = l.root_session_id
               AND mm.message_class IN ('human_prompt', 'queued_prompt')
+              AND mm.prompt_origin IS DISTINCT FROM 'agent_message'
+              AND left(mm.text, 15) <> '<agent-message '
               AND mm.ts >= l.launch_ts AND mm.ts < COALESCE(l.end_ts, 'infinity')) AS turns_human,
            c.llm_calls, c.input_uncached, c.cache_read, c.cache_write, c.output, c.reasoning, c.api_errors,
            c.peak_context_tokens, tc.tool_calls, tc.tool_errors, tc.tool_denials, tc.tool_interrupts,

@@ -38,8 +38,9 @@ Turns (pi has no turn records)
   loop_watch, loop-wake -> loop_wake, loop-continuation -> loop_continuation, subagent-notify and
   subagent-incremental-child-notify -> task_notification, else unknown. An assistant message while
   idle with no pending trigger continues the current turn (pi's automatic retry after an error).
-  The exact pi-subagents parent wake user text following a pending task notification is a
-  task_notification_summary, not a human prompt; it preserves that notification's pending turn.
+  The exact pi-subagents parent wake user text (PARENT_WAKE_TEXTS, any retained version) following a
+  pending task notification is a task_notification_summary, not a human prompt; it preserves that
+  notification's pending turn.
 
 Messages (event_uid "<session uid>:<entry id>[:suffix]")
   system messages -> system_prompt (sections joined), user -> human_prompt | queued_prompt (main) or
@@ -107,7 +108,16 @@ AGENT = "pi"
 # new/changed JSONL and independent checkpoints without invalidating indexed sessions. Unchanged
 # historical sources remain without telemetry; no backfill or rebuild is implied. Lineage remains
 # independently repairable by the existing metadata-only post-pass.
-PARSER_VERSION = "10"
+# Version 11 reclassifies the current pi-subagents parent wake text as a task notification.
+PARSER_VERSION = "11"
+# The exact user-role wake texts pi-subagents sends after a pending subagent notice, oldest first.
+PARENT_WAKE_TEXTS = frozenset({
+    "Subagent updates above.",
+    "Inspect subagent updates above. Answer pending supervisor requests within your authority. "
+    "For completed work, read saved results and resume the already-authorized parent task, or report completion. "
+    "If approval is required, explicitly ask the user. Do not silently yield, rerun completed work, "
+    "or infer new authorization.",
+})
 # Artifact metadata replay is independent of the session parser version.
 ARTIFACT_PARSER_VERSION = "6-links1"
 # Resolved agent-file names are evidence, including custom agents and route suffixes such as -low.
@@ -659,7 +669,7 @@ class PiParser:
         # pi-subagents 0.76.1 appends a notice, then sends this user-role wake so pi runs prompt
         # setup. The extension source is not persisted. Require the pending notice as provenance;
         # literal mentions, mixed human text and image prompts must remain genuine user input.
-        if (not self.sub and text == "Subagent updates above." and not _images(m.get("content"))
+        if (not self.sub and text in PARENT_WAKE_TEXTS and not _images(m.get("content"))
                 and pending is not None and pending["o"] == "task_notification"):
             return self._custom_message({"customType": "subagent-parent-wake", "content": m.get("content")},
                                         eid, uid, ts, pos)

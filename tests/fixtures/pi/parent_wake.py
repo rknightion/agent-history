@@ -7,7 +7,16 @@ user-role wake mirror the retained record shapes; pi does not persist the extens
 from __future__ import annotations
 
 
-def records() -> list[dict]:
+WAKE = "Subagent updates above."
+CURRENT_WAKE = (
+    "Inspect subagent updates above. Answer pending supervisor requests within your authority. "
+    "For completed work, read saved results and resume the already-authorized parent task, or report completion. "
+    "If approval is required, explicitly ask the user. Do not silently yield, rerun completed work, "
+    "or infer new authorization."
+)
+
+
+def records(wake: str = WAKE) -> list[dict]:
     rows = [
         {
             "type": "session",
@@ -49,7 +58,7 @@ def records() -> list[dict]:
         add("custom_message", id=f"notice-{index}", customType=ctype, content="Synthetic child update.", display=True)
         for _ in range(3):
             add("custom", customType="loop-wait-state", data={"v": 1})
-        user(f"wake-{index}", "Subagent updates above.")
+        user(f"wake-{index}", wake)
         assistant(f"response-{index}")
     user("genuine", "Please check the final result.")
     assistant("final")

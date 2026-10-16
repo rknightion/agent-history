@@ -1549,17 +1549,10 @@ def _tag_tree(conn: psycopg.Connection, loop_id: int, root_id: int, start: Any, 
         _lane(conn, loop_id, sid, method)
 
 
-def parse_lane_return(text: str) -> tuple[Any, str | None]:
-    """(lane_return, return_status) of the last ```lane-return block in a lane's final message.
-
-    The earlier free-form object (no `v` key) keeps any string `status`. Versioned v2 and v3 objects
-    (`"v"` the integer 2 or 3, with a string `lane` and `status` in complete|partial|blocked|failed) are
-    stored whole and give return_status only when both are valid. Other versions are stored whole
-    with no return_status. A block that is not a JSON object is {"unparsed": true}. CRLF line endings
-    and a closing fence on the JSON's last line are accepted.
-    """
+def _lane_blocks(text: str) -> list[Any]:
+    """Every ```lane-return block of a message, in order: a decoded JSON object or UNPARSED."""
     text = text or ""
-    value: Any = None
+    values: list[Any] = []
     pos = 0
     while opened := LANE_OPEN.search(text, pos):
         body = opened.end()
@@ -1575,10 +1568,14 @@ def parse_lane_return(text: str) -> tuple[Any, str | None]:
             if close is None:
                 break
             candidate = None
-        value = candidate if isinstance(candidate, dict) else UNPARSED
+        values.append(candidate if isinstance(candidate, dict) else UNPARSED)
         pos = close.end()
-    if value is None or value is UNPARSED:
-        return (None if value is None else {"unparsed": True}), None
+    return values
+
+
+def _projected(value: Any) -> tuple[Any, str | None]:
+    if value is UNPARSED:
+        return {"unparsed": True}, None
     status = value.get("status")
     if "v" in value:
         # Only supported integer versions project status; unknown versions never fall back to the
@@ -1593,13 +1590,99 @@ def parse_lane_return(text: str) -> tuple[Any, str | None]:
     return value, status if isinstance(status, str) else None
 
 
+def parse_lane_returns(text: str) -> list[tuple[Any, str | None]]:
+    """(lane_return, return_status) of every ```lane-return block in a message, in order."""
+    return [_projected(value) for value in _lane_blocks(text)]
+
+
+def parse_lane_return(text: str) -> tuple[Any, str | None]:
+    """(lane_return, return_status) of the last ```lane-return block in a lane's final message.
+
+    The earlier free-form object (no `v` key) keeps any string `status`. Versioned v2 and v3 objects
+    (`"v"` the integer 2 or 3, with a string `lane` and `status` in complete|partial|blocked|failed) are
+    stored whole and give return_status only when both are valid. Other versions are stored whole
+    with no return_status. A block that is not a JSON object is {"unparsed": true}. CRLF line endings
+    and a closing fence on the JSON's last line are accepted.
+    """
+    values = _lane_blocks(text)
+    return _projected(values[-1]) if values else (None, None)
+
+
+def _hand_back_header(agent_id: str) -> re.Pattern[str]:
+    """The harness frame around a subagent's report relayed to its parent as an agent message."""
+    return re.compile(
+        r'\A(?:[^\n<][^\n]*\n)?<agent-message from="' + re.escape(agent_id) + r'">\s*\[Subagent hand-back\][^\n]*\n'
+    )
+
+
+def lane_returns(
+    conn: psycopg.Connection, session_id: int, agent: str | None, agent_id: str | None, parents: Sequence[int]
+) -> list[dict[str, Any]]:
+    """Every lane-return of one lane session, oldest first.
+
+    Sources: the session's own final reports, then (Claude) subagent hand-backs addressed from its
+    agent id and relayed to a parent as an agent message or queued prompt, which is the only place a
+    lane resumed after a one-shot hand-back returns again. A relayed copy equal to a return already
+    held is the same return, not another.
+    """
+    found: list[tuple[Any, int, int, dict[str, Any]]] = []
+    seen: set[str] = set()
+
+    def add(source: str, ts: Any, uid: str, text: str, rank: int, keep_equal: bool) -> None:
+        for index, (value, status) in enumerate(parse_lane_returns(text)):
+            key = json.dumps(value, sort_keys=True)
+            if not keep_equal and key in seen:
+                continue
+            seen.add(key)
+            entry = {"at": ts.isoformat(), "source": source, "event_uid": uid, "status": status, "return": value}
+            found.append((ts, rank, index, entry))
+
+    for uid, ts, text in conn.execute(
+        "SELECT event_uid, ts, text FROM ah.message WHERE session_id = %s AND message_class = 'subagent_report' "
+        "AND position('```lane-return' in text) > 0 ORDER BY ts, byte_offset, id",
+        (session_id,),
+    ):
+        add("report", ts, uid, text, 0, True)
+    if agent == "claude" and agent_id and parents:
+        header = _hand_back_header(agent_id)
+        for uid, ts, text in conn.execute(
+            "SELECT event_uid, ts, text FROM ah.message WHERE session_id = ANY(%s) "
+            "AND message_class IN ('agent_message', 'queued_prompt') AND position(%s in text) > 0 "
+            "AND position('```lane-return' in text) > 0 ORDER BY ts, byte_offset, id",
+            (list(parents), f'<agent-message from="{agent_id}">'),
+        ):
+            framed = header.match(text)
+            if framed:
+                add("hand_back", ts, uid, text[framed.end() :], 1, False)
+    found.sort(key=lambda item: item[:3])
+    return [entry for *_, entry in found]
+
+
+def _return_lane(entries: Sequence[dict[str, Any]]) -> str | None:
+    """The lane a versioned lane-return names, taken from the latest return that names one."""
+    for entry in reversed(entries):
+        value = entry["return"]
+        if (
+            isinstance(value, dict)
+            and type(value.get("v")) is int
+            and value["v"] in (2, 3)
+            and isinstance(value.get("lane"), str)
+            and value["lane"].strip()
+        ):
+            return value["lane"].strip()
+    return None
+
+
 def _lane(conn: psycopg.Connection, loop_id: int, session_id: int, method: str) -> None:
     info = conn.execute(
-        "SELECT s.agent_type, s.agent_role, s.agent_path, sp.name, sp.child_task_name, sp.requested_type, s.agent "
+        "SELECT s.agent_type, s.agent_role, s.agent_path, sp.name, sp.child_task_name, sp.requested_type, s.agent, "
+        "s.agent_id, s.parent_session_id, s.root_session_id "
         "FROM ah.session s LEFT JOIN ah.subagent_spawn sp ON sp.child_session_id = s.id WHERE s.id = %s LIMIT 1",
         (session_id,),
     ).fetchone()
-    agent_type, agent_role, agent_path, spawn_name, task_name, requested, agent = info or (None,) * 7
+    agent_type, agent_role, agent_path, spawn_name, task_name, requested, agent, agent_id, parent, root = (
+        info or (None,) * 10
+    )
     if agent == "pi":
         # a pi child's agent_path and spawn child_task_name end in "<run dir>/run-<i>", never a
         # lane name: the spawn's workflow key or agent, else the child's own agent type
@@ -1615,20 +1698,18 @@ def _lane(conn: psycopg.Connection, loop_id: int, session_id: int, method: str) 
         if brief:
             m = LANE_LINE.search(brief[0][:2000])
             name = m.group(1) if m else None
-    lane_return, return_status = None, None
-    report = conn.execute(
-        "SELECT text FROM ah.message WHERE session_id = %s AND message_class = 'subagent_report' "
-        "ORDER BY ts DESC LIMIT 1",
-        (session_id,),
-    ).fetchone()
-    if report:
-        lane_return, return_status = parse_lane_return(report[0])
+    parents = [p for p in dict.fromkeys((parent, root)) if p is not None and p != session_id]
+    returns = lane_returns(conn, session_id, agent, agent_id, parents)
+    # The lane's own return names it; a spawn name, agent path or agent type is only a fallback.
+    name = _return_lane(returns) or name
+    lane_return, return_status = (returns[-1]["return"], returns[-1]["status"]) if returns else (None, None)
     conn.execute(
-        "INSERT INTO ah.lane (loop_run_id, session_id, lane_name, role, link_method, return_status, lane_return) "
-        "VALUES (%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (loop_run_id, session_id) DO UPDATE SET "
+        "INSERT INTO ah.lane (loop_run_id, session_id, lane_name, role, link_method, return_status, lane_return, returns) "
+        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (loop_run_id, session_id) DO UPDATE SET "
         "lane_name = COALESCE(EXCLUDED.lane_name, lane.lane_name), role = COALESCE(EXCLUDED.role, lane.role), "
         "return_status = COALESCE(EXCLUDED.return_status, lane.return_status), "
-        "lane_return = COALESCE(EXCLUDED.lane_return, lane.lane_return)",
+        "lane_return = COALESCE(EXCLUDED.lane_return, lane.lane_return), "
+        "returns = COALESCE(EXCLUDED.returns, lane.returns)",
         (
             loop_id,
             session_id,
@@ -1637,5 +1718,6 @@ def _lane(conn: psycopg.Connection, loop_id: int, session_id: int, method: str) 
             method,
             return_status,
             Jsonb(lane_return) if lane_return is not None else None,
+            Jsonb(returns) if returns else None,
         ),
     )

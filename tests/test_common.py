@@ -36,7 +36,7 @@ def test_parser_versions_match_progress_ingestion_contract():
     from agent_history.parse_pi import ARTIFACT_PARSER_VERSION, PARSER_VERSION
 
     assert (PARSER_VERSION_CLAUDE, PARSER_VERSION_CODEX, PARSER_VERSION, ARTIFACT_PARSER_VERSION) == (
-        "10", "10", "10", "6-links1")
+        "10", "10", "11", "6-links1")
 
 
 def legacy_peer_envelope(safety=0, batch=1):

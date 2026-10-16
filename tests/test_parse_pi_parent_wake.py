@@ -29,18 +29,20 @@ def parse(tmp_path, records, batch_lines=1):
 
 
 @pytest.mark.parametrize("batch_lines", [1, 5000])
-def test_parent_wake_notification_context_excludes_only_injected_turns(tmp_path, batch_lines):
-    store = parse(tmp_path, fixture.records(), batch_lines)
+@pytest.mark.parametrize("wake", [fixture.WAKE, fixture.CURRENT_WAKE])
+def test_parent_wake_notification_context_excludes_only_injected_turns(tmp_path, batch_lines, wake):
+    wake_text = wake
+    store = parse(tmp_path, fixture.records(wake_text), batch_lines)
     # This is the exact predicate used by load.ROLLUP_SQL for session_rollup.turns_human.
     human = [r["turn_key"] for r in store.rows("turn") if r.get("origin") == "human"]
     assert human == ["launch", "genuine"]
     messages = {r["event_uid"].split(":", 1)[1]: r for r in store.rows("message")}
     for index in range(2):
-        wake = messages[f"wake-{index}"]
-        assert wake["message_class"] == "task_notification_summary"
-        assert wake["text"] == "Subagent updates above."
-        assert wake["detail"]["source"] == "subagent-parent-wake"
-        assert wake["turn_key"] == f"notice-{index}"
+        notice = messages[f"wake-{index}"]
+        assert notice["message_class"] == "task_notification_summary"
+        assert notice["text"] == wake_text
+        assert notice["detail"]["source"] == "subagent-parent-wake"
+        assert notice["turn_key"] == f"notice-{index}"
     turns = {r["turn_key"]: r for r in store.rows("turn")}
     assert set(turns) == {"launch", "notice-0", "notice-1", "genuine"}
     assert all(turns[f"notice-{i}"]["origin"] == "task_notification" for i in range(2))
@@ -56,6 +58,10 @@ def test_parent_wake_notification_context_excludes_only_injected_turns(tmp_path,
         ("```\nSubagent updates above.\n```", True),
         ("> Subagent updates above.", True),
         ("Subagent updates above.\nAlso check the tests.", True),
+        (fixture.CURRENT_WAKE, False),
+        (fixture.CURRENT_WAKE + "\nAlso check the tests.", True),
+        (fixture.CURRENT_WAKE.replace("Inspect ", "Please ", 1), True),
+        ("Please explain '" + fixture.CURRENT_WAKE + "'.", True),
     ],
 )
 def test_literal_or_mixed_genuine_user_text_is_not_a_wake(tmp_path, text, notice):

@@ -579,13 +579,25 @@ Migration `026_loop_planner_signals.sql` adds the collector tables `ah.backlog_d
   `lanes_accepted` now requires qualifying retained state evidence as described below; report
   Data supplies only `lanes_reported`, never a fallback accepted outcome.
 
-`ah.lane.return_status` and `lane_return` come from the last `lane-return` fenced block in the lane's final
-message. A v2 or v3 block (`"v"` the JSON integer 2 or 3, with `lane` and `status` in
+`ah.lane.returns` (migration `040_lane_returns.sql`) holds every `lane-return` block of the lane, oldest first, as a
+JSON array of `{at, source, event_uid, status, return}`. `source` is `report` for a block in the lane session's own
+`subagent_report` messages, or `hand_back` for a block in a Claude subagent hand-back (`[Subagent hand-back]`,
+`<agent-message from="<the lane's agent id>">`) relayed to the lane's parent as an `agent_message` or
+`queued_prompt`: a lane resumed after a one-shot hand-back returns again only that way. A relayed block equal to
+one already held is the same return. `ah.lane.return_status` and `lane_return` are the latest entry's.
+A v2 or v3 block (`"v"` the JSON integer 2 or 3, with `lane` and `status` in
 `complete|partial|blocked|failed`) is stored whole and gives `return_status` only when both are valid;
 an object with any other `v` is stored whole with no `return_status`; the earlier free-form object (no
 `v`) keeps any string `status`. The block's JSON is decoded, so a fence inside a string never ends it;
 the closing fence may sit on its own line or end the JSON's last line, and CRLF line endings are
-accepted.
+accepted. `ah.lane.lane_name` is the `lane` of the latest valid v2 or v3 block when the lane has one, else the
+spawn name, agent path or agent type as before.
+
+`ah.v_loop_summary.status` is the lifecycle status of `ah.loops` (`running`, `waiting`, `paused`, `stale` or
+`finished`), and the launch-resolution `loop_run.status` only while no lifecycle row exists. Its `turns_human`
+counts root `human_prompt` and `queued_prompt` messages inside the launch window except relayed agent messages
+(`prompt_origin = 'agent_message'`, or text opening `<agent-message `). pi parent wake notices
+(`PARENT_WAKE_TEXTS`, sent after a subagent notice) are `task_notification_summary`, not prompts.
 
 `ah.v_notify_lag` has one row per completion notification a session received (message class
 `task_notification_summary`, or source `subagent-notify` / `subagent-incremental-child-notify`):
