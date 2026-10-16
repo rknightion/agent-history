@@ -27,6 +27,7 @@ from typing import Any, Sequence
 import psycopg
 from psycopg.types.json import Jsonb
 
+from . import loop_v3_state
 from .loop_launch import REPORT_HEADER, identity_fields, parse_launch, report_lane_counts
 
 ACTIVATED_AT = "1970-01-01T00:00:00Z"  # launches before this instant are ignored
@@ -1013,11 +1014,11 @@ def _state_value_valid(kind, value) -> bool:
     return False
 
 
-def _state_body_valid(event) -> bool:
-    schema = _STATE_SCHEMA.get(event["ev"])
-    if schema is None:
+def _state_body_valid(event, *, schema=None) -> bool:
+    body = (_STATE_SCHEMA if schema is None else schema).get(event["ev"])
+    if body is None:
         return False
-    required, optional = schema
+    required, optional = body
     if set(event) - required.keys() - optional.keys() - {"ev", "v", "seq", "ts", "by"}:
         return False
     # An invalid/missing heartbeat at does not erase independent complete count evidence.
@@ -1038,9 +1039,10 @@ def _state_body_valid(event) -> bool:
 class _StateEvents(list):
     """Projected observations with a complete pre-filter framed-event fingerprint ledger."""
 
-    def __init__(self, events=(), *, ledger=None):
+    def __init__(self, events=(), *, ledger=None, dialect="v1"):
         super().__init__(events)
         self.ledger = {} if ledger is None else ledger
+        self.dialect = dialect
 
 
 def _state_conflicts(cohorts) -> set[str]:
@@ -1060,7 +1062,7 @@ def _state_conflicts(cohorts) -> set[str]:
 
 
 def state_progress(content: str) -> tuple[str, datetime, list[dict[str, Any]]] | None:
-    """Read frozen v1 framing, count evidence and explicitly recorded root heartbeats.
+    """Read either frozen state dialect, count evidence and recorded root heartbeats.
 
     Preserve source bytes in the collector. A torn JSON object has no event and is ignored, as
     by loop-state check. Other invalid framing or malformed count evidence leaves counts unknown.
@@ -1085,6 +1087,16 @@ def _read_state_progress(content: str, *, identity_only: bool = False):
     events = _StateEvents()
     opened = None
     previous = 0
+    frames = []
+
+    def valid_frames():
+        schema = loop_v3_state.SCHEMA if events.dialect == "v3" else _STATE_SCHEMA
+        return all(
+            _state_body_valid(frame, schema=schema)
+            and (events.dialect != "v3" or frame["by"] in loop_v3_state.BY_VALUES)
+            for frame in frames
+        )
+
     for raw in content.splitlines():
         if not raw.strip():
             continue
@@ -1115,19 +1127,20 @@ def _read_state_progress(content: str, *, identity_only: bool = False):
             return None
         previous = seq
         ev = event["ev"]
-        if not _state_body_valid(event):
-            return None
+        frames.append(event)
+        # Validate against the open-selected dialect, including frames preceding open.
         # Capture every frame, including return, open, non-root close and invalid
         # heartbeat activity, before any projection, actor or launch-window filter.
         events.ledger[seq] = (ev, json.dumps(event, sort_keys=True))
         if ev == "open":
-            goal = event.get("goal_sha256")
+            events.dialect = "v3" if "charter_sha256" in event else "v1"
+            goal = event.get("charter_sha256" if events.dialect == "v3" else "goal_sha256")
             if opened is not None or not isinstance(goal, str) or not re.fullmatch(r"[0-9a-f]{64}", goal):
                 return None
             opened = (goal, at)
             if identity_only:
-                # The entire prefix through this open is valid. Never expose prefix counts.
-                return (*opened, [])
+                # Never expose prefix counts, but retain the dialect for invalid-copy attribution.
+                return (*opened, _StateEvents(dialect=events.dialect)) if valid_frames() else None
         elif ev == "heartbeat":
             activity = event.get("at")
             # loop-state framing ts is append observation time. Root activity is the
@@ -1147,7 +1160,16 @@ def _read_state_progress(content: str, *, identity_only: bool = False):
             # Neither a pre-open close nor a worker/daemon observation establishes an end.
             if opened is not None and event["by"] in ("root", "dispatcher"):
                 events.append({**event, "at": at})
-    return (*opened, events) if opened else None
+    return (*opened, events) if opened and valid_frames() else None
+
+
+def _state_kind_known(cohorts, kind):
+    """Only legacy opens establish zeros without explicit outcome observations."""
+    return any(
+        getattr(events, "dialect", "v1") == "v1"
+        or any(e["ev"] == kind and (kind != "land" or e["by"] == "root") for e in events)
+        for _, events in cohorts
+    )
 
 
 def _state_event_counts(cohorts: list[tuple[datetime, list[dict[str, Any]]]]) -> tuple[int | None, int | None]:
@@ -1182,9 +1204,12 @@ def _state_event_counts(cohorts: list[tuple[datetime, list[dict[str, Any]]]]) ->
                     accepted.update(candidates)
                 else:
                     unresolved = True
-            elif event["ev"] == "land":
+            elif event["ev"] == "land" and (getattr(events, "dialect", "v1") != "v3" or event["by"] == "root"):
                 landed.add(event["task"])
-    return (None if unresolved else len(accepted)), (None if conflicts & {"open", "land"} else len(landed))
+    return (
+        None if unresolved or not _state_kind_known(cohorts, "accept") else len(accepted),
+        None if conflicts & {"open", "land"} or not _state_kind_known(cohorts, "land") else len(landed),
+    )
 
 
 def state_cohorts(
@@ -1233,8 +1258,14 @@ def state_cohorts(
                 # Do not silently use a stale valid machine copy as complete outcome proof.
                 prefix = _read_state_progress(content, identity_only=True)
                 if prefix is not None:
-                    digest, opened, _ = prefix
-                    snapshots[key].append((digest, opened, [{"ev": "invalid", "seq": 0, "at": opened}]))
+                    digest, opened, prefix_events = prefix
+                    snapshots[key].append(
+                        (
+                            digest,
+                            opened,
+                            _StateEvents([{"ev": "invalid", "seq": 0, "at": opened}], dialect=prefix_events.dialect),
+                        )
+                    )
         cohorts = []
         for digest, opened, events in snapshots[key]:
             if digest != goal:
@@ -1262,6 +1293,7 @@ def state_cohorts(
                             )
                         ],
                         ledger=getattr(events, "ledger", {}),
+                        dialect=getattr(events, "dialect", "v1"),
                     ),
                 )
             )
@@ -1285,7 +1317,7 @@ def state_outcomes(cohorts: list[tuple[datetime, list[dict[str, Any]]]]) -> tupl
     conflicts = _state_conflicts(cohorts)
     result = []
     for kind in ("admit", "land", "park"):
-        if kind in conflicts or "open" in conflicts:
+        if kind in conflicts or "open" in conflicts or not _state_kind_known(cohorts, kind):
             result.append(None)
         elif kind == "park":
             result.append(len({(opened, e["seq"]) for opened, events in cohorts for e in events if e["ev"] == kind}))
