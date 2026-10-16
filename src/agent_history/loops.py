@@ -39,7 +39,7 @@ LANE_CLOSE = re.compile(r"\s*```")
 FENCE_LINE_END = re.compile(r"```[ \t]*\r?$", re.M)
 UNPARSED = object()
 LANE_STATUS_V2 = ("complete", "partial", "blocked", "failed")
-CAMPAIGN = re.compile(r"^report-(.*?)-(?:loop|wave)\d+\.md$")
+CAMPAIGN = re.compile(r"^(?:report|closeout)-(.*?)-(?:loop|wave)\d+\.md$")
 # wave-notify completion receipts by kind. `.notified` (no longer written): `sha256:<64 hex> request
 # <id>`, or the legacy `request <id>`. `.posted`, written once the receiver accepted the report:
 # `sha256:<64 hex> receiver <JSON object>`, always with a digest.
@@ -68,17 +68,17 @@ def _launch(text: str, cwd: str | None, ts_iso: str) -> dict[str, Any] | None:
         path = bare.group(1)
         if not os.path.isabs(path) and cwd:
             path = os.path.normpath(os.path.join(cwd, path))
-        # The launch file is not read; derive its report by the protocol's naming convention
-        # (launch-<x>.txt|md -> report-<x>.md in the same codex/ directory).
+        # Unread launches default to the v3 terminal path. A complete captured read below can
+        # still establish a same-stem v2 report without consulting the indexer's filesystem.
         stem = PurePosixPath(path).stem.removeprefix("launch-")
-        report = str(PurePosixPath(path).parent / f"report-{stem}.md")
+        report = str(PurePosixPath(path).parent / f"closeout-{stem}.md")
         loop = re.search(r"-(?:loop|wave)(\d+)$", stem)
         return {
             "status": "unresolved_path",
             "launch_path": path,
             "report": report,
             "loop": int(loop.group(1)) if loop else None,
-            "mode": None,
+            "mode": "v3",
             "launch_sha256": None,
             "budget": None,
         }
@@ -98,7 +98,8 @@ def _report_meta(report: str | None) -> dict[str, Any]:
     out: dict[str, Any] = {"naming": "wave" if "-wave" in p.name else "loop"}
     if p.parent.name == "codex":
         out["repo_slug"] = p.parent.parent.name
-        out["goal_path"] = str(p.parent / p.name.replace("report-", "goal-", 1))
+        prefix, replacement = ("closeout-", "charter-") if p.name.startswith("closeout-") else ("report-", "goal-")
+        out["goal_path"] = str(p.parent / p.name.replace(prefix, replacement, 1))
     m = CAMPAIGN.match(p.name)
     if m:
         out["campaign_slug"] = m.group(1)
@@ -112,7 +113,7 @@ def enqueue_backfill(conn: psycopg.Connection) -> None:
     explicitly resets this cursor with the derived session rows.
     """
     # A new evidence policy needs a new bounded historical pass, not a reset of the old cursor.
-    key = "loops_links_projection_v2"
+    key = "loops_links_projection_v3"
     saved = conn.execute("SELECT value FROM ah.meta WHERE key = %s", (key,)).fetchone()
     cursor = saved[0] if saved else "0"
     if cursor == "complete":
@@ -173,7 +174,7 @@ def _captured_launch(
     """Complete successful structured reads of the exact launch file, never local file I/O.
 
     Partial, failed and truncated reads do not resolve a path. Conflicting observed contents remain
-    unknown. A captured launch must name the protocol's exact report target.
+    unknown. A captured launch must name the same-stem closeout or legacy report target.
     """
     path = hit.get("launch_path")
     if not path:
@@ -209,7 +210,11 @@ def _captured_launch(
         return None
     text = next(iter(texts))
     parsed = _launch(text, str(PurePosixPath(path).parent.parent), start.isoformat())
-    return text if parsed and parsed.get("report") == hit.get("report") and parsed["status"] == "resolved" else None
+    expected = {hit.get("report")}
+    terminal = PurePosixPath(hit["report"])
+    if terminal.name.startswith("closeout-"):
+        expected.add(str(terminal.with_name(terminal.name.replace("closeout-", "report-", 1))))
+    return text if parsed and parsed.get("report") in expected and parsed["status"] == "resolved" else None
 
 
 def _resume_targets(conn: psycopg.Connection, root_id: int, cwd: str | None) -> set[str]:
@@ -218,7 +223,15 @@ def _resume_targets(conn: psycopg.Connection, root_id: int, cwd: str | None) -> 
     Command text is linkage evidence only. It never supplies identity or a terminal outcome.
     Do not interpret shell expansions, quoted text printed by echo, pipelines or substitutions.
     """
-    targets = set()
+    observations: list[set[str]] = []
+
+    def terminal_paths(path: PurePosixPath, prefix: str) -> set[str]:
+        stem = path.stem.removeprefix(prefix + "-")
+        # Charter/goal are version-specific; launch/state names alone are ambiguous. Existing
+        # catalogue rows, not a date or a preference for one version, resolve those alternatives.
+        versions = ("closeout",) if prefix == "charter" else ("report",) if prefix == "goal" else ("report", "closeout")
+        return {str(path.with_name(f"{version}-{stem}.md")) for version in versions}
+
     first = conn.execute(
         "SELECT text FROM ah.message WHERE session_id = %s "
         "AND message_class IN ('human_prompt', 'queued_prompt') ORDER BY ts, id LIMIT 1",
@@ -226,11 +239,11 @@ def _resume_targets(conn: psycopg.Connection, root_id: int, cwd: str | None) -> 
     ).fetchone()
     if first:
         path = first[0].strip().strip("`")
-        if re.fullmatch(r"\S*/(?:launch|goal)-[^/\s]+\.(?:txt|md)", path):
+        if re.fullmatch(r"\S*/(?:launch|goal|charter)-[^/\s]+\.(?:txt|md)", path):
             path = os.path.normpath(os.path.join(cwd or "", path))
             p = PurePosixPath(path)
             if p.parent.name == "codex":
-                targets.add(str(p.with_name(re.sub(r"^(launch|goal)-", "report-", p.stem) + ".md")))
+                observations.append(terminal_paths(p, p.name.split("-", 1)[0]))
     for raw in conn.execute(
         "SELECT i.input_text FROM ah.tool_io i JOIN ah.tool_call t "
         "ON t.agent = i.agent AND t.call_uid = i.call_uid "
@@ -268,8 +281,9 @@ def _resume_targets(conn: psycopg.Connection, root_id: int, cwd: str | None) -> 
             path = os.path.normpath(os.path.join(cwd or "", recorded_path))
             p = PurePosixPath(path)
             if p.parent.name == "codex" and re.fullmatch(r"state-.+-(?:loop|wave)\d+\.jsonl", p.name):
-                targets.add(str(p.with_name(p.stem.replace("state-", "report-", 1) + ".md")))
-    return targets
+                observations.append(terminal_paths(p, "state"))
+    # All exact observations must agree; a later append cannot override a contradictory prompt.
+    return set.intersection(*observations) if observations else set()
 
 
 def _link_relaunch(conn: psycopg.Connection, root_id: int) -> bool:
@@ -296,12 +310,12 @@ def _link_relaunch(conn: psycopg.Connection, root_id: int) -> bool:
     if any(_launch(text, cwd, first_at.isoformat()) and not BARE_LAUNCH.match(text.strip()) for (text,) in prompts):
         return False
     targets = _resume_targets(conn, root_id, cwd)
-    if len(targets) != 1:
+    if not targets:
         return False
     matches = conn.execute(
         "SELECT id, root_session_id, launch_ts FROM ah.loop_run "
-        "WHERE report_path = %s AND root_session_id <> %s AND launch_ts <= %s",
-        (next(iter(targets)), root_id, first_at),
+        "WHERE report_path = ANY(%s) AND root_session_id <> %s AND launch_ts <= %s",
+        (sorted(targets), root_id, first_at),
     ).fetchall()
     if len(matches) != 1:
         return False
@@ -334,10 +348,10 @@ def retract_unproven_relaunches(conn: psycopg.Connection) -> None:
     for sid, cwd, uid, loop_id, owner, report, started in candidates:
         targets = _resume_targets(conn, sid, cwd)
         matches = conn.execute(
-            "SELECT id FROM ah.loop_run WHERE report_path = %s AND root_session_id <> %s AND launch_ts <= %s",
-            (report, sid, started),
+            "SELECT id FROM ah.loop_run WHERE report_path = ANY(%s) AND root_session_id <> %s AND launch_ts <= %s",
+            (sorted(targets), sid, started),
         ).fetchall()
-        if targets == {report} and matches == [(loop_id,)]:
+        if report in targets and matches == [(loop_id,)]:
             continue
         descendants = [
             r[0]
@@ -1344,7 +1358,6 @@ def _tag_root(conn: psycopg.Connection, root_id: int) -> int:
         if hit:
             launches.append((event_uid, ts, hit))
     for index, (event_uid, ts, hit) in enumerate(launches):
-        meta = _report_meta(hit.get("report"))
         next_ts = launches[index + 1][1] if index + 1 < len(launches) else None
         captured = _captured_launch(conn, root_id, hit, ts, next_ts)
         if captured:
@@ -1352,6 +1365,7 @@ def _tag_root(conn: psycopg.Connection, root_id: int) -> int:
             resolved = _launch(captured, base, ts.isoformat())
             if resolved:
                 hit = {**resolved, "launch_path": hit["launch_path"]}
+        meta = _report_meta(hit.get("report"))
         end_ts, evidence = None, None
         if end_ts is None and next_ts is not None:
             end_ts, evidence = next_ts, "next_launch"

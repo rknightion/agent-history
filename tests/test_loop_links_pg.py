@@ -121,8 +121,8 @@ def refresh(conn, source):
 def test_bare_launch_resolves_and_lane_role_counts_reproduce_from_sql(conn, tmp_path, direct_child):
     fixture(tmp_path, direct_child=direct_child, role="security-reviewer")
     refresh(conn, tmp_path)
-    assert conn.execute("SELECT status, report_path, loop_number FROM ah.loop_run").fetchall() == [
-        ("resolved", REPORT, 14)
+    assert conn.execute("SELECT status, report_path, loop_number, mode, goal_path FROM ah.loop_run").fetchall() == [
+        ("resolved", REPORT, 14, "v2", CWD + "/codex/goal-2026-10-04-loop14.md")
     ]
     assert conn.execute("SELECT role, count(*) FROM ah.lane GROUP BY role").fetchall() == [("security-reviewer", 1)]
     assert conn.execute("SELECT lanes_total, lanes_returned FROM ah.loops").fetchone() == (1, 1)
@@ -242,7 +242,7 @@ def test_foreground_direct_child_without_artifact_and_historical_spawn_path(conn
     assert conn.execute("SELECT role FROM ah.lane").fetchone() == ("lane-worker-low",)
     assert conn.execute("SELECT child_task_name FROM ah.subagent_spawn").fetchone() == (RUN,)
     conn.execute("UPDATE ah.subagent_spawn SET child_task_name=NULL")
-    conn.execute("DELETE FROM ah.meta WHERE key='loops_links_projection_v2'")
+    conn.execute("DELETE FROM ah.meta WHERE key='loops_links_projection_v3'")
     conn.commit()
     load.post_passes(conn)
     assert conn.execute("SELECT child_task_name FROM ah.subagent_spawn").fetchone() == (RUN,)
@@ -328,7 +328,7 @@ def test_source_truncated_launch_read_is_rejected_and_retained_evidence_cannot_r
         "INSERT INTO ah.meta VALUES ('loops_links_projection_v1', 'complete') "
         "ON CONFLICT (key) DO UPDATE SET value='complete'"
     )
-    conn.execute("DELETE FROM ah.meta WHERE key='loops_links_projection_v2'")
+    conn.execute("DELETE FROM ah.meta WHERE key='loops_links_projection_v3'")
     conn.execute("DELETE FROM ah.dirty_session")
     before = conn.execute("SELECT text FROM ah.message ORDER BY id").fetchall()
     conn.commit()
@@ -443,14 +443,14 @@ def test_idle_backfill_is_bounded_and_repairs_retained_roles_and_paths(conn, tmp
     conn.execute("UPDATE ah.loop_run SET status = 'unresolved_path'")
     conn.execute("UPDATE ah.lane SET role = NULL")
     conn.execute("DELETE FROM ah.dirty_session")
-    conn.execute("DELETE FROM ah.meta WHERE key='loops_links_projection_v2'")
+    conn.execute("DELETE FROM ah.meta WHERE key='loops_links_projection_v3'")
     conn.commit()
     assert load.post_passes(conn)["dirty_sessions"] == 2
     assert conn.execute("SELECT status FROM ah.loop_run").fetchone() == ("resolved",)
     assert conn.execute("SELECT role FROM ah.lane").fetchone() == ("lane-worker-low",)
     conn.commit()
     assert load.post_passes(conn)["dirty_sessions"] == 0
-    conn.execute("DELETE FROM ah.meta WHERE key='loops_links_projection_v2'")
+    conn.execute("DELETE FROM ah.meta WHERE key='loops_links_projection_v3'")
     conn.execute(
         "INSERT INTO ah.session (agent, session_uid, namespace) "
         "SELECT 'pi', 'synthetic-' || i, 'pi-test' FROM generate_series(1, 260) i"

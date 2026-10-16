@@ -1,4 +1,4 @@
-"""Loop launch parser (seam v2.1 section 1).
+"""Loop launch parser (v2 report and v3 closeout compatibility seam).
 
 Pure, stdlib-only module. No imports from other project scripts, and no I/O beyond the explicit `read_file`
 injection point and the filesystem existence checks it documents below. Its public surface is
@@ -7,12 +7,13 @@ injection point and the filesystem existence checks it documents below. Its publ
 A message is a launch when its operator text either:
 
   (a) matches ``\\bYou are the (campaign )?root\\b`` and contains exactly one distinct report
-      token; or
+      token (v2/legacy), or one distinct closeout token (v3) when no accepted report token is present; or
   (b) consists only of a path to an existing regular file named ``launch-*.txt`` or
       ``launch-*.md`` (after trimming whitespace and surrounding backticks), whose contents
       satisfy (a).
 
-The launch format is the fan-out loop protocol's: a root prompt naming one report file.
+The `report` result key holds the terminal path in both formats: a v3 closeout or a v2 report.
+V3 recognition is shape-based, independent of the legacy/v2 activation timestamp.
 """
 
 import datetime
@@ -25,6 +26,7 @@ from pathlib import Path
 MARKER_RE = re.compile(r"\bYou are the (?:campaign )?root\b")
 
 # <name> patterns. Legacy is a strict superset of v2 (it additionally accepts "-waveN.md").
+NAME_V3 = r"closeout-[\w.-]*-loop\d+\.md"
 NAME_V2 = r"report-[\w.-]*-loop\d+\.md"
 NAME_LEGACY = r"report-[\w.-]*-(?:wave|loop)\d+\.md"
 
@@ -56,6 +58,7 @@ def _token_pattern(name_pattern):
     return re.compile(_LEFT + "(" + _PREFIX + name_pattern + ")" + _RIGHT)
 
 
+_TOKEN_RE_V3 = _token_pattern(NAME_V3)
 _TOKEN_RE_V2 = _token_pattern(NAME_V2)
 _TOKEN_RE_LEGACY = _token_pattern(NAME_LEGACY)
 
@@ -124,7 +127,13 @@ def _recognize(text, legacy, base):
     """Return {"report": str, "loop": int|None} if `text` matches form (a), else None."""
     if not MARKER_RE.search(text):
         return None
-    return _single_target(_find_report_tokens(text, legacy), base, legacy)
+    reports = _find_report_tokens(text, legacy)
+    if reports:
+        # Preserve historical report recognition, including rejection of ambiguous targets.
+        # Incidental closeout tokens must not reclassify a retained v2/legacy launch.
+        return _single_target(reports, base, legacy)
+    closeouts = [m.group(1) for m in _TOKEN_RE_V3.finditer(text)]
+    return _single_target(closeouts, base, False)
 
 
 def _codex_dir_parent(abs_path):
@@ -171,7 +180,7 @@ def _finalize(legacy, target, text, launch_ts, hash_bytes):
         "report": target["report"],
         "loop": target["loop"],
         "launch_ts": launch_ts,
-        "mode": "legacy" if legacy else "v2",
+        "mode": "v3" if Path(target["report"]).name.startswith("closeout-") else "legacy" if legacy else "v2",
         "launch_sha256": hashlib.sha256(hash_bytes).hexdigest(),
         # Optional, not one of the frozen snapshot keys: the "Time budget" of the recognised text
         # (the launch file's contents for a bare-path launch), in seconds, or None.
@@ -310,14 +319,15 @@ def _identity_data(text):
 
 def report_target(text, cwd, mode):
     """Section 1 token grammar and resolution for a message that is not itself a launch (for
-    example a "Do not pivot on receipt" replacement): the single distinct report target in `text`,
-    as ``{report, loop}``, or None for zero or several targets. `mode` is the armed snapshot's
-    report mode ("legacy" or "v2"), which fixes the accepted report-name shapes.
+    example a "Do not pivot on receipt" replacement): the single distinct terminal target in
+    `text`, as ``{report, loop}``, or None for zero or several targets. `mode` is the armed
+    snapshot's mode ("v3", "v2" or "legacy"), which fixes the accepted filename shapes.
     """
     if not text:
         return None
     legacy = mode == "legacy"
-    return _single_target(_find_report_tokens(text, legacy), cwd or None, legacy)
+    tokens = [m.group(1) for m in _TOKEN_RE_V3.finditer(text)] if mode == "v3" else _find_report_tokens(text, legacy)
+    return _single_target(tokens, cwd or None, legacy)
 
 
 def parse_launch(text, cwd, launch_ts, activated_at, read_file=Path.read_text):

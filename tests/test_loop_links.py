@@ -28,7 +28,8 @@ def test_new_run_directory_lineage_and_inventory():
 
 def test_path_launch_has_protocol_target_without_local_file_reads():
     hit = loops._launch("/tmp/synthetic/codex/launch-2026-10-04-loop14.txt", None, "2026-10-04T12:00:00Z")
-    assert hit["report"] == "/tmp/synthetic/codex/report-2026-10-04-loop14.md"
+    assert hit["report"] == "/tmp/synthetic/codex/closeout-2026-10-04-loop14.md"
+    assert hit["mode"] == "v3"
     assert hit["loop"] == 14
 
 
