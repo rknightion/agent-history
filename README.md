@@ -129,6 +129,29 @@ that have already been deleted (see CONTRACT.md). Optional `[cold_sources]` pres
 The package ships the catalogue, search, classifier and application container. The Compose
 template is for local deployment.
 
+## Loop recognition and lifecycle
+
+Inline root launches recognise both historical report targets and v3 closeout targets. A v3
+launch uses `codex/closeout-<name>-loop<N>.md`, its sibling charter and an explicit charter digest;
+it needs no date cutover or `Contract` declaration. Existing report tokens keep precedence,
+including ambiguous-target rejection. Recognition is pure for inline text, not a lookup of files
+on the indexer's machine. The compatibility columns remain `report_path`, `goal_path` and
+`goal_sha256`, meaning closeout path, charter path and charter digest for `mode = 'v3'`.
+
+Qualified closeout evidence can finish a v3 run. Retained state has two strictly validated body
+dialects, both still wire version 1; the pi charter/first-wave dialect does not invent zero
+outcomes when events are absent. Observed Git Task trailers provide an independent v3 landed-task
+fallback, not proof of complete charter coverage. `WAITING` and `PAUSED` root lines can project
+`waiting` and `paused` with nullable `waiting_until`; expiry or new root activity restores the
+ordinary lifecycle, and terminal evidence wins. These are observations, not process liveness.
+
+Paid loop enrichment is retired globally, even with an existing enabled configuration. Refresh
+admits no new paid jobs, draining claims nothing and the worker CLI exits without running a
+worker. Historical summaries, queues, budgets, reservations, phase history, columns, grants and
+read queries remain; deterministic projection can still run. This retirement does not disable
+optional corpus embeddings or unrelated collectors. See [CONTRACT.md](CONTRACT.md) for exact
+evidence and historical compatibility rules.
+
 ## Metrics
 
 The container image runs two periodic processes from the same image: `index --every 60` indexes the
@@ -236,13 +259,19 @@ separate service and neither includes nor links its code.
 `[git].repos` as explicit checkout paths and `[identities].git_owners` as allowed `host/owner`
 strings. Unlisted owners, forks and unknown fork status are skipped. The collector fetches the
 remote default branch before reading git objects; it never edits the checkout or its tracker.
-Independently of that classification, it records, for every configured repository, the [fan-out protocol](https://github.com/rknightion/fan-out-protocol)'s wave-notify receipt files (`codex/report-*.md.posted`,
-the older `codex/report-*.md.notified` and `codex/goal-*.md.started`) as metadata in `ah.loop_receipt`, which finish a loop and carry its
-exact identity (CONTRACT.md, "Live loop lifecycle"). Run it once on each machine after upgrading so
-existing receipts are collected; `ah_ingest` needs `SELECT, INSERT, UPDATE` on that table, granted by
-migration 025 when the role already exists. Apply migration 035 (the indexer applies it on its next
-pass) before upgrading a collector: an older catalogue rejects `posted` rows, and that repository's
-receipt step then fails for the run. GitHub CI requires an authenticated `gh` CLI. A failed Actions request is reported against its
+Independently of that classification, it collects `codex/charter-*-loop<N>.md` and
+`codex/closeout-*-loop<N>.md` into the metadata-only `ah.loop_run_metadata` table: whole-file
+hash, qualified closeout line 1, mtime and explicit checkout origin, never document bodies.
+Migration 038 adds this table and the narrow metadata grants for an existing `ah_ingest` role;
+provision those grants separately when creating the role later. Exact state JSONL snapshots
+continue to populate `ah.loop_state`. This does not copy charter or closeout bodies to a transcript
+archive or NAS. See [the loop contract](CONTRACT.md#live-loop-lifecycle-ahloops) and
+[count precedence](docs/loop-counts.md).
+
+Legacy wave-notify receipt collection is retired globally, not merely disabled by default.
+Existing `ah.loop_receipt` rows and historical read projections remain available; no upgrade
+receipt scan is required. Git, task, feature, permission, journal and archive collectors retain
+their separate existing behaviour. GitHub CI requires an authenticated `gh` CLI. A failed Actions request is reported against its
 repository and does not create a CI observation or prevent collection of other repositories.
 
 `[collector].homes` maps feature/permission-log home paths to namespace names. Feature locations

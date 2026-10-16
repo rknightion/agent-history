@@ -63,7 +63,7 @@ loses them. Keep your own copies if you want history to survive that.
 Not truncated by `rebuild`: `ah.change_log`, `ah.refresh_log`, `ah.embedding` (a paid cache keyed by
 model and input hash) and the collector tables (`git_commit`, `git_commit_file`, `ci_run`,
 `backlog_task`, `backlog_done_event`, `backlog_done_scan`, `collector_mutation_audit`, `task_prefix`,
-`installed_feature`, `permission_log`, `loop_receipt`, `loop_state`, `session_summary`, `session_topic`).
+`installed_feature`, `permission_log`, `loop_receipt`, `loop_run_metadata`, `loop_state`, `session_summary`, `session_topic`).
 
 ### Rebuild reader boundary
 
@@ -266,6 +266,85 @@ migration `022_live_loops.sql` on its first schema pass and fills the table duri
 refresh post-pass, including refreshes with no dirty sessions. Rebuild re-reads retained transcripts
 and refills it; rows whose source transcripts are gone cannot be recovered.
 
+### Current v3 recognition, identity and completion
+
+Recognition is shape-based. Inline operator text must contain `You are the root` or
+`You are the campaign root` and one distinct accepted terminal target. Historical report tokens
+keep precedence: an accepted report target selects the historical grammar even if closeout tokens
+are also present, and several distinct report targets reject the launch rather than falling
+through to v3. Without accepted report tokens, exactly one distinct
+`codex/closeout-<name>-loop<N>.md` target selects `mode = 'v3'`. No `Contract` declaration or date
+cutover is required. Historical v2-shaped launches remain valid after v3 appears.
+
+The token prefix may be `codex/`, `./codex/` or an absolute path ending in `codex/`; names use
+word characters, dots and hyphens before `-loop<N>.md`. Token boundaries reject suffixes such as
+`.backup`. Relative targets resolve against the recorded cwd. An absolute spelling and its
+matching relative suffix describe one target; distinct resolved targets remain ambiguous.
+Inline recognition and the efficiency recogniser do not inspect the filesystem. Historical
+bare launch paths remain a separate compatibility route, including complete captured exact-path
+reads described below, not permission for v3 projection to open local files.
+
+The existing columns are compatibility slots, not new v3 names:
+
+| Column | Meaning for `mode = 'v3'` |
+|---|---|
+| `loop_run.report_path` | Exact closeout path. |
+| `loop_run.goal_path` | Sibling charter path, replacing the closeout basename prefix with `charter-`. |
+| `ah.loops.goal_sha256` | Charter SHA-256, never the launch-file hash. |
+| `ah.loops.repo`, `loop` | Explicit origin `owner/repo` and exact recognised `loop<N>`. |
+
+Migration `038_loop_run_metadata.sql` adds the collector table `ah.loop_run_metadata`, keyed by
+`(machine, kind, path)`. For explicitly configured checkouts it records `charter` and `closeout`
+files directly below `codex/`, named `charter-*-loop<N>.md` and `closeout-*-loop<N>.md`.
+Rows retain only whole-file `sha256`, `file_mtime`, `repo_origin`, `seen_at` and nullable `line1`,
+plus the key. Charter line 1 is always NULL. Closeout line 1 is retained only when the bounded
+4096-byte read contains the complete qualified header:
+
+```text
+# Closeout: <name or owner/repo> loop<N> · Charter: <64 lowercase hex>
+```
+
+No charter or closeout body or `## Data` is stored by this collector, and there is no body-copy
+step to a transcript archive or NAS. Hashing reads the whole stable file without retaining its
+body. Canonical checkout boundaries, anchored no-follow descriptors and snapshot identity checks
+reject links, special files and changed inputs. Rejected inputs are reported and retried without
+partial metadata. Rebuild preserves this collector table. The migration copies existing receipt
+SELECT grants and grants only SELECT, INSERT and UPDATE to an existing `ah_ingest`; roles created
+later need explicit equivalent grants. Existing relation grants remain unchanged.
+
+V3 identity requires exact origin, loop and charter evidence. Collected origin supplies repo,
+never the closeout display name, a basename or `ah.repo.slug`. The charter digest must agree across
+exact-path charter metadata, the captured exact-path launch manifest and qualified closeout
+headers when present. Without collected origin, explicit captured root/relaunch remote metadata
+or eligible git-event remotes can supply origin; conflicting or malformed collected evidence
+cannot be bypassed with a convenient remote. Missing pieces stay NULL; conflicting copies are not
+chosen by mtime or proximity. No new state log establishes identity by itself.
+
+A qualified exact-path closeout can finish the run with `end_evidence = 'closeout'`. Its mtime
+must be in the half-open launch window bounded by the next launch on the same root or exact
+closeout path. Equal-time attribution is ambiguous. Repo, loop and charter must be known and
+consistent; a later linked lane start blocks that candidate end. A complete successful captured
+structured `Write`/`write`, `apply_patch` Add File or executed FileChange add of that exact path can
+supply the same hash/header fallback. Both dispatch and completion must belong to the window.
+Failed or truncated results, shell text, output-only path lists and partial edits do not prove a
+complete closeout. Update, move or delete evidence cannot reconstruct a body and conservatively
+invalidates an older transcript-only fallback when completeness is no longer established.
+
+Collector-only refreshes re-evaluate identity and closeout evidence, including finished runs.
+Conflicting hashes, invalid headers, ambiguous attribution or subsequent incomplete mutations
+cannot preserve a closeout-only finish. Invalidated closeout evidence restores the ordinary
+lifecycle unless independent replacement or qualified state-close evidence still establishes an
+end. A v3 closeout does not require a legacy notification receipt. Projection reads retained
+catalogue evidence only, never the indexer's local document paths.
+
+### HISTORICAL v2 identity and retained compatibility
+
+The following report/goal rules describe historical v2 and legacy launches, not v3 closeouts.
+Stored receipts remain usable, but new legacy receipt collection is retired globally.
+Report targets use `codex/report-<name>-loop<N>.md` with the same token boundaries and path
+resolution as closeouts. The older legacy grammar additionally accepts `-wave<N>.md` and keeps
+its existing historical activation rules. Those rules never impose a v3 date cutover.
+
 Migration `023_loop_identity.sql` adds the nullable receiver join fields `repo text`, `loop text`
 and `goal_sha256 text`. `repo` is an explicitly recorded `owner/repo`, never a directory or report
 basename. `loop` is the recognised launch's `loop<N>` label. `goal_sha256` is 64 lowercase hex for
@@ -300,7 +379,7 @@ files on the indexer's machine. Partial, failed or conflicting reads supply no l
 A relaunched root joins an existing loop only through its exact launch-file path or a successful
 final simple `loop-state append` invocation naming that loop's existing state path. Ambiguous
 matches remain unlinked. A linked relaunch is another root session, not a lane; its activity
-contributes to the original loop without changing receipt-based terminal semantics.
+contributes to the original loop without changing the dialect's terminal evidence rules.
 
 Historical linkage repair visits at most 128 retained sessions per refresh with a transactional
 `ah.meta` cursor. Existing structured foreground spawn results can repair missing child paths;
@@ -308,20 +387,28 @@ metadata-only replay separately visits at most 128 retained pi artifact files pe
 path rebuilds session content or invents missing evidence. A content rebuild resets the linkage
 cursor; grants and collector tables retain their existing rebuild guarantees.
 
-The receiver seam also includes `status text`, `launch_ts timestamptz`, `end_ts timestamptz`:
+### Current lifecycle status
 
-- `running`: no qualifying completion receipt, replacement-launch or attributed state-close
-  evidence (a report write alone is not evidence), and the root's last recorded activity
+The receiver seam includes `status text`, `launch_ts timestamptz`, `end_ts timestamptz` and nullable
+`waiting_until timestamptz` (migration `039_loop_wait_status.sql`). Terminal evidence takes
+precedence over quiet-state observations:
+
+- `running`: no qualifying v3 closeout, historical completion receipt, replacement-launch or attributed state-close
+  evidence or current quiet-state override (a v2 report write alone is not evidence), and the root's last recorded activity
   (or launch, if later) is within 24 hours of refresh. `end_ts` is NULL.
 - `finished`: a valid completion receipt exists for the launch (`end_evidence =
   'completion_receipt'`, below), the next recognised launch in the same root replaces it
   (`next_launch`), or a valid complete collected state snapshot supplies an exactly attributed
   root/dispatcher `close` as described under retained state-log outcomes. `end_ts` is that
-  evidence timestamp; existing receipt/replacement evidence keeps precedence over state close. This is an observed end, not a claim of
-  success or a parsed report outcome. A transcript write of the report is not terminal evidence
-  and no transcript or shell-command text is interpreted to decide an end. `report_write` is
+  evidence timestamp; qualifying v3 closeout also establishes `finished` with `end_evidence =
+  'closeout'`. Existing closeout/receipt/replacement evidence keeps precedence over state close. This is an observed end, not a claim of
+  success or a parsed report outcome. A historical v2 transcript write of the report is not terminal
+  evidence; unstructured transcript or shell-command text never decides an end. `report_write` is
   retained only as the value on rows tagged before receipts existed.
-- `stale`: no terminal evidence and no root activity within 24 hours. `end_ts` is the last recorded
+- `waiting`: the latest eligible root line records a valid future wait. `waiting_until` is that
+  explicit deadline and `end_ts` is NULL.
+- `paused`: the latest eligible root line records a pause. Both `waiting_until` and `end_ts` are NULL.
+- `stale`: no terminal or current quiet-state evidence and no root activity within 24 hours. `end_ts` is the last recorded
   root activity (at least `launch_ts`), not an inferred death time. A loop that died without a
   report becomes stale, never finished; new root activity can make it running again.
 
@@ -331,17 +418,41 @@ A silent live root may be stale after 24 hours; a dead root may appear running f
 plus the delay until the next successful refresh. No refresh schedule or maximum indexing lag is
 guaranteed by this package. Consumers should check `observed_at` when freshness matters. Child-only
 activity is not root activity. Neither report-path parsing quality (`loop_run.status`) nor its
-fallback `root_last_event` end timestamp is terminal evidence. No heartbeat or phase feed is used.
+fallback `root_last_event` end timestamp is terminal evidence. No heartbeat or phase feed is used for this lifecycle.
 
-### Receipts: `completion_receipt` and start identity
+For v3 only, the last nonempty line of the latest original-root or exactly linked relaunch
+assistant message may be `WAITING: <reason> until <UTC timestamp>` or `PAUSED: <reason>`, with a
+nonempty reason. Waits use canonical minute or second UTC forms, for example
+`2030-01-02T03:04Z` or `2030-01-02T03:04:05Z`; explicit `+00:00` and second fractions up to six
+digits are also accepted. A missing, malformed, non-UTC or nonfuture deadline supplies no waiting
+override. `waiting_until` is an explicit observation, never a calculated process deadline.
+Newer root conversation, tool or model activity clears an older marker, including physically
+later activity at tied timestamps. Child-only activity cannot set, invalidate or revive it.
+Expiry is re-evaluated without new transcript bytes and restores ordinary running/stale semantics;
+paused has no invented expiry. Terminal evidence wins and clears `waiting_until`.
+
+The efficiency collector recognises v3 inline launches through the same pure target grammar,
+retains historical protocol labels and adds only the finite `v3` label. Explicit unexpired waits
+and pauses suppress stalled-root observations, not token/call accounting. Expiry or new root
+activity restores the existing stall rules; missing or invalid quiet evidence never suppresses
+by inference. Cache upgrades recover retained launch/quiet evidence in bounded scans without
+resetting offsets or cumulative counters. This does not establish process liveness or change
+unrelated collectors.
+
+### HISTORICAL receipts: `completion_receipt` and start identity
+
+The following describes retained rows and their historical read projection. The supported
+collector no longer scans or writes legacy receipts for any harness, including enabled legacy
+configurations. It collects new run metadata and state independently. Receipt tables, columns,
+history, grants and read queries remain; this is not a deletion or schema retirement.
 
 Migration `025_loop_receipts.sql` adds the collector table `ah.loop_receipt`, primary key
-`(machine, kind, path)`, indexed on `(kind, path)`. The hourly collector reads, for every configured
+`(machine, kind, path)`, indexed on `(kind, path)`. Historically the hourly collector read, for every configured
 repository, the exact files `codex/report-*.md.posted`, `codex/report-*.md.notified` and
 `codex/goal-*.md.started` that the wave-notify tool writes beside a report or goal only after the
 receiver accepted the report (`.posted`), a successful, non-degraded send (`.notified`) or an
 accepted start (`.started`). Current
-wave-notify writes `.posted` and no longer writes `.notified`; both remain collected and both are
+wave-notify writes `.posted` and no longer writes `.notified`; both remain readable as historical
 completion receipts. A `.tmp.notified` or `.tmp.posted` name is not a receipt. A row holds `kind`
 (`posted`, `notified` or `started`; migration `035_loop_receipt_posted.sql` adds `posted`), the absolute `path` of the receipt's target (the report or the goal), the receipt text
 `content`, its mtime `receipt_mtime`, whether the target exists (`target_exists`, true also when it exists but could not be read, in which
@@ -427,20 +538,20 @@ Migration `024_loop_progress.sql` adds nullable columns on the same grant-preser
 
 These project existing catalogue evidence, with the same membership convention as
 `ah.v_loop_summary`: root calls/actions inside the launch window and linked lane sessions whole.
-Running/stale roots have no terminal cutoff; finished roots stop at the recorded end. Session
+Running, waiting, paused and stale roots have no terminal cutoff for progress;
+finished roots stop at the recorded end. Session
 activity timestamps describe the newest observed root/lane event, not process liveness. There is
 no new collector or heartbeat. NULL always means unknown, never an alias for zero.
 
-Every successful refresh post-pass updates running rows and roots of dirty root/child sessions,
-including heuristic lanes and their descendants. Progress selection starts from the partial
-`loops_progress_repo_idx` over running rows and resolves dirty owners through
-`loop_run_progress_owner_idx`; it does not walk finished-loop history. Receiver queries can use
-`WHERE repo = <exact owner/repo> AND status = 'running'` on that same repository index. This bounds
+Every successful refresh post-pass updates open rows (`running`, `waiting` and `paused`) and
+roots of dirty root/child sessions, including heuristic lanes and descendants. Dirty-owner
+selection uses `loop_run_progress_owner_idx`; it does not walk finished-loop history. Receiver
+queries for open loops should include all three statuses, not only `running`. This bounds
 progress selection, not the separate lifecycle and identity refreshes described above.
 Initial historical fill processes at most 128 additional rows per pass with a transactional cursor
-in `ah.meta`, so existing finished rows fill without rebuild and work stays bounded. The deployed
-refresh cadence is about 320 seconds today, not a package guarantee; historical fill may therefore
-take several passes. Rebuild re-projects retained transcript evidence. Analytics re-application
+in `ah.meta`, so existing finished rows fill without rebuild and work stays bounded. No refresh
+cadence is guaranteed; historical fill may therefore take several passes. Rebuild re-projects
+retained transcript evidence. Analytics re-application
 preserves values, and both operations preserve table-level consumer SELECT grants. Identity and
 lifecycle meanings above are unchanged; consumers should still inspect `observed_at` for freshness.
 
@@ -457,7 +568,7 @@ Migration `026_loop_planner_signals.sql` adds the collector tables `ah.backlog_d
   collector table `ah.backlog_done_scan`, `repo_slug` and `widened_at`), and removes rows in the
   window whose commit the clone proves is no longer on the default branch. Rebuild keeps both tables.
 - `tasks_done bigint`: distinct tasks with a Done flip in the loop's `repo` between `launch_ts` and
-  `end_ts`, whatever session made the change. Only a running loop's window is open; a stale loop's
+  `end_ts`, whatever session made the change. Running/waiting/paused windows are open; a stale loop's
   ends at its `end_ts`, the root's last observed activity. NULL when `repo` is unknown or the collector
   has not yet finished that repo's first Done scan (`ah.backlog_done_scan`). Recomputed on every
   refresh because collector rows can arrive after a loop finishes. Qualifying retained state
@@ -469,7 +580,7 @@ Migration `026_loop_planner_signals.sql` adds the collector tables `ah.backlog_d
   Data supplies only `lanes_reported`, never a fallback accepted outcome.
 
 `ah.lane.return_status` and `lane_return` come from the last `lane-return` fenced block in the lane's final
-message. A v2 block (`"v"` the JSON integer 2, with `lane` and `status` in
+message. A v2 or v3 block (`"v"` the JSON integer 2 or 3, with `lane` and `status` in
 `complete|partial|blocked|failed`) is stored whole and gives `return_status` only when both are valid;
 an object with any other `v` is stored whole with no `return_status`; the earlier free-form object (no
 `v`) keeps any string `status`. The block's JSON is decoded, so a fence inside a string never ends it;
@@ -500,6 +611,30 @@ sets `completion_status` on the spawn row of the async launch named by its
 
 ### Retained state-log counts
 
+Two strict body schemas share integer wire `v = 1`; selection is by the open event's fields,
+not wire version or date. The original frozen schema uses `open.goal_sha256` and actors
+`root`/`dispatcher`/`ext`/`daemon` as defined by that schema. The second pi schema is selected by
+`open.charter_sha256`, requires `root = 'llm'`, `root_model` and `first_wave`, and permits
+`by` values `root`, `ext` and `daemon`. Its frozen producer SHA-256 is
+`052d7fd5702b849572c826906d0fe48c505eb5c2af8972ebb64477f85a6c440f`.
+It rejects legacy-only dispatcher actors, envelope-source admits, gate events and gate/triage
+dispatch kinds. Unknown events, unknown members and invalid types invalidate the snapshot;
+this is a second validator, not a relaxation of the original validator.
+
+In the pi dialect a valid open, first-wave task list, dispatch or return does not establish
+admitted, landed, parked or accepted outcomes. Missing events remain independently NULL, never
+invented zero. Explicit valid events project independently, with only `by = 'root'` lands proving
+publication. Extension/daemon observations and a return's `landed` claim cannot prove a land.
+Shared-position fingerprint conflicts still withhold the affected outcome; a conflicting open
+withholds all outcomes. Close attribution and terminal proof retain the full-ledger agreement
+requirement. The original dialect's valid-open known-zero policy is unchanged.
+
+The detailed original-dialect rules below retain their historical meaning. References to
+`open.goal_sha256` use `open.charter_sha256` for the pi dialect through the same compatibility
+slot and exact origin/loop/digest attribution. References to root/dispatcher authority apply to
+root alone in the pi dialect. Statements that an open establishes zero apply only to the original
+dialect. See [count precedence](docs/loop-counts.md) for the independent v3 trailer fallback.
+
 Migration `032_loop_state_counts.sql` adds `ah.loop_state`, a collector table keyed by
 `(machine, path)`. The hourly collector reads exact `codex/state-*-loop<N>.jsonl` files from
 explicitly configured repository copies, retaining complete UTF-8 JSONL `content`, absolute
@@ -528,13 +663,14 @@ qualifying cohort; never choose a worker over a reviewer, use timing proximity o
 return. Any unresolved true acceptance leaves `lanes_accepted` NULL, independently of known
 landed-task counts. False and string-shaped booleans and return statuses do not add lanes. This
 counts observed acceptance events, not final acceptance state: later rejection does not erase an
-earlier true event. A valid open without true acceptance establishes zero for `lanes_accepted`.
+earlier true event. In the original dialect a valid open without true acceptance establishes zero for `lanes_accepted`.
 The separate legacy `tasks_done` override requires a valid attributed closed state log, with
 root/dispatcher close authority and agreement across machine copies. It counts distinct exact
 tracker IDs on root/dispatcher `ev=land` events using the `tasks_landed` projection, never alias
-lands, worker observations or a return's `landed` claim. A qualifying closed log with no such lands
-establishes zero; duplicate events and machine copies do not inflate counts. Otherwise collected
-Done-flip task counts remain the unchanged fallback. See `docs/loop-counts.md` for precedence.
+lands, worker observations or a return's `landed` claim. In the original dialect a qualifying closed log with no such lands
+establishes zero; in the pi dialect a qualifying close with absent lands supplies NULL, not zero.
+Duplicate events and machine copies do not inflate counts. Without a qualifying closed-state
+override, collected Done-flip task counts remain the unchanged fallback. See `docs/loop-counts.md` for precedence.
 Invalid framing supplies no state override; torn non-events are ignored while original bytes remain
 stored. Without qualifying state evidence, `lanes_accepted` is NULL. No state-only outcome column
 takes the Done-flip fallback. `lanes_reported` and `lanes_total` are unchanged.
@@ -542,8 +678,11 @@ takes the Done-flip fallback. `lanes_reported` and `lanes_total` are unchanged.
 #### Observed v3 Task-trailer lands
 
 For launches explicitly recorded with `loop_run.mode = 'v3'`, `tasks_landed` can also count
-observed Git Task trailers when no qualifying retained state cohort exists. State evidence,
-including unknown outcomes from conflicting qualified snapshots, keeps precedence. v2 launches
+observed Git Task trailers when no qualifying retained state cohort exists. Authoritative state evidence,
+including unknown outcomes from conflicting qualified snapshots, keeps precedence. A valid pi
+cohort with no explicit root land and no invalid/open/land conflict does not assert a known land
+count, so it permits this independent fallback. An invalid or conflicting cohort cannot be used
+to claim that lands were absent. v2 launches
 and the other state outcome fields retain their existing meanings.
 
 The observed repository set is the authoritative `ah.loops.repo` plus explicit captured
@@ -569,13 +708,15 @@ Existing rows stay NULL until rescanned; an observed commit without valid IDs su
 #### State-only outcome normalization
 
 Existing nullable `tasks_admitted`, `tasks_landed`, `parks_total` and `lanes_accepted` columns
-project complete qualified v1 state snapshots on every successful refresh, including closed loops
+project complete qualified wire-v1 state snapshots on every successful refresh, including closed loops
 and collector-only passes. There is no new column, default, schema replacement or grant. Projection
 uses the same exact origin, filename loop, frozen open-goal and launch-window attribution above.
-No report, transcript append, return claim or local-file lookup is an outcome fallback. Missing,
+No report, transcript append, return claim or local-file lookup is a state outcome fallback.
+The separately observed v3 Task-trailer fallback for `tasks_landed` is described above. Missing,
 invalid or ambiguously attributed state evidence leaves these numeric columns NULL, independently
-of legacy transcript structure or progress telemetry. A qualifying valid open establishes known
-zero, including when its envelope names tasks but no admit occurred.
+of legacy transcript structure or progress telemetry. In the original dialect a qualifying valid open establishes known
+zero, including when its envelope names tasks but no admit occurred. The pi dialect requires
+explicit events and retains NULL for absent outcomes.
 
 - `tasks_admitted`: distinct exact tracker IDs on explicit valid `admit` events. Envelope entries,
   dispatches, accepts and parks do not admit tasks.
@@ -604,8 +745,8 @@ wrong identity or overlapping open attribution cannot finish a launch. Lifecycle
 starts from existing transcript/receipt evidence each pass, so a removed or invalidated state
 snapshot cannot retain a state-only finish. Identity and root activity remain unchanged.
 
-Every complete framed event is validated against the frozen public `bin/loop-state` v1
-`validate_event` schema before observations are extracted. Its source SHA-256 is
+For the original body dialect, every complete framed event is validated against the frozen
+public `bin/loop-state` v1 `validate_event` schema before observations are extracted. Its source SHA-256 is
 `f44713f19942be7296feb377c79c6e9db4310c0796a0f4869dcd5ecadba00561`; the catalogue contains a local
 frozen validator, with no runtime dependency on that CLI or a checkout. The additive optional
 `return.artifact` field extends that baseline: it must be a nonempty absolute POSIX path without
@@ -633,7 +774,19 @@ The migration copies existing receipt SELECT grants to the new table and grants 
 INSERT and UPDATE to existing `ah_ingest`. Provision these privileges if that role is created
 later. Existing relation grants are unchanged.
 
-### Live phase and generated summaries
+### Deterministic live phase and retained summaries
+
+Paid loop admission and execution are retired globally for every harness and configuration,
+including `enabled = true`. Refresh creates no new paid jobs or reservations. `drain_one` claims
+nothing and invokes no provider; `run_pass` does nothing before loading config or connecting.
+The worker CLI retains its accepted arguments and interval validation but exits without a repeat
+loop or worker. Old queued work is not resumed by repaired credentials, a new day or a rebuild.
+There is no instruction to schedule a new worker.
+
+Deterministic structure/phase projection, retained cache application and phase history may
+continue. No table, column, historical queue/cache/budget/reservation row, grant or existing read
+query is removed. Optional corpus embeddings and unrelated collectors are not retired by this
+change. The historical paid rules below explain stored data, not current admission or execution.
 
 Additive `ah.loops` fields project retained catalogue evidence from pi roots and linked
 relaunches: successful complete append calls to the recorded state target, structured watches
@@ -659,8 +812,8 @@ Projection still uses only collected bytes, not a local state-file lookup; lifec
 is unchanged and completion follows the exactly attributed close rule above.
 
 `live_phase` is nullable and uses preparing, working, reviewing, gating, landing, waiting or
-closing. `phase_since` is the observed transition time. The frozen hybrid combines deterministic
-lane/timing evidence with Jev yes/no decisions; an explicit unexpired watch overrides nominal
+closing. `phase_since` is the observed transition time. The historical hybrid combined deterministic
+lane/timing evidence with retained Jev yes/no decisions; an explicit unexpired watch overrides nominal
 stale lanes and preparation. Stop/deadline retires the watch. Heartbeat evidence is deduplicated
 to one per five minutes. Independent nullable `jev_phase` and `jev_phase_probs` retain the whole
 phase decision. Jev results are accepted only when their authoritative returned model is
@@ -694,6 +847,13 @@ JSON null. Canonical UTC output is accepted by the receiver's broader microsecon
 and needs no consumer alignment change. Member nulls do not invalidate the remaining object;
 invalid members never reach `ah.loops` verbatim.
 
+### HISTORICAL paid enrichment and stored data
+
+This section specifies retained paid results and the pre-retirement worker. All admission,
+queueing, inference, retry and scheduling descriptions here are historical only. Current refresh
+and worker entrypoints cannot authorise or execute them, even with enabled configuration.
+Deterministic projection and retained cache application are the exceptions described above.
+
 `headline` is at most 120 characters; `summary` is at most 600 characters and two to four
 sentences. Generation time/model/error and `final_summary` accompany them. Failure retains the
 last successful text. Full provider replies, including reasoning, are retained unredacted in
@@ -724,7 +884,8 @@ advances. A successful paid step is reused when the remaining unpaid step is def
 Committed reservations with unknown results remain terminal/uncertain: no inference retry or
 refund on token/day changes, missing usage, timeout or rebuild. Public `summary_error` contains
 finite reason/status labels only; full unredacted provider errors stay in restricted cache.
-The operator must configure routes and schedule this bounded worker before enabling enrichment.
+Before retirement, enabling enrichment required configured routes and a separately scheduled
+bounded worker. It must not be scheduled to resume paid work under the current contract.
 
 A catalogue-global atomic UTC-day USD 5 ceiling uses independent budget/reservation tables that
 survive refresh and rebuild. Reservations commit before calls and are never refunded, including
@@ -759,7 +920,7 @@ cannot recover transcripts already deleted from their source homes.
 ## Collector metadata
 
 The collector writes `task_prefix`, `backlog_task`, `backlog_done_event`, `backlog_done_scan`, `collector_mutation_audit`, `git_commit`,
-`git_commit_file`, `ci_run`, `installed_feature`, `permission_log` and `loop_receipt`. Git subjects, tracker titles, labels and project values,
+`git_commit_file`, `ci_run`, `installed_feature`, `permission_log` and `loop_run_metadata`. Git subjects, tracker titles, labels and project values,
 file paths, repository slugs, workflow names and installed-feature names are stored verbatim.
 The collector also writes `loop_state`: complete unredacted JSONL snapshots, including judgement
 text, protected like transcripts. They supply progress counts and explicitly attributed root
@@ -767,14 +928,17 @@ heartbeat activity for live phase and exactly attributed valid close evidence fo
 never identity or inferred lifecycle root activity.
 Author emails are compared to configured identities but only `author_is_owner` is stored.
 Permission logs contribute timestamps, line hashes, tool names, command verbs, classifier reasons
-and sub-agent flags, never command arguments or target text. Loop receipts contribute the receipt
-text, a report's first line, target hashes and the checkout's origin slug, never a report or goal body. These metadata fields may themselves
+and sub-agent flags, never command arguments or target text. New run metadata contributes only
+hashes, qualified closeout line 1, mtime and origin alongside its key, never charter/closeout bodies.
+Legacy `loop_receipt` rows retain receipt text, qualified report line 1, hashes and origin for
+historical reads; new receipt collection is retired globally. These metadata fields may themselves
 be sensitive. Protect collector homes, configuration and the catalogue accordingly.
 
 Repositories and homes are explicitly configured. A failed CI query is an attributable collection
-error, not a failed or successful CI run. Other repositories continue independently. A receipt that cannot be read, or changed while it was
-read, is skipped, reported in the run's `errors` and retried next run; like other step errors it
-does not fail the run (only `gh_unavailable` does). Feature
+error, not a failed or successful CI run. Other repositories continue independently. New metadata
+or state inputs that cannot be read or change during collection are skipped, reported in the
+run's `errors` and retried next run; like other step errors they do not fail the run (only
+`gh_unavailable` does). Feature
 snapshots reconcile removed features; task removal and off-default git flags require a successful
 remote fetch. The collector changes remote-tracking git refs, never the working tree or tracker.
 The hourly collector validates the server's session and current role as dedicated `ah_ingest`,

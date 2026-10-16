@@ -35,6 +35,14 @@ and SARIF upload are available for this public repository without enabling a pai
 security feature. Keep the pinned reusable and the failing audit gate; do not bypass the audit or
 weaken the leak gate to make CI green.
 
+## Loop catalogue
+
+V3 recognition coexists with historical v2 evidence; never select the dialect by a cutover date.
+Charter and closeout collection is metadata-only, not a document archive. Keep the current and
+explicitly historical catalogue contracts distinct. Paid loop-live admission and worker entrypoints,
+and new legacy receipt collection, are retired globally; do not re-enable them to make old tests
+pass. Preserve the retained tables, grants and historical read behaviour.
+
 ## Content and tests
 
 - Never add redaction, omission or scrubbing to the parsers or the loader (CONTRACT.md).
