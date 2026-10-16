@@ -17,6 +17,9 @@ Session identity
   SessionKey('pi', <header id>, ''). The header (`type: session`) is the first line; records before
   it are ignored with one `missing_session_header` issue. A child's direct parent_session_uid
   prefers the UUID suffix of the header parentSession basename, without opening that path.
+  When the basename carries no uid (a lane's own `run-0/session.jsonl`), the path is kept in the
+  parser state as `parent_file` and the loader resolves parent_session_uid from the session whose
+  indexed file path equals it.
   An unusable header falls back to the directory root for a first-level child (nested parents
   resolve in SQL through agent_path). Directory evidence supplies root_session_uid and spawn_depth
   only without a usable header, or when a first-level header agrees with that root. Otherwise
@@ -141,6 +144,8 @@ CHILD_DONE_RE = re.compile(r"^Workflow child (\w+): \*\*([^*]+)\*\*", re.M)
 # "Retention-managed async directory: .../async-subagent-runs/<runId>" line
 ASYNC_DONE_RE = re.compile(r"Background task (completed|failed): \*\*([^*]+)\*\*")
 ASYNC_DIR_RE = re.compile(rf"^Retention-managed async directory: .*/async-subagent-runs/({UUID})[ \t]*$", re.M)
+# Longest header parentSession path kept in parser state for loader-side matching.
+PARENT_FILE_MAX = 1024
 # a child session path inside a notify: .../<root base>/<run dir>/run-<i>/<file>.jsonl
 SESSION_PATH_RE = re.compile(rf"/({UUID})/(?:(run-\d+)/)?[^/\"\s]+\.jsonl")
 ERROR_KIND_RE = re.compile(r"^([a-z][a-z0-9_]{2,63}):")
@@ -596,6 +601,11 @@ class PiParser:
         # Main-session fork extraction intentionally retains its existing semantics.
         if self.sub and (parent_uid is None or not re.fullmatch(UUID, parent_uid)):
             parent_uid = None
+            # A lane's own session file is `<run dir>/run-0/session.jsonl`, whose basename names no
+            # session. Keep the recorded path (never opened) so the loader can match it to the
+            # session whose indexed file it is; an over-long value is dropped, not truncated.
+            if parent_file and len(parent_file) <= PARENT_FILE_MAX:
+                s["parent_file"] = parent_file
         # A usable direct parent does not establish that parent's root or depth. The directory
         # can agree for a first-level child; every other header family waits for catalogue rows.
         path_family = parent_uid is None or (depth == 1 and parent_uid == lin.get("root"))

@@ -174,7 +174,9 @@ historical search and class counts reflect this boundary.
 - pi: children of a pi-subagents run are linked to their parent by path; archived
   `subagent-artifacts/*_transcript.jsonl` copies pair a run id with the child's response id and are
   indexed as evidence only (no messages or model calls). Both direct run-id directories and
-  legacy `run-<index>` children under a root session directory establish nested lineage. Explicit
+  legacy `run-<index>` children under a root session directory establish nested lineage. A child whose
+  header `parentSession` names a file with no uid in its basename (a lane's own `run-0/session.jsonl`)
+  gets `parent_session_uid` from the session whose indexed file path ends with that path. Explicit
   agent names from retained spawn/artifact metadata, including `-low` agents, supply lane roles;
   directory names and timing alone never choose an agent type.
 

@@ -1089,3 +1089,28 @@ def test_all_zero_usage_without_stop_reason_is_unknown_row():
     assert (stopped.input_uncached, stopped.output) == (0, 0)
     real = LlmCallRow("pi", "r3", key, at, 0, input_uncached=0, output=5).unknown_if_zero()
     assert (real.input_uncached, real.output) == (0, 5)
+
+
+@pytest.mark.parametrize("parent_file,kept", [
+    # A UUID-suffixed basename already names the parent: nothing to resolve later.
+    ("/tmp/synthetic/sessions/slug/2026-10-07T00-00-00-000Z_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa.jsonl", False),
+    # A fixed basename or malformed value is kept as a path for the loader to match to an indexed file.
+    ("/tmp/synthetic/sessions/slug/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/run-0/session.jsonl", True),
+    ("/tmp/synthetic/malformed.jsonl", True),
+    ("/" + "x" * 5000 + "/session.jsonl", False),   # an over-long value is dropped, never truncated
+    ("", False), (None, False), (123, False), ([], False),
+], ids=["uuid-basename", "fixed-basename", "malformed", "over-long", "empty", "none", "int", "list"])
+def test_child_header_parent_path_is_kept_only_when_the_basename_names_no_parent(tmp_path, parent_file, kept):
+    child_uid = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+    path = tmp_path / "session.jsonl"
+    header = {"type": "session", "version": 3, "id": child_uid, "timestamp": "2026-10-07T00:00:00Z",
+              "cwd": "/tmp/synthetic", "parentSession": parent_file}
+    path.write_text(json.dumps(header) + "\n")
+    rel = f"pi-test/sessions/slug/{ASYNC_ROOT}/{MAPPER_DIR}/run-0/session/{WORKER_DIR}/run-1/session.jsonl"
+    ctx = FileContext(str(path), rel, "pi-test", "pi", "test", None, "subagent")
+    store = MemStore()
+    _, parser_state = run_file(PiParser, ctx, store)
+    session = one(store, "session", session=SessionKey("pi", child_uid, ""))
+    if kept:
+        assert session["parent_session_uid"] is None   # the loader, not the parser, resolves the path
+    assert parser_state.get("parent_file") == (parent_file if kept else None)

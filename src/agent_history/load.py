@@ -1013,6 +1013,34 @@ def _link_pi_lineage(conn: psycopg.Connection) -> None:
     a second family. Changed children enter the ordinary post-pass queue so loop/lane projections
     see the repair.
     """
+    # A child whose header parentSession names a file with no uid in its basename (a lane's own
+    # `run-0/session.jsonl`) kept that path in its parser state. The parent is the one session
+    # whose indexed file ends with that path, below the namespace directory; a path matching no
+    # file, or more than one session, resolves nothing and leaves the directory fallback below.
+    conn.execute("""
+        WITH hdr AS (
+            SELECT c.id, c.namespace, sf.parser_state->>'parent_file' AS parent_file
+            FROM ah.session c JOIN ah.source_file sf
+              ON sf.agent='pi' AND sf.file_role='subagent' AND sf.namespace=c.namespace
+             AND sf.parser_state->>'sid'=c.session_uid
+            WHERE c.agent='pi' AND c.agent_id='' AND c.is_subagent AND NOT c.is_stub
+              AND c.parent_session_uid IS NULL AND sf.parser_state->>'parent_file' IS NOT NULL
+        ), resolved AS (
+            SELECT h.id, min(p.session_uid) AS parent_uid
+            FROM hdr h JOIN ah.source_file pf
+              ON pf.agent='pi' AND pf.file_role IN ('main','subagent') AND pf.namespace=h.namespace
+             AND starts_with(pf.rel_path, pf.namespace || '/')
+             AND right(h.parent_file, length(pf.rel_path) - length(pf.namespace))
+                 = substr(pf.rel_path, length(pf.namespace) + 1)
+            JOIN ah.session p ON p.agent='pi' AND p.agent_id='' AND p.namespace=h.namespace
+             AND p.session_uid=pf.parser_state->>'sid' AND NOT p.is_stub AND p.id<>h.id
+            GROUP BY h.id HAVING count(DISTINCT p.id)=1
+        ), changed AS (
+            UPDATE ah.session c SET parent_session_uid=r.parent_uid
+            FROM resolved r WHERE c.id=r.id AND c.parent_session_uid IS NULL
+            RETURNING c.id
+        ) INSERT INTO dirty_now SELECT id FROM changed ON CONFLICT DO NOTHING
+    """)
     conn.execute("""
         WITH wanted AS (
             SELECT c.id, CASE WHEN c.parent_session_uid IS NOT NULL THEN (

@@ -506,3 +506,95 @@ def test_notify_lag_counts_steered_and_idle_notifications(clean, tmp_path):  # n
     rows = clean.execute("SELECT source, steered, lag_s::int FROM ah.v_notify_lag ORDER BY notified_at").fetchall()
     assert rows == [("subagent-notify", True, 3), ("subagent-notify", False, 4)]
     clean.rollback()
+
+
+def test_pi_child_of_a_fixed_name_session_file_resolves_its_parent_from_the_header_path(clean, tmp_path):  # noqa: F811
+    """A lane's own session file is `<run dir>/run-0/session.jsonl`, so its basename carries no uid.
+    A child whose header `parentSession` is that file is linked to the session that file indexes,
+    whatever its directory suggests, and a UUID-named parent keeps the existing handling."""
+    root, lane, other = (f"30000000-0000-4000-8000-00000000000{i}" for i in (1, 2, 3))
+    child, stray, unmatched = (f"30000000-0000-4000-8000-00000000001{i}" for i in (1, 2, 3))
+    runs = [f"40000000-0000-4000-8000-00000000000{i}" for i in range(1, 7)]
+    at = "2026-10-09T00:00:00Z"
+    hot, cold = tmp_path / "hot", tmp_path / "cold"
+    base = hot / "pi-local" / "sessions" / "-synthetic-"
+    (cold / ".archive-receipts").mkdir(parents=True)
+    (cold / ".archive-receipts" / "receipt.json").write_text("{}")
+    root_dir = base / f"2026-10-09T00-00-00-000Z_{root}"
+    recorded = "/synthetic/home/pi-local/sessions/-synthetic-/" + root_dir.name   # the writer's absolute path
+
+    def write(path, uid, parent=None):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        header = {"type": "session", "version": 3, "id": uid, "timestamp": at, "cwd": "/tmp/synthetic"}
+        if parent is not None:
+            header["parentSession"] = parent
+        path.write_text(json.dumps(header) + "\n")
+
+    lane_dir, other_dir = root_dir / runs[0] / "run-0", root_dir / runs[1] / "run-0"
+    write(base / (root_dir.name + ".jsonl"), root)
+    write(lane_dir / "session.jsonl", lane, f"{recorded}.jsonl")
+    write(other_dir / "session.jsonl", other, f"{recorded}.jsonl")
+    # Directory-nested under the lane, header names the lane's fixed-name file: the common case.
+    write(lane_dir / "session" / runs[2] / "run-0" / "session.jsonl", child,
+          f"{recorded}/{runs[0]}/run-0/session.jsonl")
+    # Directory-nested under the lane, header names a different lane's file: the header wins.
+    write(lane_dir / "session" / runs[3] / "run-0" / "session.jsonl", stray,
+          f"{recorded}/{runs[1]}/run-0/session.jsonl")
+    # Header names a path no indexed file matches: no parent uid is invented from the header.
+    write(lane_dir / "session" / runs[4] / "run-0" / "session.jsonl", unmatched,
+          "/elsewhere/sessions/-synthetic-/not-indexed/run-0/session.jsonl")
+
+    def refresh():
+        stats = load.refresh(clean, hot, cold, textfile=None, log=lambda *_: None)
+        assert stats.errors == 0
+
+    def family(uid):
+        return clean.execute(
+            "SELECT c.parent_session_uid, p.session_uid, r.session_uid, c.spawn_depth "
+            "FROM ah.session c LEFT JOIN ah.session p ON p.id=c.parent_session_id "
+            "LEFT JOIN ah.session r ON r.id=c.root_session_id WHERE c.agent='pi' AND c.session_uid=%s",
+            (uid,)).fetchone()
+
+    refresh()
+    assert family(lane) == (root, root, root, 1)      # UUID-named parent: unchanged
+    assert family(child) == (lane, lane, root, 2)
+    assert family(stray) == (other, other, root, 2)
+    assert family(unmatched)[0] is None               # the directory fallback still supplies parent_session_id
+    snapshot = {uid: family(uid) for uid in (root, lane, other, child, stray, unmatched)}
+    refresh()                                          # idempotent
+    assert {uid: family(uid) for uid in snapshot} == snapshot
+    clean.rollback()
+
+
+def test_pi_header_path_parent_resolves_when_the_parent_file_arrives_later(clean, tmp_path):  # noqa: F811
+    root, lane, child = (f"31000000-0000-4000-8000-00000000000{i}" for i in (1, 2, 3))
+    run, inner = "41000000-0000-4000-8000-000000000001", "41000000-0000-4000-8000-000000000002"
+    at = "2026-10-09T00:00:00Z"
+    hot, cold = tmp_path / "hot", tmp_path / "cold"
+    base = hot / "pi-local" / "sessions" / "-synthetic-"
+    (cold / ".archive-receipts").mkdir(parents=True)
+    (cold / ".archive-receipts" / "receipt.json").write_text("{}")
+    root_name = f"2026-10-09T00-00-00-000Z_{root}"
+    lane_file = base / root_name / run / "run-0" / "session.jsonl"
+
+    def write(path, uid, parent):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"type": "session", "version": 3, "id": uid, "timestamp": at,
+                                    "cwd": "/tmp/synthetic", "parentSession": parent}) + "\n")
+
+    recorded = f"/synthetic/home/pi-local/sessions/-synthetic-/{root_name}"
+    write(base / root_name / run / "run-0" / "session" / inner / "run-0" / "session.jsonl", child,
+          f"{recorded}/{run}/run-0/session.jsonl")
+
+    def refresh():
+        assert load.refresh(clean, hot, cold, textfile=None, log=lambda *_: None).errors == 0
+
+    def parent_uid(uid):
+        return clean.execute("SELECT parent_session_uid FROM ah.session WHERE session_uid=%s", (uid,)).fetchone()[0]
+
+    refresh()
+    assert parent_uid(child) is None
+    write(lane_file, lane, f"{recorded}.jsonl")
+    refresh()
+    assert parent_uid(child) == lane
+    clean.rollback()
