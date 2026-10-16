@@ -235,7 +235,21 @@ def states(repo: Path, machine: str, errors: list[dict[str, str]] | None = None)
 
 def collect(collector, repositories, machine: str) -> None:
     """Collect receipts and state snapshots of explicitly configured repositories."""
+    from . import collect_loop_metadata
+
     for repo in repositories:
+        collector.check_time()
+        try:
+            rows = []
+            for row in collect_loop_metadata.metadata(Path(repo), machine, collector.errors):
+                collector.check_time()
+                rows.append(row)
+            collector.write("loop_run_metadata", collect_loop_metadata.COLS, collect_loop_metadata.KEY, rows)
+        except Deadline:
+            raise
+        except Exception as error:
+            collector.rollback()
+            collector.errors.append({"repo": Path(repo).name, "step": "loop_run_metadata", "error": type(error).__name__})
         collector.check_time()
         try:
             rows = []

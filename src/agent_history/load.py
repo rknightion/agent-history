@@ -1724,7 +1724,7 @@ def rebuild(conn: psycopg.Connection, hot: Path | None = HOT_ROOT, cold: Path | 
                 conn.execute(f"UPDATE ah.{table} SET session_id = NULL WHERE session_id IS NOT NULL")
             conn.execute("TRUNCATE " + ", ".join(f"ah.{t}" for t in DATA_TABLES) + " RESTART IDENTITY CASCADE")
             # Derived enrichment is re-derived from scratch; collector-owned tables are kept.
-            conn.execute("DELETE FROM ah.meta WHERE key IN ('task_ref_hash', 'loops_links_projection_v1', 'loops_links_projection_v2', 'loops_links_projection_v3')")
+            conn.execute("DELETE FROM ah.meta WHERE key IN ('task_ref_hash', 'loops_links_projection_v1', 'loops_links_projection_v2', 'loops_links_projection_v3', 'loops_identity_v3_projection_v1')")
             # The embedder skips while this is set (it never holds the refresh lock across API calls).
             conn.execute("INSERT INTO ah.meta (key, value) VALUES ('rebuild_in_progress', now()::text) "
                          "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value")

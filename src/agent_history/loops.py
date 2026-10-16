@@ -53,7 +53,7 @@ HEADER_IDENTITY = re.compile(r"# Loop: [A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)? (loo
 START = re.compile(r"([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#(loop[0-9]+)#([0-9a-f]{64})\n?")
 # Evidence values that end a loop. `report_write` only survives on rows tagged before receipts.
 START_SKEW = timedelta(seconds=120)  # a start ping may be stamped slightly before its launch message
-FINISHED_EVIDENCE = ("completion_receipt", "next_launch", "report_write")
+FINISHED_EVIDENCE = ("completion_receipt", "next_launch", "report_write", "closeout")
 
 
 def _no_read(path: Any) -> str:  # noqa: ARG001
@@ -399,17 +399,20 @@ def refresh_live(conn: psycopg.Connection) -> dict[str, int]:
     within 24 hours is evidence of running, not proof of a live process. A silent root is stale and
     may resume. Do not reuse loop_run's fallback end timestamp as evidence of completion.
     """
-    finished = _refresh_completion_receipts(conn)
+    from .loop_identity_v3 import projections
+
+    v3_projected = projections(conn)
+    finished = _refresh_completion_receipts(conn, v3_projected)
     result = conn.execute("""
         INSERT INTO ah.loops (launch_uid, status, launch_ts, end_ts, observed_at)
         SELECT l.launch_uid,
-               CASE WHEN l.end_evidence IN ('completion_receipt', 'next_launch', 'report_write')
+               CASE WHEN l.end_evidence IN ('completion_receipt', 'next_launch', 'report_write', 'closeout')
                     AND l.end_ts IS NOT NULL
                     THEN 'finished'
                     WHEN greatest(s.last_event_at, l.launch_ts) >= now() - interval '24 hours'
                     THEN 'running' ELSE 'stale' END,
                l.launch_ts,
-               CASE WHEN l.end_evidence IN ('completion_receipt', 'next_launch', 'report_write')
+               CASE WHEN l.end_evidence IN ('completion_receipt', 'next_launch', 'report_write', 'closeout')
                     AND l.end_ts IS NOT NULL
                     THEN l.end_ts
                     WHEN greatest(s.last_event_at, l.launch_ts) >= now() - interval '24 hours'
@@ -425,7 +428,7 @@ def refresh_live(conn: psycopg.Connection) -> dict[str, int]:
             observed_at = EXCLUDED.observed_at
     """)
     count = result.rowcount
-    _refresh_identity(conn, finished)
+    _refresh_identity(conn, finished, v3_projected)
     _refresh_progress(conn)
     _refresh_state_counts(conn)
     from .loop_live import refresh as refresh_phase
@@ -479,9 +482,12 @@ def _valid_completions(conn: psycopg.Connection, uid: str | None = None) -> dict
     `posted` receipt always carries a digest and is checked the same way as a digest `notified` one.
     """
     if uid is None:
-        scope, params = "NOT COALESCE(l.end_evidence = ANY(%s), false)", (list(FINISHED_EVIDENCE),)
+        scope, params = (
+            "l.mode IS DISTINCT FROM 'v3' AND NOT COALESCE(l.end_evidence = ANY(%s), false)",
+            (list(FINISHED_EVIDENCE),),
+        )
     else:
-        scope, params = "l.launch_uid = %s", (uid,)
+        scope, params = "l.mode IS DISTINCT FROM 'v3' AND l.launch_uid = %s", (uid,)
     found: dict[str, list[tuple]] = {}
     for row in conn.execute(COMPLETION_SQL.format(scope=scope), params):
         uid_, number, naming, kind, when, content, exists, digest, line1, origin = row
@@ -499,7 +505,7 @@ def _valid_completions(conn: psycopg.Connection, uid: str | None = None) -> dict
     return found
 
 
-def _refresh_completion_receipts(conn: psycopg.Connection) -> list[str]:
+def _refresh_completion_receipts(conn: psycopg.Connection, v3_projected: dict[str, Any] | None = None) -> list[str]:
     """Finish unfinished launches that have a valid wave-notify completion receipt.
 
     See `_valid_completions` for validity. The earliest valid mtime across machines is the end.
@@ -513,7 +519,9 @@ def _refresh_completion_receipts(conn: psycopg.Connection) -> list[str]:
                 "UPDATE ah.loop_run SET end_ts = %s, end_evidence = 'completion_receipt' WHERE launch_uid = %s",
                 [(when, uid) for uid, when in ends.items()],
             )
-    return list(ends)
+    from .loop_identity_v3 import refresh_completion
+
+    return list(ends) + refresh_completion(conn, v3_projected)
 
 
 UNKNOWN = {"repo": None, "loop": None, "goal_sha256": None}
@@ -636,7 +644,9 @@ def _receipt_identity(
     return found
 
 
-def _refresh_identity(conn: psycopg.Connection, finished: Sequence[str] = ()) -> None:
+def _refresh_identity(
+    conn: psycopg.Connection, finished: Sequence[str] = (), v3_projected: dict[str, Any] | None = None
+) -> None:
     """Re-project exact identity on every pass, including previously indexed launches.
 
     Only recorded metadata is authoritative: never read the current checkout or goal/report files.
@@ -653,7 +663,7 @@ def _refresh_identity(conn: psycopg.Connection, finished: Sequence[str] = ()) ->
     rows = conn.execute(
         """
         WITH ordered_launches AS (
-            SELECT l.launch_uid, l.root_session_id,
+            SELECT l.launch_uid, l.root_session_id, l.mode,
                    CASE WHEN l.naming = 'loop' THEN l.loop_number END AS number,
                    l.goal_path, l.report_path, l.launch_ts, m.text,
                    lead(l.launch_ts) OVER (
@@ -671,13 +681,13 @@ def _refresh_identity(conn: psycopg.Connection, finished: Sequence[str] = ()) ->
         SELECT l.launch_uid, l.root_session_id, l.number, l.goal_path, l.report_path,
                l.launch_ts, l.text, l.following, l.window_known, l.tied_start
         FROM ordered_launches l JOIN ah.loops live ON live.launch_uid = l.launch_uid
-        WHERE %s OR live.status = 'running' OR EXISTS (
+        WHERE l.mode IS DISTINCT FROM 'v3' AND (%s OR live.status = 'running' OR EXISTS (
             SELECT 1 FROM dirty_now d JOIN ah.session changed ON changed.id = d.session_id
             WHERE COALESCE(changed.root_session_id, changed.id) = l.root_session_id
         ) OR EXISTS (
             SELECT 1 FROM ah.loop_receipt r WHERE r.kind = 'started' AND r.path = l.goal_path
               AND r.seen_at >= %s::timestamptz - interval '2 hours'
-        ) OR l.launch_uid = ANY(%s)
+        ) OR l.launch_uid = ANY(%s))
     """,
         (initial, mark[0] if mark else "-infinity", list(finished)),
     ).fetchall()
@@ -751,6 +761,9 @@ def _refresh_identity(conn: psycopg.Connection, finished: Sequence[str] = ()) ->
             "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
             (newest.isoformat(),),
         )
+    from .loop_identity_v3 import refresh_identity
+
+    refresh_identity(conn, v3_projected)
 
 
 PROGRESS_SELECTION_SQL = """
