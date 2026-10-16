@@ -1,5 +1,75 @@
 # Changelog
 
+## [0.4.0](https://github.com/rknightion/agent-history/compare/v0.3.0...v0.4.0) (2026-10-16)
+
+
+### Features
+
+* **alerts:** consolidate the archive alert rules and alert on the index poller ([17753ae](https://github.com/rknightion/agent-history/commit/17753ae4751324f5c7f700d984eb657f2333889e))
+* **catalogue:** persist content-free request progress observations ([d5810e2](https://github.com/rknightion/agent-history/commit/d5810e21a2998162ba0419f18f85e96b8f432efa))
+* chart catalogue call throughput and cost diagnostics ([33fdde2](https://github.com/rknightion/agent-history/commit/33fdde2e99a31c446c245b3043631b86c774b610))
+* **dashboards:** generate and publish the catalogue and archive dashboards ([355b76e](https://github.com/rknightion/agent-history/commit/355b76e61241cb2ca241e531873f1264295c1044))
+* drain periodic workers on SIGTERM instead of dying mid-pass ([ef9813c](https://github.com/rknightion/agent-history/commit/ef9813cb5d7b2de30bb9ecb41bac9e37c5ed3cd0))
+* ingest provenance-honest pi compaction events ([136f4ce](https://github.com/rknightion/agent-history/commit/136f4ce9d240ab52cdec6dbe90b1657e68969d24))
+* **loops:** accept the strict pi v3 state dialect ([7e31977](https://github.com/rknightion/agent-history/commit/7e31977cbf51e462c248b1c7146d09229e16e656))
+* **loops:** classify v3 lane role families ([c7b9a77](https://github.com/rknightion/agent-history/commit/c7b9a7703e24d3a28727628a2bee4554dc8f7687))
+* **loops:** count observed Task trailer lands ([58acf48](https://github.com/rknightion/agent-history/commit/58acf480aa95442940cceb50233f3bc064e89a43))
+* **loops:** derive v3 identity and closeout completion ([ba15d63](https://github.com/rknightion/agent-history/commit/ba15d6307d0c1091fd72e4b737ac74720a94eb87))
+* **loops:** project waiting and paused lifecycle states ([bcbc4d4](https://github.com/rknightion/agent-history/commit/bcbc4d4543de8c7cdd7d5f8ae18b69c62735f6de))
+* **loops:** recognise v3 launches and retained links ([abd3e40](https://github.com/rknightion/agent-history/commit/abd3e403340e648cf9a9368bdcc92137b93da609))
+* **metrics:** recognise v3 roots and explicit quiet states ([342a3b1](https://github.com/rknightion/agent-history/commit/342a3b15505e1487a15806fa9dbdcd3758793402))
+* **parser:** capture recorded Claude call and turn telemetry ([6c9ca44](https://github.com/rknightion/agent-history/commit/6c9ca4464a6624e3ba510427b18f621ff9910dcc))
+* **parser:** capture recorded Codex call and operation telemetry ([2eb8212](https://github.com/rknightion/agent-history/commit/2eb8212c346a276bc00c1775ffe5212e67ea929e))
+* **parser:** capture validated pi telemetry and native async dispatch ([abf126b](https://github.com/rknightion/agent-history/commit/abf126b79319d779c83b72a34573510187af6794))
+* **pricing:** seed Sonnet 5.5 and Haiku 5.5 list prices ([8f0d0af](https://github.com/rknightion/agent-history/commit/8f0d0af52454d45f56b9bf1161e8a71399536721))
+* project live loop phases with durable guarded enrichment ([292690e](https://github.com/rknightion/agent-history/commit/292690e45fe81b3a456da4de35ad483fc360816b))
+* **state:** accept optional native return artifact paths ([d6366f0](https://github.com/rknightion/agent-history/commit/d6366f0f4dea6c605a500d7643455b68d8659379))
+* treat .posted closeout receipts as completion receipts ([16cffae](https://github.com/rknightion/agent-history/commit/16cffaef7597afcd78ccf192cc7f74dab2900cf6))
+
+
+### Bug Fixes
+
+* **alerts:** treat an omitted pending period as zero when verifying live rules ([25d7dba](https://github.com/rknightion/agent-history/commit/25d7dbaa28c7a41c16ecdf7d8f8719c400e1cdb1))
+* **ci:** ignore empty lists and objects when verifying published dashboards ([8011f87](https://github.com/rknightion/agent-history/commit/8011f87b6a7baaefad13b1eca038d28f84df0714))
+* classify complete legacy peer transport losslessly ([de5b8d2](https://github.com/rknightion/agent-history/commit/de5b8d2ab3ec8ea123f7807c691dc9cb9759f038))
+* **collector:** restore caller alarm state after CLI completion ([2d46ac7](https://github.com/rknightion/agent-history/commit/2d46ac74c6cc1f40dc2eaba67e405c8813cbec42))
+* consume collected root heartbeats for live phase ([9cee924](https://github.com/rknightion/agent-history/commit/9cee92414b37b2d073ad391a97eee3019080197e))
+* **container:** retain the verified Python 3.14 builder and runtime pair ([7c585c6](https://github.com/rknightion/agent-history/commit/7c585c6304f625363622e96152fe1d94b9d9a203))
+* **dashboards:** pin the HTTP attempt error ratio axis to 0 to 100 percent ([be27087](https://github.com/rknightion/agent-history/commit/be27087b8231037a7182b222638abf0a01a5bc24))
+* **deps:** require review for Python image ABI changes ([4229d12](https://github.com/rknightion/agent-history/commit/4229d1239b94f76c2b654f2856cda9d1ab20d6a5))
+* **efficiency:** count pi process waits and deadline budgets ([2bdac23](https://github.com/rknightion/agent-history/commit/2bdac23d7a03e0a20cbed30323f7bb813a4c1fe7))
+* enforce nullable live phase projection shapes ([3e71425](https://github.com/rknightion/agent-history/commit/3e714254592999c7b183ef24ab4415432493ae17))
+* exclude contextual parent wake notifications from human turns ([5575bfc](https://github.com/rknightion/agent-history/commit/5575bfce8307952beeceeec3bffc054210420ec9))
+* **leak-scan:** allow noreply@anthropic.com in commit attribution ([71ffd9d](https://github.com/rknightion/agent-history/commit/71ffd9d5d00f7646fee92637f7c5658b0b6746bf))
+* **live:** project native dispatch watches and trustworthy append receipts ([950fa5a](https://github.com/rknightion/agent-history/commit/950fa5ad09bca0e35a2ed6c0142ef931d1e54e7d))
+* **loop-live:** distinguish observed activity from unproved state writers ([4db0c1d](https://github.com/rknightion/agent-history/commit/4db0c1d9a68fbd4adc7afce5bf351bb916523cfe))
+* **loop-live:** report observational live phase under unscoped uncertainty ([96a10c0](https://github.com/rknightion/agent-history/commit/96a10c04468ddfa0402d9fc5e581a7c70f9e9be3))
+* **loops:** count closed root tracker publications for completion ([43ec5cd](https://github.com/rknightion/agent-history/commit/43ec5cdb06542f0e1e7630ace9792cd60e3610b4))
+* **loops:** project authoritative state outcomes and reject divergent snapshots ([03e1783](https://github.com/rknightion/agent-history/commit/03e178381634b7d0c3357badf8b1bcf51d95d8ab))
+* **loops:** project v3 lane return status ([8d4f4de](https://github.com/rknightion/agent-history/commit/8d4f4de8d5c3bb9f6366390d85d1a9eb732102ea))
+* **loops:** reject incomplete reads and unproven relaunch paths ([20e0b97](https://github.com/rknightion/agent-history/commit/20e0b9775a730ea9167d851405f83c5dc23342f6))
+* **loops:** retain qualified prefix counts and invalid-copy identities ([d14c9ee](https://github.com/rknightion/agent-history/commit/d14c9ee1b1e3afa8e80f73144171b7c48a7d3ab9))
+* **parser:** preserve causal Claude streaming duration lineage ([4a88b9c](https://github.com/rknightion/agent-history/commit/4a88b9c6625920400363eb4a6abed41de3a9032a))
+* **pi:** prefer usable child header parent identity ([d0c1406](https://github.com/rknightion/agent-history/commit/d0c14061d1cfdc7d6a394d9c79bc7133f06cd447))
+* **pi:** reconcile parent lineage and stale spawn attribution ([17924ee](https://github.com/rknightion/agent-history/commit/17924eee9d664e299a06cb5b00c921bcc0c4437c))
+* **rebuild:** fence readers until complete source loading finishes ([46fff39](https://github.com/rknightion/agent-history/commit/46fff3911f8f697757e663c9731bfc948cfc513b))
+* reject threaded collector calls before changing timers ([9c6b187](https://github.com/rknightion/agent-history/commit/9c6b1873d5bd98fd70c8be770740fb50fdbfc9ef))
+* reserve visible output within high-effort summary guidance ([915124d](https://github.com/rknightion/agent-history/commit/915124d85654b25a1e26b0a58f8a6a69d2ef0f94))
+* retain ordered hook fragments and known repeat ancestry ([c280abe](https://github.com/rknightion/agent-history/commit/c280abec96ab65c3b7e01ac7928e4147df22a45b))
+* **scan:** validate linked worktree control metadata separately ([dc496e8](https://github.com/rknightion/agent-history/commit/dc496e861ae87011aeb2fb9152211fddd98ac190))
+* **schema:** align telemetry memory merges and recorded summary mode ([39c6d25](https://github.com/rknightion/agent-history/commit/39c6d257f268fbe61464f04467dfddc7a5f8b735))
+* **telemetry:** give every OTLP log record a severity ([5faa652](https://github.com/rknightion/agent-history/commit/5faa6526247064d944b759c7248638f7858f261c))
+* tune vacuum triggers for frequently updated collector tables ([67898ed](https://github.com/rknightion/agent-history/commit/67898eda8076a36eabaffc37afb09efc2a07c744))
+* use exact state close for analytical loop end fallback ([ecfeb23](https://github.com/rknightion/agent-history/commit/ecfeb23c18d19d6cfc5c613a23682de1e1872ef1))
+
+
+### Documentation
+
+* add metadata comparison queries for catalogue telemetry ([8a48f97](https://github.com/rknightion/agent-history/commit/8a48f9775604bce43f28f08fdb503ab3d0cadf4d))
+* clarify recorded pi limits deadlines and dispatch timestamps ([311e6dd](https://github.com/rknightion/agent-history/commit/311e6dd216bb0a7761ae0089bd2148d02c6f0be7))
+* **deps:** state the Python image compatibility review surface ([7d94ebe](https://github.com/rknightion/agent-history/commit/7d94ebe3bfe32bfb1b5fe65c47c0b303febf74a3))
+* **loops:** describe v3 recognition and historical compatibility ([b11bcd7](https://github.com/rknightion/agent-history/commit/b11bcd700d6400ccfe9c94b78f8b89341e2d73e0))
+
 ## [0.3.0](https://github.com/rknightion/agent-history/compare/v0.2.0...v0.3.0) (2026-10-04)
 
 
