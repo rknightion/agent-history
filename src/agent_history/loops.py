@@ -1437,9 +1437,9 @@ def _tag_tree(conn: psycopg.Connection, loop_id: int, root_id: int, start: Any, 
 def parse_lane_return(text: str) -> tuple[Any, str | None]:
     """(lane_return, return_status) of the last ```lane-return block in a lane's final message.
 
-    Two shapes, one projection: the earlier free-form object (no `v` key) keeps any string `status`; the
-    v2 object (`"v"` the integer 2, with `lane` and `status` in complete|partial|blocked|failed) is stored
-    whole and gives return_status only when both are valid. An object with any other `v` is stored whole
+    The earlier free-form object (no `v` key) keeps any string `status`. Versioned v2 and v3 objects
+    (`"v"` the integer 2 or 3, with a string `lane` and `status` in complete|partial|blocked|failed) are
+    stored whole and give return_status only when both are valid. Other versions are stored whole
     with no return_status. A block that is not a JSON object is {"unparsed": true}. CRLF line endings
     and a closing fence on the JSON's last line are accepted.
     """
@@ -1466,11 +1466,11 @@ def parse_lane_return(text: str) -> tuple[Any, str | None]:
         return (None if value is None else {"unparsed": True}), None
     status = value.get("status")
     if "v" in value:
-        # a versioned object: only the integer 2 is v2, and an unknown version never falls back to the
-        # free-form shape
+        # Only supported integer versions project status; unknown versions never fall back to the
+        # free-form shape. Patch and committed-sha returns share the same status rules.
         valid = (
             type(value["v"]) is int
-            and value["v"] == 2
+            and value["v"] in (2, 3)
             and isinstance(value.get("lane"), str)
             and status in LANE_STATUS_V2
         )

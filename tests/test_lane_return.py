@@ -1,4 +1,4 @@
-"""parse_lane_return: the old free-form lane-return object and the v2 object, side by side."""
+"""Lane-return projection from legacy, v2 and v3 final messages."""
 
 from __future__ import annotations
 
@@ -60,8 +60,66 @@ def test_crlf_line_endings_and_a_closing_fence_on_the_json_line():
     assert parse_lane_return(compact) == (V2, "complete")  # the fence inside the tail does not end it
 
 
-@pytest.mark.parametrize("version", ["2", 2.0, True, 3])
-def test_only_the_integer_2_is_v2_and_other_versions_give_no_status(version):
+@pytest.mark.parametrize("version", ["2", 2.0, True, "3", 3.0, 4])
+def test_only_supported_integer_versions_give_status(version):
     # an object that declares a version is never read as the free-form shape
     value = {**V2, "v": version}
+    assert parse_lane_return(block(value)) == (value, None)
+
+
+@pytest.mark.parametrize("status", ["complete", "partial", "blocked", "failed"])
+@pytest.mark.parametrize("form", ["patch", "sha"])
+def test_v3_final_message_through_pi_parser(tmp_path, status, form):
+    from agent_history.memstore import MemStore, run_file
+    from agent_history.model import FileContext
+    from agent_history.parse_pi import PiParser
+
+    value = {
+        "v": 3,
+        "lane": "parser",
+        "task": "TASK-123",
+        "status": status,
+        "base": "a" * 40,
+        "worktree": "/tmp/example-tree",
+        "check": "just check",
+        "exit": 0,
+        "tail": "result\n```\ncomplete",
+        "coderabbit": {"ran": True, "major": 0, "unreviewed": 0},
+        "questions": [],
+    }
+    if form == "patch":
+        value.update(patch="/tmp/candidate.patch", patch_sha256="b" * 64)
+    else:
+        value["sha"] = "c" * 40
+    final = f"```lane-return\n{json.dumps(value)}\n```\nCandidate ready."
+    records = [
+        {"type": "session", "version": 3, "id": "synthetic-lane", "timestamp": "2026-09-01T10:00:00Z"},
+        {
+            "type": "message",
+            "id": "final",
+            "timestamp": "2026-09-01T10:01:00Z",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": final}],
+                "stopReason": "stop",
+            },
+        },
+    ]
+    path = tmp_path / "session.jsonl"
+    path.write_text("".join(json.dumps(record) + "\n" for record in records))
+    store = MemStore()
+    context = FileContext(str(path), "pi-test/session.jsonl", "pi-test", "pi", "test", None, "subagent")
+    run_file(PiParser, context, store)
+    reports = [row for row in store.rows("message") if row["message_class"] == "subagent_report"]
+    assert len(reports) == 1
+    assert reports[0]["text"] == final
+    parsed, return_status = parse_lane_return(reports[0]["text"])
+    assert (parsed, return_status) == (value, status)
+    assert (parsed["lane"], parsed["task"]) == ("parser", "TASK-123")
+    assert parsed[form] == value[form]
+
+
+@pytest.mark.parametrize("bad", [{"lane": 7}, {"status": "accepted"}, {"status": None}])
+def test_invalid_v3_fields_give_no_status(bad):
+    value = {**V2, "v": 3, **bad}
     assert parse_lane_return(block(value)) == (value, None)
