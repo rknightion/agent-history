@@ -567,6 +567,11 @@ def github_forks() -> set[str] | None:
     return forks
 
 
+# A public commit's neutral `Task: loop<N>-<lane>` alias. The private commit that consumes the work
+# carries the tracker IDs, so an alias is never a landed task even when its lane is numeric.
+LOOP_ALIAS = re.compile(r"loop[0-9]+-", re.I)
+
+
 def git_commits(info: dict[str, Any], days: int) -> list[dict[str, Any]]:
     repo, branch = info["path"], info["ref"]
     since = f"--since={days}.days.ago"
@@ -584,6 +589,7 @@ def git_commits(info: dict[str, Any], days: int) -> list[dict[str, Any]]:
                 value.strip()
                 for value in trailer_fields[i + 1].split("\n")
                 if re.fullmatch(r"[A-Za-z][A-Za-z0-9]*-[0-9]+(?:\.[0-9]+)*", value.strip())
+                and not LOOP_ALIAS.match(value.strip())
             }
         )
         for i in range(0, len(trailer_fields) - 1, 2)

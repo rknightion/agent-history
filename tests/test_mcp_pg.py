@@ -180,3 +180,8 @@ def test_search_and_session_stay_inside_the_context(loaded, tmp_path, monkeypatc
         loaded.session_impl(root, "", "claude")
     rows = json.loads(loaded.efficiency_impl(root, "", True, "pi").partition("\n")[2])
     assert [r["trigger"] for r in rows][:2] == ["user", "status"]
+    # A context without the pi namespace finds nothing; naming it explicitly reaches the root.
+    assert json.loads(loaded.efficiency_impl(root, "", False, "claude").partition("\n")[2]) == []
+    explicit = mcp_server.efficiency(root, "", False, "claude", namespaces=["pi-local"])
+    assert explicit.startswith("[context=explicit namespaces=pi-local]")
+    assert [r["role"] for r in json.loads(explicit.partition("\n")[2])] == ["root"]

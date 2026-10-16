@@ -204,6 +204,7 @@ transcripts are required. No live catalogue rebuild is implied by migration appl
 | Table | New columns and SQL types | Authoritative source and meaning |
 |---|---|---|
 | `ah.llm_call` | `duration_ms int`, `latency_basis text` | The observed per-call timestamp interval described below, never a turn duration or an inferred server duration. |
+| `ah.llm_call` | usage counts | A Claude or pi usage record whose counts are all zero and which carries no stop reason stores every count (and a zero recorded cost) as NULL: Claude Code writes each content block with message_start usage, which a provider-adapting proxy can send as all zero. Codex token records carry no stop reason, so their zeros stay known. With a configured `[litellm]` spend-log DSN, unknown counts in the named Claude namespaces are filled from `LiteLLM_SpendLogs` by request id; a known count is never overwritten. |
 | `ah.llm_call` | `cost_usd numeric` | A call's explicitly recorded USD usage cost (including pi assistant usage cost), not catalogue list-price accounting or an allocation from cumulative session cost. |
 | `ah.llm_call` | `thinking_ms int` | Explicit recorded thinking duration in milliseconds, not reasoning tokens converted to time. |
 | `ah.llm_call` | `raw_stop_reason text` | The provider/harness stop reason verbatim before any existing normalisation; `stop_reason` semantics are unchanged. |
@@ -533,7 +534,10 @@ Migration `024_loop_progress.sql` adds nullable columns on the same grant-preser
   zero. This is list-price accounting, not an invoice.
 - `tool_errors bigint` and `api_errors bigint`: recorded tool failures and API-error calls.
   No tool/call evidence leaves the respective count NULL; known outcomes can establish zero.
-  `commits bigint` includes recorded commits/cherry-picks; `pushes bigint` counts recorded pushes.
+  `commits bigint` includes recorded commits/cherry-picks; `pushes bigint` counts recorded pushes,
+  one per distinct pushed range and branch (a range reported twice is one push) plus each push
+  recorded without a range. A ref range under a `From <url>` fetch header is not a push; only
+  ranges under `To <url>`, or with no header, are read as pushes.
   No matching git event leaves the count NULL, rather than claiming none happened.
 
 These project existing catalogue evidence, with the same membership convention as
@@ -716,6 +720,10 @@ Migration `037_git_commit_tasks.sql` adds nullable `ah.git_commit.task_ids text[
 default or historical backfill. The collector retains distinct exact tracker IDs from Git's
 terminal Task trailers, validating complete unfolded values rather than body mentions or aliases.
 Existing rows stay NULL until rescanned; an observed commit without valid IDs supplies `[]`.
+A neutral public alias (`Task: loop<N>-<lane>`, any case) is never a task, even when its lane is
+numeric and so has the tracker shape: the collector drops it and the count ignores any already
+collected. The private commit that consumes the work carries one `Task: <ID>` per delivered task,
+and those IDs are the landed count.
 
 #### State-only outcome normalization
 
@@ -822,6 +830,15 @@ the affected transcript structure unknown independently of enrichment. Outcome t
 complete collected-state normalization above, independently of this transcript structure.
 Projection still uses only collected bytes, not a local state-file lookup; lifecycle root activity
 is unchanged and completion follows the exactly attributed close rule above.
+
+A run with an attributed pi-dialect (v3) state cohort takes its live structure from that log alone,
+whatever the root harness: the loop-state extension writes dispatch, return, watch and heartbeat
+events itself and the root writes none by shell, so transcript appends, native watch records and
+spawn synthesis are not read for it. Machine copies of one event are one observation; an invalid
+copy leaves the structure unknown and disagreeing copies leave the affected kinds unknown. Root
+`judgement` and `park` events in that log supply `last_judgement` and `last_park`. A finished v3
+run whose end evidence is its closeout, completion receipt or report is `closing`. Outcome counts
+are unchanged: absent v3 admits, parks and lands stay NULL.
 
 `live_phase` is nullable and uses preparing, working, reviewing, gating, landing, waiting or
 closing. `phase_since` is the observed transition time. The historical hybrid combined deterministic

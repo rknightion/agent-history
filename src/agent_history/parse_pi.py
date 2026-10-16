@@ -874,7 +874,7 @@ class PiParser:
                            attempts=_recorded_int(timing.get("attempts")),
                            processing_ms=_recorded_int(timing.get("processingMs")),
                            is_api_error=stop == "error", error_kind=kind, api_error_status=status,
-                           is_sidechain=self.sub, line_count=1)]
+                           is_sidechain=self.sub, line_count=1).unknown_if_zero()]
 
     def _compaction(self, rtype: str, record: dict[str, Any], uid: str, ts: datetime, pos: LinePos) -> list[Row]:
         turn = self.s["cur"]

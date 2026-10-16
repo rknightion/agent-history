@@ -412,7 +412,7 @@ def infra_actions(
     return infra_actions_impl(host, around, window, namespaces or context)
 
 
-def efficiency_impl(session_uid: str | None, agent_id: str | None, calls: bool, context: str | None) -> str:
+def efficiency_impl(session_uid: str | None, agent_id: str | None, calls: bool, context: str | list[str] | None) -> str:
     ns, ctx = _ns(context)
     if calls:
         if not session_uid:
@@ -431,12 +431,17 @@ def efficiency_impl(session_uid: str | None, agent_id: str | None, calls: bool, 
 
 @mcp.tool()
 def efficiency(
-    session_uid: str | None = None, agent_id: str | None = None, calls: bool = False, context: str | None = None
+    session_uid: str | None = None,
+    agent_id: str | None = None,
+    calls: bool = False,
+    context: str | None = None,
+    namespaces: list[str] | None = None,
 ) -> str:
     """How sessions spent their model calls: each call attributed to what triggered it (user, model,
     work, status, wait, event, noop, orchestrate, agent_msg). A root that polls shows a high share of
-    wait and status calls. calls=true lists every call of one session."""
-    return efficiency_impl(session_uid, agent_id, calls, context)
+    wait and status calls. calls=true lists every call of one session. `namespaces` (for example a pi
+    namespace outside the context) overrides the context's namespace list."""
+    return efficiency_impl(session_uid, agent_id, calls, namespaces or context)
 
 
 def sql_impl(query: str) -> str:

@@ -222,6 +222,8 @@ def main(argv: list[str] | None = None) -> int:
     gcp.add_argument("--max-rows", type=int, default=50_000)
     sub.add_parser("create-vector-index", help="build the HNSW index on ah.embedding (after a backfill)")
 
+    usage = sub.add_parser("litellm-usage", help="fill unknown proxied usage from LiteLLM spend logs ([litellm])")
+    usage.add_argument("--days", type=int, default=90, help="look back this many days (default 90)")
     sub.add_parser("collect-git", help="ingest commits of the configured [git] repos into ah.git_commit")
     sub.add_parser("mcp", help="run the read-only MCP server on stdio")
     from . import reader
@@ -510,8 +512,17 @@ def _dispatch(args, parser, argv, reader_commands):
             if args.archive_root:
                 stats = load.refresh(conn, args.archive_root, None, args.namespace, args.limit_files, None)
             else:
+                from . import litellm_usage
+
                 stats = load.refresh(
-                    conn, None, None, None, args.limit_files, None, sources=_sources(config, args.source)
+                    conn,
+                    None,
+                    None,
+                    None,
+                    args.limit_files,
+                    None,
+                    sources=_sources(config, args.source),
+                    usage_fill=litellm_usage.filler(config.litellm),
                 )
             if not stats.lock_held:
                 _ensure_search_indexes(conn)
@@ -559,6 +570,17 @@ def _dispatch(args, parser, argv, reader_commands):
                 print("seeded")
             elif args.command == "create-indexes":
                 load.create_post_load_indexes(conn)
+            elif args.command == "litellm-usage":
+                from . import litellm_usage
+
+                if args.days < 1:
+                    parser.error("--days must be positive")
+                run_fill = litellm_usage.filler(config.litellm, days=args.days)
+                if run_fill is None:
+                    print("agent-history: [litellm] needs a dsn and namespaces", file=sys.stderr)
+                    return 2
+                print(json.dumps(run_fill(conn)))
+                conn.commit()
             elif args.command == "postpass":
                 print(json.dumps(load.post_passes(conn)))
                 conn.commit()

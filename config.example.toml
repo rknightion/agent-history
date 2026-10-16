@@ -41,6 +41,17 @@ pi-local = "~/.pi/agent"
 # [efficiency]
 # workflow_transcripts = true
 
+# Optional usage source for Claude Code homes routed through a LiteLLM proxy. Such a proxy can
+# write every subagent content block with all-zero usage; those rows are stored as unknown (NULL).
+# With a read-only DSN to the proxy's spend-log database, each index pass fills unknown usage for
+# these namespaces from "LiteLLM_SpendLogs" by request id. Without a DSN usage stays unknown.
+# $AGENT_HISTORY_LITELLM_DSN (or the variable named by dsn_env) overrides dsn and dsn_file.
+# `agent-history litellm-usage --days N` backfills older rows within the proxy's log retention.
+# [litellm]
+# dsn_file = "~/.config/agent-history/litellm-reader.dsn"
+# namespaces = ["claude-proxied"]
+# lookback_days = 3
+
 # Named search scopes, not access-control boundaries. Search tools use the selected context's
 # namespaces (the `context` argument, else $AGENT_HISTORY_CONTEXT, else default_context), but the
 # MCP `sql` tool can read every row in the database. Use separate databases for real separation.

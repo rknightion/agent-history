@@ -1498,6 +1498,7 @@ class ClaudeParser:
         if usage:
             _fill_usage(row, usage)
             row.inference_geo = as_str(usage.get("inference_geo"))
+            row.unknown_if_zero()
             iterations = usage.get("iterations")
             if isinstance(iterations, list) and all(isinstance(item, dict) for item in iterations):
                 row.iterations = _telemetry_int(len(iterations))

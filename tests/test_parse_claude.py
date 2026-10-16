@@ -1115,3 +1115,53 @@ def test_command_text_adds_no_second_event_when_output_matched_or_call_failed(tm
         ["output_regex"]
     failed = _with_b3(tmp_path, "git push -q origin main", "error: failed to push", is_error=True)
     assert not [r for r in failed.rows("git_event") if r["event_uid"].startswith("toolu_b3:")]
+
+
+def test_fetch_ref_ranges_are_not_pushes(tmp_path):
+    # `git pull` and `gh pr merge` print a fetch block whose ref range has the push shape.
+    out = ("From https://example.invalid/x/y\n * branch            main       -> FETCH_HEAD\n"
+           "   1111111..2222222  main       -> origin/main\nUpdating 1111111..2222222\nFast-forward\n")
+    pulled = _with_b3(tmp_path, "git pull --ff-only", out)
+    assert not [r for r in pulled.rows("git_event") if r["event_uid"].startswith("toolu_b3:")]
+    # A fetch block before a real push leaves exactly the push, from its own To block.
+    both = out + "To example.invalid:x/y.git\n   2222222..3333333  main -> main\n"
+    pushed = _with_b3(tmp_path, "git pull --ff-only && git push origin main", both)
+    events = [r for r in pushed.rows("git_event") if r["event_uid"].startswith("toolu_b3:")]
+    assert [(r["op"], r["evidence"], r["sha_short"]) for r in events] == [("push", "output_regex", "3333333")]
+
+
+def _subagent_blocks(tmp_path, blocks):
+    """One synthetic subagent response written as one record per content block, as Claude Code does."""
+    zero = {"input_tokens": 0, "output_tokens": 0, "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0}
+    records = []
+    for n, (mid, stop, usage) in enumerate(blocks):
+        records.append({"type": "assistant", "sessionId": SID, "agentId": "a1", "isSidechain": True,
+                        "uuid": f"sub-{n}", "timestamp": f"2026-09-20T10:00:{10 + n:02d}.000Z",
+                        "message": {"id": mid, "role": "assistant", "model": "synthetic-proxied",
+                                    "stop_reason": stop, "usage": usage or zero,
+                                    "content": [{"type": "text", "text": f"block {n}"}]}})
+    path = tmp_path / "agent-a1.jsonl"
+    path.write_text("".join(json.dumps(r) + "\n" for r in records))
+    store = MemStore()
+    run_file(ClaudeParser, FileContext(str(path), f"claude-test/projects/synthetic/{SID}/subagents/agent-a1.jsonl",
+                                       "claude-test", "claude", "test", None, "subagent"), store)
+    return store
+
+
+def test_all_zero_usage_without_stop_reason_is_unknown(tmp_path):
+    real = {"input_tokens": 7, "output_tokens": 30, "cache_read_input_tokens": 900,
+            "cache_creation_input_tokens": 0}
+    store = _subagent_blocks(tmp_path, [("msg_a", None, None), ("msg_a", None, None), ("msg_a", "end_turn", real),
+                                        ("msg_b", None, None), ("msg_b", None, None)])
+    complete = one(store, "llm_call", response_id="msg_a")
+    assert (complete["input_uncached"], complete["cache_read"], complete["output"]) == (7, 900, 30)
+    # Only message_start usage was written: every count is unknown, never a measured zero.
+    partial = one(store, "llm_call", response_id="msg_b")
+    assert [partial[k] for k in ("input_uncached", "cache_read", "cache_write_5m", "output")] == [None] * 4
+
+
+def test_zero_usage_with_a_stop_reason_stays_a_known_zero(tmp_path):
+    store = _subagent_blocks(tmp_path, [("msg_c", "end_turn", None)])
+    call = one(store, "llm_call", response_id="msg_c")
+    assert (call["input_uncached"], call["output"]) == (0, 0)

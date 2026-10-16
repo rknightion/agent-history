@@ -254,6 +254,30 @@ class LlmCallRow(Row):
     attempts: int | None = None
     processing_ms: int | None = None
 
+    def unknown_if_zero(self) -> "LlmCallRow":
+        """An all-zero usage record that carries no stop reason is unknown, not a measured zero.
+
+        Claude Code writes each content block with the usage of the stream's message_start, and a
+        proxy that adapts another provider can send that event with every count zero. Only the
+        record written after message_delta (which sets stop_reason) carries real counts. Storing
+        those zeros would make lane totals and cost a false zero; NULL keeps them unknown, and the
+        loader's GREATEST merge still lets a later real record for the same response win.
+        Claude and pi call this. Codex token records never carry a stop reason, so there an
+        all-zero record is a reported zero and the rule does not apply.
+        """
+        if self.stop_reason is not None:
+            return self
+        values = [getattr(self, name) for name in USAGE_FIELDS]
+        if all(v is None or v == 0 for v in values) and any(v == 0 for v in values):
+            for name in USAGE_FIELDS:
+                setattr(self, name, None)
+            if self.cost_usd is not None and self.cost_usd == 0:
+                self.cost_usd = None
+        return self
+
+
+USAGE_FIELDS = ("input_uncached", "cache_read", "cache_write_5m", "cache_write_1h", "output", "reasoning")
+
 
 @dataclass
 class RequestProgressRow(Row):

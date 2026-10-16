@@ -1112,7 +1112,9 @@ SELECT s.id, now(),
     (SELECT count(*) FROM ah.subagent_spawn x WHERE x.parent_session_id = s.id),
     (SELECT count(*) FROM ah.compaction x WHERE x.session_id = s.id),
     (SELECT count(*) FROM ah.git_event g WHERE g.session_id = s.id AND g.op IN ('commit','cherry_pick')),
-    (SELECT count(*) FROM ah.git_event g WHERE g.session_id = s.id AND g.op = 'push'),
+    (SELECT count(DISTINCT CASE WHEN g.sha_short IS NOT NULL THEN 'sha:' || g.sha_short || ':' || COALESCE(g.branch, '')
+                                ELSE 'event:' || g.id END)
+       FROM ah.git_event g WHERE g.session_id = s.id AND g.op = 'push'),
     l.api_errors,
     (SELECT count(*) FROM ah.session_event e WHERE e.session_id = s.id AND e.kind = 'interrupt'),
     l.models,
@@ -1478,8 +1480,12 @@ def refresh(conn: psycopg.Connection, hot: Path | None = HOT_ROOT, cold: Path | 
             namespaces: Iterable[str] | None = None, limit_files: int | None = None,
             textfile: Path | None = TEXTFILE, log=print, kind: str = "refresh",
             sources: dict[str, Path] | None = None,
-            source_entries: dict[str, SourceEntry] | None = None) -> RunStats:
-    """Index new transcript bytes from `sources` (namespace -> agent home) or the hot/cold archive."""
+            source_entries: dict[str, SourceEntry] | None = None,
+            usage_fill=None) -> RunStats:
+    """Index new transcript bytes from `sources` (namespace -> agent home) or the hot/cold archive.
+
+    `usage_fill(conn)`, when given, fills unknown usage from an external source under the index
+    lock before the post passes. Its failure leaves that usage unknown and never fails the pass."""
     stats = RunStats()
     previous = previous_success_timestamp(textfile) if textfile else None
     got = conn.execute("SELECT pg_try_advisory_lock(%s)", (ADVISORY_LOCK,)).fetchone()[0]
@@ -1530,7 +1536,17 @@ def refresh(conn: psycopg.Connection, hot: Path | None = HOT_ROOT, cold: Path | 
                     cur.executemany("UPDATE ah.source_file SET status='unavailable', available_hot=false, "
                                     "available_cold=false WHERE rel_path=%s", [(m,) for m in missing])
         conn.commit()
+        filled = None
+        if usage_fill is not None:
+            try:
+                filled = usage_fill(conn)
+                conn.commit()
+            except (psycopg.Error, OSError) as exc:
+                conn.rollback()
+                log(json.dumps({"usage_fill": "failed", "category": type(exc).__name__}))
         post = post_passes(conn, refresh_id)
+        if filled is not None:
+            post["usage_fill"] = filled
         conn.execute("INSERT INTO ah.meta VALUES ('last_refresh_at', now()::text) "
                      "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value")
         success = stats.errors == 0

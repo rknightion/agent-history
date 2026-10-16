@@ -26,6 +26,8 @@ from psycopg.types.json import Jsonb
 from .common import _join_continuations
 from .config import ConfigError, LoopLive, load_config
 
+# Terminal end evidence of a v3 run (the closeout is its last file), as loops.refresh_live finishes it.
+V3_TERMINAL = ("closeout", "completion_receipt", "report_write")
 PHASES = ("preparing", "working", "reviewing", "gating", "landing", "waiting", "closing")
 DIGEST_BYTES = 12000
 # Complete UTF-8 wire envelope, including instructions and JSON escaping. This is a byte
@@ -1182,9 +1184,56 @@ def drain_one(conn: psycopg.Connection, config: LoopLive, infer=request) -> bool
     return False
 
 
+_V3_STATE_KINDS = ("dispatch", "return", "watch", "heartbeat", "judgement", "park", "admit", "land", "gate")
+
+
+def _v3_state_events(cohorts, start: datetime, end: datetime | None) -> list[dict]:
+    """Live evidence from a collected v3 state log, the run's canonical writer.
+
+    The pi loop-state extension records dispatch, return, watch and heartbeat events itself; the
+    root writes none of them by shell. Machine copies of one frozen event are one observation.
+    An invalid copy, or copies that disagree at a shared position, leave the affected structure
+    unknown rather than choosing a copy.
+    """
+    from .loops import _state_conflicts
+
+    events, seen = [], set()
+    if any(e["ev"] == "invalid" for _, cohort in cohorts for e in cohort):
+        return [{"ev": "uncertain", "at": start}]
+    for kind in _state_conflicts(cohorts) & set(_V3_STATE_KINDS):
+        events.append({"ev": "uncertain", "for_ev": kind, "at": start})
+    for opened, cohort in cohorts:
+        for e in cohort:
+            if e["ev"] not in _V3_STATE_KINDS or (opened, e["seq"]) in seen:
+                continue
+            seen.add((opened, e["seq"]))
+            at = e["at"]
+            if at < start or (end is not None and at >= end):
+                continue
+            if e["ev"] == "heartbeat":
+                events.append({"ev": "heartbeat", "at": at})
+            elif e["ev"] == "dispatch":
+                events.append({"ev": "dispatch", "at": at, **{k: e.get(k) for k in ("run", "lane", "agent", "task")}})
+            elif e["ev"] == "return":
+                events.append({"ev": "return", "at": at, "run": e.get("run"), "lane": e.get("lane")})
+            elif e["ev"] == "watch":
+                events.append({"ev": "watch", "at": at, **{k: e.get(k) for k in ("op", "what", "deadline")}})
+            else:
+                events.append({k: v for k, v in e.items() if k not in ("v", "seq", "ts", "by")})
+    return events
+
+
 def _events(
     conn: psycopg.Connection, loop_id: int, root: int, start: datetime, end: datetime | None, report: str
 ) -> list[dict]:
+    from .loops import state_cohorts
+
+    uid = conn.execute("SELECT launch_uid FROM ah.loop_run WHERE id=%s", (loop_id,)).fetchone()[0]
+    cohorts = state_cohorts(conn, uid).get(uid, [])
+    if any(getattr(cohort, "dialect", "v1") == "v3" for _, cohort in cohorts):
+        # The v3 log is complete collected evidence for any harness that writes one, so
+        # transcript appends, native watch records and spawn synthesis would only duplicate it.
+        return _v3_state_events(cohorts, start, end)
     roots = [
         row[0]
         for row in conn.execute(
@@ -1245,12 +1294,9 @@ def _events(
     # The root-only producer appends heartbeats directly to state JSONL, not the pi
     # transcript. Consume collected bytes through the existing exact identity/open join.
     # Native watch/heartbeat evidence above remains readable for older retained logs.
-    from .loops import state_cohorts
-
-    uid = conn.execute("SELECT launch_uid FROM ah.loop_run WHERE id=%s", (loop_id,)).fetchone()[0]
     heartbeats = {
         e["at"]
-        for _, cohort in state_cohorts(conn, uid).get(uid, [])
+        for _, cohort in cohorts
         for e in cohort
         if e["ev"] == "heartbeat" and e["at"] >= start and (end is None or e["at"] < end and e["_observed_at"] < end)
     }
@@ -1344,7 +1390,9 @@ def refresh(conn: psycopg.Connection) -> None:
         row[0]
         for row in conn.execute(
             "SELECT l.launch_uid FROM ah.loops l JOIN ah.loop_run r USING(launch_uid) "
-            "WHERE l.status='finished' AND r.end_evidence='state_close' AND l.live_phase IS DISTINCT FROM 'closing'"
+            "WHERE l.status='finished' AND l.live_phase IS DISTINCT FROM 'closing' AND (r.end_evidence='state_close' "
+            "OR (r.mode='v3' AND r.end_evidence = ANY(%s)))",
+            (list(V3_TERMINAL),),
         )
     ]
     for uid in dict.fromkeys(historical + sorted(active) + completed + state_closes):
@@ -1366,14 +1414,17 @@ def refresh(conn: psycopg.Connection) -> None:
         # Outcome totals are complete collected-state evidence, not captured shell appends.
         # Overlay before both queue digest and SQL write: phase refresh must not erase them.
         outcomes = conn.execute(
-            "SELECT tasks_admitted,tasks_landed,parks_total,r.end_evidence FROM ah.loops l "
+            "SELECT tasks_admitted,tasks_landed,parks_total,r.end_evidence,r.mode FROM ah.loops l "
             "JOIN ah.loop_run r USING(launch_uid) WHERE l.launch_uid=%s",
             (uid,),
         ).fetchone()
         for field, value in zip(("tasks_admitted", "tasks_landed", "parks_total"), outcomes[:3]):
             state[field] = value
         state["phase_input"]["park_events_so_far"] = state["parks_total"]
-        if target[5] == "finished" and outcomes[3] == "state_close":
+        # A v3 closeout (or completion receipt or report) is the run's terminal file: the loop is closed.
+        if target[5] == "finished" and (
+            outcomes[3] == "state_close" or (outcomes[4] == "v3" and outcomes[3] in V3_TERMINAL)
+        ):
             state["close_recorded"] = state["phase_input"]["close_recorded"] = True
             state["live_phase"] = "closing"
         key = digest_key(state, config.reasoning)

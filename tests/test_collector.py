@@ -31,6 +31,18 @@ def test_git_commits_collects_only_exact_task_trailers(tmp_path):
     }
 
 
+def test_git_commits_drop_neutral_loop_alias_trailers(tmp_path):
+    """A public trailer carries a neutral `loop<N>-<lane>` alias; only the consuming private
+    commit names tracker tasks. An alias whose lane is numeric still has the tracker shape."""
+    repo = tmp_path / "aliases"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    message = "land lanes\n\nTask: loop36-7\nTask: LOOP12-3\nTask: loop36-roles\nTask: TASK-1001"
+    _git(repo, "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-q", "-m", message)
+    [row] = C.git_commits({"path": repo, "ref": "main", "slug": "github.com/example/widget", "emails": set()}, 1)
+    assert row["task_ids"] == ["TASK-1001"]
+
+
 def test_revert_detection():
     body = 'Revert "x"\n\nThis reverts commit 0123456789abcdef0123456789abcdef01234567.\n'
     assert C.reverts_sha(body) == "0123456789abcdef0123456789abcdef01234567"

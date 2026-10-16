@@ -282,3 +282,15 @@ def test_git_event_extras_skip_what_output_already_showed():
     # one output-matched commit covers one command commit; the second is command-only
     assert git_event_extras(["commit", "commit", "push"], 1, 0) == [("commit", 1), ("push", 0)]
     assert git_event_extras(["commit", "push"], 1, 1) == []
+
+
+def test_git_from_output_reads_only_push_blocks():
+    from agent_history.common import git_from_output
+
+    fetch = "From https://example.invalid/x/y\n   1111111..2222222  main       -> origin/main\n"
+    push = "To https://example.invalid/x/y.git\n   2222222..3333333  main -> main\n"
+    assert git_from_output(fetch) == ([], [])
+    assert git_from_output(fetch + push)[1] == [("2222222", "3333333", "main", "main")]
+    assert git_from_output(push + fetch)[1] == [("2222222", "3333333", "main", "main")]
+    # A bare range with no header keeps the historical reading.
+    assert git_from_output("   2222222..3333333  main -> main\n")[1] == [("2222222", "3333333", "main", "main")]

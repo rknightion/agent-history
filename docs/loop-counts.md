@@ -80,6 +80,8 @@ Migration 037 adds nullable `ah.git_commit.task_ids text[]`, without a default o
 Historical NULL means unobserved trailers; known `[]` means an observed commit with no valid task
 IDs. Folded terminal trailer values are validated whole; body mentions and aliases do not count.
 Exact spelling and subtasks survive. Counts deduplicate repositories, commits and collector copies.
+Neutral public aliases (`Task: loop<N>-<lane>`) never count, even with a numeric lane; the private
+commit that consumes the work carries one `Task: <ID>` per delivered task.
 No observed commits, or any matching commit with unknown trailers, leaves NULL. Observed commits
 with known empty arrays can establish zero. Collector-only refreshes recompute even finished
 loops; legacy `tasks_done`, retained commit history, reader shapes and grants remain unchanged.

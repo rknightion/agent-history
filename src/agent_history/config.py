@@ -98,6 +98,21 @@ class Efficiency:
     workflow_transcripts: bool = True
 
 
+# Optional usage source for proxied Claude Code namespaces: a read-only LiteLLM spend-log database.
+@dataclass
+class LiteLLM:
+    """Fill unknown llm_call usage from LiteLLM_SpendLogs by request id. Off without a DSN."""
+
+    dsn: str | None = None
+    namespaces: tuple[str, ...] = ()
+    lookback_days: int = 3
+    batch: int = 500
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.dsn) and bool(self.namespaces)
+
+
 # Metric collection settings, run by the periodic indexer. The table keeps its historical name
 # `[exporter]`. All roots are optional; no private paths are defaults.
 @dataclass
@@ -159,6 +174,7 @@ class Config:
     embedding: Embedding = field(default_factory=Embedding)
     loop_live: LoopLive = field(default_factory=LoopLive)
     efficiency: Efficiency = field(default_factory=Efficiency)
+    litellm: LiteLLM = field(default_factory=LiteLLM)
     exporter: Exporter = field(default_factory=Exporter)
     metrics_labels: MetricsLabels = field(default_factory=MetricsLabels)
     path: Path | None = None
@@ -193,6 +209,7 @@ def parse_config(data: dict[str, Any], path: Path | None = None) -> Config:
         "embedding",
         "loop_live",
         "efficiency",  # lane C
+        "litellm",
         "exporter",
         "metrics_labels",
     }
@@ -290,6 +307,27 @@ def parse_config(data: dict[str, Any], path: Path | None = None) -> Config:
         raise ConfigError("efficiency workflow_transcripts must be true or false")
     if efficiency.first_parse_days < 0 or efficiency.baseline_ts < 0:
         raise ConfigError("efficiency baseline and first_parse_days must be non-negative")
+    lite = _table(data, "litellm")
+    unexpected = set(lite) - {"dsn", "dsn_file", "dsn_env", "namespaces", "lookback_days", "batch"}
+    if unexpected:
+        raise ConfigError(f"unknown litellm keys: {', '.join(sorted(unexpected))}")
+    lite_namespaces = lite.get("namespaces", [])
+    if not isinstance(lite_namespaces, list) or not all(
+        isinstance(n, str) and NAMESPACE.match(n) and n.startswith("claude-") for n in lite_namespaces
+    ):
+        raise ConfigError("litellm.namespaces must be a list of claude-<name> namespaces")
+    dsn_env = lite.get("dsn_env", "AGENT_HISTORY_LITELLM_DSN")
+    if not isinstance(dsn_env, str) or not dsn_env:
+        raise ConfigError("litellm.dsn_env must be a non-empty string")
+    lookback, batch = lite.get("lookback_days", 3), lite.get("batch", 500)
+    if type(lookback) is not int or not 1 <= lookback <= 366 or type(batch) is not int or not 1 <= batch <= 10000:
+        raise ConfigError("litellm.lookback_days must be 1 to 366 and litellm.batch 1 to 10000")
+    litellm = LiteLLM(
+        dsn=_secret(lite.get("dsn"), lite.get("dsn_file"), dsn_env, "litellm dsn"),
+        namespaces=tuple(lite_namespaces),
+        lookback_days=lookback,
+        batch=batch,
+    )
     embedding = Embedding(
         enabled=bool(emb.get("enabled", False)),
         base_url=str(emb.get("base_url", Embedding.base_url)),
@@ -346,6 +384,7 @@ def parse_config(data: dict[str, Any], path: Path | None = None) -> Config:
         embedding=embedding,
         loop_live=loop_live,
         efficiency=efficiency,
+        litellm=litellm,
         exporter=exporter,
         metrics_labels=_metrics_labels(data.get("metrics_labels")),
         path=path,

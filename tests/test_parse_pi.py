@@ -1073,3 +1073,19 @@ def test_recorded_telemetry_replay_enriches_without_erasing_or_rewriting_content
     assert one(store, "tool_call", call_uid="watch")["deadline_hit"] is False
     assert one(store, "tool_io", io_uid="watch")["output_text"] == "Synthetic output retained."
     assert one(store, "subagent_spawn", spawn_uid="async")["timeout_ms"] == 0
+
+
+def test_all_zero_usage_without_stop_reason_is_unknown_row():
+    from datetime import datetime, timezone
+
+    from agent_history.model import LlmCallRow, SessionKey
+
+    key = SessionKey("pi", "synthetic", "")
+    at = datetime(2026, 9, 20, tzinfo=timezone.utc)
+    zero = LlmCallRow("pi", "r1", key, at, 0, input_uncached=0, cache_read=0, cache_write_5m=0,
+                      cache_write_1h=0, output=0, cost_usd=0.0).unknown_if_zero()
+    assert (zero.input_uncached, zero.output, zero.cost_usd) == (None, None, None)
+    stopped = LlmCallRow("pi", "r2", key, at, 0, stop_reason="stop", input_uncached=0, output=0).unknown_if_zero()
+    assert (stopped.input_uncached, stopped.output) == (0, 0)
+    real = LlmCallRow("pi", "r3", key, at, 0, input_uncached=0, output=5).unknown_if_zero()
+    assert (real.input_uncached, real.output) == (0, 5)

@@ -120,3 +120,19 @@ def test_v3_state_outcomes_keep_precedence_over_positive_trailers(clean, tmp_pat
     assert landed(clean) == 1
     assert surface(clean) == [("finished", 2, 1, 3, 1)]
     assert clean.execute("SELECT tasks_done FROM ah.loops").fetchone() == (1,)
+
+
+def test_public_alias_trailers_do_not_add_to_the_private_consuming_commit(clean, tmp_path):
+    clean.execute("DELETE FROM ah.loop_state")  # collected state is not a data table; earlier tests leave it
+    root, _, at = setup_run(clean, tmp_path)
+    clean.execute(
+        "INSERT INTO ah.git_event (agent,event_uid,session_id,ts,op,remote_url,evidence,source_id,byte_offset) "
+        "VALUES ('pi','synthetic-public-remote',%s,%s,'push','https://example.com/example/public.git','command',0,0)",
+        (root, at + timedelta(seconds=1)),
+    )
+    # Public lane commits carry neutral aliases, collected before aliases were excluded at the source.
+    commit(clean, "a", at + timedelta(seconds=2), ["loop1-1"], "machine/example/public")
+    commit(clean, "b", at + timedelta(seconds=3), ["loop1-2", "LOOP1-3"], "machine/example/public")
+    # The private commit that consumes the work names every delivered task once.
+    commit(clean, "c", at + timedelta(seconds=4), ["TASK-1001", "TASK-1002", "TASK-1003"])
+    assert landed(clean) == 3

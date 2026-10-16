@@ -13,6 +13,7 @@ from typing import Any
 MARKDOWN_PATH = re.compile(r"\[[^\]]*\]\((?:file://)?(<?/[^)>]+>?)(?:\s+['\"][^'\"]*['\"])?\)")
 GIT_COMMIT_LINE = re.compile(r"^\[([^\]\s]+)(?: \(root-commit\))? ([0-9a-f]{7,40})\]", re.M)
 GIT_PUSH_RANGE = re.compile(r"^\s*([0-9a-f]{7,})\.\.([0-9a-f]{7,})\s+(\S+)\s+->\s+(\S+)", re.M)
+GIT_RANGE_HEADER = re.compile(r"^(From|To) \S", re.M)
 BOUNDED_STATE_SECONDS = 24 * 3600
 
 
@@ -522,7 +523,15 @@ def git_from_output(text: str) -> tuple[list[tuple[str, str]], list[tuple[str, s
     if not isinstance(text, str) or not text:
         return [], []
     commits = [(m.group(1), m.group(2)) for m in GIT_COMMIT_LINE.finditer(text)]
-    pushes = [(m.group(1), m.group(2), m.group(3), m.group(4)) for m in GIT_PUSH_RANGE.finditer(text)]
+    # Fetch, pull and `gh pr merge` print ref ranges of the same shape under a `From <url>` header;
+    # push prints them under `To <url>`. A range under the latest From header is not a push. A range
+    # with no header at all keeps the historical reading.
+    headers = [(m.start(), m.group(1)) for m in GIT_RANGE_HEADER.finditer(text)]
+    pushes = []
+    for m in GIT_PUSH_RANGE.finditer(text):
+        latest = next((kind for at, kind in reversed(headers) if at < m.start()), None)
+        if latest != "From":
+            pushes.append((m.group(1), m.group(2), m.group(3), m.group(4)))
     return commits, pushes
 
 

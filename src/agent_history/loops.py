@@ -860,7 +860,11 @@ def _refresh_progress(conn: psycopg.Connection) -> None:
                                        t.started_at < COALESCE(s.end_ts, 'infinity'))
             ), git AS (
                 SELECT NULLIF(count(*) FILTER (WHERE g.op IN ('commit','cherry_pick')), 0) AS commits,
-                       NULLIF(count(*) FILTER (WHERE g.op = 'push'), 0) AS pushes
+                       -- One pushed range reported by two calls (or two collector copies) is one
+                       -- push; a quiet push without a range is its own event.
+                       NULLIF(count(DISTINCT CASE WHEN g.op = 'push' THEN
+                           CASE WHEN g.sha_short IS NOT NULL THEN 'sha:' || g.sha_short || ':' || COALESCE(g.branch, '')
+                                ELSE 'event:' || g.id END END), 0) AS pushes
                 FROM members s JOIN ah.git_event g ON g.session_id = s.id
                 WHERE NOT s.is_root OR (g.ts >= s.launch_ts AND g.ts < COALESCE(s.end_ts, 'infinity'))
             ), lanes AS (
@@ -967,8 +971,12 @@ def _refresh_trailer_lands(conn: psycopg.Connection, state_qualified: list[str])
             WHERE c.on_default AND c.committed_at >= t.launch_ts
               AND c.committed_at < COALESCE(t.cutoff, 'infinity')
         ), counted AS (
+            -- Neutral `loop<N>-<lane>` aliases on public commits are not tasks: the consuming private
+            -- commit names each delivered task. Rows collected before the collector dropped them
+            -- still carry them, so exclude them here too.
             SELECT o.launch_uid,
-                   CASE WHEN NOT bool_or(o.task_ids IS NULL) THEN count(DISTINCT task) END AS n
+                   CASE WHEN NOT bool_or(o.task_ids IS NULL) THEN
+                       count(DISTINCT task) FILTER (WHERE task !~* '^loop[0-9]+-') END AS n
             FROM observed o LEFT JOIN LATERAL unnest(o.task_ids) AS task ON true
             GROUP BY o.launch_uid
         )
@@ -1224,6 +1232,9 @@ def _read_state_progress(content: str, *, identity_only: bool = False):
                 continue
             events.append({**event, "at": activity_at, "_observed_at": at})
         elif ev in ("dispatch", "accept", "land", "admit", "park"):
+            events.append({**event, "at": at})
+        elif ev in ("return", "watch", "judgement", "gate"):
+            # Live structure only (lanes, watches, the latest judgement); no outcome counts these.
             events.append({**event, "at": at})
         elif ev == "close":
             # Neither a pre-open close nor a worker/daemon observation establishes an end.
