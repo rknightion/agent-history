@@ -911,6 +911,71 @@ def _refresh_tasks_done(conn: psycopg.Connection) -> None:
     """)
 
 
+def _state_blocks_trailer_lands(cohorts) -> bool:
+    """Absent v3 lands permit independent trailers; invalid/conflicting authority does not."""
+    if not cohorts:
+        return False
+    return (
+        any(getattr(events, "dialect", "v1") != "v3" for _, events in cohorts)
+        or any(event["ev"] == "invalid" for _, events in cohorts for event in events)
+        or bool(_state_conflicts(cohorts) & {"open", "land"})
+        or _state_kind_known(cohorts, "land")
+    )
+
+
+def _refresh_trailer_lands(conn: psycopg.Connection, state_qualified: list[str]) -> None:
+    """Count observed Task trailers for v3 only, after authoritative state outcomes.
+
+    The observed repository set is explicit loop identity plus captured in-window git-event
+    remotes on the root or linked sessions. It is not a claim of complete charter coverage.
+    Collector slugs lose exactly their first component; host is not part of loop identity.
+    No commits, or any matching commit with uncollected trailers, means unknown, not zero.
+    """
+    conn.execute(
+        """
+        WITH target AS (
+            SELECT l.launch_uid, r.id, r.root_session_id, l.repo, l.launch_ts,
+                   least(l.end_ts, (
+                       SELECT min(n.launch_ts) FROM ah.loop_run n
+                       WHERE n.launch_ts > l.launch_ts
+                         AND (n.root_session_id = r.root_session_id OR
+                              (r.report_path IS NOT NULL AND n.report_path = r.report_path))
+                   )) AS cutoff
+            FROM ah.loops l JOIN ah.loop_run r USING (launch_uid)
+            WHERE r.mode = 'v3' AND NOT (l.launch_uid = ANY(%s))
+              AND NOT EXISTS (
+                  SELECT 1 FROM ah.loop_run n WHERE n.id <> r.id AND n.launch_ts = l.launch_ts
+                    AND (n.root_session_id = r.root_session_id OR
+                         (r.report_path IS NOT NULL AND n.report_path = r.report_path))
+              )
+        ), repos AS (
+            SELECT launch_uid, lower(repo) AS repo FROM target
+            WHERE repo ~ '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'
+            UNION
+            SELECT t.launch_uid, regexp_replace(ah.remote_slug(g.remote_url), '^[^/]+/', '')
+            FROM target t JOIN ah.session s ON s.id = t.root_session_id OR s.loop_run_id = t.id
+            JOIN ah.git_event g ON g.session_id = s.id
+            WHERE g.ts >= t.launch_ts AND g.ts < COALESCE(t.cutoff, 'infinity')
+              AND ah.remote_slug(g.remote_url) ~ '^[^/]+/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'
+        ), observed AS (
+            SELECT t.launch_uid, c.task_ids FROM target t JOIN repos p USING (launch_uid)
+            JOIN ah.git_commit c ON lower(regexp_replace(c.repo_slug, '^[^/]+/', '')) = p.repo
+            WHERE c.on_default AND c.committed_at >= t.launch_ts
+              AND c.committed_at < COALESCE(t.cutoff, 'infinity')
+        ), counted AS (
+            SELECT o.launch_uid,
+                   CASE WHEN NOT bool_or(o.task_ids IS NULL) THEN count(DISTINCT task) END AS n
+            FROM observed o LEFT JOIN LATERAL unnest(o.task_ids) AS task ON true
+            GROUP BY o.launch_uid
+        )
+        UPDATE ah.loops l SET tasks_landed = c.n
+        FROM target t LEFT JOIN counted c USING (launch_uid)
+        WHERE l.launch_uid = t.launch_uid AND l.tasks_landed IS DISTINCT FROM c.n
+        """,
+        (state_qualified,),
+    )
+
+
 # Frozen loop-state v1 validate_event schema, from public bin/loop-state.
 # Frozen base source SHA-256: f44713f19942be7296feb377c79c6e9db4310c0796a0f4869dcd5ecadba00561.
 # The optional return artifact path is additive; every other v1 field remains strict.
@@ -1381,6 +1446,7 @@ def _refresh_state_counts(conn: psycopg.Connection) -> None:
                 "WHERE launch_uid=%s",
                 (closed, uid),
             )
+    _refresh_trailer_lands(conn, [uid for uid, cohorts in qualified.items() if _state_blocks_trailer_lands(cohorts)])
 
 
 def _tag_root(conn: psycopg.Connection, root_id: int) -> int:

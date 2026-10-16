@@ -44,7 +44,7 @@ def repo(tmp_path, clean):  # noqa: F811
     git(path, "remote", "add", "origin", "git@github.com:example-org/widget.git")
     (path / "a.txt").write_text("one\n")
     git(path, "add", "a.txt")
-    git(path, "commit", "-q", "-m", "add a")
+    git(path, "commit", "-q", "-m", "add a", "-m", "Task: TASK-1001\nTask: TASK-1001\nTask: TASK-1002.1")
     (path / "a.txt").write_text("one\ntwo\n")
     git(path, "commit", "-q", "-am", "extend a", email="someone@example.net")
     return path
@@ -72,6 +72,12 @@ def test_commits_are_ingested_with_owner_flag_and_no_email(clean, repo):  # noqa
         "WHERE repo_slug = 'github.com/example-org/widget' ORDER BY committed_at, subject"
     ).fetchall()
     assert sorted(rows) == [("add a", True, 1, 1), ("extend a", False, 1, 1)]
+    assert clean.execute("SELECT subject, task_ids FROM ah.git_commit ORDER BY subject").fetchall() == [
+        ("add a", ["TASK-1001", "TASK-1002.1"]),
+        ("extend a", []),
+    ]
+    # Simulate a retained pre-migration commit. A rescan enriches it, without deleting history.
+    clean.execute("UPDATE ah.git_commit SET task_ids=NULL WHERE subject='add a'")
     dump = " ".join(str(v) for row in clean.execute("SELECT * FROM ah.git_commit").fetchall() for v in row)
     assert "@" not in dump
     assert clean.execute("SELECT count(*) FROM ah.git_commit_file").fetchone()[0] == 2

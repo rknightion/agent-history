@@ -572,6 +572,22 @@ def git_commits(info: dict[str, Any], days: int) -> list[dict[str, Any]]:
     since = f"--since={days}.days.ago"
     meta = git(repo, "log", branch, since, "--format=%x1e%H%x1f%ct%x1f%ae%x1f%P%x1f%s%x1f%b", timeout=120)
     stats = parse_numstat(git(repo, "log", branch, since, "--format=%x1e%H", "--numstat", timeout=300))
+    # Let git recognise the terminal trailer block, rather than treating body mentions as lands.
+    # NUL separates the fixed SHA/trailer fields; newlines inside trailer values stay inside a field.
+    trailer_log = git(
+        repo, "log", branch, since, "-z", "--format=%H%x00%(trailers:key=Task,unfold,valueonly)", timeout=120
+    )
+    trailer_fields = trailer_log.split("\0")
+    task_ids = {
+        trailer_fields[i]: sorted(
+            {
+                value.strip()
+                for value in trailer_fields[i + 1].split("\n")
+                if re.fullmatch(r"[A-Za-z][A-Za-z0-9]*-[0-9]+(?:\.[0-9]+)*", value.strip())
+            }
+        )
+        for i in range(0, len(trailer_fields) - 1, 2)
+    }
     rows = []
     for record in meta.split("\x1e")[1:]:
         fields = record.split("\x1f")
@@ -587,6 +603,7 @@ def git_commits(info: dict[str, Any], days: int) -> list[dict[str, Any]]:
                 "committed_at": datetime.fromtimestamp(int(ct), tz=timezone.utc),
                 "author_is_owner": is_owner(email, info["emails"]),
                 "subject": subject[:1000],
+                "task_ids": task_ids[sha],
                 "parent_count": len(parents.split()),
                 "files_changed": files,
                 "insertions": ins,
@@ -1090,6 +1107,7 @@ GIT_COLS = [
     ("committed_at", "timestamptz"),
     ("author_is_owner", "boolean"),
     ("subject", "text"),
+    ("task_ids", "text[]"),
     ("parent_count", "smallint"),
     ("files_changed", "integer"),
     ("insertions", "integer"),

@@ -10,6 +10,27 @@ import pytest
 from agent_history import collect_git as C
 
 
+def test_git_commits_collects_only_exact_task_trailers(tmp_path):
+    """Body mentions and operational aliases are not landed tracker-task evidence."""
+    repo = tmp_path / "trailers"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    messages = [
+        "plain subject\n\nTask: TASK-9999\n\nThis is body text, not a trailer.",
+        "land changes\n\nTask: TASK-1001\nTask: TASK-1001\nTask: A2-1002.3\nTask: operational-alias\nTask: TASK-1003 extra\nTask: TASK-1004\n pending review",
+        "no trailers",
+    ]
+    for message in messages:
+        _git(repo, "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-q", "-m", message)
+    rows = C.git_commits({"path": repo, "ref": "main", "slug": "github.com/example/widget", "emails": set()}, 1)
+    by_subject = {row["subject"]: row["task_ids"] for row in rows}
+    assert by_subject == {
+        "plain subject": [],
+        "land changes": ["A2-1002.3", "TASK-1001"],
+        "no trailers": [],
+    }
+
+
 def test_revert_detection():
     body = 'Revert "x"\n\nThis reverts commit 0123456789abcdef0123456789abcdef01234567.\n'
     assert C.reverts_sha(body) == "0123456789abcdef0123456789abcdef01234567"

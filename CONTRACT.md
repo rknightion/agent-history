@@ -539,6 +539,33 @@ Invalid framing supplies no state override; torn non-events are ignored while or
 stored. Without qualifying state evidence, `lanes_accepted` is NULL. No state-only outcome column
 takes the Done-flip fallback. `lanes_reported` and `lanes_total` are unchanged.
 
+#### Observed v3 Task-trailer lands
+
+For launches explicitly recorded with `loop_run.mode = 'v3'`, `tasks_landed` can also count
+observed Git Task trailers when no qualifying retained state cohort exists. State evidence,
+including unknown outcomes from conflicting qualified snapshots, keeps precedence. v2 launches
+and the other state outcome fields retain their existing meanings.
+
+The observed repository set is the authoritative `ah.loops.repo` plus explicit captured
+`git_event.remote_url` values on the root or linked sessions inside the launch window. Remotes
+are normalised with `ah.remote_slug`; collector repository slugs lose exactly their first
+component, retaining owner/repo. Host is not part of this identity. No basename, inferred
+`ah.repo.slug`, local file or uncaptured charter supplies repository evidence. This set describes
+observed repositories, not proof that every charter repository has been collected.
+
+Only `on_default` commits in the half-open launch window qualify. Its upper bound is the earlier
+recorded loop end or following launch on the same root or exact report path. Equal-time launches
+on that root or path are ambiguous and supply no trailer count. Exact task IDs are deduplicated
+across repositories, collector copies and commits. No matching commit evidence, or any matching
+commit whose trailers are still unknown, leaves the count NULL. Observed commits with known
+empty Task-trailer arrays can establish zero. Collector-only refreshes recompute these counts,
+including finished launches, without changing legacy `tasks_done` or deleting commit history.
+
+Migration `037_git_commit_tasks.sql` adds nullable `ah.git_commit.task_ids text[]` without a
+default or historical backfill. The collector retains distinct exact tracker IDs from Git's
+terminal Task trailers, validating complete unfolded values rather than body mentions or aliases.
+Existing rows stay NULL until rescanned; an observed commit without valid IDs supplies `[]`.
+
 #### State-only outcome normalization
 
 Existing nullable `tasks_admitted`, `tasks_landed`, `parks_total` and `lanes_accepted` columns

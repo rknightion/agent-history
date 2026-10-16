@@ -39,6 +39,7 @@ REPLAYED = (
     # 025 creates the receipt table on fresh init, so its widened kind check must replay too.
     "035_loop_receipt_posted.sql",
     "036_request_progress.sql",
+    "037_git_commit_tasks.sql",
     "038_loop_run_metadata.sql",
 )
 
