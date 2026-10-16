@@ -81,7 +81,7 @@ def test_sigterm_between_passes_exits_without_waiting_out_the_interval(tmp_path)
     assert marks.read_text().split() == ["start", "end"]
 
 
-def test_loop_live_pass_claims_no_job_after_a_drain_request(monkeypatch):
+def test_retired_loop_live_pass_claims_no_job_even_before_a_drain_request(monkeypatch):
     config = Config(dsn="synthetic", loop_live=LoopLive(enabled=True))
     monkeypatch.setattr(loop_live, "load_config", lambda: config)
     monkeypatch.delenv("AGENT_HISTORY_DSN", raising=False)
@@ -108,4 +108,5 @@ def test_loop_live_pass_claims_no_job_after_a_drain_request(monkeypatch):
 
     monkeypatch.setattr(loop_live, "drain_one", drain_one)
     loop_live.run_pass(stop)
-    assert len(calls) == 1
+    assert calls == []
+    assert not stop.requested

@@ -1,5 +1,6 @@
-"""The collector's receipt step runs from `main`, including without a database (--dry-run)."""
+"""Current metadata/state collection and historical receipt readers."""
 
+import hashlib
 import json
 import signal
 import subprocess
@@ -13,14 +14,20 @@ from agent_history import collect_git, collect_receipts, loops
 
 
 @pytest.mark.parametrize("state_source", ["regular", "file-link", "directory-link"])
-def test_main_dry_run_counts_receipts_of_configured_repositories(tmp_path, monkeypatch, capsys, state_source):
+def test_main_dry_run_retires_receipts_but_collects_metadata_and_state(tmp_path, monkeypatch, capsys, state_source):
     repo = tmp_path / "checkout"
     (repo / "codex").mkdir(parents=True)
     subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
     (repo / "codex/report-synthetic-loop1.md.notified").write_text("request req-1\n")
-    # wave-notify's current completion receipt; the older `.notified` one stays collected.
+    # Both current and older completion sidecars must be ignored by collection.
     (repo / "codex/report-synthetic-loop2.md.posted").write_text("sha256:" + "c" * 64 + ' receiver {"id": "r"}\n')
     (repo / "codex/goal-synthetic-loop1.md.started").write_text("example/repo#loop1#" + "a" * 64 + "\n")
+    charter = repo / "codex/charter-synthetic-loop1.md"
+    charter.write_text("Synthetic charter.\n")
+    digest = hashlib.sha256(charter.read_bytes()).hexdigest()
+    (repo / "codex/closeout-synthetic-loop1.md").write_text(
+        f"# Closeout: example/repo loop1 · Charter: {digest}\nSynthetic closeout.\n"
+    )
     state = repo / "codex/state-synthetic-loop1.jsonl"
     state.write_text(state_log())
     if state_source == "file-link":
@@ -43,10 +50,14 @@ def test_main_dry_run_counts_receipts_of_configured_repositories(tmp_path, monke
     assert summary["machine"] == "synthetic-mac"
     if state_source == "regular":
         assert summary["errors"] == []
-    else:
+    elif state_source == "file-link":
         assert len(summary["errors"]) == 1
         assert summary["errors"][0]["step"] == "loop_state"
-    assert summary["tables"]["loop_receipt"] == {"rows": 3}
+    else:
+        assert len(summary["errors"]) == 2
+        assert {error["step"] for error in summary["errors"]} == {"loop_run_metadata", "loop_state"}
+    assert "loop_receipt" not in summary["tables"]
+    assert summary["tables"]["loop_run_metadata"] == {"rows": 0 if state_source == "directory-link" else 2}
     assert summary["tables"]["loop_state"] == {"rows": 1 if state_source == "regular" else 0}
 
 

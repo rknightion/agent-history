@@ -17,6 +17,7 @@ from test_loop_live_pg import (
     DSN,
     clean as _clean_fixture,
     fake_infer,
+    historical_cache,
     live_config as _config_fixture,
     psycopg,
     refresh,
@@ -31,7 +32,7 @@ transcript = _transcript_fixture
 
 @contextmanager
 def summary_upstream(config, response):
-    """Exercise the real worker HTTP path against a bounded local synthetic provider."""
+    """A listening synthetic provider must receive no requests from retired workers."""
     captured = []
 
     class Handler(BaseHTTPRequestHandler):
@@ -52,34 +53,28 @@ def summary_upstream(config, response):
     with HTTPServer(("127.0.0.1", 0), Handler) as server:
         server.timeout = 5
 
-        def serve():
-            for _ in range(2):
-                server.handle_request()
-
-        worker = Thread(target=serve)
+        worker = Thread(target=lambda: server.serve_forever(poll_interval=0.05))
         worker.start()
         base = f"http://127.0.0.1:{server.server_port}"
         try:
             yield replace(config, jev_url=base + "/jev", summary_url=base + "/summary"), captured
         finally:
-            worker.join(timeout=12)
+            server.shutdown()
+            worker.join(timeout=5)
         assert not worker.is_alive()
-    assert [path for path, _ in captured] == ["/jev", "/summary"]
-    assert captured[1][1]["max_tokens"] == 2048
-    assert captured[1][1]["reasoning_effort"] == "high"
-    assert captured[1][1]["thinking"] == {"type": "enabled"}
+    assert captured == []
 
 
-def drain_summary(config, response):
+def drain_summary(conn, uid, config, response):
     with summary_upstream(config, response) as (local_config, captured):
         with psycopg.connect(DSN, autocommit=True) as worker:
-            assert loop_live.drain_one(worker, local_config)
             assert not loop_live.drain_one(worker, local_config)
+    historical_cache(conn, uid, config, {"summary": response})
     return captured
 
 
 @pytest.mark.skipif(not scratch_database(DSN), reason="disposable agent_history_test database required")
-def test_real_high_summary_success_applies_visible_text(clean, transcript, live_config, monkeypatch):
+def test_historical_high_summary_applies_without_worker_http(clean, transcript, live_config, monkeypatch):
     config = replace(live_config, reasoning="high")
     monkeypatch.setattr(loop_live, "load_config", lambda: Config(loop_live=config))
     transcript["state"]("watch", "op=start what=gate 'deadline=2099-01-01T00:00:00Z'")
@@ -87,7 +82,7 @@ def test_real_high_summary_success_applies_visible_text(clean, transcript, live_
     assert (phase, error) == ("gating", None)
     clean.commit()
     response = summary_fixture("visible")
-    drain_summary(config, response)
+    drain_summary(clean, uid, config, response)
     refresh(clean, transcript)
     assert clean.execute("SELECT live_phase,headline,summary,summary_error FROM ah.loops").fetchone() == (
         "gating",
@@ -110,7 +105,7 @@ def test_real_high_summary_success_applies_visible_text(clean, transcript, live_
 
 @pytest.mark.skipif(not scratch_database(DSN), reason="disposable agent_history_test database required")
 @pytest.mark.parametrize("failure", ["length", "empty-stop", "timeout"])
-def test_real_summary_failure_preserves_text_and_structural_phase_updates(
+def test_historical_summary_failure_preserves_text_and_structural_phase_updates(
     clean, transcript, live_config, monkeypatch, failure
 ):
     config = replace(live_config, reasoning="high")
@@ -118,7 +113,7 @@ def test_real_summary_failure_preserves_text_and_structural_phase_updates(
     transcript["state"]("watch", "op=start what=gate 'deadline=2099-01-01T00:00:00Z'")
     uid = refresh(clean, transcript)[0]
     clean.commit()
-    drain_summary(config, summary_fixture("visible"))
+    drain_summary(clean, uid, config, summary_fixture("visible"))
     refresh(clean, transcript)
     previous = clean.execute("SELECT headline,summary,summary_generated_at FROM ah.loops").fetchone()
     transcript["state"]("watch", "op=stop what=gate")
@@ -138,13 +133,14 @@ def test_real_summary_failure_preserves_text_and_structural_phase_updates(
             return fake_infer(config, kind, state)
 
         with psycopg.connect(DSN, autocommit=True) as worker:
-            assert loop_live.drain_one(worker, config, fail)
             assert not loop_live.drain_one(worker, config, fail)
+        historical_cache(clean, uid, config, {"summary": None}, {"summary": "TimeoutError: synthetic summary timeout"})
     else:
         response = summary_fixture("length" if failure == "length" else "visible")
         if failure == "empty-stop":
             response["choices"][0]["message"]["content"] = ""
-        drain_summary(config, response)
+        assert not loop_live.drain_one(clean, config)
+        historical_cache(clean, uid, config, {"summary": response}, {"summary": expected_error})
     refresh(clean, transcript)
     assert clean.execute("SELECT live_phase,summary_error,last_gate->>'exit' FROM ah.loops").fetchone() == (
         "reviewing",

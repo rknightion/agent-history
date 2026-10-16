@@ -180,6 +180,61 @@ def fake_infer(config, kind, state):
     }
 
 
+def historical_cache(conn, uid, config, responses=None, errors=None, final=False):
+    """Seed retained pre-retirement records, never run a worker or make a provider request."""
+    target = conn.execute(
+        "SELECT r.id,r.root_session_id,r.launch_ts,CASE WHEN l.status='finished' THEN l.end_ts END,r.report_path "
+        "FROM ah.loop_run r JOIN ah.loops l USING(launch_uid) WHERE launch_uid=%s",
+        (uid,),
+    ).fetchone()
+    now = conn.execute("SELECT transaction_timestamp()").fetchone()[0]
+    state = loop_live.project(loop_live._events(conn, *target), now)
+    outcomes = conn.execute(
+        "SELECT tasks_admitted,tasks_landed,parks_total FROM ah.loops WHERE launch_uid=%s", (uid,)
+    ).fetchone()
+    for field, value in zip(("tasks_admitted", "tasks_landed", "parks_total"), outcomes):
+        state[field] = value
+    state["phase_input"]["park_events_so_far"] = state["parks_total"]
+    key = loop_live.digest_key(state, config.reasoning)
+    conn.execute(
+        "INSERT INTO ah.loop_live_job(launch_uid,digest_sha256,state,close_requested,finished_at,error) "
+        "VALUES (%s,%s,%s,%s,now(),%s) ON CONFLICT(launch_uid) DO UPDATE SET "
+        "digest_sha256=EXCLUDED.digest_sha256,state=EXCLUDED.state,close_requested=EXCLUDED.close_requested,"
+        "finished_at=EXCLUDED.finished_at,applied_at=NULL,error=EXCLUDED.error",
+        (uid, key, psycopg.types.json.Jsonb(state), final, next(iter((errors or {}).values()), None)),
+    )
+    for kind in ("jev", "summary"):
+        response = (responses or {}).get(kind, fake_infer(config, kind, {}))
+        error = (errors or {}).get(kind)
+        conn.execute(
+            "INSERT INTO ah.loop_live_cache(launch_uid,digest_sha256,kind,response,error,model,final_summary,requested_at) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,now()) ON CONFLICT DO NOTHING",
+            (
+                uid,
+                key,
+                kind,
+                psycopg.types.json.Jsonb(response) if response is not None else None,
+                error,
+                loop_live.JEV_MODEL if kind == "jev" else loop_live.SUMMARY_MODEL,
+                final and kind == "summary" and error is None,
+            ),
+        )
+        amount = loop_live.reservation(kind)
+        inserted = conn.execute(
+            "INSERT INTO ah.loop_live_reservation(launch_uid,digest_sha256,kind,day,reserved_usd) "
+            "VALUES (%s,%s,%s,CURRENT_DATE,%s) ON CONFLICT DO NOTHING RETURNING day",
+            (uid, key, kind, amount),
+        ).fetchone()
+        if inserted:
+            conn.execute(
+                "INSERT INTO ah.loop_live_budget(day,reserved_usd) VALUES (CURRENT_DATE,%s) "
+                "ON CONFLICT(day) DO UPDATE SET reserved_usd=ah.loop_live_budget.reserved_usd+EXCLUDED.reserved_usd",
+                (amount,),
+            )
+    conn.commit()
+    return key
+
+
 @pytest.mark.parametrize("jev_shape", ["legacy", "cf-direct", "cf-run-record"])
 def test_real_collector_structure_summary_history_and_failed_call(clean, transcript, live_config, jev_shape):
     def documented_infer(config, kind, state):
@@ -213,8 +268,11 @@ def test_real_collector_structure_summary_history_and_failed_call(clean, transcr
     before = clean.execute("SELECT phase_since FROM ah.loops").fetchone()[0]
     clean.commit()
     with psycopg.connect(DSN, autocommit=True) as worker:
-        assert loop_live.drain_one(worker, live_config, documented_infer)
         assert not loop_live.drain_one(worker, live_config, documented_infer)
+    assert clean.execute("SELECT count(*) FROM ah.loop_live_job").fetchone()[0] == 0
+    historical_cache(
+        clean, uid, live_config, {kind: documented_infer(live_config, kind, {}) for kind in ("jev", "summary")}
+    )
     refresh(clean, transcript)
     assert clean.execute(
         "SELECT jev_phase,live_phase,headline,summary_model,final_summary FROM ah.loops"
@@ -261,7 +319,14 @@ def test_real_collector_structure_summary_history_and_failed_call(clean, transcr
         raise TimeoutError("synthetic provider timeout")
 
     with psycopg.connect(DSN, autocommit=True) as worker:
-        assert loop_live.drain_one(worker, live_config, fail)
+        assert not loop_live.drain_one(worker, live_config, fail)
+    historical_cache(
+        clean,
+        uid,
+        live_config,
+        {"jev": None, "summary": None},
+        {kind: "TimeoutError: synthetic provider timeout" for kind in ("jev", "summary")},
+    )
     refresh(clean, transcript)
     assert clean.execute("SELECT tasks_landed,headline,summary_error FROM ah.loops").fetchone() == (
         None,
@@ -278,7 +343,7 @@ def test_real_collector_structure_summary_history_and_failed_call(clean, transcr
     )
 
 
-def test_slow_worker_does_not_hold_collector_and_close_is_once(clean, transcript, live_config):
+def test_retired_worker_never_starts_provider_and_close_still_projects(clean, transcript, live_config):
     transcript["state"]("dispatch", "lane=one task=TASK-1 agent=complex-worker run=one")
     refresh(clean, transcript)
     clean.commit()
@@ -297,7 +362,8 @@ def test_slow_worker_does_not_hold_collector_and_close_is_once(clean, transcript
     with ThreadPoolExecutor(max_workers=1) as executor:
         future = executor.submit(work)
         try:
-            assert started.wait(5)
+            assert future.result(timeout=5) is None
+            assert not started.is_set()
             transcript["state"]("park", "task=TASK-2 needs=dependency reason=Pending")
             before = time.monotonic()
             refresh(clean, transcript)
@@ -313,15 +379,16 @@ def test_slow_worker_does_not_hold_collector_and_close_is_once(clean, transcript
     refresh(clean, transcript)
     clean.commit()
     with psycopg.connect(DSN, autocommit=True) as worker:
-        assert loop_live.drain_one(worker, live_config, fake_infer)
+        assert not loop_live.drain_one(worker, live_config, fake_infer)
     refresh(clean, transcript)
-    assert clean.execute("SELECT live_phase,final_summary FROM ah.loops").fetchone() == ("closing", True)
+    assert clean.execute("SELECT live_phase,final_summary FROM ah.loops").fetchone() == ("closing", None)
+    assert clean.execute("SELECT count(*) FROM ah.loop_live_job").fetchone()[0] == 0
     clean.commit()
     with psycopg.connect(DSN, autocommit=True) as worker:
         assert not loop_live.drain_one(worker, live_config, fake_infer)
 
 
-def test_global_atomic_budget_survives_rebuild_and_missing_usage(clean, transcript, live_config):
+def test_historical_budget_survives_rebuild_and_missing_usage(clean, transcript, live_config):
     refresh(clean, transcript)
     clean.commit()
 
@@ -331,8 +398,10 @@ def test_global_atomic_budget_survives_rebuild_and_missing_usage(clean, transcri
         response.get("result", {}).pop("usage", None)
         return response
 
+    uid = clean.execute("SELECT launch_uid FROM ah.loops").fetchone()[0]
     with psycopg.connect(DSN, autocommit=True) as worker:
-        assert loop_live.drain_one(worker, live_config, no_usage)
+        assert not loop_live.drain_one(worker, live_config, no_usage)
+    historical_cache(clean, uid, live_config, {kind: no_usage(live_config, kind, {}) for kind in ("jev", "summary")})
     refresh(clean, transcript)
     initial = clean.execute("SELECT reserved_usd FROM ah.loop_live_budget").fetchone()[0]
     assert initial == loop_live.reservation("jev") + loop_live.reservation("summary")
@@ -603,8 +672,10 @@ def test_grant_preservation_and_finished_summary_application(clean, transcript, 
         clean.commit()
         load.post_passes(clean)
         clean.commit()
+        uid = clean.execute("SELECT launch_uid FROM ah.loops").fetchone()[0]
         with psycopg.connect(DSN, autocommit=True) as worker:
-            assert loop_live.drain_one(worker, live_config, fake_infer)
+            assert not loop_live.drain_one(worker, live_config, fake_infer)
+        historical_cache(clean, uid, live_config, final=True)
         load.post_passes(clean)
         assert clean.execute("SELECT status,final_summary FROM ah.loops").fetchone() == ("finished", True)
         clean.commit()

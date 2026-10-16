@@ -379,14 +379,12 @@ def test_file_binding_requires_sanitised_selector_and_uses_existing_consumer(tmp
     assert config.loop_live.token() == "synthetic-file-token"
 
 
-@pytest.mark.parametrize("stop", ["jobs", "deadline", "empty"])
-def test_independent_module_drainer_checks_job_limit_and_deadline_before_admission(monkeypatch, stop):
+@pytest.mark.parametrize("argv", [[], ["--every", "1"]])
+def test_independent_module_drainer_is_retired_even_with_enabled_config(monkeypatch, argv):
     calls = []
     config = Config(dsn="synthetic", loop_live=LoopLive(enabled=True))
     monkeypatch.setattr(loop_live, "load_config", lambda: config)
     monkeypatch.delenv("AGENT_HISTORY_DSN", raising=False)
-    ticks = iter([0] + ([0, 61] if stop == "deadline" else [0] * 21))
-    monkeypatch.setattr(loop_live.time, "monotonic", lambda: next(ticks))
 
     class Connection:
         def __enter__(self):
@@ -396,6 +394,6 @@ def test_independent_module_drainer_checks_job_limit_and_deadline_before_admissi
             return None
 
     monkeypatch.setattr(loop_live.psycopg, "connect", lambda dsn, **kw: Connection())
-    monkeypatch.setattr(loop_live, "drain_one", lambda *_: calls.append(True) is None and stop != "empty")
-    loop_live.main([])
-    assert len(calls) == (20 if stop == "jobs" else 1)
+    monkeypatch.setattr(loop_live, "drain_one", lambda *_: calls.append(True))
+    assert loop_live.main(argv) == 0
+    assert calls == []

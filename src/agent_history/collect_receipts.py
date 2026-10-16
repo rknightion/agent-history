@@ -234,7 +234,7 @@ def states(repo: Path, machine: str, errors: list[dict[str, str]] | None = None)
 
 
 def collect(collector, repositories, machine: str) -> None:
-    """Collect receipts and state snapshots of explicitly configured repositories."""
+    """Collect v3 metadata and state; retain receipt readers for historical queries only."""
     from . import collect_loop_metadata
 
     for repo in repositories:
@@ -249,19 +249,9 @@ def collect(collector, repositories, machine: str) -> None:
             raise
         except Exception as error:
             collector.rollback()
-            collector.errors.append({"repo": Path(repo).name, "step": "loop_run_metadata", "error": type(error).__name__})
-        collector.check_time()
-        try:
-            rows = []
-            for row in receipts(Path(repo), machine, collector.errors):
-                collector.check_time()
-                rows.append(row)
-            collector.write("loop_receipt", COLS, KEY, rows)
-        except Deadline:
-            raise
-        except Exception as error:  # one repository must not stop the others
-            collector.rollback()
-            collector.errors.append({"repo": Path(repo).name, "step": "loop_receipt", "error": type(error).__name__})
+            collector.errors.append(
+                {"repo": Path(repo).name, "step": "loop_run_metadata", "error": type(error).__name__}
+            )
         collector.check_time()
         try:
             rows = []

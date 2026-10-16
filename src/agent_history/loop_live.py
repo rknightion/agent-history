@@ -1,9 +1,8 @@
-"""Live loop projection and a separate, bounded paid-enrichment queue drain.
+"""Live loop projection with historical paid-enrichment reads.
 
-The refresh boundary reads catalogue rows only and never performs network I/O. Run this module
-as a worker after refresh: failed or slow inference cannot hold the collector's connection,
-transaction or process. Durable jobs, paid responses and conservative reservations survive rebuild.
-There is deliberately no endpoint default, live configuration write or provider fallback.
+The refresh boundary reads catalogue rows only and never performs network I/O. Paid admission
+and worker entrypoints are retired, including under existing enabled configuration. Durable
+jobs, paid responses and conservative reservations remain available as historical records.
 """
 
 from __future__ import annotations
@@ -14,7 +13,6 @@ import json
 import math
 import os
 import re
-import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
@@ -27,7 +25,6 @@ from psycopg.types.json import Jsonb
 
 from .common import _join_continuations
 from .config import ConfigError, LoopLive, load_config
-from .drain import Drain
 
 PHASES = ("preparing", "working", "reviewing", "gating", "landing", "waiting", "closing")
 DIGEST_BYTES = 12000
@@ -1181,106 +1178,8 @@ def summary_answer(response: dict) -> dict:
 
 
 def drain_one(conn: psycopg.Connection, config: LoopLive, infer=request) -> bool:
-    """Separate worker: unpaid deferrals wake only on actual prerequisites, never a timer retry."""
-    if not conn.autocommit or conn.info.transaction_status != psycopg.pq.TransactionStatus.IDLE:
-        raise ValueError("worker_requires_idle_autocommit_connection")
-    prerequisite, auth_detail = _auth_state(config)
-    day = _utc_day(conn)
-    with conn.transaction():
-        job = conn.execute(
-            "SELECT j.launch_uid,j.digest_sha256,j.state,j.close_requested,j.queued_at FROM ah.loop_live_job j "
-            "JOIN ah.loops l USING(launch_uid) WHERE j.claimed_at IS NULL "
-            "AND (l.status='running' OR j.close_requested) "
-            "AND (NOT j.state ? '_defer' "
-            "OR (j.state #>> '{_defer,reason}'='auth' AND j.state #>> '{_defer,prerequisite}' IS DISTINCT FROM %s) "
-            "OR (j.state #>> '{_defer,reason}'='budget' AND j.state #>> '{_defer,day}' < %s)) "
-            "ORDER BY j.close_requested DESC,j.queued_at,j.launch_uid FOR UPDATE OF j SKIP LOCKED LIMIT 1",
-            (prerequisite, day.isoformat()),
-        ).fetchone()
-        if not job:
-            return False
-        uid, key, state, closed, requested_at = job
-        claimed_at = conn.execute(
-            "UPDATE ah.loop_live_job SET claimed_at=clock_timestamp(),state=state-'_defer', "
-            "applied_at=NULL,error=NULL WHERE launch_uid=%s AND digest_sha256=%s AND queued_at=%s RETURNING claimed_at",
-            (uid, key, requested_at),
-        ).fetchone()[0]
-    state.pop("_defer", None)  # Internal prerequisite metadata is not model input/content.
-
-    def defer(metadata: dict, reason: str) -> bool:
-        conn.execute(
-            "UPDATE ah.loop_live_job SET state=jsonb_set(state,'{_defer}',%s),claimed_at=NULL, "
-            "finished_at=NULL,applied_at=NULL,error=%s WHERE launch_uid=%s AND digest_sha256=%s "
-            "AND queued_at=%s AND claimed_at=%s",
-            (Jsonb(metadata), reason, uid, key, requested_at, claimed_at),
-        )
-        return True
-
-    error = None
-    for kind in ("jev", "summary"):
-        response, failure = None, None
-        saved = conn.execute(
-            "SELECT response,error FROM ah.loop_live_cache WHERE launch_uid=%s AND digest_sha256=%s AND kind=%s",
-            (uid, key, kind),
-        ).fetchone()
-        if saved:
-            response, failure = saved
-        else:
-            existing = conn.execute(
-                "SELECT 1 FROM ah.loop_live_reservation WHERE launch_uid=%s AND digest_sha256=%s AND kind=%s",
-                (uid, key, kind),
-            ).fetchone()
-            if existing:
-                failure = "reservation_uncertain"
-            else:
-                if auth_detail is not None:
-                    return defer(
-                        {"reason": "auth", "prerequisite": prerequisite, "kind": kind, "detail": auth_detail},
-                        "auth_unavailable",
-                    )
-                outcome, charged_day = _reserve_outcome(conn, uid, key, kind)
-                if outcome == "budget":
-                    return defer({"reason": "budget", "day": charged_day.isoformat(), "kind": kind}, "daily_budget_cap")
-                if outcome == "existing":
-                    failure = "reservation_uncertain"
-                else:
-                    # A committed reservation is final even without usage/response after this point.
-                    try:
-                        response = infer(config, kind, state)
-                        if kind == "jev":
-                            jev_answers(response)
-                        else:
-                            summary_answer(response)
-                    except Exception as exc:
-                        failure = f"{type(exc).__name__}: {exc}"
-            conn.execute(
-                "INSERT INTO ah.loop_live_cache (launch_uid,digest_sha256,kind,response,error,model,final_summary,requested_at) "
-                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING",
-                (
-                    uid,
-                    key,
-                    kind,
-                    Jsonb(response) if response is not None else None,
-                    failure,
-                    JEV_MODEL if kind == "jev" else SUMMARY_MODEL,
-                    closed and kind == "summary" and failure is None,
-                    requested_at,
-                ),
-            )
-        if failure:
-            error = _public_error(failure)
-        elif kind == "jev" and response:
-            try:
-                nouls, _, _ = jev_answers(response)
-                state["live_phase"] = hybrid_decide(state["phase_input"], nouls)
-            except ValueError as exc:
-                error = _public_error(exc)
-    conn.execute(
-        "UPDATE ah.loop_live_job SET finished_at=clock_timestamp(),error=%s WHERE launch_uid=%s "
-        "AND digest_sha256=%s AND queued_at=%s AND claimed_at=%s",
-        (error, uid, key, requested_at, claimed_at),
-    )
-    return True
+    """Retired worker boundary. Existing jobs and reservations are historical records only."""
+    return False
 
 
 def _events(
@@ -1410,7 +1309,7 @@ def _events(
 
 
 def refresh(conn: psycopg.Connection) -> None:
-    """Collector boundary: projection, history and at most one job per selected loop, no HTTP."""
+    """Project retained evidence and cached history without admitting new paid work."""
     from .loops import PROGRESS_SELECTION_SQL
 
     now = conn.execute("SELECT transaction_timestamp()").fetchone()[0]
@@ -1433,10 +1332,6 @@ def refresh(conn: psycopg.Connection) -> None:
         ]
     )
     active = set(r[0] for r in conn.execute(PROGRESS_SELECTION_SQL))
-    conn.execute(
-        "UPDATE ah.loop_live_job SET finished_at=clock_timestamp(),error='worker_timeout_or_interrupted' "
-        "WHERE claimed_at < clock_timestamp()-interval '5 minutes' AND finished_at IS NULL"
-    )
     completed = [
         r[0]
         for r in conn.execute(
@@ -1527,25 +1422,7 @@ def refresh(conn: psycopg.Connection) -> None:
                     (headline, content["summary"], *summary[1:], uid),
                 )
         error = config_error or _public_error(cache_error) or _public_error(observed_job[4] if observed_job else None)
-        current_live = uid in active and target[5] == "running"
-        new_close = state["close_recorded"] and (
-            (observed_job is not None and not observed_job[5])
-            or (uid in active and previous[0] not in (None, "closing"))
-        )
-        # A dirty/rebuilt historical root is not current work. Structural backfill never silently
-        # authorises inference. Existing live admission also authorises that loop's one new close.
-        if config.enabled and state["live_phase"] is not None and (current_live or new_close):
-            try:
-                body = digest(state)
-                conn.execute(
-                    "INSERT INTO ah.loop_live_job (launch_uid,digest_sha256,state,close_requested) VALUES (%s,%s,%s,%s) "
-                    "ON CONFLICT (launch_uid) DO UPDATE SET digest_sha256=EXCLUDED.digest_sha256,state=EXCLUDED.state, "
-                    "close_requested=EXCLUDED.close_requested,queued_at=clock_timestamp(),claimed_at=NULL,finished_at=NULL,applied_at=NULL,error=NULL "
-                    "WHERE ah.loop_live_job.digest_sha256 IS DISTINCT FROM EXCLUDED.digest_sha256",
-                    (uid, key, Jsonb(body), state["close_recorded"]),
-                )
-            except ValueError as exc:
-                error = _public_error(exc)
+        # Paid admission is retired even for previously enabled configurations and new closes.
         conn.execute("UPDATE ah.loops SET summary_error=%s WHERE launch_uid=%s", (error, uid))
         if observed_job and (observed_job[3] is not None or observed_job[6] is not None):
             conn.execute(
@@ -1585,45 +1462,17 @@ def refresh(conn: psycopg.Connection) -> None:
 
 
 def run_pass(stop=None) -> None:
-    """Bounded queue drain, independently schedulable by the operator alongside the indexer.
-
-    `stop` is a Drain: once it is requested no further job is claimed, and the job in flight
-    finishes its claim, provider call and apply before the pass returns.
-    """
-    config = load_config()
-    if not config.loop_live.enabled:
-        return
-    dsn = os.environ.get("AGENT_HISTORY_DSN") or config.dsn
-    if not dsn:
-        raise SystemExit("loop-live: writer DSN required")
-    deadline = time.monotonic() + 60
-    with psycopg.connect(dsn, autocommit=True, connect_timeout=5) as conn:
-        for _ in range(20):
-            if stop is not None and stop.requested:
-                break
-            if time.monotonic() >= deadline or not drain_one(conn, config.loop_live):
-                break
+    """Retired scheduled pass: do not load credentials, connect or claim existing work."""
+    return
 
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="python -m agent_history.loop_live")
     parser.add_argument("--every", type=float, help="repeat the pass every N seconds (positive)")
     args = parser.parse_args(argv)
-    if args.every is None:
-        run_pass()
-        return 0
-    if args.every <= 0:
+    if args.every is not None and args.every <= 0:
         parser.error("--every must be positive")
-    with Drain("loop-live") as drain:
-        while not drain.requested:
-            try:
-                run_pass(drain)
-                print("loop-live-pass-exit=0", flush=True)
-            except Exception as exc:
-                # Type only: a driver or provider message can quote a DSN or response body.
-                print(f"loop-live-pass-exit=1 ({type(exc).__name__})", flush=True)
-            drain.wait(args.every)
-        drain.drained()
+    # Keep accepting scheduled invocations, but exit without a worker or a repeating loop.
     return 0
 
 

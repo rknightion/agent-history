@@ -1,7 +1,8 @@
-"""Loop lifecycle and identity from wave-notify receipts, against a disposable catalogue.
+"""Historical v2 receipt compatibility and current metadata grants on a disposable catalogue.
 
-Receipt rows are synthetic (`/work/example/repo`); the collector tests use real files in a
-temporary repository. Skipped unless the AGENT_HISTORY_TEST_* DSNs name a *_test database.
+Legacy receipt fixtures explicitly import snapshots with the retained reader, not retired
+collector admission. Current collection remains receipt-free. Skipped unless all configured
+AGENT_HISTORY_TEST_* DSNs name a *_test database.
 """
 
 from __future__ import annotations
@@ -632,12 +633,16 @@ def make_repo(tmp_path, origin="https://git.example.test/example/repo.git"):
 def run_collector(conn, repos, machine="mac-a"):
     from agent_history import collect_receipts
 
+    # Seed historical evidence through the unchanged reader/upsert boundary.
+    # The supported collector must not resume legacy receipt admission.
     collector = collect_git.Collector(conn, False, time.monotonic() + 60)
-    collect_receipts.collect(collector, repos, machine)
+    for repo in repos:
+        rows = list(collect_receipts.receipts(repo, machine, collector.errors))
+        collector.write("loop_receipt", collect_receipts.COLS, collect_receipts.KEY, rows)
     return collector
 
 
-def test_collector_ships_exact_receipts_and_metadata_only(clean, tmp_path):
+def test_historical_receipt_import_keeps_exact_metadata_only(clean, tmp_path):
     repo = make_repo(tmp_path)
     body = "SECRET-BODY-MARKER"
     report = repo / "codex/report-synthetic-loop1.md"
@@ -687,7 +692,7 @@ def test_collector_ships_exact_receipts_and_metadata_only(clean, tmp_path):
     assert run_collector(clean, [repo]).counts["loop_receipt"].get("updated", 0) == 0
 
 
-def test_collector_bounds_the_first_line_and_keeps_only_a_report_header(clean, tmp_path):
+def test_historical_reader_bounds_the_first_line_and_keeps_only_a_report_header(clean, tmp_path):
     repo = make_repo(tmp_path)
     huge = b"x" * (3 * 1024 * 1024)  # one enormous line: no header, nothing to store, still hashed whole
     (repo / "codex/report-synthetic-loop1.md").write_bytes(huge)
@@ -724,7 +729,7 @@ def test_unreadable_target_keeps_the_receipt_with_unknown_target_metadata(clean,
     )
 
 
-def test_collector_without_origin_or_target(clean, tmp_path):
+def test_historical_reader_without_origin_or_target(clean, tmp_path):
     repo = make_repo(tmp_path, origin=None)
     (repo / "codex/report-synthetic-loop1.md.notified").write_text("request req-1\n")
     run_collector(clean, [repo])
@@ -797,8 +802,16 @@ def ingest_role(clean):
         password = psycopg.conninfo.conninfo_to_dict(ADMIN_DSN).get("password")
         if password:
             admin.execute(sql.SQL("ALTER ROLE ah_ingest PASSWORD {}").format(sql.Literal(password)))
-    clean.execute("DROP TABLE ah.loop_receipt")
-    clean.execute("DELETE FROM ah.meta WHERE key = 'migration:025_loop_receipts.sql'")
+    clean.execute("DROP TABLE ah.loop_receipt, ah.loop_run_metadata")
+    # Recreate the entire 038 footprint on this disposable catalogue. Its other
+    # indexes belong to retained derived tables, not the collector table above.
+    clean.execute(
+        "DROP INDEX ah.loop_metadata_terminal_idx, ah.loop_metadata_owner_idx, "
+        "ah.loop_metadata_charter_idx, ah.loop_metadata_history_idx, ah.loops_metadata_active_idx"
+    )
+    clean.execute(
+        "DELETE FROM ah.meta WHERE key IN ('migration:025_loop_receipts.sql', 'migration:038_loop_run_metadata.sql')"
+    )
     clean.commit()
     load.apply_schema(clean, force=True)
     clean.commit()
@@ -808,7 +821,7 @@ def ingest_role(clean):
         admin.execute("DROP ROLE ah_ingest")
 
 
-def test_collector_role_upserts_with_only_the_migration_grants(ingest_role, clean, tmp_path):
+def test_collector_role_preserves_history_and_collects_metadata_with_migration_grants(ingest_role, clean, tmp_path):
     repo = make_repo(tmp_path)
     receipt = repo / "codex/report-synthetic-loop1.md.notified"
     receipt.write_text("request req-1\n")
@@ -818,9 +831,19 @@ def test_collector_role_upserts_with_only_the_migration_grants(ingest_role, clea
     try:
         for content in ("request req-1\n", "request req-2\n"):
             receipt.write_text(content)
+            collector = run_collector(writer, [repo])
+            assert collector.errors == []
+        receipt.write_text("request req-3\n")  # current collection must leave retained receipts untouched
+        charter = repo / "codex/charter-synthetic-loop1.md"
+        charter.write_text("Synthetic charter.\n")
+        digest = hashlib.sha256(charter.read_bytes()).hexdigest()
+        closeout = repo / "codex/closeout-synthetic-loop1.md"
+        for suffix in ("first", "updated"):
+            closeout.write_text(f"# Closeout: example/repo loop1 · Charter: {digest}\n{suffix}\n")
             collector = collect_git.Collector(writer, False, time.monotonic() + 60)
             collect_receipts.collect(collector, [repo], "mac-a")
             assert collector.errors == []
+        assert collector.counts["loop_run_metadata"]["updated"] == 1
     finally:
         writer.close()
     assert clean.execute("SELECT content FROM ah.loop_receipt").fetchall() == [("request req-2\n",)]
@@ -831,3 +854,15 @@ def test_collector_role_upserts_with_only_the_migration_grants(ingest_role, clea
     assert privileges == [(True,), (True,), (True,), (False,), (False,)]
     assert clean.execute("SELECT has_table_privilege('ah_reader', 'ah.loop_receipt', 'SELECT')").fetchone() == (True,)
     assert clean.execute("SELECT has_table_privilege('ah_reader', 'ah.loop_receipt', 'INSERT')").fetchone() == (False,)
+    assert clean.execute("SELECT kind FROM ah.loop_run_metadata ORDER BY kind").fetchall() == [
+        ("charter",),
+        ("closeout",),
+    ]
+    assert clean.execute(
+        "SELECT has_table_privilege('ah_ingest', 'ah.loop_run_metadata', p) FROM "
+        "unnest(ARRAY['SELECT','INSERT','UPDATE','DELETE','TRUNCATE']) p"
+    ).fetchall() == [(True,), (True,), (True,), (False,), (False,)]
+    assert clean.execute(
+        "SELECT has_table_privilege('ah_reader','ah.loop_run_metadata','SELECT'),"
+        "has_table_privilege('ah_reader','ah.loop_run_metadata','INSERT')"
+    ).fetchone() == (True, False)
