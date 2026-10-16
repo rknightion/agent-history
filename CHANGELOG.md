@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.1](https://github.com/rknightion/agent-history/compare/v0.5.0...v0.5.1) (2026-10-16)
+
+
+### Bug Fixes
+
+* **load:** reparse pi files after a parser upgrade and keep metrics on error passes ([b20248c](https://github.com/rknightion/agent-history/commit/b20248c23dc12826eea8971de6cf9858138c56fa))
+
 ## [0.5.0](https://github.com/rknightion/agent-history/compare/v0.4.0...v0.5.0) (2026-10-16)
 
 
