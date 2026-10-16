@@ -14,6 +14,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
+from agent_history.loop_launch import recognize_inline
+
 from .context_windows import PI_CONTEXT_WINDOWS, claude_context_window
 
 
@@ -214,7 +216,7 @@ EFFICIENCY_SPAWN_OK_TEXT = re.compile(r'"(?:task_name|agent_id)"\s*:')
 EFFICIENCY_ROUTE_KEYS = ("model", "reasoning_effort", "agent_type", "fork_turns")
 # v1.3: the loop protocol a thread's first human prompt declares, and the stalled-loop windows.
 EFFICIENCY_PROTOCOL_RE = re.compile(r"Contract:\s*`?loop-v(\d+(?:\.\d+)*)")
-EFFICIENCY_PROTOCOLS = frozenset({"v2.1", "v2.0", "other", "none"})
+EFFICIENCY_PROTOCOLS = frozenset({"v3", "v2.1", "v2.0", "other", "none"})
 EFFICIENCY_PROTOCOL_SCAN_BYTES = 16 * 1024 * 1024
 EFFICIENCY_CHILD_FLIGHT_SECONDS = 3600
 EFFICIENCY_LIVE_ROOT_SECONDS = 1500
@@ -316,6 +318,8 @@ EFFICIENCY_CODEX_PARSE_PAYLOAD = {
             b"function_call_output",
             b"custom_tool_call_output",
             b"agent_message",
+            b"message",
+            b"reasoning",
         }
     ),
     b"event_msg": frozenset(
@@ -853,12 +857,112 @@ def efficiency_codex_human_item(content: Any) -> bool:
 
 
 def efficiency_protocol(text: str) -> str:
-    """The loop protocol a first human prompt declares: v2.1, v2.0, other or none."""
+    """Use launch shape for v3, retaining the legacy Contract declaration labels."""
+    # Only inline root prompts are candidates here. Never resolve a path against the
+    # collector's filesystem: retained transcript text is the only authority.
+    launch = recognize_inline(text, legacy=True)
+    if launch and Path(launch["report"]).name.startswith("closeout-"):
+        return "v3"
     match = EFFICIENCY_PROTOCOL_RE.search(text)
     if not match:
         return "none"
     version = match.group(1)
     return "v2.1" if version == "2.1" else "v2.0" if version in ("2", "2.0") else "other"
+
+
+def efficiency_quiet_line(text: str) -> str | float | None:
+    """Pure last-nonempty-line quiet marker: paused, a UTC deadline, or unknown.
+
+    Quoted/fenced examples and malformed or timezone-less deadlines are not live
+    status. Store only bounded state, never the free-text reason in metric labels.
+    """
+    lines = text.splitlines()
+    last = next((line.strip() for line in reversed(lines) if line.strip()), "")
+    fenced = False
+    fence = ""
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith(("```", "~~~")):
+            marker = stripped[:3]
+            if not fenced:
+                fenced, fence = True, marker
+            elif marker == fence:
+                fenced = False
+    if fenced:
+        return None
+    if re.fullmatch(r"PAUSED:\s*\S.*", last):
+        return "paused"
+    match = re.fullmatch(
+        r"WAITING:\s*\S.*?\s+until\s+(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,6})?)?(?:Z|\+00:00))",
+        last,
+    )
+    if match:
+        try:
+            return datetime.fromisoformat(match.group(1).replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            pass
+    return None
+
+
+def efficiency_quiet_record(agent: str, record: dict[str, Any], previous: str | float | None) -> str | float | None:
+    """Fold only new root conversation activity, not trailing lifecycle metadata."""
+    kind = record.get("type")
+    if agent == "codex":
+        payload = record.get("payload") if isinstance(record.get("payload"), dict) else {}
+        payload_type = payload.get("type")
+        if kind == "response_item" and payload_type == "message":
+            return (
+                efficiency_quiet_line(efficiency_block_text(payload.get("content")))
+                if payload.get("role") == "assistant"
+                else None
+            )
+        if (
+            (
+                kind == "response_item"
+                and payload_type
+                in (
+                    "function_call",
+                    "custom_tool_call",
+                    "function_call_output",
+                    "custom_tool_call_output",
+                    "agent_message",
+                    "reasoning",
+                )
+            )
+            or (kind == "event_msg" and payload_type in ("task_started", "user_message"))
+            or kind in ("token_usage_record", "compacted")
+        ):
+            return None
+    elif agent == "pi":
+        if kind in ("compaction", "model_change"):
+            return None
+        if kind == "custom_message" and record.get("customType") in (
+            "loop-watch",
+            "loop-wake",
+            "loop-continuation",
+            "subagent-notify",
+            "subagent-incremental-child-notify",
+        ):
+            return None
+        if kind == "message":
+            message = record.get("message") if isinstance(record.get("message"), dict) else {}
+            content = message.get("content")
+            if message.get("role") == "assistant" and not any(
+                isinstance(block, dict) and block.get("type") == "toolCall" for block in content or []
+            ):
+                return efficiency_quiet_line(pi_format()._text(content))
+            return None
+    elif kind == "system" and record.get("subtype") == "compact_boundary":
+        return None
+    elif kind in ("user", "assistant"):
+        message = record.get("message") if isinstance(record.get("message"), dict) else {}
+        content = message.get("content")
+        if kind == "assistant" and not any(
+            isinstance(block, dict) and block.get("type") == "tool_use" for block in content or []
+        ):
+            return efficiency_quiet_line(efficiency_block_text(content))
+        return None
+    return previous
 
 
 def efficiency_codex_human_text(content: Any) -> str:
@@ -994,6 +1098,7 @@ EFFICIENCY_FILE_UPGRADE: dict[str, Any] = {
     "spawn_ts": None,
     "pi_spawns": [],
     "pi_launch_ts": None,
+    "quiet": "?",
 }
 
 
@@ -1038,11 +1143,19 @@ def efficiency_file_state(relative: str, skip: float) -> dict[str, Any]:
         "spawn_ts": None,
         "pi_spawns": [],
         "pi_launch_ts": None,
+        "quiet": None,
+        "protocol_shape_version": 3,
     }
 
 
 def efficiency_upgrade_file(file_state: dict[str, Any]) -> None:
     """Give a v1.1 per-file state the v1.2 fields without touching its offsets or counters."""
+    if file_state.get("protocol_shape_version") != 3:
+        # Revisit retained first prompts without replaying cumulative counters. Force
+        # scheduling even when a fully indexed transcript has not changed on disk.
+        file_state["proto"] = "?"
+        file_state["size"] = -1
+        file_state["protocol_shape_version"] = 3
     for key, default in EFFICIENCY_FILE_UPGRADE.items():
         if key not in file_state:
             file_state[key] = default.copy() if isinstance(default, dict) else default
@@ -1430,6 +1543,7 @@ class EfficiencyParser:
             kind, payload_type = header.group(2), header.group(3)
             wanted = EFFICIENCY_CODEX_PARSE_PAYLOAD.get(kind)
             if kind == b"compacted":
+                self.s["quiet"] = None
                 ts = efficiency_event_ts(header.group(1))
                 if ts is not None:
                     self.tick(ts)
@@ -1482,6 +1596,7 @@ class EfficiencyParser:
         if ts is not None:
             self.tick(ts)
         event_ts = ts if ts is not None else s["last"]
+        s["quiet"] = efficiency_quiet_record("codex", record, s.get("quiet"))
         if kind == "turn_context" and payload.get("model"):
             s["model"] = str(payload["model"])
         elif kind == "event_msg" and payload_type == "thread_settings_applied":
@@ -1818,6 +1933,7 @@ class EfficiencyParser:
             and self.run.loops.label(loop_session_key("pi", s["tid"], ""), None, event_ts) != LOOP_NONE
         ):
             s["role"] = "root"
+        s["quiet"] = efficiency_quiet_record("pi", record, s.get("quiet"))
         if kind == "model_change":
             model = record.get("modelId")
             if isinstance(model, str) and model:
@@ -2023,6 +2139,7 @@ class EfficiencyParser:
         kind = record.get("type")
         ts = efficiency_event_ts(record.get("timestamp"))
         event_ts = ts if ts is not None else s["last"]
+        s["quiet"] = efficiency_quiet_record("claude", record, s.get("quiet"))
         # One compaction writes a compact_boundary plus an isCompactSummary user line; count it once.
         if kind == "system" and record.get("subtype") == "compact_boundary":
             s["cb"] = True
@@ -2207,7 +2324,7 @@ def efficiency_recover_protocol(path: Path, agent: str, limit: int) -> str | Non
             if agent == "codex":
                 if b'"user_message"' not in raw[:160] and b'"role":"user"' not in raw[:200]:
                     continue
-            elif b'"type":"user"' not in raw:
+            elif agent == "claude" and b'"type":"user"' not in raw:
                 continue
             try:
                 record = json.loads(raw)
@@ -2228,6 +2345,11 @@ def efficiency_recover_protocol(path: Path, agent: str, limit: int) -> str | Non
                 ):
                     return efficiency_protocol(efficiency_codex_human_text(payload.get("content")))
                 continue
+            if agent == "pi":
+                message = record.get("message") if isinstance(record.get("message"), dict) else {}
+                if record.get("type") == "message" and message.get("role") == "user":
+                    return efficiency_protocol(pi_format()._text(message.get("content")))
+                continue
             if record.get("type") != "user":
                 continue
             message = record.get("message") if isinstance(record.get("message"), dict) else {}
@@ -2240,6 +2362,31 @@ def efficiency_recover_protocol(path: Path, agent: str, limit: int) -> str | Non
             if not text.startswith("[Request interrupted") and efficiency_claude_human(record, text):
                 return efficiency_protocol(text)
     return None
+
+
+def efficiency_recover_quiet(path: Path, agent: str, consumed: int) -> str | float | None:
+    """Recover the latest bounded quiet evidence without replaying counters.
+
+    A tail beginning mid-record is discarded. No observed marker means unknown,
+    never inferred quiet. Only already-consumed, complete records are considered.
+    """
+    quiet = None
+    with path.open("rb") as handle:
+        start = max(0, consumed - EFFICIENCY_PROTOCOL_SCAN_BYTES)
+        handle.seek(start)
+        if start:
+            handle.readline()
+        while handle.tell() < consumed:
+            raw = handle.readline()
+            if not raw or not raw.endswith(b"\n") or handle.tell() > consumed:
+                break
+            try:
+                record = json.loads(raw)
+            except ValueError:
+                continue
+            if isinstance(record, dict):
+                quiet = efficiency_quiet_record(agent, record, quiet)
+    return quiet
 
 
 def efficiency_parse_file(
@@ -2275,6 +2422,12 @@ def efficiency_parse_file(
                 if proto is None and file_state["offset"] > EFFICIENCY_PROTOCOL_SCAN_BYTES:
                     proto = "none"
             file_state["proto"] = proto
+        if file_state.get("quiet") == "?":
+            file_state["quiet"] = (
+                efficiency_recover_quiet(path, namespace.split("-", 1)[0], file_state["offset"])
+                if file_state["role"] != "worker"
+                else None
+            )
         handle.seek(file_state["offset"])
         parser = EfficiencyParser(run, file_state, relative)
         lines = 0
@@ -2581,7 +2734,7 @@ def efficiency_emit_stalls(
 ) -> None:
     """Stalled-loop gauges: live spawning loop roots with no child task in flight, and for how long.
 
-    Only loop roots count: a root whose first prompt declared a protocol (v2.1, v2.0 or other). Interactive
+    Only loop roots count: a root whose first prompt declared a protocol (v3, v2.1, v2.0 or other). Interactive
     sessions (none) and legacy threads whose protocol is not yet recovered (?) are excluded.
     """
     roots: dict[str, dict[str, Any]] = {}
@@ -2608,6 +2761,9 @@ def efficiency_emit_stalls(
     for relative, root in roots.items():
         last = root.get("last")
         if not root.get("in_task") or last is None or now - last > EFFICIENCY_LIVE_ROOT_SECONDS:
+            continue
+        quiet = root.get("quiet")
+        if quiet == "paused" or (isinstance(quiet, (int, float)) and quiet > now):
             continue
         namespace = relative.split("/", 1)[0]
         in_flight = False

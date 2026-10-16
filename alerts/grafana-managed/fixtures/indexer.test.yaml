@@ -303,6 +303,113 @@
     {
       "input_series": [
         {
+          "series": "agent_efficiency_root_no_lane_seconds{namespace=\"pi-local\",loop=\"example/loop7\",job=\"agent-history-index\"}",
+          "values": "1300x40"
+        }
+      ],
+      "interval": "1m",
+      "name": "v3 root stalled",
+      "promql_expr_test": [
+        {
+          "eval_time": "30m",
+          "exp_samples": [
+            {
+              "labels": "{namespace=\"pi-local\"}",
+              "value": 1300
+            }
+          ],
+          "expr": "max by (namespace) (agent_efficiency_root_no_lane_seconds{job=\"agent-history-index\"}) > 1200"
+        }
+      ]
+    },
+    {
+      "input_series": [
+        {
+          "series": "agent_efficiency_root_no_lane_seconds{namespace=\"pi-local\",loop=\"example/loop7\",job=\"agent-history-index\"}",
+          "values": "0x40"
+        }
+      ],
+      "interval": "1m",
+      "name": "v3 root active lanes",
+      "promql_expr_test": [
+        {
+          "eval_time": "30m",
+          "exp_samples": [],
+          "expr": "max by (namespace) (agent_efficiency_root_no_lane_seconds{job=\"agent-history-index\"}) > 1200"
+        }
+      ]
+    },
+    {
+      "input_series": [
+        {
+          "series": "agent_efficiency_root_no_lane_seconds{namespace=\"pi-local\",loop=\"example/loop7\",job=\"agent-history-index\"}",
+          "values": "0x40"
+        }
+      ],
+      "interval": "1m",
+      "name": "v3 root waiting",
+      "promql_expr_test": [
+        {
+          "eval_time": "30m",
+          "exp_samples": [],
+          "expr": "max by (namespace) (agent_efficiency_root_no_lane_seconds{job=\"agent-history-index\"}) > 1200"
+        }
+      ]
+    },
+    {
+      "input_series": [
+        {
+          "series": "agent_efficiency_root_no_lane_seconds{namespace=\"pi-local\",loop=\"example/loop7\",job=\"agent-history-index\"}",
+          "values": "0x40"
+        }
+      ],
+      "interval": "1m",
+      "name": "v3 root paused",
+      "promql_expr_test": [
+        {
+          "eval_time": "30m",
+          "exp_samples": [],
+          "expr": "max by (namespace) (agent_efficiency_root_no_lane_seconds{job=\"agent-history-index\"}) > 1200"
+        }
+      ]
+    },
+    {
+      "input_series": [
+        {
+          "series": "agent_efficiency_root_no_lane_seconds{namespace=\"pi-local\",loop=\"example/loop7\",job=\"agent-history-index\"}",
+          "values": "0x10 1300x30"
+        }
+      ],
+      "interval": "1m",
+      "name": "v3 wait expired",
+      "promql_expr_test": [
+        {
+          "eval_time": "30m",
+          "exp_samples": [
+            {
+              "labels": "{namespace=\"pi-local\"}",
+              "value": 1300
+            }
+          ],
+          "expr": "max by (namespace) (agent_efficiency_root_no_lane_seconds{job=\"agent-history-index\"}) > 1200"
+        }
+      ]
+    },
+    {
+      "input_series": [],
+      "interval": "1m",
+      "name": "v3 root evidence missing",
+      "promql_expr_test": [
+        {
+          "eval_time": "30m",
+          "exp_samples": [],
+          "expr": "max by (namespace) (agent_efficiency_root_no_lane_seconds{job=\"agent-history-index\"}) > 1200"
+        }
+      ]
+    },
+    {
+      "input_series": [
+        {
           "series": "node_systemd_unit_state{job=\"agent-sessions\",name=\"agent-session-archive.timer\",state=\"active\"}",
           "values": "1x20"
         }

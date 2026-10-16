@@ -2,7 +2,7 @@
 
 Pure, stdlib-only module. No imports from other project scripts, and no I/O beyond the explicit `read_file`
 injection point and the filesystem existence checks it documents below. Its public surface is
-`parse_launch`, `report_target` and `identity_fields`; do not import anything else from outside.
+`parse_launch`, `recognize_inline`, `report_target` and `identity_fields`; do not import anything else from outside.
 
 A message is a launch when its operator text either:
 
@@ -134,6 +134,16 @@ def _recognize(text, legacy, base):
         return _single_target(reports, base, legacy)
     closeouts = [m.group(1) for m in _TOKEN_RE_V3.finditer(text)]
     return _single_target(closeouts, base, False)
+
+
+def recognize_inline(text, cwd=None, *, legacy=False):
+    """Pure inline launch target, as {report, loop}, or None; never stat or read files.
+
+    Reuse the launch recogniser's marker, report precedence and ambiguity rules.
+    `legacy` additionally accepts historical wave report names. No date or local
+    filesystem state supplies protocol evidence.
+    """
+    return _recognize(text, legacy, cwd or None) if text else None
 
 
 def _codex_dir_parent(abs_path):

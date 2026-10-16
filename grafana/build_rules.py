@@ -594,6 +594,15 @@ def indexer_fixtures() -> dict:
         "45m",
         one(1, '{section="loops"}'),
     )
+    # Protocol is deliberately not a metric label here. The transcript collector
+    # emits the same bounded gauge for v3 and legacy roots and suppresses quiet
+    # roots before aggregation. Missing evidence must never imply a stall.
+    no_lane = NO_LANE.replace("{", '{namespace="pi-local",loop="example/loop7",', 1)
+    case("v3 root stalled", [(no_lane, "1300x40")], LOOP_ROOT_STALLED, "30m", one(1300, '{namespace="pi-local"}'))
+    for state in ("active lanes", "waiting", "paused"):
+        case(f"v3 root {state}", [(no_lane, "0x40")], LOOP_ROOT_STALLED, "30m", [])
+    case("v3 wait expired", [(no_lane, "0x10 1300x30")], LOOP_ROOT_STALLED, "30m", one(1300, '{namespace="pi-local"}'))
+    case("v3 root evidence missing", [], LOOP_ROOT_STALLED, "30m", [])
     case("archive timer active", [(TIMER_ACTIVE, "1x20")], ARCHIVE_TIMER_INACTIVE, "10m", [])
     case("archive timer inactive", [(TIMER_ACTIVE, "0x20")], ARCHIVE_TIMER_INACTIVE, "10m", one(1))
     case(
