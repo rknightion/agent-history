@@ -429,9 +429,13 @@ def refresh_live(conn: psycopg.Connection) -> dict[str, int]:
             observed_at = EXCLUDED.observed_at
     """)
     count = result.rowcount
+    from .loop_v3_status import refresh as refresh_status
+
+    refresh_status(conn)
     _refresh_identity(conn, finished, v3_projected)
     _refresh_progress(conn)
     _refresh_state_counts(conn)
+    conn.execute("UPDATE ah.loops SET waiting_until=NULL WHERE status='finished' AND waiting_until IS NOT NULL")
     from .loop_live import refresh as refresh_phase
 
     refresh_phase(conn)
@@ -682,7 +686,7 @@ def _refresh_identity(
         SELECT l.launch_uid, l.root_session_id, l.number, l.goal_path, l.report_path,
                l.launch_ts, l.text, l.following, l.window_known, l.tied_start
         FROM ordered_launches l JOIN ah.loops live ON live.launch_uid = l.launch_uid
-        WHERE l.mode IS DISTINCT FROM 'v3' AND (%s OR live.status = 'running' OR EXISTS (
+        WHERE l.mode IS DISTINCT FROM 'v3' AND (%s OR live.status IN ('running', 'waiting', 'paused') OR EXISTS (
             SELECT 1 FROM dirty_now d JOIN ah.session changed ON changed.id = d.session_id
             WHERE COALESCE(changed.root_session_id, changed.id) = l.root_session_id
         ) OR EXISTS (
@@ -788,7 +792,7 @@ PROGRESS_SELECTION_SQL = """
             WHERE parent.id = c.root_session_id OFFSET 0
         ) owned
     )
-    SELECT launch_uid FROM ah.loops WHERE status = 'running'
+    SELECT launch_uid FROM ah.loops WHERE status IN ('running', 'waiting', 'paused')
     UNION
     SELECT launch_uid FROM dirty_owners
 """

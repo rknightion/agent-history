@@ -41,6 +41,7 @@ REPLAYED = (
     "036_request_progress.sql",
     "037_git_commit_tasks.sql",
     "038_loop_run_metadata.sql",
+    "039_loop_wait_status.sql",
 )
 
 
