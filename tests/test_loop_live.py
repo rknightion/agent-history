@@ -39,6 +39,30 @@ def test_frozen_hybrid_rules_and_watch_heartbeat():
     assert loop_live.project([dispatch, event("close", 1)], AT)["live_phase"] == "closing"
 
 
+@pytest.mark.parametrize("prefix", ["", "agent-workflows:", "lane-", "agent-workflows:lane-"])
+def test_v3_roles_through_live_projection(prefix):
+    for name, family in (
+        ("worker", "implementation"),
+        ("senior", "implementation"),
+        ("senior-escalation", "implementation"),
+        ("reviewer", "review"),
+        ("scout", "scout"),
+    ):
+        state = loop_live.project([event("dispatch", lane="one", agent=prefix + name, run="one")], AT)
+        assert state["phase_input"]["live_lanes"][0]["role"] == family
+        assert state["live_phase"] == ("reviewing" if family == "review" else "working")
+
+
+def test_qualified_v2_live_roles_keep_their_families():
+    for name, family in (
+        ("gate-runner-low", "gate"),
+        ("security-reviewer", "review"),
+        ("lane-worker", "implementation"),
+    ):
+        state = loop_live.project([event("dispatch", agent="agent-workflows:" + name, run="one")], AT)
+        assert state["phase_input"]["live_lanes"][0]["role"] == family
+
+
 def test_hybrid_latest_note_probabilities_and_whole_phase_are_separate():
     events = [event("dispatch", agent="complex-worker", run="one"), event("return", 1, run="one")]
     state = loop_live.project(events, AT + timedelta(minutes=20))

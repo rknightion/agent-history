@@ -633,6 +633,42 @@ def test_spawns_by_route_and_first_spawn_histogram(eff: Harness):
     assert value(samples, "agent_efficiency_first_spawn_seconds_count", agent="claude", namespace=CLAUDE) == 1
 
 
+def test_v3_claude_spawn_routes_through_collector(eff: Harness):
+    b = eff.baseline + 500
+    routes = {
+        "worker": "sonnet",
+        "senior": "opus",
+        "senior-escalation": "opus",
+        "reviewer": "opus",
+        "scout": "sonnet",
+        # Gateway aliases identify roles, not an authoritative recorded model.
+        "lane-senior": "inherit",
+        "lane-senior-escalation": "inherit",
+        "lane-reviewer": "inherit",
+        "lane-scout": "inherit",
+        "lane-worker": "sonnet",  # existing v2 pin stays unchanged
+    }
+    rows = [claude(b, "user", {"role": "user", "content": "go"})]
+    for i, name in enumerate(routes):
+        rows.extend(
+            [
+                claude_tool(
+                    b + 2 * i + 1,
+                    f"r{i}",
+                    f"a{i}",
+                    "Agent",
+                    {"prompt": "p", "subagent_type": "agent-workflows:" + name},
+                ),
+                claude_result(b + 2 * i + 2, f"a{i}", "ok"),
+            ]
+        )
+    eff.claude_file("sess-v3-routes.jsonl", rows)
+    samples = eff.collect(eff.now)
+    assert select(samples, "agent_efficiency_spawns_by_route_total", agent="claude", namespace=CLAUDE, role="root") == {
+        key(spawn_model=model, effort="inherit", agent_type=name, fork="none"): 1 for name, model in routes.items()
+    }
+
+
 def test_spawn_errors_one_per_kind_and_failed_spawns_register_nothing(eff: Harness):
     b = eff.baseline + 500
     outputs = {

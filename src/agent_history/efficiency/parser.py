@@ -159,8 +159,25 @@ EFFICIENCY_CLAUDE_PINNED = {
     "rescue-specialist": "opus",
     "reviewer": "opus",
     "security-reviewer": "opus",
+    "worker": "sonnet",
+    "senior": "opus",
+    "senior-escalation": "opus",
+    "scout": "sonnet",
 }
-EFFICIENCY_CLAUDE_AGENT_TYPES = frozenset({*EFFICIENCY_CLAUDE_PINNED, "general-purpose", "Explore", "Plan"})
+# Gateway lane aliases identify a role but do not pin a catalogue model. Keep the v2
+# lane-worker pin above, and let an explicit spawn model override it as before.
+EFFICIENCY_CLAUDE_AGENT_TYPES = frozenset(
+    {
+        *EFFICIENCY_CLAUDE_PINNED,
+        "lane-senior",
+        "lane-senior-escalation",
+        "lane-reviewer",
+        "lane-scout",
+        "general-purpose",
+        "Explore",
+        "Plan",
+    }
+)
 EFFICIENCY_SAFE_LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/\[\]+-]{0,63}")
 EFFICIENCY_SPAWN_OK_KEYS = ("task_name", "agent_id", "thread_id", "nickname")
 EFFICIENCY_SPAWN_ERRORS = (

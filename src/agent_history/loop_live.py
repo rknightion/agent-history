@@ -662,10 +662,13 @@ def watch_events(records: list[tuple], hooks: list[tuple], start: datetime, end:
 
 
 def _role(agent: str | None) -> str:
-    if (agent or "").startswith("gate-runner"):
+    name = (agent or "").removeprefix("agent-workflows:")
+    if name.startswith("gate-runner"):
         return "gate"
-    if (agent or "").startswith(("reviewer", "security-reviewer")):
+    if name.startswith(("reviewer", "security-reviewer")) or name == "lane-reviewer":
         return "review"
+    if name in ("scout", "lane-scout"):
+        return "scout"
     return "implementation"
 
 

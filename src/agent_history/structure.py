@@ -255,6 +255,15 @@ WHERE r.session_id = d.session_id AND s.id = r.session_id
 LOOP_SKILL = r"^/?(loop|agent-workflows:(loop|evidence-led-unattended-campaign))$"
 WAVE_SKILL = r"^/?agent-workflows:wave-(cycle|fan-out)$"
 LANE_ROLE = r"(lane[-_ ]?worker|complex[-_ ]?(lane[-_ ]?)?worker|gate[-_ ]?runner|mapper|rescue|worktree[-_ ]?auditor)"
+# New names are exact recorded types, not display-name fragments such as "networker".
+V3_LANE_ROLE = r"(^|[[:space:]])(agent-workflows:)?(lane-)?(worker|senior(-escalation)?|scout)($|[[:space:]])"
+# Only bare worker/explorer collide with Codex built-ins. Independent explicit
+# v3 evidence must win even when another metadata field records a built-in role.
+V3_EXPLICIT_LANE_ROLE = (
+    r"(^|[[:space:]])((agent-workflows:)?lane-worker|agent-workflows:worker|"
+    r"(agent-workflows:)?(lane-)?(senior(-escalation)?|scout))($|[[:space:]])"
+)
+CODEX_BUILTIN_ROLE = r"(^|[[:space:]])(worker|explorer)($|[[:space:]])"
 POLLER_ROLE = r"poller"
 REVIEWER_ROLE = r"(review|auditor)"
 FANOUT_TYPES = r"^(agent-workflows:)"
@@ -349,6 +358,13 @@ ORCH_SQL = [
                 WHEN role.r ~* '{REVIEWER_ROLE}' THEN 'reviewer'
                 WHEN role.r ~* '{LANE_ROLE}' OR EXISTS (SELECT 1 FROM ah.lane ln WHERE ln.session_id = t.session_id)
                     THEN 'lane'
+                WHEN role.typed ~* '{V3_LANE_ROLE}'
+                     AND (s.agent <> 'codex' OR role.typed ~* '{V3_EXPLICIT_LANE_ROLE}'
+                          OR rk.kind IN ('loop_root', 'wave_root') OR s.loop_run_id IS NOT NULL)
+                    THEN 'lane'
+                WHEN s.agent = 'codex' AND role.typed ~* '{CODEX_BUILTIN_ROLE}'
+                     AND (rk.kind IN ('loop_root', 'wave_root') OR s.loop_run_id IS NOT NULL)
+                    THEN 'lane'
                 WHEN s.is_subagent OR s.parent_session_id IS NOT NULL THEN 'subagent'
                 ELSE 'other' END AS kind,
            CASE WHEN rk.kind <> 'none' THEN rk.root_id END AS orch_root,
@@ -361,7 +377,10 @@ ORCH_SQL = [
     LEFT JOIN LATERAL (
         SELECT concat_ws(' ', s.agent_type, s.agent_role, s.agent_nickname,
                          (SELECT string_agg(sp.requested_type || ' ' || COALESCE(sp.name, ''), ' ')
-                          FROM ah.subagent_spawn sp WHERE sp.child_session_id = s.id)) AS r) role ON true
+                          FROM ah.subagent_spawn sp WHERE sp.child_session_id = s.id)) AS r,
+               concat_ws(' ', s.agent_type, s.agent_role,
+                         (SELECT string_agg(sp.requested_type, ' ')
+                          FROM ah.subagent_spawn sp WHERE sp.child_session_id = s.id)) AS typed) role ON true
     """,
 ]
 

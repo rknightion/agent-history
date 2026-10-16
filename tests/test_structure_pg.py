@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import random
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -19,8 +20,9 @@ pytestmark = pytest.mark.skipif(not DSN or "agent_history_test" not in DSN,
 psycopg = pytest.importorskip("psycopg")
 
 from agent_history import load, structure  # noqa: E402
+from agent_history.parse_claude import ClaudeParser  # noqa: E402
 from agent_history.model import (ContinuationRow, FileContext, MessageRow, SessionKey,  # noqa: E402
-                                 SessionRow, SubagentSpawnRow, ToolCallRow, ToolIoRow, ToolOpRow)
+                                 LinePos, SessionRow, SubagentSpawnRow, ToolCallRow, ToolIoRow, ToolOpRow)
 
 T0 = datetime(2026, 9, 20, 12, 0, tzinfo=timezone.utc)
 
@@ -226,6 +228,77 @@ def test_orchestration_tree(db):
     assert rows[("r", "a3")] == ("subagent", True, "r")
     assert rows[("p", "")] == ("none", False, None)
     assert rows[("p", "b1")] == ("subagent", False, None)
+
+
+@pytest.mark.parametrize("agent", ["claude", "codex", "pi"])
+def test_v3_role_names_and_codex_builtin_context(db, agent):
+    roots = [SessionKey(agent, "loop-root"), SessionKey(agent, "plain-root")]
+    for root in roots:
+        rows = [session_row(root)]
+        if root == roots[0]:
+            rows.append(msg(root, "launch", 1, "human_prompt", "You are the root.", "launch_message", "user"))
+        write(db, rows, rel=f"{root.session_uid}.jsonl", agent=agent)
+    expected = {}
+    names = ["worker", "senior", "senior-escalation", "reviewer", "scout", "explorer", "networker"]
+    for root in roots:
+        for i, name in enumerate(names):
+            for j, prefix in enumerate(("", "agent-workflows:", "lane-", "agent-workflows:lane-")):
+                uid = f"{root.session_uid}-{i}-{j}"
+                if agent == "claude":
+                    # Claude children share the root UID; the agent ID distinguishes them.
+                    rel = f"projects/p/{root.session_uid}/subagents/agent-{uid}.jsonl"
+                    parser = ClaudeParser(replace(ctx(rel, agent), file_role="subagent"), {})
+                    list(parser.line({"type": "user", "uuid": uid, "sessionId": root.session_uid,
+                                      "timestamp": T0.isoformat(), "message": {"role": "user", "content": "brief"}},
+                                     LinePos(0, 100, 1)))
+                    row = next(row for row in parser.flush() if isinstance(row, SessionRow))
+                    child = row.session
+                    assert child == SessionKey(agent, root.session_uid, uid)
+                    row = replace(row, agent_type=prefix + name)
+                else:
+                    child = SessionKey(agent, uid)
+                    rel = f"{uid}.jsonl"
+                    row = session_row(child, is_subagent=True, root_session_uid=root.session_uid,
+                                      parent_session_uid=root.session_uid, agent_type=prefix + name)
+                write(db, [row], rel=rel, agent=agent)
+                kind = "reviewer" if name == "reviewer" else "lane"
+                if name == "networker" or (name == "explorer" and (agent != "codex" or prefix)):
+                    kind = "subagent"
+                if agent == "codex" and root == roots[1] and not prefix and name in ("worker", "explorer"):
+                    kind = "subagent"
+                expected[(child.session_uid, child.agent_id)] = kind
+    load.post_passes(db, None)
+    got = {(uid, aid): kind for uid, aid, kind in db.execute(
+        "SELECT session_uid, agent_id, orchestration_kind FROM ah.session WHERE is_subagent")}
+    assert got == expected
+
+
+def test_codex_explicit_v3_role_survives_independent_builtin_metadata(db):
+    root = SessionKey("codex", "plain-root")
+    write(db, [session_row(root)], rel="plain-root.jsonl", agent="codex")
+    cases = [
+        ("senior", "worker", None, "lane"),
+        ("scout", "explorer", None, "lane"),
+        ("agent-workflows:worker", "worker", None, "lane"),
+        (None, "worker", "senior-escalation", "lane"),
+        (None, "explorer", "lane-scout", "lane"),
+        ("worker", "explorer", None, "subagent"),
+        (None, "worker", None, "subagent"),
+    ]
+    expected = {}
+    for i, (agent_type, agent_role, requested_type, kind) in enumerate(cases):
+        child = SessionKey("codex", f"mixed-{i}")
+        write(db, [session_row(child, is_subagent=True, root_session_uid=root.session_uid,
+                               parent_session_uid=root.session_uid, agent_type=agent_type, agent_role=agent_role)],
+              rel=f"mixed-{i}.jsonl", agent="codex")
+        if requested_type:
+            write(db, [SubagentSpawnRow(agent="codex", spawn_uid=f"spawn-{i}", session=root, byte_offset=i,
+                                       child_session_uid=child.session_uid, requested_type=requested_type)],
+                  rel="plain-root.jsonl", agent="codex")
+        expected[child.session_uid] = kind
+    load.post_passes(db, None)
+    got = dict(db.execute("SELECT session_uid, orchestration_kind FROM ah.session WHERE is_subagent"))
+    assert got == expected
 
 
 def test_change_log_refresh_and_notify(db):
