@@ -728,6 +728,10 @@ Migration `037_git_commit_tasks.sql` adds nullable `ah.git_commit.task_ids text[
 default or historical backfill. The collector retains distinct exact tracker IDs from Git's
 terminal Task trailers, validating complete unfolded values rather than body mentions or aliases.
 Existing rows stay NULL until rescanned; an observed commit without valid IDs supplies `[]`.
+Metadata, statistics and trailers come from one snapshot per pass: the ref resolved once to a
+commit and the window fixed once as an absolute cutoff. A commit missing from any of those reads
+fails that repository's `git_commit` step and leaves its stored `ah.git_commit` rows and their
+off-default reconciliation unchanged; it never supplies `[]` or zeros.
 A neutral public alias (`Task: loop<N>-<lane>`, any case) is never a task, even when its lane is
 numeric and so has the tracker shape: the collector drops it and the count ignores any already
 collected. The private commit that consumes the work carries one `Task: <ID>` per delivered task,

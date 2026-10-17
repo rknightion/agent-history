@@ -572,15 +572,27 @@ def github_forks() -> set[str] | None:
 LOOP_ALIAS = re.compile(r"loop[0-9]+-", re.I)
 
 
+class SnapshotMismatch(RuntimeError):
+    """A query of one fixed collection snapshot did not list a commit the metadata query listed."""
+
+
+def commit_snapshot(repo: Path, ref: str, days: int) -> tuple[str, str]:
+    """(commit SHA, absolute `--since`) fixed once per pass, so a fetch or the clock cannot move it."""
+    sha = git(repo, "rev-parse", "--verify", f"{ref}^{{commit}}").strip()
+    return sha, f"--since=@{int(time.time()) - days * 86400}"
+
+
 def git_commits(info: dict[str, Any], days: int) -> list[dict[str, Any]]:
-    repo, branch = info["path"], info["ref"]
-    since = f"--since={days}.days.ago"
-    meta = git(repo, "log", branch, since, "--format=%x1e%H%x1f%ct%x1f%ae%x1f%P%x1f%s%x1f%b", timeout=120)
-    stats = parse_numstat(git(repo, "log", branch, since, "--format=%x1e%H", "--numstat", timeout=300))
+    repo = info["path"]
+    # Every query reads the same immutable commit and the same absolute cutoff. A relative
+    # `N.days.ago` is re-evaluated per git call, and a branch can move between calls.
+    tip, since = commit_snapshot(repo, info["ref"], days)
+    meta = git(repo, "log", tip, since, "--format=%x1e%H%x1f%ct%x1f%ae%x1f%P%x1f%s%x1f%b", timeout=120)
+    stats = parse_numstat(git(repo, "log", tip, since, "--format=%x1e%H", "--numstat", timeout=300))
     # Let git recognise the terminal trailer block, rather than treating body mentions as lands.
     # NUL separates the fixed SHA/trailer fields; newlines inside trailer values stay inside a field.
     trailer_log = git(
-        repo, "log", branch, since, "-z", "--format=%H%x00%(trailers:key=Task,unfold,valueonly)", timeout=120
+        repo, "log", tip, since, "-z", "--format=%H%x00%(trailers:key=Task,unfold,valueonly)", timeout=120
     )
     trailer_fields = trailer_log.split("\0")
     task_ids = {
@@ -600,7 +612,11 @@ def git_commits(info: dict[str, Any], days: int) -> list[dict[str, Any]]:
         if len(fields) < 6:
             continue
         sha, ct, email, parents, subject, body = fields[0], fields[1], fields[2], fields[3], fields[4], fields[5]
-        files, ins, dele = stats.get(sha, [0, 0, 0])
+        # Missing evidence is never a known zero or a known-empty trailer list: fail the repo pass
+        # so its stored history stays as it was until a consistent read succeeds.
+        if sha not in stats or sha not in task_ids:
+            raise SnapshotMismatch("commit missing from a snapshot query")
+        files, ins, dele = stats[sha]
         rows.append(
             {
                 "repo_slug": info["slug"],
