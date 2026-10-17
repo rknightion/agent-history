@@ -94,26 +94,50 @@ def test_the_fill_reports_which_litellm_stage_failed_without_content(tmp_path, c
     assert secret not in str(caught.value) and private not in str(caught.value)
 
 
+class _Source:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        return False
+
+    def close(self):
+        pass
+
+
 def test_a_spend_log_query_failure_is_the_query_stage(monkeypatch):
     secret = marker("cred")
 
-    class Source:
-        def __enter__(self):
-            return self
+    class Broken(_Source):
+        def transaction(self):
+            raise psycopg.ProgrammingError(f"relation missing {secret}")
 
-        def __exit__(self, *_):
-            return False
+    class Catalogue:
+        def execute(self, *_args):
+            class Rows:
+                def fetchall(self):
+                    return [(1, "msg_synthetic", 7)]
 
-    def broken(*_args, **_kwargs):
-        raise psycopg.ProgrammingError(f"relation missing {secret}")
+            return Rows()
 
-    monkeypatch.setattr(litellm_usage, "connect_source", lambda dsn: Source())
-    monkeypatch.setattr(litellm_usage, "fill", broken)
+    monkeypatch.setattr(litellm_usage, "connect_source", lambda dsn: Broken())
     run = litellm_usage.filler(LiteLLM(dsn="postgresql://example.invalid/x", namespaces=("claude-proxied",)))
     with pytest.raises(litellm_usage.SourceUnavailable) as caught:
-        run(None)
+        run(Catalogue())
     assert caught.value.stage == "query"
     assert secret not in str(caught.value)
+
+
+def test_a_catalogue_failure_is_not_blamed_on_litellm(monkeypatch):
+    class Catalogue:
+        def execute(self, *_args):
+            raise psycopg.errors.LockNotAvailable("synthetic catalogue lock")
+
+    monkeypatch.setattr(litellm_usage, "connect_source", lambda dsn: _Source())
+    run = litellm_usage.filler(LiteLLM(dsn="postgresql://example.invalid/x", namespaces=("claude-proxied",)))
+    # It propagates to the index pass, which records it as usage_fill.error, not litellm.query.
+    with pytest.raises(psycopg.errors.LockNotAvailable):
+        run(Catalogue())
 
 
 def periodic(monkeypatch, capsys, argv: list[str]) -> list[str]:

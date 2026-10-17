@@ -102,12 +102,19 @@ def usage_from_spend(prompt: Any, completion: Any, usage_object: Any) -> tuple[i
     return prompt - cached - written, cached, written, completion, reasoning
 
 
+class SpendReadFailed(Exception):
+    """A spend-log read failed. Raised without its cause, which can quote the source's text."""
+
+
 def _spend_rows(source: psycopg.Connection, ids: list[str]) -> dict[str, tuple]:
-    with source.transaction():
-        source.execute("SET TRANSACTION READ ONLY")
-        # The fill runs under the index lock: a stalled spend log must fail, not hold indexing.
-        source.execute("SET LOCAL statement_timeout = '30s'")
-        return {row[0]: row[1:] for row in source.execute(SPEND_SQL, (ids,))}
+    try:
+        with source.transaction():
+            source.execute("SET TRANSACTION READ ONLY")
+            # The fill runs under the index lock: a stalled spend log must fail, not hold indexing.
+            source.execute("SET LOCAL statement_timeout = '30s'")
+            return {row[0]: row[1:] for row in source.execute(SPEND_SQL, (ids,))}
+    except psycopg.Error:
+        raise SpendReadFailed from None
 
 
 def fill(
@@ -166,7 +173,10 @@ def connect_source(dsn: str) -> psycopg.Connection:
 
 
 def _attempt(conn, config: LiteLLM, days: int, max_rows: int | None) -> tuple[dict[str, int] | None, str | None]:
-    """(stats, None) on success, else (None, the failed stage). Causes are dropped, not chained."""
+    """(stats, None) on success, else (None, the failed LiteLLM stage). Causes are dropped, not chained.
+
+    Only failures of the LiteLLM source are staged here. A catalogue error from `conn` propagates,
+    so the index pass records it as its own usage-fill failure rather than blaming the proxy."""
     try:
         dsn = config.resolve_dsn()
     except ConfigError:
@@ -176,10 +186,14 @@ def _attempt(conn, config: LiteLLM, days: int, max_rows: int | None) -> tuple[di
     except (psycopg.Error, OSError):
         return None, "connect"
     try:
-        with source:
-            return fill(conn, source, config.namespaces, days, config.batch, max_rows), None
-    except Exception:
+        return fill(conn, source, config.namespaces, days, config.batch, max_rows), None
+    except SpendReadFailed:
         return None, "query"
+    finally:
+        try:
+            source.close()
+        except psycopg.Error:
+            pass
 
 
 def filler(config: LiteLLM, days: int | None = None, max_rows: int | None = None):
