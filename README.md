@@ -247,6 +247,16 @@ just ci         # check plus the database tests against a throwaway ParadeDB con
 
 Test fixtures are synthetic. Never add a real transcript to `tests/fixtures`.
 
+### Isolated telemetry environment
+
+The test suite never inherits OpenTelemetry settings from the shell that runs it. `tests/conftest.py`
+removes every `OTEL_*` variable when pytest starts, so a shell that exports an OTLP endpoint, headers or a
+service name cannot start exporters in a test process or in a subprocess a test spawns, and nothing can
+export to an inherited destination. A test that covers telemetry sets its own variables with
+`monkeypatch.setenv` (or builds an explicit subprocess environment) and points them at a loopback receiver
+it starts itself, never at a real endpoint. `tests/test_hermetic_telemetry_env.py` pins this behaviour. Run
+`just check` as usual from an instrumented shell; no variable needs unsetting first.
+
 ## Licence
 
 MIT, see [LICENSE](LICENSE). ParadeDB is AGPL-3.0; this project talks to it over the network as a
