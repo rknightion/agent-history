@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.2](https://github.com/rknightion/agent-history/compare/v0.5.1...v0.5.2) (2026-10-17)
+
+
+### Bug Fixes
+
+* **collect:** read git metadata, stats and trailers from one snapshot ([75e190e](https://github.com/rknightion/agent-history/commit/75e190e296fa7b8892f0f8c4aac3fe9e628e7935))
+
 ## [0.5.1](https://github.com/rknightion/agent-history/compare/v0.5.0...v0.5.1) (2026-10-16)
 
 
