@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.5.3](https://github.com/rknightion/agent-history/compare/v0.5.2...v0.5.3) (2026-10-17)
+
+
+### Bug Fixes
+
+* **litellm:** blame only spend-log failures on the LiteLLM source ([d73d510](https://github.com/rknightion/agent-history/commit/d73d5101350dbd456f1f56091af5f350b4984b94))
+* **litellm:** keep every worker running when the LiteLLM source is unavailable ([caf5589](https://github.com/rknightion/agent-history/commit/caf558992d37d99ac61da0ee9f695f0efd763c2a))
+
 ## [0.5.2](https://github.com/rknightion/agent-history/compare/v0.5.1...v0.5.2) (2026-10-17)
 
 
