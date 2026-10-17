@@ -18,10 +18,10 @@ def test_the_dsn_comes_from_the_environment_first(monkeypatch, tmp_path):
     file.write_text("postgresql://example.invalid/from-file\n")
     section = {"dsn_file": str(file), "namespaces": ["claude-proxied"]}
     monkeypatch.delenv("AGENT_HISTORY_LITELLM_DSN", raising=False)
-    assert parse_config({"litellm": section}).litellm.dsn.endswith("/from-file")
+    assert parse_config({"litellm": section}).litellm.resolve_dsn().endswith("/from-file")
     monkeypatch.setenv("AGENT_HISTORY_LITELLM_DSN", "postgresql://example.invalid/from-env")
     configured = parse_config({"litellm": section}).litellm
-    assert configured.enabled and configured.dsn.endswith("/from-env")
+    assert configured.enabled and configured.resolve_dsn().endswith("/from-env")
     assert litellm_usage.filler(configured) is not None
 
 

@@ -47,6 +47,10 @@ pi-local = "~/.pi/agent"
 # these namespaces from "LiteLLM_SpendLogs" by request id. Without a DSN usage stays unknown.
 # $AGENT_HISTORY_LITELLM_DSN (or the variable named by dsn_env) overrides dsn and dsn_file.
 # `agent-history litellm-usage --days N` backfills older rows within the proxy's log retention.
+# The source is optional at run time: only the usage fill reads the DSN, so no other command needs
+# the file. If the file is unreadable, or the proxy database is down or rejects the query, that
+# usage stays unknown and the index pass still succeeds; a periodic indexer prints
+# `index succeeded (usage unknown: litellm.<config|connect|query>)` and emits `outbound.call.failed`.
 # [litellm]
 # dsn_file = "~/.config/agent-history/litellm-reader.dsn"
 # namespaces = ["claude-proxied"]

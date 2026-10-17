@@ -25,8 +25,54 @@ NAMESPACE = re.compile(r"^(claude|codex|pi)-[a-z0-9][a-z0-9_-]{0,62}$")
 DIMENSIONS = 1024  # ah.embedding is halfvec(1024)
 
 
+# The config keys a ConfigError may name. A worker's failure line and event carry only one of these
+# fixed names, never a value, a path or an operator-written key.
+CONFIG_KEYS = frozenset(
+    {
+        "config_file",
+        "top_level",
+        "dsn_file",
+        "reader_dsn_file",
+        "sources",
+        "cold_sources",
+        "contexts",
+        "default_context",
+        "collector",
+        "collector.homes",
+        "collector.repo_contexts",
+        "loop_live",
+        "loop_live.enabled",
+        "loop_live.reasoning",
+        "loop_live.jev_url",
+        "loop_live.summary_url",
+        "loop_live.api_key_env",
+        "loop_live.api_key_file",
+        "efficiency",
+        "efficiency.workflow_transcripts",
+        "litellm",
+        "litellm.namespaces",
+        "litellm.dsn_env",
+        "litellm.dsn_file",
+        "litellm.lookback_days",
+        "embedding",
+        "embedding.api_key_file",
+        "embedding.dimensions",
+        "exporter",
+        "exporter.collectors",
+        "exporter.refresh_interval",
+        "git",
+        "identities",
+        "metrics_labels",
+    }
+)
+
+
 class ConfigError(ValueError):
-    pass
+    """A configuration error. `key` is the fixed config key at fault (from CONFIG_KEYS), or None."""
+
+    def __init__(self, message: str, key: str | None = None):
+        super().__init__(message)
+        self.key = key if key in CONFIG_KEYS else None
 
 
 def config_path() -> Path:
@@ -37,16 +83,17 @@ def config_path() -> Path:
     return base / "agent-history" / "config.toml"
 
 
-def _secret(value: str | None, file: str | None, env: str | None, what: str) -> str | None:
-    """A value given inline, in a file (first line) or in an environment variable."""
+def _secret(value: str | None, file: str | None, env: str | None, key: str) -> str | None:
+    """A value given inline, in a file (first line) or in an environment variable.
+
+    An unreadable file names its config key, not the path: the message reaches worker logs."""
     if env and os.environ.get(env):
         return os.environ[env]
     if file:
-        path = Path(file).expanduser()
         try:
-            return path.read_text().strip().splitlines()[0].strip()
-        except (OSError, IndexError) as exc:
-            raise ConfigError(f"{what}: cannot read {path}") from exc
+            return Path(file).expanduser().read_text().strip().splitlines()[0].strip()
+        except (OSError, IndexError):
+            raise ConfigError(f"{key}: cannot read the file it names", key=key) from None
     return value
 
 
@@ -62,7 +109,7 @@ class Embedding:
     headers: dict[str, str] = field(default_factory=dict)
 
     def token(self) -> str:
-        return _secret(None, self.api_key_file, self.api_key_env, "embedding api key") or ""
+        return _secret(None, self.api_key_file, self.api_key_env, "embedding.api_key_file") or ""
 
 
 @dataclass
@@ -77,7 +124,7 @@ class LoopLive:
     reasoning: str | None = None  # Set only after the operator's summary evaluation.
 
     def token(self) -> str:
-        return _secret(None, self.api_key_file, self.api_key_env, "loop live api key") or ""
+        return _secret(None, self.api_key_file, self.api_key_env, "loop_live.api_key_file") or ""
 
 
 @dataclass
@@ -101,16 +148,30 @@ class Efficiency:
 # Optional usage source for proxied Claude Code namespaces: a read-only LiteLLM spend-log database.
 @dataclass
 class LiteLLM:
-    """Fill unknown llm_call usage from LiteLLM_SpendLogs by request id. Off without a DSN."""
+    """Fill unknown llm_call usage from LiteLLM_SpendLogs by request id. Off without a DSN.
+
+    The DSN is resolved only by `resolve_dsn`, when the usage fill runs: no other command needs it,
+    and an unreadable DSN file must leave every other command and the rest of an index pass working.
+    """
 
     dsn: str | None = None
     namespaces: tuple[str, ...] = ()
     lookback_days: int = 3
     batch: int = 500
+    dsn_file: str | None = None
+    dsn_env: str | None = "AGENT_HISTORY_LITELLM_DSN"
 
     @property
     def enabled(self) -> bool:
-        return bool(self.dsn) and bool(self.namespaces)
+        configured = self.dsn or self.dsn_file or (self.dsn_env and os.environ.get(self.dsn_env))
+        return bool(configured) and bool(self.namespaces)
+
+    def resolve_dsn(self) -> str:
+        """The spend-log DSN: the environment variable, else the file's first line, else the inline value."""
+        dsn = _secret(self.dsn, self.dsn_file, self.dsn_env, "litellm.dsn_file")
+        if not dsn:
+            raise ConfigError("litellm: no dsn", key="litellm")
+        return dsn
 
 
 # Metric collection settings, run by the periodic indexer. The table keeps its historical name
@@ -182,14 +243,14 @@ class Config:
     def namespaces(self, context: str | None = None) -> list[str]:
         name = context or self.default_context
         if name not in self.contexts:
-            raise ConfigError(f"unknown context {name!r} (known: {', '.join(sorted(self.contexts))})")
+            raise ConfigError(f"unknown context {name!r} (known: {', '.join(sorted(self.contexts))})", key="contexts")
         return list(self.contexts[name])
 
 
 def _table(data: dict[str, Any], key: str) -> dict[str, Any]:
     value = data.get(key, {})
     if not isinstance(value, dict):
-        raise ConfigError(f"[{key}] must be a table")
+        raise ConfigError(f"[{key}] must be a table", key=key)
     return value
 
 
@@ -215,33 +276,37 @@ def parse_config(data: dict[str, Any], path: Path | None = None) -> Config:
     }
     unknown = set(data) - known
     if unknown:
-        raise ConfigError(f"unknown top-level keys: {', '.join(sorted(unknown))}")
+        raise ConfigError(f"unknown top-level keys: {', '.join(sorted(unknown))}", key="top_level")
     sources_raw = _table(data, "sources") if "sources" in data else dict(DEFAULT_SOURCES)
     sources: dict[str, Path] = {}
     for namespace, directory in sources_raw.items():
         if not NAMESPACE.match(namespace):
-            raise ConfigError("sources namespace key must look like claude-<name>, codex-<name> or pi-<name>")
+            raise ConfigError(
+                "sources namespace key must look like claude-<name>, codex-<name> or pi-<name>", key="sources"
+            )
         if not isinstance(directory, str):
-            raise ConfigError(f"source {namespace}: directory must be a string")
+            raise ConfigError(f"source {namespace}: directory must be a string", key="sources")
         # The configured home itself may be a symlink (resolved here); symlinked transcript files
         # inside it are still skipped by the loader.
         sources[namespace] = Path(directory).expanduser().resolve()
     cold_sources: dict[str, Path] = {}
     for namespace, directory in _table(data, "cold_sources").items():
         if namespace not in sources or not isinstance(directory, str) or not directory:
-            raise ConfigError("cold_sources must map configured source namespaces to directory strings")
+            raise ConfigError(
+                "cold_sources must map configured source namespaces to directory strings", key="cold_sources"
+            )
         cold_sources[namespace] = Path(directory).expanduser().resolve()
     contexts_raw = _table(data, "contexts")
     contexts: dict[str, list[str]] = {}
     for name, namespaces in contexts_raw.items():
         if not isinstance(namespaces, list) or not all(isinstance(n, str) and NAMESPACE.match(n) for n in namespaces):
-            raise ConfigError(f"context {name!r} must be a list of namespaces")
+            raise ConfigError(f"context {name!r} must be a list of namespaces", key="contexts")
         contexts[name] = list(namespaces)
     if not contexts:
         contexts = {"default": sorted(sources)}
     default_context = data.get("default_context") or ("default" if "default" in contexts else sorted(contexts)[0])
     if default_context not in contexts:
-        raise ConfigError(f"default_context {default_context!r} is not a context")
+        raise ConfigError(f"default_context {default_context!r} is not a context", key="default_context")
     ident = _table(data, "identities")
     identities = Identities(
         owner_emails=frozenset(e.strip().lower() for e in ident.get("owner_emails", [])),
@@ -251,17 +316,17 @@ def parse_config(data: dict[str, Any], path: Path | None = None) -> Config:
     col = _table(data, "collector")
     allowed_collector = {"machine", "homes", "repo_contexts", "lock_file", "journal_db"}
     if set(col) - allowed_collector:
-        raise ConfigError(f"unknown collector keys: {', '.join(sorted(set(col) - allowed_collector))}")
+        raise ConfigError(f"unknown collector keys: {', '.join(sorted(set(col) - allowed_collector))}", key="collector")
     homes = col.get("homes", {})
     repo_contexts = col.get("repo_contexts", {})
     if not isinstance(homes, dict) or not all(
         isinstance(p, str) and isinstance(n, str) and NAMESPACE.match(n) for p, n in homes.items()
     ):
-        raise ConfigError("collector.homes must map home paths to namespaces")
+        raise ConfigError("collector.homes must map home paths to namespaces", key="collector.homes")
     if not isinstance(repo_contexts, dict) or not all(
         isinstance(p, str) and isinstance(n, str) for p, n in repo_contexts.items()
     ):
-        raise ConfigError("collector.repo_contexts must map repo slugs to contexts")
+        raise ConfigError("collector.repo_contexts must map repo slugs to contexts", key="collector.repo_contexts")
     collector = CollectorConfig(
         machine=col.get("machine"),
         homes=homes,
@@ -272,31 +337,34 @@ def parse_config(data: dict[str, Any], path: Path | None = None) -> Config:
     live = _table(data, "loop_live")
     live_keys = {"enabled", "jev_url", "summary_url", "api_key_env", "api_key_file", "reasoning"}
     if set(live) - live_keys:
-        raise ConfigError(f"unknown loop_live keys: {', '.join(sorted(set(live) - live_keys))}")
+        raise ConfigError(f"unknown loop_live keys: {', '.join(sorted(set(live) - live_keys))}", key="loop_live")
     loop_live = LoopLive(**live)
     if not isinstance(loop_live.enabled, bool):
-        raise ConfigError("loop_live.enabled must be true or false")
+        raise ConfigError("loop_live.enabled must be true or false", key="loop_live.enabled")
     if loop_live.reasoning not in (None, "off", "low", "high", "max"):
-        raise ConfigError("loop_live.reasoning must be off, low, high or max")
+        raise ConfigError("loop_live.reasoning must be off, low, high or max", key="loop_live.reasoning")
     for key in ("jev_url", "summary_url", "api_key_env", "api_key_file"):
         value = getattr(loop_live, key)
         if value is not None and (not isinstance(value, str) or not value):
-            raise ConfigError(f"loop_live.{key} must be a non-empty string")
+            raise ConfigError(f"loop_live.{key} must be a non-empty string", key=f"loop_live.{key}")
     if loop_live.enabled:
         from urllib.parse import urlsplit
 
         for key in ("jev_url", "summary_url"):
             url = urlsplit(getattr(loop_live, key) or "")
             if url.scheme != "https" or not url.netloc or url.username or url.password or url.query or url.fragment:
-                raise ConfigError(f"loop_live.{key} requires an explicit HTTPS Gateway route")
+                raise ConfigError(f"loop_live.{key} requires an explicit HTTPS Gateway route", key=f"loop_live.{key}")
         if loop_live.reasoning is None:
-            raise ConfigError("loop_live.reasoning must be selected by the summary evaluation before enabling")
+            raise ConfigError(
+                "loop_live.reasoning must be selected by the summary evaluation before enabling",
+                key="loop_live.reasoning",
+            )
     emb = _table(data, "embedding")
     # Efficiency collector configuration (lane C).
     eff = _table(data, "efficiency")
     unexpected = set(eff) - {"baseline_ts", "loop_dsn", "first_parse_days", "workflow_transcripts"}
     if unexpected:
-        raise ConfigError(f"unknown efficiency keys: {', '.join(sorted(unexpected))}")
+        raise ConfigError(f"unknown efficiency keys: {', '.join(sorted(unexpected))}", key="efficiency")
     efficiency = Efficiency(
         baseline_ts=float(eff.get("baseline_ts", 0.0)),
         loop_dsn=eff.get("loop_dsn"),
@@ -304,26 +372,35 @@ def parse_config(data: dict[str, Any], path: Path | None = None) -> Config:
         workflow_transcripts=eff.get("workflow_transcripts", True),
     )
     if not isinstance(efficiency.workflow_transcripts, bool):
-        raise ConfigError("efficiency workflow_transcripts must be true or false")
+        raise ConfigError(
+            "efficiency workflow_transcripts must be true or false", key="efficiency.workflow_transcripts"
+        )
     if efficiency.first_parse_days < 0 or efficiency.baseline_ts < 0:
-        raise ConfigError("efficiency baseline and first_parse_days must be non-negative")
+        raise ConfigError("efficiency baseline and first_parse_days must be non-negative", key="efficiency")
     lite = _table(data, "litellm")
     unexpected = set(lite) - {"dsn", "dsn_file", "dsn_env", "namespaces", "lookback_days", "batch"}
     if unexpected:
-        raise ConfigError(f"unknown litellm keys: {', '.join(sorted(unexpected))}")
+        raise ConfigError(f"unknown litellm keys: {', '.join(sorted(unexpected))}", key="litellm")
     lite_namespaces = lite.get("namespaces", [])
     if not isinstance(lite_namespaces, list) or not all(
         isinstance(n, str) and NAMESPACE.match(n) and n.startswith("claude-") for n in lite_namespaces
     ):
-        raise ConfigError("litellm.namespaces must be a list of claude-<name> namespaces")
+        raise ConfigError("litellm.namespaces must be a list of claude-<name> namespaces", key="litellm.namespaces")
     dsn_env = lite.get("dsn_env", "AGENT_HISTORY_LITELLM_DSN")
     if not isinstance(dsn_env, str) or not dsn_env:
-        raise ConfigError("litellm.dsn_env must be a non-empty string")
+        raise ConfigError("litellm.dsn_env must be a non-empty string", key="litellm.dsn_env")
     lookback, batch = lite.get("lookback_days", 3), lite.get("batch", 500)
     if type(lookback) is not int or not 1 <= lookback <= 366 or type(batch) is not int or not 1 <= batch <= 10000:
-        raise ConfigError("litellm.lookback_days must be 1 to 366 and litellm.batch 1 to 10000")
+        raise ConfigError(
+            "litellm.lookback_days must be 1 to 366 and litellm.batch 1 to 10000", key="litellm.lookback_days"
+        )
+    dsn_file = lite.get("dsn_file")
+    if dsn_file is not None and (not isinstance(dsn_file, str) or not dsn_file):
+        raise ConfigError("litellm.dsn_file must be a non-empty string", key="litellm.dsn_file")
     litellm = LiteLLM(
-        dsn=_secret(lite.get("dsn"), lite.get("dsn_file"), dsn_env, "litellm dsn"),
+        dsn=lite.get("dsn"),
+        dsn_file=dsn_file,
+        dsn_env=dsn_env,
         namespaces=tuple(lite_namespaces),
         lookback_days=lookback,
         batch=batch,
@@ -343,22 +420,27 @@ def parse_config(data: dict[str, Any], path: Path | None = None) -> Config:
     exp = _table(data, "exporter")
     allowed = {"listen", "refresh_interval", "state_dir", "collectors", "hot", "cold", "incoming", "conflicts"}
     if set(exp) - allowed:
-        raise ConfigError(f"unknown [exporter] keys: {', '.join(sorted(set(exp) - allowed))}")
+        raise ConfigError(f"unknown [exporter] keys: {', '.join(sorted(set(exp) - allowed))}", key="exporter")
     selected = exp.get("collectors", ["archive", "catalogue", "runs", "efficiency", "self"])
     if (
         not isinstance(selected, list)
         or len(set(selected)) != len(selected)
         or not set(selected) <= {"archive", "catalogue", "runs", "self", "efficiency"}
     ):
-        raise ConfigError("exporter.collectors must be unique names: archive, catalogue, runs, self, efficiency")
+        raise ConfigError(
+            "exporter.collectors must be unique names: archive, catalogue, runs, self, efficiency",
+            key="exporter.collectors",
+        )
     import math
 
     try:
         interval = float(exp.get("refresh_interval", 15))
     except (TypeError, ValueError, OverflowError) as exc:
-        raise ConfigError("exporter.refresh_interval must be finite and positive") from exc
+        raise ConfigError(
+            "exporter.refresh_interval must be finite and positive", key="exporter.refresh_interval"
+        ) from exc
     if not math.isfinite(interval) or interval <= 0:
-        raise ConfigError("exporter.refresh_interval must be finite and positive")
+        raise ConfigError("exporter.refresh_interval must be finite and positive", key="exporter.refresh_interval")
     exporter = Exporter(
         refresh_interval=interval,
         state_dir=Path(exp.get("state_dir", Path.home() / ".local/state/agent-history")).expanduser(),
@@ -369,10 +451,12 @@ def parse_config(data: dict[str, Any], path: Path | None = None) -> Config:
         },
     )
     if embedding.dimensions != DIMENSIONS:
-        raise ConfigError(f"embedding.dimensions must be {DIMENSIONS} (the ah.embedding column type)")
+        raise ConfigError(
+            f"embedding.dimensions must be {DIMENSIONS} (the ah.embedding column type)", key="embedding.dimensions"
+        )
     return Config(
-        dsn=_secret(data.get("dsn"), data.get("dsn_file"), None, "dsn"),
-        reader_dsn=_secret(data.get("reader_dsn"), data.get("reader_dsn_file"), None, "reader_dsn"),
+        dsn=_secret(data.get("dsn"), data.get("dsn_file"), None, "dsn_file"),
+        reader_dsn=_secret(data.get("reader_dsn"), data.get("reader_dsn_file"), None, "reader_dsn_file"),
         sources=sources,
         cold_sources=cold_sources,
         contexts=contexts,
@@ -396,4 +480,8 @@ def load_config(path: Path | None = None) -> Config:
     if not path.exists():
         return parse_config({}, None)
     with path.open("rb") as handle:
-        return parse_config(tomllib.load(handle), path)
+        try:
+            data = tomllib.load(handle)
+        except tomllib.TOMLDecodeError:
+            raise ConfigError("the config file is not valid TOML", key="config_file") from None
+    return parse_config(data, path)

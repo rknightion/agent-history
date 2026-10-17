@@ -100,13 +100,22 @@ _ENUMS = {
     "agent_history.collector": {"archive", "catalogue", "runs", "efficiency", "self"},
     "db.system.name": {"postgresql", "sqlite"},
     "db.operation.name": {"connect", "query", "copy", "commit", "rollback"},
+    "agent_history.usage_source": {"litellm"},
 }
+
+
+def _config_keys():
+    from .config import CONFIG_KEYS
+
+    return CONFIG_KEYS
 
 
 def _safe(attributes):
     result = {}
     for key, value in (attributes or {}).items():
         if key in _ENUMS and isinstance(value, str) and value in _ENUMS[key]:
+            result[key] = value
+        elif key == "agent_history.config_key" and isinstance(value, str) and value in _config_keys():
             result[key] = value
         elif key in _COUNTS and type(value) is int and value >= 0:
             result[key] = value
@@ -121,6 +130,8 @@ def _safe(attributes):
 
 
 def _category(exc):
+    if type(exc).__name__ == "ConfigError":
+        return "config"
     if isinstance(exc, OSError):
         return "io"
     if isinstance(exc, LookupError):
@@ -339,6 +350,11 @@ class PassResult:
         if self.attributes.get("errors", 0):
             self.attributes["agent_history.outcome"] = "error"
 
+    def failed(self, category, config_key=None):
+        """Mark the pass failed with a bounded category and, for a config error, its fixed key."""
+        self.attributes.update(_safe({"agent_history.outcome": "error", "error.type": category}))
+        self.attributes.update(_safe({"agent_history.config_key": config_key}))
+
     def skipped(self, reason):
         self.attributes.update(_safe({"agent_history.outcome": "skipped", "agent_history.skip_reason": reason}))
 
@@ -373,8 +389,15 @@ def pass_span(name):
             result.span = span
             try:
                 yield result
-            except BaseException:
-                emit("worker.pass.failed", {"agent_history.outcome": "error"})
+            except BaseException as exc:
+                emit(
+                    "worker.pass.failed",
+                    {
+                        "agent_history.outcome": "error",
+                        "error.type": _category(exc),
+                        "agent_history.config_key": getattr(exc, "key", None) if _category(exc) == "config" else None,
+                    },
+                )
                 raise
             else:
                 span.set_attributes(result.attributes)

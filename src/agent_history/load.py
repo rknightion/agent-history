@@ -631,6 +631,9 @@ class RunStats:
     rows: int = 0
     errors: int = 0
     lock_held: bool = False
+    # The fixed label of a usage source that could not be read this pass (e.g. "litellm.connect"):
+    # its usage stays unknown and the pass carries on.
+    usage_fill_failed: str | None = None
 
 
 AGENT_PI = "pi"
@@ -1547,7 +1550,8 @@ def refresh(conn: psycopg.Connection, hot: Path | None = HOT_ROOT, cold: Path | 
     """Index new transcript bytes from `sources` (namespace -> agent home) or the hot/cold archive.
 
     `usage_fill(conn)`, when given, fills unknown usage from an external source under the index
-    lock before the post passes. Its failure leaves that usage unknown and never fails the pass."""
+    lock before the post passes. Any failure of it is rolled back, leaves that usage unknown (never
+    a stored zero), is recorded as `stats.usage_fill_failed`, and never fails the pass."""
     stats = RunStats()
     previous = previous_success_timestamp(textfile) if textfile else None
     got = conn.execute("SELECT pg_try_advisory_lock(%s)", (ADVISORY_LOCK,)).fetchone()[0]
@@ -1603,12 +1607,20 @@ def refresh(conn: psycopg.Connection, hot: Path | None = HOT_ROOT, cold: Path | 
             try:
                 filled = usage_fill(conn)
                 conn.commit()
-            except (psycopg.Error, OSError) as exc:
+            except Exception as exc:
+                # An optional external source: whatever went wrong, its writes are dropped and the
+                # pass goes on. Only fixed names are logged, never the exception's text.
+                from .litellm_usage import SourceUnavailable
+
                 conn.rollback()
-                log(json.dumps({"usage_fill": "failed", "category": type(exc).__name__}))
+                source, stage = (exc.source, exc.stage) if isinstance(exc, SourceUnavailable) else ("usage_fill", "error")
+                stats.usage_fill_failed = f"{source}.{stage}"
+                log(json.dumps({"usage_fill": "failed", "source": source, "stage": stage}))
         post = post_passes(conn, refresh_id)
         if filled is not None:
             post["usage_fill"] = filled
+        if stats.usage_fill_failed:
+            post["usage_fill_failed"] = stats.usage_fill_failed
         conn.execute("INSERT INTO ah.meta VALUES ('last_refresh_at', now()::text) "
                      "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value")
         success = stats.errors == 0

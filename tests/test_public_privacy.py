@@ -295,7 +295,8 @@ def test_periodic_nested_config_diagnostic_is_suppressed(monkeypatch, tmp_path, 
         cli.main(["--config", str(config), command, "--every", "1"])
     output = capsys.readouterr()
     assert output.out == ""
-    assert output.err == f"agent-history: {command} failed (status); retrying\n"
+    # The line names the fixed config key that failed, never the operator's misspelt key or its value.
+    assert output.err == f"agent-history: {command} failed (config: top_level); retrying\n"
     assert cli.main(["--config", str(config), command]) == 2
     assert "synthetic_private_diagnostic" in capsys.readouterr().err  # Interactive diagnostics stay useful.
 

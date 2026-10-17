@@ -142,3 +142,106 @@ def test_zero_rows_indexed_before_the_unknown_rule_are_backfilled(clean, spend_l
     assert litellm_usage.fill(clean, spend_logs, ["claude-proxied"], days=90, batch=1)["filled"] == 1
     clean.commit()
     assert usage(clean, old) == (30, 20, 0, 0, 5, None)
+
+
+@pytest.mark.parametrize(
+    ("section", "label"),
+    [
+        ({"dsn_file": "{root}/absent/litellm.dsn"}, "litellm.config"),
+        ({"dsn": "host=127.0.0.1 port=1 connect_timeout=2"}, "litellm.connect"),
+        # A reachable database without the spend-log table: the query fails.
+        ({"dsn": ADMIN_DSN}, "litellm.query"),
+    ],
+)
+def test_an_unavailable_litellm_leaves_usage_unknown_and_the_pass_succeeds(
+    clean,  # noqa: F811
+    tmp_path,
+    monkeypatch,
+    section,
+    label,
+):
+    from agent_history.config import LiteLLM
+
+    monkeypatch.delenv("AGENT_HISTORY_LITELLM_DSN", raising=False)
+    at = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(hours=1)
+    unknown = f"msg_{uuid.uuid4()}"
+    transcript(tmp_path / "home", at, [(unknown, None, None)])
+    values = {key: value.format(root=tmp_path) for key, value in section.items()}
+    fill = litellm_usage.filler(LiteLLM(namespaces=("claude-proxied",), **values))
+    logged = []
+    stats = load.refresh(
+        clean, sources={"claude-proxied": tmp_path / "home"}, textfile=None, log=logged.append, usage_fill=fill
+    )
+    assert stats.errors == 0 and stats.usage_fill_failed == label
+    assert usage(clean, unknown) == (None,) * 6
+    assert clean.execute("SELECT ok FROM ah.refresh_log ORDER BY refresh_id DESC LIMIT 1").fetchone() == (True,)
+    assert json.loads(logged[0]) == {"usage_fill": "failed", "source": "litellm", "stage": label.split(".")[1]}
+    assert "absent" not in "".join(logged) and "port=1" not in "".join(logged)
+
+
+def test_an_unexpected_fill_error_never_fails_the_pass(clean, tmp_path):  # noqa: F811
+    at = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(hours=1)
+    transcript(tmp_path, at, [(f"msg_{uuid.uuid4()}", None, None)])
+
+    def broken(_conn):
+        raise RuntimeError("synthetic")
+
+    stats = load.refresh(
+        clean, sources={"claude-proxied": tmp_path}, textfile=None, log=lambda *_: None, usage_fill=broken
+    )
+    assert stats.errors == 0 and stats.usage_fill_failed == "usage_fill.error"
+
+
+def test_the_periodic_index_line_reports_unknown_litellm_usage(clean, tmp_path, monkeypatch, capsys):  # noqa: F811
+    from agent_history import cli
+
+    monkeypatch.delenv("AGENT_HISTORY_LITELLM_DSN", raising=False)
+    (tmp_path / "home").mkdir()
+    config = tmp_path / "config.toml"
+    config.write_text(
+        f'dsn = "{DSN}"\n[sources]\nclaude-proxied = "{tmp_path / "home"}"\n'
+        f'[litellm]\ndsn_file = "{tmp_path / "absent.dsn"}"\nnamespaces = ["claude-proxied"]\n'
+    )
+    from pathlib import Path
+
+    monkeypatch.setattr(
+        cli,
+        "Path",
+        lambda value: tmp_path / "textfiles" if value == "/var/lib/alloy/textfile-agent-history" else Path(value),
+    )
+
+    def stop(_):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli.time, "sleep", stop)
+    with pytest.raises(KeyboardInterrupt):
+        cli.main(["--config", str(config), "index", "--every", "60"])
+    lines = [line for line in capsys.readouterr().err.splitlines() if line.startswith("agent-history:")]
+    assert lines == ["agent-history: index succeeded (usage unknown: litellm.config)"]
+
+
+@pytest.mark.parametrize("command", ["embed", "journal-sync"])
+def test_other_workers_pass_with_an_unreadable_litellm_dsn(clean, tmp_path, monkeypatch, command):  # noqa: F811
+    from agent_history import cli
+
+    monkeypatch.delenv("AGENT_HISTORY_LITELLM_DSN", raising=False)
+    monkeypatch.setenv("SYNTHETIC_EMBED_KEY", "synthetic")
+    config = tmp_path / "config.toml"
+    config.write_text(
+        f'dsn = "{DSN}"\n'
+        '[embedding]\nenabled = true\nbase_url = "http://127.0.0.1:1/v1"\napi_key_env = "SYNTHETIC_EMBED_KEY"\n'
+        f'[litellm]\ndsn_file = "{tmp_path / "absent.dsn"}"\nnamespaces = ["claude-proxied"]\n'
+    )
+    # An earlier suite test may have recorded its own embedding model; this one only proves config
+    # loading, so it steps around that record and puts it back for later tests.
+    prior = clean.execute("SELECT value FROM ah.meta WHERE key = 'embedding_model'").fetchone()
+    clean.execute("DELETE FROM ah.meta WHERE key = 'embedding_model'")
+    clean.commit()
+    extra = ["--source-db", str(tmp_path / "absent.db")] if command == "journal-sync" else []
+    try:
+        assert cli.main(["--config", str(config), command, *extra]) == 0
+    finally:
+        clean.execute("DELETE FROM ah.meta WHERE key = 'embedding_model'")
+        if prior:
+            clean.execute("INSERT INTO ah.meta VALUES ('embedding_model', %s)", prior)
+        clean.commit()

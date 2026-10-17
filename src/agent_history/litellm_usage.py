@@ -9,6 +9,11 @@ transcript records as the response id.
 Only rows in the configured namespaces whose usage is still unknown (NULL, or the all-zero shape
 indexed before that rule) are touched; a known count is never overwritten. The spend-log
 connection is read-only. Without a configured DSN nothing runs and usage stays unknown.
+
+LiteLLM is optional and may be down, unreachable or removed. Its DSN is resolved only here, and a
+failure to resolve it, to connect or to query raises SourceUnavailable: the index pass rolls the
+fill back, so the usage stays unknown (never a stored zero), and carries on. The failure is recorded
+as a fixed stage name and a content-free `outbound.call.failed` event, never a DSN, path or message.
 """
 
 from __future__ import annotations
@@ -17,7 +22,23 @@ from typing import Any, Iterable
 
 import psycopg
 
-from .config import LiteLLM
+from . import telemetry
+from .config import ConfigError, LiteLLM
+
+SOURCE = "litellm"
+# stage -> (error.type, db.operation.name) for the failure event.
+STAGES = {"config": ("config", None), "connect": ("io", "connect"), "query": ("error", "query")}
+
+
+class SourceUnavailable(Exception):
+    """The usage source could not be read. Its message is a fixed label, never the cause's text."""
+
+    def __init__(self, stage: str):
+        self.source = SOURCE
+        self.stage = stage
+        self.label = f"{SOURCE}.{stage}"
+        super().__init__(f"usage source {self.label} unavailable")
+
 
 UNKNOWN_SQL = """
     SELECT c.id, c.response_id, c.session_id
@@ -144,13 +165,44 @@ def connect_source(dsn: str) -> psycopg.Connection:
     return psycopg.connect(dsn, autocommit=False, connect_timeout=10, application_name="agent-history-usage")
 
 
+def _attempt(conn, config: LiteLLM, days: int, max_rows: int | None) -> tuple[dict[str, int] | None, str | None]:
+    """(stats, None) on success, else (None, the failed stage). Causes are dropped, not chained."""
+    try:
+        dsn = config.resolve_dsn()
+    except ConfigError:
+        return None, "config"
+    try:
+        source = connect_source(dsn)
+    except (psycopg.Error, OSError):
+        return None, "connect"
+    try:
+        with source:
+            return fill(conn, source, config.namespaces, days, config.batch, max_rows), None
+    except Exception:
+        return None, "query"
+
+
 def filler(config: LiteLLM, days: int | None = None, max_rows: int | None = None):
-    """A refresh hook for load.refresh(usage_fill=...), or None when no DSN is configured."""
+    """A refresh hook for load.refresh(usage_fill=...), or None when no DSN is configured.
+
+    The hook raises SourceUnavailable when the spend logs cannot be read."""
     if not config.enabled:
         return None
 
     def run(conn: psycopg.Connection) -> dict[str, int]:
-        with connect_source(config.dsn) as source:
-            return fill(conn, source, config.namespaces, days or config.lookback_days, config.batch, max_rows)
+        with telemetry.operation(
+            "usage_fill", {"agent_history.usage_source": SOURCE, "db.system.name": "postgresql"}
+        ) as span:
+            stats, stage = _attempt(conn, config, days or config.lookback_days, max_rows)
+            if stage is not None:
+                category, operation = STAGES[stage]
+                telemetry.fail(span, category)
+                event = {"agent_history.usage_source": SOURCE, "db.system.name": "postgresql", "error.type": category}
+                if operation:
+                    event["db.operation.name"] = operation
+                telemetry.emit("outbound.call.failed", event)
+        if stage is not None:
+            raise SourceUnavailable(stage)
+        return stats
 
     return run

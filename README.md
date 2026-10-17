@@ -170,6 +170,12 @@ start, the indexer keeps indexing, prints `metric collection disabled (config)` 
 `telemetry.configuration.invalid` OTLP log; the `agent-history-metrics-stale` alert rule catches a
 collection that is absent or no longer completes runs.
 
+Each periodic iteration prints one line: `<command> succeeded`, or `<command> failed (<category>);
+retrying`, where the category is fixed (`config: <key>` names the config key at fault, e.g.
+`config: dsn_file`, never its value or path; then `database`, `io`, `provider`, `status` or `error`).
+An index pass that could not read its optional `[litellm]` usage source still succeeds and prints
+`index succeeded (usage unknown: litellm.<stage>)`.
+
 The `[exporter]` table keeps its historical name and configures this collection; its `listen` key
 is accepted and ignored. Set `state_dir = "/state"`: the state volume preserves the collectors'
 counter offsets and efficiency state through restarts, and must be writable by the indexer. Set

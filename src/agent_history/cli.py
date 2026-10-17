@@ -45,6 +45,10 @@ WORKER_COMMANDS = frozenset(
 # Commands that accept --every and drain on SIGTERM/SIGINT instead of dying mid-pass.
 PERIODIC = ("index", "embed", "journal-sync")
 _command: str | None = None  # the parsed subcommand of the current process, for run()
+# Set by the latest main() call so a periodic loop and the pass span can say what went wrong without
+# the nested output: the config error that ended it, and a usage source left unknown by an index pass.
+_config_failure: ConfigError | None = None
+_usage_unknown: str | None = None
 
 
 def failure_category(error: BaseException) -> str:
@@ -60,6 +64,11 @@ def failure_category(error: BaseException) -> str:
     if isinstance(error, LookupError):
         return "provider"
     return "error"
+
+
+def config_category(error: ConfigError) -> str:
+    """`config`, plus the fixed config key at fault when known: never a value or a path."""
+    return f"config: {error.key}" if error.key else "config"
 
 
 def failure_line(command: str, error: BaseException) -> str:
@@ -241,8 +250,9 @@ def main(argv: list[str] | None = None) -> int:
     journal.add_argument("--every", type=float, help="repeat journal-sync every N seconds (positive)")
 
     args = parser.parse_args(argv)
-    global _command
+    global _command, _config_failure, _usage_unknown
     _command = args.command
+    _config_failure = _usage_unknown = None
     workers = {
         "index": "index.pass",
         "embed": "embed.pass",
@@ -260,6 +270,8 @@ def main(argv: list[str] | None = None) -> int:
             result = _dispatch(args, parser, argv, reader_commands)
             if result:
                 span.counts({"errors": 1})
+                if _config_failure is not None:
+                    span.failed("config", _config_failure.key)
             return result
 
 
@@ -329,6 +341,7 @@ def _start_collection(args, runs_directory: Path):
 
 
 def _dispatch(args, parser, argv, reader_commands):
+    global _config_failure, _usage_unknown
     from . import reader
 
     # Periodic workers reload config inside the suppressed single-shot iteration.
@@ -389,20 +402,22 @@ def _dispatch(args, parser, argv, reader_commands):
                     # emitted before an exception. Never retain transcript/error text in memory.
                     with open(os.devnull, "w") as sink, redirect_stdout(sink), redirect_stderr(sink):
                         result = main(once)
-                    category = "status" if result else None
+                    if result and _config_failure is not None:
+                        # The nested diagnostic was discarded: name the failing key instead.
+                        category = config_category(_config_failure)
+                    elif result:
+                        category = "status"
                 except SystemExit as exc:
                     # Escape, do not retry; the interpreter must never print a raw payload.
                     raise SystemExit(exc.code if isinstance(exc.code, int) else 1) from None
-                except ConfigError:
-                    category = "config"
-                except OSError:
-                    category = "io"
-                except LookupError:
-                    category = "provider"
-                except Exception:
-                    category = "error"
+                except ConfigError as exc:
+                    category = config_category(exc)
+                except Exception as exc:
+                    category = failure_category(exc)
                 if category:
                     print(f"agent-history: {args.command} failed ({category}); retrying", file=sys.stderr)
+                elif _usage_unknown:
+                    print(f"agent-history: {args.command} succeeded (usage unknown: {_usage_unknown})", file=sys.stderr)
                 else:
                     print(f"agent-history: {args.command} succeeded", file=sys.stderr)
                 # Ended iteration spans/logs reach OTLP before the idle interval.
@@ -423,6 +438,7 @@ def _dispatch(args, parser, argv, reader_commands):
     try:
         config = load_config(args.config)
     except ConfigError as exc:
+        _config_failure = exc
         print(f"agent-history: config: {exc}", file=sys.stderr)
         return 2
 
@@ -524,6 +540,7 @@ def _dispatch(args, parser, argv, reader_commands):
                     sources=_sources(config, args.source),
                     usage_fill=litellm_usage.filler(config.litellm),
                 )
+                _usage_unknown = stats.usage_fill_failed
             if not stats.lock_held:
                 _ensure_search_indexes(conn)
             return 1 if stats.errors else 0
@@ -579,7 +596,12 @@ def _dispatch(args, parser, argv, reader_commands):
                 if run_fill is None:
                     print("agent-history: [litellm] needs a dsn and namespaces", file=sys.stderr)
                     return 2
-                print(json.dumps(run_fill(conn)))
+                try:
+                    print(json.dumps(run_fill(conn)))
+                except litellm_usage.SourceUnavailable as exc:
+                    conn.rollback()
+                    print(f"agent-history: litellm-usage failed ({exc.label})", file=sys.stderr)
+                    return 1
                 conn.commit()
             elif args.command == "postpass":
                 print(json.dumps(load.post_passes(conn)))

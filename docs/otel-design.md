@@ -126,6 +126,8 @@ Permitted attributes include:
 - `agent_history.outcome`: `success`, `skipped`, `error`;
 - `agent_history.skip_reason`: a producer-defined bounded enum;
 - `error.type`: bounded category;
+- `agent_history.config_key`: on a failed pass with `error.type="config"`, the fixed config key at fault (`config.CONFIG_KEYS`), never a value, path or operator-written key;
+- `agent_history.usage_source`: an optional usage source (`litellm`) on its `usage_fill` span and `outbound.call.failed` event, with `error.type` and `db.operation.name` naming the failed stage;
 - integer counts and finite durations;
 - an existing refresh identifier;
 - explicitly selected session UID, canonical repository slug or loop identifier when an operation genuinely has one.
