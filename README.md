@@ -280,8 +280,8 @@ remote default branch before reading git objects; it never edits the checkout or
 Independently of that classification, it collects `codex/charter-*-loop<N>.md` and
 `codex/closeout-*-loop<N>.md` into the metadata-only `ah.loop_run_metadata` table: whole-file
 hash, qualified closeout line 1, mtime and explicit checkout origin, never document bodies. A
-qualified closeout also records two integers, the distinct task IDs under its `## Landed` and
-`## Parked` headings (migration 041); titles and IDs are not stored.
+qualified closeout also records two integers, the distinct task IDs opening a list item or table row
+under its `## Landed` and `## Parked` headings (migration 041); titles and IDs are not stored.
 Migration 038 adds this table and the narrow metadata grants for an existing `ah_ingest` role;
 provision those grants separately when creating the role later. Exact state JSONL snapshots
 continue to populate `ah.loop_state`. This does not copy charter or closeout bodies to a transcript

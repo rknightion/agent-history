@@ -171,12 +171,13 @@ HEADER = "# Closeout: sample/project loop12 · Charter: " + "a" * 64
 @pytest.mark.parametrize(
     ("body", "expected"),
     [
-        # Bullets, with a duplicate, a subtask and a mention outside both sections.
+        # Bullets, with a duplicate, a subtask, a second ID inside an entry (a reference, not an
+        # entry) and a mention outside both sections.
         (
             "Preamble ABC-0009.\n## Landed\n- ABC-0001 (first): 1a2b3c.\n- ABC-0002, ABC-0001 again.\n"
             "- XY2-0003.1.2 (subtask) and DEF-0004\n## Parked\n- ABC-0005: needs the owner.\n"
             "## For ratification\n- ABC-0006 is not landed or parked.\n## Notes\nABC-0007.\n",
-            (4, 1),
+            (3, 1),
         ),
         # A table and level-3 sub-headings stay inside their section; trailing heading text is allowed.
         (
@@ -189,14 +190,18 @@ HEADER = "# Closeout: sample/project loop12 · Charter: " + "a" * 64
         ("## Landed\nNothing shipped.\n## Notes\nABC-0001\n", (0, None)),
         ("## Notes\nABC-0001\n", (None, None)),
         ("## Parked\n\n## Landed\n- ABC-0001\n", (1, 0)),
-        # Lower case, embedded and partial shapes are not task IDs; repeated sections are combined.
+        # Lower case, embedded and partial shapes do not open an entry; bold, code and numbered
+        # entries do; repeated sections are combined.
         (
-            "## Landed\n- abc-0001, xABC-0002, ABC-0003x, ABC-, -0004, ABC-0005-6, loop12-lane\n"
-            "## Notes\n## Landed again\n- (ABC-0007). **ABC-0008**, `ABC-0007`\n",
-            (2, None),
+            "## Landed\n- abc-0001\n- xABC-0002\n- ABC-0003x\n- ABC-\n- -0004\n- ABC-0005-6\n"
+            "- loop12-lane\n- (ABC-0010) in brackets\n## Notes\n## Landed again\n- **ABC-0008** bold\n"
+            "* `ABC-0007` code\n1. ABC-0009 numbered\n- ABC-0007 again\n",
+            (3, None),
         ),
+        # A task named in prose is a reference, not a landed entry.
+        ("## Landed\nNone. Only one commit changes source: ABC-0290 (repin).\n", (0, None)),
         # A heading inside a fenced block does not open or close a section.
-        ("## Notes\n```\n## Landed\nABC-0001\n```\n## Landed\n```\n## Parked\nABC-0002\n```\n", (1, None)),
+        ("## Notes\n```\n## Landed\n- ABC-0001\n```\n## Landed\n```\n## Parked\n- ABC-0002\n```\n", (1, None)),
         # Level 1 and level 3 headings are not section boundaries.
         ("### Landed\nABC-0001\n# Landed\nABC-0002\n", (None, None)),
     ],

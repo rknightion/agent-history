@@ -314,12 +314,14 @@ plus the key. Charter line 1 is always NULL. Closeout line 1 is retained only wh
 ```
 
 Migration `041_closeout_counts.sql` adds nullable `landed_count integer` and `parked_count integer`.
-For a closeout whose header qualifies, they hold the number of distinct task IDs under its
+For a closeout whose header qualifies, they hold the number of distinct task IDs that open an entry under its
 `## Landed` and `## Parked` headings: level-2 headings whose text starts with `Landed` or `Parked`
 in any case (trailing words allowed), each section running to the next level-2 heading, so
 level-3 sub-headings, bullets and tables stay inside it. Headings inside fenced code blocks do
 not count. IDs match `[A-Z][A-Z0-9]*-[0-9]+(?:\.[0-9]+)*`, case-sensitive and not embedded in a
-longer word; repeats count once. A missing section is NULL and a section without IDs is 0.
+longer word. An entry is a list item (`-`, `*`, `+`, `1.` or `1)`) or a table row whose first
+token is the ID, optionally in bold or code; an ID later in an entry or in prose is a reference
+and does not count. Repeats count once. A missing section is NULL and a section without IDs is 0.
 Charters, unqualified closeouts, files over 1 MiB and non-UTF-8 bodies are NULL. The body is
 counted from the same descriptor and snapshot it is hashed from and is not retained; only the two
 integers are stored. Rows collected before this migration stay NULL until collected again.
