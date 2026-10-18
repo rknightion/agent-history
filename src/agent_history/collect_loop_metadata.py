@@ -1,4 +1,9 @@
-"""Collect charter/closeout identity metadata, never document bodies or receipt state."""
+"""Collect charter/closeout identity metadata, never document bodies or receipt state.
+
+A qualified closeout also yields two integers, the distinct task IDs under its `## Landed` and
+`## Parked` headings. The body is counted in memory while it is hashed and then discarded; only
+the integers leave this module.
+"""
 
 from __future__ import annotations
 
@@ -22,11 +27,45 @@ COLS = [
     ("line1", "text"),
     ("file_mtime", "timestamptz"),
     ("repo_origin", "text"),
+    ("landed_count", "integer"),
+    ("parked_count", "integer"),
 ]
 KEY = ["machine", "kind", "path"]
 SOURCE_NAME = re.compile(r"(charter|closeout)-[\w.-]*-loop[0-9]+\.md")
 MAX_LINE1_BYTES = 4096
 CHUNK_BYTES = 1024 * 1024
+# Closeouts are a few kilobytes; a larger file is not counted (both counts NULL), so no
+# unbounded body is ever held in memory.
+MAX_COUNT_BYTES = 1024 * 1024
+TASK_ID = re.compile(r"(?<![A-Za-z0-9_.-])[A-Z][A-Z0-9]*-[0-9]+(?:\.[0-9]+)*(?![A-Za-z0-9_-]|\.[0-9])")
+HEADING2 = re.compile(r" {0,3}##(?!#)(?:[ \t]+(.*?))?[ \t]*")
+FENCE = re.compile(r" {0,3}(```|~~~)")
+
+
+def closeout_counts(body: str) -> tuple[int | None, int | None]:
+    """Distinct task IDs under the `## Landed` and `## Parked` level-2 headings.
+
+    A section runs from its heading to the next level-2 heading. Headings match on text starting
+    with Landed or Parked in any case, so trailing words are allowed. A missing section is None;
+    a present section without IDs is 0. Repeated sections of one kind are counted together.
+    Headings inside fenced code blocks are not headings.
+    """
+    found: dict[str, set[str] | None] = {"landed": None, "parked": None}
+    current: str | None = None
+    fence: str | None = None
+    for line in body.splitlines():
+        marker = FENCE.match(line)
+        if marker and (fence is None or marker[1] == fence):
+            fence = None if fence else marker[1]
+        elif fence is None and (heading := HEADING2.fullmatch(line)):
+            title = (heading[1] or "").lower()
+            current = next((kind for kind in found if title.startswith(kind)), None)
+            if current is not None and found[current] is None:
+                found[current] = set()
+            continue
+        if current is not None:
+            found[current].update(TASK_ID.findall(line))
+    return tuple(None if ids is None else len(ids) for ids in found.values())
 
 
 class Changed(OSError):
@@ -99,12 +138,16 @@ def _snapshot(
         # including the bounded prefix, through the same open descriptor.
         first = handle.readline(MAX_LINE1_BYTES)
         digest = hashlib.sha256(first)
+        # A closeout's body is counted from the same descriptor and snapshot it is hashed from.
+        body = bytearray() if kind == "closeout" and before.st_size <= MAX_COUNT_BYTES else None
         remaining = max(0, before.st_size - len(first))
         while remaining:
             chunk = handle.read(min(CHUNK_BYTES, remaining))
             if not chunk:
                 raise Changed(name)
             digest.update(chunk)
+            if body is not None:
+                body += chunk
             remaining -= len(chunk)
         after = os.fstat(handle.fileno())
         bound = os.stat(name, dir_fd=codex_fd, follow_symlinks=False)
@@ -121,6 +164,13 @@ def _snapshot(
         # A full-size prefix without a newline is incomplete, even if it resembles a header.
         if (len(first) < MAX_LINE1_BYTES or first.endswith(b"\n")) and CLOSEOUT_HEADER.fullmatch(candidate):
             line1 = candidate
+    landed = parked = None
+    if line1 is not None and body is not None:
+        try:
+            landed, parked = closeout_counts(body.decode("utf-8"))
+        except UnicodeDecodeError:
+            pass
+    del body
     return {
         "machine": machine,
         "path": str(repo / "codex" / name),
@@ -129,6 +179,8 @@ def _snapshot(
         "line1": line1,
         "file_mtime": _utc(before.st_mtime_ns),
         "repo_origin": origin,
+        "landed_count": landed,
+        "parked_count": parked,
     }
 
 

@@ -43,6 +43,7 @@ REPLAYED = (
     "038_loop_run_metadata.sql",
     "039_loop_wait_status.sql",
     "040_lane_returns.sql",
+    "041_closeout_counts.sql",
 )
 
 

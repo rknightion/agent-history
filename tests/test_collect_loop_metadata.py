@@ -36,7 +36,17 @@ def test_metadata_only_stream_hash_and_origin(repo):
     write(repo, "closeout-project-loop12.md.tmp", b"not a source")
     rows = list(cm.metadata(repo, "test-machine"))
     assert len(rows) == 2
-    expected = {"machine", "path", "kind", "sha256", "line1", "file_mtime", "repo_origin"}
+    expected = {
+        "machine",
+        "path",
+        "kind",
+        "sha256",
+        "line1",
+        "file_mtime",
+        "repo_origin",
+        "landed_count",
+        "parked_count",
+    }
     assert {name for name, _ in cm.COLS} == expected
     assert cm.KEY == ["machine", "kind", "path"]
     for row in rows:
@@ -153,3 +163,74 @@ def test_stream_reads_are_bounded(repo, monkeypatch):
     assert next(cm.metadata(repo, "test-machine"))["sha256"] == hashlib.sha256(data).hexdigest()
     # Reads are bounded by the initial snapshot size, not an ever-moving EOF.
     assert sum(reads) == len(data) - cm.MAX_LINE1_BYTES
+
+
+HEADER = "# Closeout: sample/project loop12 · Charter: " + "a" * 64
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        # Bullets, with a duplicate, a subtask and a mention outside both sections.
+        (
+            "Preamble ABC-0009.\n## Landed\n- ABC-0001 (first): 1a2b3c.\n- ABC-0002, ABC-0001 again.\n"
+            "- XY2-0003.1.2 (subtask) and DEF-0004\n## Parked\n- ABC-0005: needs the owner.\n"
+            "## For ratification\n- ABC-0006 is not landed or parked.\n## Notes\nABC-0007.\n",
+            (4, 1),
+        ),
+        # A table and level-3 sub-headings stay inside their section; trailing heading text is allowed.
+        (
+            "## Landed (about 40 tasks)\n| Task | SHA |\n| --- | --- |\n| ABC-0001 (x) | `abc` |\n"
+            "| ABC-0002 (y) | `def` |\n### Release\n- ABC-0003 released.\n## PARKED and waiting\n"
+            "| ABC-0004 | owner |\n",
+            (3, 1),
+        ),
+        # Missing sections are unknown; an empty one is a known zero.
+        ("## Landed\nNothing shipped.\n## Notes\nABC-0001\n", (0, None)),
+        ("## Notes\nABC-0001\n", (None, None)),
+        ("## Parked\n\n## Landed\n- ABC-0001\n", (1, 0)),
+        # Lower case, embedded and partial shapes are not task IDs; repeated sections are combined.
+        (
+            "## Landed\n- abc-0001, xABC-0002, ABC-0003x, ABC-, -0004, ABC-0005-6, loop12-lane\n"
+            "## Notes\n## Landed again\n- (ABC-0007). **ABC-0008**, `ABC-0007`\n",
+            (2, None),
+        ),
+        # A heading inside a fenced block does not open or close a section.
+        ("## Notes\n```\n## Landed\nABC-0001\n```\n## Landed\n```\n## Parked\nABC-0002\n```\n", (1, None)),
+        # Level 1 and level 3 headings are not section boundaries.
+        ("### Landed\nABC-0001\n# Landed\nABC-0002\n", (None, None)),
+    ],
+)
+def test_closeout_counts(body, expected):
+    assert cm.closeout_counts(body) == expected
+
+
+def test_collected_closeout_counts_only_leave_as_integers(repo):
+    body = "## Landed\n- ABC-0001 (confidential title)\n- ABC-0002\n## Parked\n- ABC-0003\n"
+    write(repo, "closeout-project-loop12.md", f"{HEADER}\n{body}".encode())
+    write(repo, "charter-project-loop12.md", body.encode())
+    rows = {row["kind"]: row for row in cm.metadata(repo, "test-machine")}
+    assert (rows["closeout"]["landed_count"], rows["closeout"]["parked_count"]) == (2, 1)
+    # Charters and unqualified closeouts are never counted.
+    assert (rows["charter"]["landed_count"], rows["charter"]["parked_count"]) == (None, None)
+    assert not any(
+        "confidential" in str(value) or "ABC-" in str(value) for row in rows.values() for value in row.values()
+    )
+    write(repo, "closeout-project-loop12.md", f"# Closeout: draft\n{body}".encode())
+    row = next(r for r in cm.metadata(repo, "test-machine") if r["kind"] == "closeout")
+    assert (row["line1"], row["landed_count"], row["parked_count"]) == (None, None, None)
+
+
+def test_oversize_or_undecodable_closeout_is_not_counted(repo):
+    body = "## Landed\n- ABC-0001\n## Parked\n"
+    padding = "x" * (cm.MAX_COUNT_BYTES + 1)
+    write(repo, "closeout-project-loop12.md", f"{HEADER}\n{body}{padding}\n".encode())
+    row = next(cm.metadata(repo, "test-machine"))
+    assert row["line1"] == HEADER
+    assert (row["landed_count"], row["parked_count"]) == (None, None)
+    write(repo, "closeout-project-loop12.md", f"{HEADER}\n{body}".encode() + b"\xff\n")
+    row = next(cm.metadata(repo, "test-machine"))
+    assert (row["landed_count"], row["parked_count"]) == (None, None)
+    write(repo, "closeout-project-loop12.md", f"{HEADER}\n{body}".encode())
+    row = next(cm.metadata(repo, "test-machine"))
+    assert (row["landed_count"], row["parked_count"]) == (1, 0)
