@@ -200,8 +200,10 @@ HEADER = "# Closeout: sample/project loop12 · Charter: " + "a" * 64
         ),
         # A task named in prose is a reference, not a landed entry.
         ("## Landed\nNone. Only one commit changes source: ABC-0290 (repin).\n", (0, None)),
-        # A heading inside a fenced block does not open or close a section.
-        ("## Notes\n```\n## Landed\n- ABC-0001\n```\n## Landed\n```\n## Parked\n- ABC-0002\n```\n", (1, None)),
+        # A heading inside a fenced block does not open or close a section, and a list item inside
+        # one is code, not an entry.
+        ("## Notes\n```\n## Landed\n- ABC-0001\n```\n## Landed\n```\n## Parked\n- ABC-0002\n```\n", (0, None)),
+        ("## Landed\n- ABC-0001\n~~~\n- ABC-0002\n~~~\n- ABC-0003\n", (2, None)),
         # Level 1 and level 3 headings are not section boundaries.
         ("### Landed\nABC-0001\n# Landed\nABC-0002\n", (None, None)),
     ],

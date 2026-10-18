@@ -67,7 +67,7 @@ def closeout_counts(body: str) -> tuple[int | None, int | None]:
                 found[current] = set()
             continue
         if current is not None:
-            if entry := ENTRY.match(line):
+            if fence is None and (entry := ENTRY.match(line)):
                 found[current].add(entry[1])
     return tuple(None if ids is None else len(ids) for ids in found.values())
 
