@@ -138,7 +138,9 @@ including ambiguous-target rejection. Recognition is pure for inline text, not a
 on the indexer's machine. The compatibility columns remain `report_path`, `goal_path` and
 `goal_sha256`, meaning closeout path, charter path and charter digest for `mode = 'v3'`.
 
-Qualified closeout evidence can finish a v3 run. Retained state has two strictly validated body
+Qualified closeout evidence can finish a v3 run, and its collected Landed and Parked task counts
+then supply that run's `tasks_landed`, `tasks_done` and `parks_total` ahead of every other
+count source ([count precedence](docs/loop-counts.md)). Retained state has two strictly validated body
 dialects, both still wire version 1; the pi charter/first-wave dialect does not invent zero
 outcomes when events are absent. Observed Git Task trailers provide an independent v3 landed-task
 fallback, not proof of complete charter coverage. `WAITING` and `PAUSED` root lines can project
@@ -277,7 +279,9 @@ strings. Unlisted owners, forks and unknown fork status are skipped. The collect
 remote default branch before reading git objects; it never edits the checkout or its tracker.
 Independently of that classification, it collects `codex/charter-*-loop<N>.md` and
 `codex/closeout-*-loop<N>.md` into the metadata-only `ah.loop_run_metadata` table: whole-file
-hash, qualified closeout line 1, mtime and explicit checkout origin, never document bodies.
+hash, qualified closeout line 1, mtime and explicit checkout origin, never document bodies. A
+qualified closeout also records two integers, the distinct task IDs under its `## Landed` and
+`## Parked` headings (migration 041); titles and IDs are not stored.
 Migration 038 adds this table and the narrow metadata grants for an existing `ah_ingest` role;
 provision those grants separately when creating the role later. Exact state JSONL snapshots
 continue to populate `ah.loop_state`. This does not copy charter or closeout bodies to a transcript
@@ -328,6 +332,17 @@ first four opts into context filtering. The optional legacy embedding adapters
 read `AGENT_HISTORY_EMBED_ENV`; OpenAI/Cohere gateway routes require `EMBED_BASE_URL` alongside
 `EMBED_PROVIDER`, `EMBED_MODEL` and `CF_AIG_TOKEN`. Workers AI also reads `CF_ACCOUNT_ID` and optional
 `CF_AIG_GATEWAY_ID`. Otherwise query embedding uses `[embedding]` from the public config.
+
+`agent-history loop <id>` prints one run's summary and lanes. The argument may instead be the
+run's absolute closeout path; when several launches share that closeout (a relaunch), they are
+shown together and the output says so. `agent-history loop <id or closeout path> --usage` prints
+a short Markdown block for a v3 root to paste into its closeout Notes: an `as of` UTC timestamp,
+wall time, LLM calls, the list-price cost total and a cost and calls table by role (root, then
+each lane role from `ah.lane.role`, `unattributed` for linked sessions without a lane) and model.
+Scope follows `ah.v_loop_summary` (root calls inside each launch window, linked sessions whole)
+and prices follow `ah.v_session_cost`. Unpriced calls and heuristic-linked sessions are stated
+when non-zero. It prints no prompt text or lane names. An unknown id or path exits non-zero with
+a one-line reason. The catalogue lags the transcripts by an indexer pass, hence the timestamp.
 
 Private command add-ons can import `agent_history.reader.main(argv, register, dispatch)`.
 `register(subparsers)` adds parsers; `dispatch(args)` returns an integer status when handled or

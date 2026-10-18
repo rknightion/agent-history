@@ -478,6 +478,117 @@ def print_wrapped(w: dict) -> None:
             print(f"  {row.get('model')}: output={row.get('output')} cost=${row.get('priced_cost_usd')}")
 
 
+def loop_id_array(ids: list[int]) -> str:
+    return "ARRAY[" + ",".join(str(int(i)) for i in ids) + "]::bigint[]"
+
+
+def resolve_loop(value: str) -> list[int]:
+    """Loop run ids for a numeric id or an exact closeout path; exit with one line if unknown.
+
+    A v3 run relaunched under the same closeout has one loop_run per launch, so a path can
+    name several. They are returned together, oldest first, to be treated as one run.
+    """
+    if value.isdigit():
+        rows = query(f"SELECT id FROM ah.loop_run WHERE id = {int(value)};", {})
+        if not rows:
+            sys.exit(f"agent-history: no loop run with id {int(value)}")
+        return [int(rows[0]["id"])]
+    if not os.path.isabs(value):
+        sys.exit("agent-history: loop takes a numeric id or an absolute closeout path")
+    path = os.path.normpath(value)
+    rows = query("SELECT id FROM ah.loop_run WHERE report_path = :'path' ORDER BY launch_ts, id;", {"path": path})
+    if not rows:
+        sys.exit(f"agent-history: no loop run has closeout path {path}")
+    return [int(row["id"]) for row in rows]
+
+
+# Scope as ah.v_loop_summary: root calls inside each launch window, linked sessions whole.
+# Prices as ah.v_session_cost: one ah.priced_usd per model and day. Relaunch sessions are root.
+USAGE_SUMMARY_SQL = """
+SELECT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS as_of,
+       EXTRACT(EPOCH FROM (max(CASE WHEN live.status = 'finished' AND l.end_ts IS NOT NULL
+                                    THEN l.end_ts ELSE now() END) - min(l.launch_ts)))::bigint AS wall_s,
+       (SELECT count(*) FROM ah.session s WHERE s.loop_run_id = ANY({ids})
+          AND s.loop_link_method = 'heuristic') AS heuristic_sessions
+FROM ah.loop_run l LEFT JOIN ah.loops live USING (launch_uid)
+WHERE l.id = ANY({ids});
+"""
+
+USAGE_ROWS_SQL = """
+WITH runs AS (
+    -- An unfinished run's end_ts is only its last observed root event: leave the window open.
+    SELECT l.id, l.root_session_id, l.launch_ts, CASE WHEN live.status = 'finished' THEN l.end_ts END AS end_ts
+    FROM ah.loop_run l LEFT JOIN ah.loops live USING (launch_uid) WHERE l.id = ANY({ids})
+), members AS (
+    SELECT r.root_session_id AS session_id, 'root' AS role, true AS windowed, r.launch_ts, r.end_ts
+    FROM runs r
+    UNION ALL
+    SELECT s.id, CASE WHEN s.loop_link_method = 'relaunch' THEN 'root'
+                      ELSE COALESCE(NULLIF(ln.role, ''), 'unattributed') END, false, r.launch_ts, r.end_ts
+    FROM runs r JOIN ah.session s ON s.loop_run_id = r.id AND s.id <> r.root_session_id
+    LEFT JOIN ah.lane ln ON ln.loop_run_id = r.id AND ln.session_id = s.id
+), calls AS (
+    SELECT DISTINCT ON (c.id) c.id, m.role, c.model, c.ts, c.input_uncached, c.cache_read,
+           c.cache_write_5m, c.cache_write_1h, c.output
+    FROM members m JOIN ah.llm_call c ON c.session_id = m.session_id
+    WHERE NOT m.windowed OR (c.ts >= m.launch_ts AND c.ts < COALESCE(m.end_ts, 'infinity'))
+    ORDER BY c.id, m.role
+), priced AS (
+    SELECT role, model, count(*) AS calls,
+           ah.priced_usd(model, ts::date, sum(input_uncached), sum(cache_read), sum(cache_write_5m),
+                         sum(cache_write_1h), sum(output)) AS cost
+    FROM calls GROUP BY role, model, ts::date
+)
+SELECT role, COALESCE(model, '(unknown)') AS model, sum(calls) AS calls, sum(cost) AS cost,
+       COALESCE(sum(calls) FILTER (WHERE cost IS NULL), 0) AS unpriced
+FROM priced GROUP BY 1, 2
+ORDER BY role <> 'root', role, sum(cost) DESC NULLS LAST, model;
+"""
+
+
+def _duration(seconds: int) -> str:
+    hours, rest = divmod(max(0, seconds), 3600)
+    days, hours = divmod(hours, 24)
+    text = f"{hours}h {rest // 60}m"
+    return f"{days}d {text}" if days else text
+
+
+def usage_markdown(summary: dict[str, str], rows: list[dict[str, str]], runs: int) -> str:
+    """The closeout Notes block: totals and a role/model table, no prompt text or lane names."""
+    from decimal import Decimal
+
+    calls = sum(int(r["calls"]) for r in rows)
+    unpriced = sum(int(r["unpriced"]) for r in rows)
+    cost = sum((Decimal(r["cost"]) for r in rows if r["cost"]), Decimal(0))
+    lines = [
+        f"Usage as of {summary['as_of']} (agent-history catalogue, list prices)",
+        "",
+        f"- Wall time: {_duration(int(summary['wall_s'] or 0))}",
+        f"- LLM calls: {calls:,}",
+        f"- List-price cost: ${cost:,.2f}",
+    ]
+    if runs > 1:
+        lines.append(f"- Launches: {runs} share this closeout and are counted as one run")
+    if unpriced:
+        lines.append(f"- Unpriced calls: {unpriced:,} (not in the cost total)")
+    heuristic = int(summary.get("heuristic_sessions") or 0)
+    if heuristic:
+        lines.append(f"- Heuristic-linked sessions: {heuristic:,} (attributed by timing, not by an explicit link)")
+    if rows:
+        lines += ["", "| Role | Model | Calls | Cost |", "| --- | --- | ---: | ---: |"]
+        for r in rows:
+            priced = f"${Decimal(r['cost']):,.2f}" if r["cost"] else "unpriced"
+            role, model = (r[k].replace("|", "\\|") for k in ("role", "model"))
+            lines.append(f"| {role} | {model} | {int(r['calls']):,} | {priced} |")
+    return "\n".join(lines) + "\n"
+
+
+def loop_usage(ids: list[int]) -> str:
+    array = loop_id_array(ids)
+    (summary,) = query(USAGE_SUMMARY_SQL.format(ids=array), {})
+    return usage_markdown(summary, query(USAGE_ROWS_SQL.format(ids=array), {}), len(ids))
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="agent-history", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -510,8 +621,11 @@ def build_parser():
     p = sub.add_parser("loops", help="recent loop runs")
     p.add_argument("--repo")
     p.add_argument("--limit", type=int, default=20)
-    p = sub.add_parser("loop", help="one loop: summary and lanes")
-    p.add_argument("id", type=int)
+    p = sub.add_parser("loop", help="one loop: summary and lanes, or --usage for its closeout")
+    p.add_argument("id", help="numeric loop_run_id, or the run's absolute closeout path")
+    p.add_argument(
+        "--usage", action="store_true", help="print a Markdown usage and list-price cost block for a closeout"
+    )
     p = sub.add_parser("compare", help="loops side by side")
     p.add_argument("ids", type=int, nargs="+")
     p = sub.add_parser("session", help="structural timeline of one session")
@@ -656,12 +770,30 @@ def execute(args) -> int:
             fmt,
         )
     if args.cmd == "loop":
+        if args.id.isdigit() and not args.usage:
+            rc = run(
+                f"SELECT * FROM ah.v_loop_summary WHERE loop_run_id = {int(args.id)};",
+                {},
+                "expanded" if fmt == "aligned" else fmt,
+            )
+            return rc or run(f"SELECT * FROM ah.loop_lanes({int(args.id)});", {}, fmt)
+        ids = resolve_loop(args.id)
+        if args.usage:
+            print(loop_usage(ids), end="")
+            return 0
+        if len(ids) > 1:
+            print(f"{len(ids)} launches share this closeout; showing them together as one run.")
+        array = loop_id_array(ids)
         rc = run(
-            f"SELECT * FROM ah.v_loop_summary WHERE loop_run_id = {int(args.id)};",
+            f"SELECT * FROM ah.v_loop_summary WHERE loop_run_id = ANY({array}) ORDER BY launch_ts;",
             {},
             "expanded" if fmt == "aligned" else fmt,
         )
-        return rc or run(f"SELECT * FROM ah.loop_lanes({int(args.id)});", {}, fmt)
+        return rc or run(
+            f"SELECT l.* FROM unnest({array}) AS r(id), ah.loop_lanes(r.id) AS l ORDER BY l.first_event_at;",
+            {},
+            fmt,
+        )
     if args.cmd == "compare":
         ids = ",".join(str(int(i)) for i in args.ids)
         return run(
