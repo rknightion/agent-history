@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.1](https://github.com/rknightion/agent-history/compare/v0.6.0...v0.6.1) (2026-10-18)
+
+
+### Bug Fixes
+
+* **loops:** finish a v3 run whose closeout was revised by an edit ([dc622bd](https://github.com/rknightion/agent-history/commit/dc622bd3f7b5a71d604b97172d5013e45e303b43))
+
 ## [0.6.0](https://github.com/rknightion/agent-history/compare/v0.5.4...v0.6.0) (2026-10-18)
 
 
