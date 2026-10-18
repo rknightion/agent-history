@@ -313,6 +313,17 @@ plus the key. Charter line 1 is always NULL. Closeout line 1 is retained only wh
 # Closeout: <name or owner/repo> loop<N> · Charter: <64 lowercase hex>
 ```
 
+Migration `041_closeout_counts.sql` adds nullable `landed_count integer` and `parked_count integer`.
+For a closeout whose header qualifies, they hold the number of distinct task IDs under its
+`## Landed` and `## Parked` headings: level-2 headings whose text starts with `Landed` or `Parked`
+in any case (trailing words allowed), each section running to the next level-2 heading, so
+level-3 sub-headings, bullets and tables stay inside it. Headings inside fenced code blocks do
+not count. IDs match `[A-Z][A-Z0-9]*-[0-9]+(?:\.[0-9]+)*`, case-sensitive and not embedded in a
+longer word; repeats count once. A missing section is NULL and a section without IDs is 0.
+Charters, unqualified closeouts, files over 1 MiB and non-UTF-8 bodies are NULL. The body is
+counted from the same descriptor and snapshot it is hashed from and is not retained; only the two
+integers are stored. Rows collected before this migration stay NULL until collected again.
+
 No charter or closeout body or `## Data` is stored by this collector, and there is no body-copy
 step to a transcript archive or NAS. Hashing reads the whole stable file without retaining its
 body. Canonical checkout boundaries, anchored no-follow descriptors and snapshot identity checks
@@ -584,7 +595,7 @@ Migration `026_loop_planner_signals.sql` adds the collector tables `ah.backlog_d
   ends at its `end_ts`, the root's last observed activity. NULL when `repo` is unknown or the collector
   has not yet finished that repo's first Done scan (`ah.backlog_done_scan`). Recomputed on every
   refresh because collector rows can arrive after a loop finishes. Qualifying retained state
-  evidence supersedes this legacy fallback as described below.
+  evidence, and for a v3 run its counted closeout, supersede this legacy fallback as described below.
 - `lanes_reported bigint`: all lanes in the `lanes` list of the latest captured report's
   `## Data`, read under the identity rules above. NULL when no report was captured, its Data is
   absent, invalid or names another identity, or has no `lanes` list. `lanes_total` is unchanged: indexed lane sessions.
@@ -736,6 +747,21 @@ A neutral public alias (`Task: loop<N>-<lane>`, any case) is never a task, even 
 numeric and so has the tracker shape: the collector drops it and the count ignores any already
 collected. The private commit that consumes the work carries one `Task: <ID>` per delivered task,
 and those IDs are the landed count.
+
+#### V3 closeout delivery counts
+
+The closeout is a v3 run's authoritative delivery record. For a `mode = 'v3'` run that is
+`finished` with `end_evidence = 'closeout'`, a non-NULL collected `landed_count` sets both
+`tasks_landed` and `tasks_done`, and a non-NULL `parked_count` sets `parks_total`. The counted rows
+are the exact-path closeout snapshots with a qualified line 1 whose mtime lies in the run's
+half-open window (bounded by the next launch on the same root or exact closeout path); they must
+share one hash, and machine copies of that snapshot agree. This override is applied after the
+Done-flip, state and Task-trailer projections on every refresh, collector-only passes included,
+so it takes precedence over all three for that run. A NULL count leaves that column as the other
+projections computed it. When the closeout end is revoked, the next refresh restores the ordinary
+values; a v3 run whose repository identity is withdrawn has `tasks_done` NULL. Runs whose end
+came only from a transcript write, v3 runs without a counted closeout, and v2 or legacy runs
+keep the projections described above. The dialect is never selected by date.
 
 #### State-only outcome normalization
 
@@ -970,7 +996,8 @@ never identity or inferred lifecycle root activity.
 Author emails are compared to configured identities but only `author_is_owner` is stored.
 Permission logs contribute timestamps, line hashes, tool names, command verbs, classifier reasons
 and sub-agent flags, never command arguments or target text. New run metadata contributes only
-hashes, qualified closeout line 1, mtime and origin alongside its key, never charter/closeout bodies.
+hashes, qualified closeout line 1, mtime, origin and two closeout task counts alongside its key,
+never charter/closeout bodies, titles or task IDs.
 Legacy `loop_receipt` rows retain receipt text, qualified report line 1, hashes and origin for
 historical reads; new receipt collection is retired globally. These metadata fields may themselves
 be sensitive. Protect collector homes, configuration and the catalogue accordingly.

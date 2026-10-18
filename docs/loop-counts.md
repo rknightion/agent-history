@@ -5,6 +5,16 @@ Unknown is NULL, not an invented zero. See [the catalogue contract](../CONTRACT.
 identity, lifecycle and state validation rules. Neither loop status nor a worker return proves
 publication, and these projections do not authorise paid work.
 
+## V3 closeout counts first
+
+A v3 run finished by its own qualified closeout (`end_evidence = 'closeout'`) takes
+`tasks_landed` and `tasks_done` from the closeout's collected `landed_count`, and `parks_total`
+from its `parked_count`: distinct task IDs under the `## Landed` and `## Parked` headings. This
+supersedes every rule below for that run and is reapplied last on every refresh. NULL counts
+(an old collector row, a missing section, an oversize file) fall through to the rules below,
+column by column. Revoking the closeout end restores them on the next refresh. See the
+contract's "V3 closeout delivery counts".
+
 ## Legacy `tasks_done`
 
 `ah.loops.tasks_done` keeps its column and report/reader shape:

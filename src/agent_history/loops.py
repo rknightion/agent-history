@@ -917,6 +917,13 @@ def _refresh_tasks_done(conn: psycopg.Connection) -> None:
         UPDATE ah.loops l SET tasks_done = c.n
         FROM counted c WHERE l.launch_uid = c.launch_uid AND l.tasks_done IS DISTINCT FROM c.n
     """)
+    # A v3 run whose identity is later withdrawn (for example a revoked closeout) has no repo to
+    # count in, so a count kept from a previous pass, including closeout counts, must not linger.
+    # Historical runs keep their existing behaviour.
+    conn.execute("""
+        UPDATE ah.loops l SET tasks_done = NULL FROM ah.loop_run r
+        WHERE r.launch_uid = l.launch_uid AND r.mode = 'v3' AND l.repo IS NULL AND l.tasks_done IS NOT NULL
+    """)
 
 
 def _state_blocks_trailer_lands(cohorts) -> bool:
@@ -1462,6 +1469,45 @@ def _refresh_state_counts(conn: psycopg.Connection) -> None:
                 (closed, uid),
             )
     _refresh_trailer_lands(conn, [uid for uid, cohorts in qualified.items() if _state_blocks_trailer_lands(cohorts)])
+    _refresh_closeout_counts(conn)
+
+
+def _refresh_closeout_counts(conn: psycopg.Connection) -> None:
+    """A v3 run finished by its own closeout takes its delivery counts from that closeout.
+
+    Runs last among the count refreshes on every pass, so it supersedes the Done-flip, state and
+    Task-trailer values for that run without being undone by them. Only a run whose recorded end
+    is the closeout qualifies; the identity projection has already applied the exact-path,
+    half-open window, tie and single-snapshot rules to that end. The counted rows are the same
+    in-window exact-path snapshots, which must still share one hash. A NULL count (an old
+    collector row, an absent section, an oversize file) leaves that column as computed above.
+    """
+    conn.execute("""
+        WITH target AS (
+            SELECT l.launch_uid, r.report_path, r.launch_ts,
+                   (SELECT min(n.launch_ts) FROM ah.loop_run n
+                    WHERE n.launch_ts > r.launch_ts
+                      AND (n.report_path = r.report_path OR n.root_session_id = r.root_session_id)) AS following
+            FROM ah.loops l JOIN ah.loop_run r USING (launch_uid)
+            WHERE r.mode = 'v3' AND r.end_evidence = 'closeout' AND r.end_ts IS NOT NULL
+              AND l.status = 'finished' AND r.report_path IS NOT NULL
+        ), counted AS (
+            SELECT t.launch_uid, max(m.landed_count) AS landed, max(m.parked_count) AS parked
+            FROM target t JOIN ah.loop_run_metadata m
+              ON m.kind = 'closeout' AND m.path = t.report_path AND m.line1 IS NOT NULL
+             AND m.file_mtime >= t.launch_ts AND m.file_mtime < COALESCE(t.following, 'infinity')
+            GROUP BY t.launch_uid
+            HAVING count(DISTINCT m.sha256) = 1
+        )
+        UPDATE ah.loops l SET tasks_landed = COALESCE(c.landed, l.tasks_landed),
+                              tasks_done = COALESCE(c.landed, l.tasks_done),
+                              parks_total = COALESCE(c.parked, l.parks_total)
+        FROM counted c
+        WHERE l.launch_uid = c.launch_uid
+          AND (c.landed IS NOT NULL OR c.parked IS NOT NULL)
+          AND (l.tasks_landed, l.tasks_done, l.parks_total) IS DISTINCT FROM
+              (COALESCE(c.landed, l.tasks_landed), COALESCE(c.landed, l.tasks_done), COALESCE(c.parked, l.parks_total))
+    """)
 
 
 def _tag_root(conn: psycopg.Connection, root_id: int) -> int:
