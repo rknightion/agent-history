@@ -194,7 +194,9 @@ class EfficiencyCollector:
         _save(path, state)
         rendered = _Series()
         rules.efficiency_emit(rendered, state, now, run)
-        labels = {label for spans in (loop_map or {}).get("roots", {}).values() for _, _, label in spans}
+        labels = {
+            label for spans in (loop_map or {}).get("roots", {}).values() for span in spans for label in span[2:3]
+        }
         labels.update((loop_map or {}).get("members", {}).values())
         rendered.add(
             "agent_efficiency_loop_map_loops",

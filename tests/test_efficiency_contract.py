@@ -1314,6 +1314,57 @@ def test_stalled_loop_claude_subagents_are_children(eff: Harness):
     assert v("agent_efficiency_root_no_lane_seconds") == pytest.approx(80, abs=0.01)
 
 
+def resumed_root(h: Harness) -> None:
+    """A loop root whose only lane ended long ago, then resumed by a human message and still mid-turn."""
+    now = h.now
+    use = {"input_tokens": 1, "output_tokens": 1}
+    h.claude_file(
+        "sess-resumed.jsonl",
+        [
+            claude(now - 5000, "user", {"role": "user", "content": "go\nContract: loop-v2.0"}),
+            claude_tool(now - 4900, "r1", "a1", "Agent", {"prompt": "p", "subagent_type": "general-purpose"}),
+            claude_result(now - 4899, "a1", "launched", toolUseResult={"agentId": "x1", "isAsync": True}),
+            claude(now - 300, "user", {"role": "user", "content": "what is left to decide?"}),
+            claude_tool(now - 60, "r2", "a2", "Bash", {"command": "ls -la /tmp/far/away/dir"}),
+        ],
+    )
+    subagents = h.claude_dir / "sess-resumed" / "subagents"
+    subagents.mkdir(parents=True)
+    (subagents / "agent-x1.jsonl").write_text(
+        claude(now - 4898, "user", {"role": "user", "content": "task"})
+        + claude(
+            now - 4000,
+            "assistant",
+            {"id": "w1", "model": "claude-test", "usage": use, "stop_reason": "end_turn", "content": []},
+        ),
+        encoding="utf-8",
+    )
+
+
+def resumed_rows(h: Harness, evidence: str, end: float) -> tuple[list, list]:
+    roots = [("claude", "sess-resumed", "", "example-repo", "2026-09-25", "loop", 16, h.now - 5000, end, evidence)]
+    return roots, []
+
+
+def test_stalled_loop_skips_a_root_resumed_after_its_closeout(eff: Harness):
+    eff.baseline = eff.now - 7200
+    resumed_root(eff)
+    samples = eff.collect(eff.now, loop_rows=resumed_rows(eff, "closeout", eff.now - 3500))
+    assert total(samples, "agent_efficiency_roots_without_lanes", namespace=CLAUDE) == 0
+    assert total(samples, "agent_efficiency_root_no_lane_seconds", namespace=CLAUDE) == 0
+
+
+def test_stalled_loop_clock_restarts_at_the_owners_message(eff: Harness):
+    eff.baseline = eff.now - 7200
+    resumed_root(eff)
+    # The run has no end evidence and its root is live, so the loop is still open.
+    samples = eff.collect(eff.now, loop_rows=resumed_rows(eff, "root_last_event", eff.now - 60))
+    v = lambda name: value(samples, name, agent="claude", namespace=CLAUDE, loop=LOOP16)
+    assert v("agent_efficiency_roots_without_lanes") == 1
+    # Counted from the human message, not from the lane that ended 4000 s ago.
+    assert v("agent_efficiency_root_no_lane_seconds") == pytest.approx(300, abs=0.01)
+
+
 def test_lane_seconds_histogram(eff: Harness):
     now = eff.now
     eff.baseline = now - 20000

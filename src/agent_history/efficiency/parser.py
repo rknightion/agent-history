@@ -399,7 +399,11 @@ def loop_session_key(agent: Any, session_uid: Any, agent_id: Any) -> str:
 
 
 def build_loop_map(roots: Iterable[Iterable[Any]], members: Iterable[Iterable[Any]], fetched: float) -> dict[str, Any]:
-    """JSON-serialisable loop map: root windows and lane membership keyed by catalogue natural key."""
+    """JSON-serialisable loop map: root windows and lane membership keyed by catalogue natural key.
+
+    Each root window is [launch, stop, label, concluded]. Concluded means the run has end evidence other
+    than its root falling quiet (a closeout or report write), so the loop is over even if the root talks again.
+    """
     windows: dict[str, list[list[Any]]] = defaultdict(list)
     for agent, uid, agent_id, repo, campaign, naming, number, launch, end, evidence in roots:
         if launch is None:
@@ -411,7 +415,8 @@ def build_loop_map(roots: Iterable[Iterable[Any]], members: Iterable[Iterable[An
             stop = float(end) + LOOP_OPEN_GRACE_SECONDS
         else:
             stop = float(end)
-        windows[loop_session_key(agent, uid, agent_id)].append([float(launch), stop, label])
+        concluded = stop is not None and evidence != "root_last_event"
+        windows[loop_session_key(agent, uid, agent_id)].append([float(launch), stop, label, concluded])
     for spans in windows.values():
         spans.sort(key=lambda span: span[0])
     lanes = {
@@ -460,11 +465,22 @@ class LoopMap:
             if spans:
                 if ts is None:
                     return LOOP_NONE
-                for start, stop, label in reversed(spans):
+                for span in reversed(spans):
+                    start, stop, label = span[:3]
                     if ts >= start:
                         return label if stop is None or ts < stop else LOOP_NONE
                 return LOOP_NONE
         return LOOP_NONE
+
+    def concluded(self, key: str | None, ts: float | None) -> bool:
+        """Whether a root's latest loop window at `ts` has ended with a closeout or report write."""
+        spans = self.roots.get(key) if key else None
+        if not spans or ts is None:
+            return False
+        for span in reversed(spans):
+            if ts >= span[0]:
+                return len(span) > 3 and span[3] is True and span[1] is not None and ts >= span[1]
+        return False
 
 
 def efficiency_session_keys(relative: str, file_state: dict[str, Any]) -> tuple[str | None, str | None]:
@@ -1092,6 +1108,7 @@ EFFICIENCY_FILE_UPGRADE: dict[str, Any] = {
     "ctxw": None,
     "dprocs": {},
     "hum": False,
+    "hum_ts": None,
     "hsrc": None,
     # v1.3: "?" = protocol not yet recovered from the already-parsed first prompt.
     "proto": "?",
@@ -1138,6 +1155,7 @@ def efficiency_file_state(relative: str, skip: float) -> dict[str, Any]:
         "ctxw": None,
         "dprocs": {},
         "hum": False,
+        "hum_ts": None,
         "hsrc": None,
         "proto": None,
         "spawn_ts": None,
@@ -1443,6 +1461,8 @@ class EfficiencyParser:
         if self.s["hum"] or self.s["last_call"] is not None:
             self.intervention(ts, "user_message")
         self.s["hum"] = True
+        if ts is not None:
+            self.s["hum_ts"] = max(ts, self.s.get("hum_ts") or ts)
 
     def deliver(self, ts: float | None, kinds: str, code: int | None, flags: str) -> None:
         """Count a finished delivery command. flags: c = CodeRabbit complete, r = rate limited, x = cancelled."""
@@ -2674,7 +2694,10 @@ def efficiency_emit(metrics: Any, state: dict[str, Any], now: float, run: Effici
             help_text="Active root threads with zero active workers in the last 10 minutes.",
         )
 
-    efficiency_emit_stalls(metrics, files, namespaces, now, loop_of)
+    def concluded(relative: str, file_state: dict[str, Any], ts: float | None) -> bool:
+        return run.loops.concluded(efficiency_session_keys(relative, file_state)[0], ts)
+
+    efficiency_emit_stalls(metrics, files, namespaces, now, loop_of, concluded)
 
     windows: dict[tuple[str, str, str], list[int]] = defaultdict(list)
     fills: dict[tuple[str, str, str], list[float]] = defaultdict(list)
@@ -2731,11 +2754,14 @@ def efficiency_emit_stalls(
     namespaces: set[str],
     now: float,
     loop_of: Callable[[str, dict[str, Any], float | None], str] = lambda relative, file_state, ts: LOOP_NONE,
+    concluded: Callable[[str, dict[str, Any], float | None], bool] = lambda relative, file_state, ts: False,
 ) -> None:
     """Stalled-loop gauges: live spawning loop roots with no child task in flight, and for how long.
 
     Only loop roots count: a root whose first prompt declared a protocol (v3, v2.1, v2.0 or other). Interactive
-    sessions (none) and legacy threads whose protocol is not yet recovered (?) are excluded.
+    sessions (none) and legacy threads whose protocol is not yet recovered (?) are excluded, as is a root whose
+    loop has concluded: the owner talking to it afterwards is a conversation, not a stall. A human message
+    restarts the clock, so a root the owner is steering counts from that message rather than its last lane.
     """
     roots: dict[str, dict[str, Any]] = {}
     by_thread: dict[tuple[str, str], str] = {}
@@ -2765,6 +2791,8 @@ def efficiency_emit_stalls(
         quiet = root.get("quiet")
         if quiet == "paused" or (isinstance(quiet, (int, float)) and quiet > now):
             continue
+        if concluded(relative, root, now):
+            continue
         namespace = relative.split("/", 1)[0]
         in_flight = False
         since = root.get("spawn_ts")
@@ -2780,6 +2808,9 @@ def efficiency_emit_stalls(
             since = until if since is None else max(since, until)
         if in_flight:
             continue
+        human = root.get("hum_ts")
+        if since is not None and isinstance(human, (int, float)):
+            since = max(since, human)
         key = (namespace, loop_of(relative, root, last))
         stalled[key] += 1
         longest.setdefault(key, 0.0)
