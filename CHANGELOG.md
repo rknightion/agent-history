@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.6.0](https://github.com/rknightion/agent-history/compare/v0.5.4...v0.6.0) (2026-10-18)
+
+
+### Features
+
+* **cli:** resolve loop by closeout path and add loop --usage ([5f68e17](https://github.com/rknightion/agent-history/commit/5f68e178fd4622400df50ac3413c196e452b1139))
+* **collector:** count tasks under a closeout's Landed and Parked headings ([17efa4a](https://github.com/rknightion/agent-history/commit/17efa4ac9fb044f62ec780e862829a8d48048073))
+* **loops:** take a v3 run's delivery counts from its closeout ([0329e3d](https://github.com/rknightion/agent-history/commit/0329e3d46f58ec870cec8a7d600caf48c1558af9))
+
+
+### Bug Fixes
+
+* **collector:** count only the task ID that opens a closeout entry ([9eb94be](https://github.com/rknightion/agent-history/commit/9eb94be6b5cd9dd35615c1c7f47968bc89d79d8d))
+* **collector:** ignore list items inside fenced code when counting closeout entries ([e4300d0](https://github.com/rknightion/agent-history/commit/e4300d0ce6f946a89075fb211f050e9a23e4e666))
+
 ## [0.5.4](https://github.com/rknightion/agent-history/compare/v0.5.3...v0.5.4) (2026-10-18)
 
 
