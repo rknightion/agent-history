@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.4](https://github.com/rknightion/agent-history/compare/v0.5.3...v0.5.4) (2026-10-18)
+
+
+### Bug Fixes
+
+* **efficiency:** stop counting resumed loop roots as stalled ([a12bd3c](https://github.com/rknightion/agent-history/commit/a12bd3cc1d44f7d4a3161ddc7ad1aa501c8969c3))
+
 ## [0.5.3](https://github.com/rknightion/agent-history/compare/v0.5.2...v0.5.3) (2026-10-17)
 
 
