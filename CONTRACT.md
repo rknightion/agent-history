@@ -349,8 +349,11 @@ consistent; a later linked lane start blocks that candidate end. A complete succ
 structured `Write`/`write`, `apply_patch` Add File or executed FileChange add of that exact path can
 supply the same hash/header fallback. Both dispatch and completion must belong to the window.
 Failed or truncated results, shell text, output-only path lists and partial edits do not prove a
-complete closeout. Update, move or delete evidence cannot reconstruct a body and conservatively
-invalidates an older transcript-only fallback when completeness is no longer established.
+complete closeout. Update, move, delete or string-replacement edit evidence (`Edit`, `MultiEdit`,
+pi `edit`) cannot reconstruct a body and conservatively invalidates an older transcript-only
+fallback. When such an edit is the latest in-window mutation, a collected closeout whose mtime is
+at or after the edit's start (whole seconds) and whose header is valid supplies the evidence; with
+no such copy the run does not finish on its closeout.
 
 Collector-only refreshes re-evaluate identity and closeout evidence, including finished runs.
 Conflicting hashes, invalid headers, ambiguous attribution or subsequent incomplete mutations

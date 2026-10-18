@@ -153,3 +153,43 @@ def test_latest_complete_write_and_ambiguous_timestamps():
         second.ended,
     )
     assert check(writes=[first, partial], origins=["example/project"]).end is None
+
+
+@pytest.mark.parametrize("tool", ["edit", "Edit", "MultiEdit"])
+def test_string_replacement_edit_is_a_partial_write(tool):
+    raw = json.dumps({"path" if tool == "edit" else "file_path": CLOSEOUT, "edits": []})
+    edited = structured_closeout(tool, raw, CLOSEOUT, CWD, AT, AT + timedelta(seconds=1))
+    assert edited == Write(AT, AT + timedelta(seconds=1), None, None)
+    other = json.dumps({"path": CWD + "/codex/loop14/DECISIONS.md"})
+    assert structured_closeout(tool, other, CLOSEOUT, CWD, AT, AT) is None
+
+
+def test_collected_copy_after_a_partial_edit_finishes_the_run():
+    first = Write(AT, AT + timedelta(seconds=10), HEADER, "c" * 64)
+    edit_at = AT + timedelta(seconds=30, microseconds=580000)
+    edited = Write(edit_at, edit_at + timedelta(milliseconds=50), None, None)
+    # The collected copy (sha b...) differs from the first full write: the edit explains it.
+    after = metadata(file_mtime=edit_at + timedelta(milliseconds=90))
+    result = check([metadata("charter"), after], writes=[first, edited])
+    assert result.fields == dict(repo="example/project", loop="loop14", goal_sha256=DIGEST)
+    assert result.end == edited.ended
+    # Whole-second mtimes from another machine still count as saved at or after the edit.
+    truncated = metadata(file_mtime=edit_at.replace(microsecond=0))
+    assert check([metadata("charter"), truncated], writes=[first, edited]).end == truncated["file_mtime"]
+
+
+@pytest.mark.parametrize("case", ["before", "none", "bad_header", "two_copies"])
+def test_partial_edit_without_a_later_valid_copy_does_not_finish(case):
+    first = Write(AT, AT + timedelta(seconds=10), HEADER, "b" * 64)
+    edit_at = AT + timedelta(seconds=90)
+    edited = Write(edit_at, edit_at + timedelta(seconds=1), None, None)
+    rows = {
+        "before": [metadata()],
+        "none": [],
+        "bad_header": [metadata(file_mtime=edit_at + timedelta(seconds=5), line1="# not a closeout")],
+        "two_copies": [
+            metadata(file_mtime=edit_at + timedelta(seconds=5)),
+            metadata(file_mtime=edit_at + timedelta(seconds=6), sha256="e" * 64),
+        ],
+    }[case]
+    assert check(rows, writes=[first, edited], origins=["example/project"]).end is None

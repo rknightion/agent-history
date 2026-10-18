@@ -44,6 +44,7 @@ REPLAYED = (
     "039_loop_wait_status.sql",
     "040_lane_returns.sql",
     "041_closeout_counts.sql",
+    "042_reproject_closeout_edits.sql",
 )
 
 

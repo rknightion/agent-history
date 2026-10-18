@@ -145,6 +145,9 @@ def structured_closeout(
         if _path(args.get("file_path", args.get("path")), cwd) == target:
             touched = True
             content = args.get("content")
+    elif tool in {"edit", "multiedit"} and isinstance(args, dict):
+        # A string replacement changes the file without revealing its bytes.
+        touched = _path(args.get("file_path", args.get("path")), cwd) == target
     elif tool == "filechange" and isinstance(args, dict):
         matches = [v for p, v in args.items() if _path(p, cwd) == target]
         touched = bool(matches)
@@ -238,14 +241,20 @@ def project(
         if len(latest_writes) != 1:
             return empty
         (written,) = latest_writes
-        header = CLOSEOUT_HEADER.fullmatch(written.line1 or "")
-        if not header or header[2] != fields["loop"]:
-            return empty
-        digests.add(header[3])
-        # A collected copy may have a later revision, but conflicting observed bytes
-        # never select the convenient machine or silently prefer a transcript write.
-        if snapshots and written.sha256 not in snapshots:
-            return empty
+        if written.sha256 is None:
+            # A partial edit hides the final bytes. Only a collected copy saved at or after it
+            # (whose header was checked above) can stand in; mtimes may be whole seconds.
+            if not snapshots or any(r["file_mtime"] < written.started.replace(microsecond=0) for r in closeouts):
+                return empty
+        else:
+            header = CLOSEOUT_HEADER.fullmatch(written.line1 or "")
+            if not header or header[2] != fields["loop"]:
+                return empty
+            digests.add(header[3])
+            # A collected copy may have a later revision, but conflicting observed bytes
+            # never select the convenient machine or silently prefer a transcript write.
+            if snapshots and written.sha256 not in snapshots:
+                return empty
         end_candidates.append(written.ended)
     if len(digests) > 1:
         return empty
@@ -347,8 +356,9 @@ TOOLS_SQL = """
       AND i.ts >= %s AND i.ts < COALESCE(%s::timestamptz,'infinity')
       AND COALESCE(t.ended_at,o.completed_at) >= i.ts
       AND COALESCE(t.ended_at,o.completed_at) < COALESCE(%s::timestamptz,'infinity')
-      AND lower(i.tool_name) ~ '(^|[.])(write|apply_patch|filechange)$'
-      AND NOT COALESCE(i.input_truncated,false) AND NOT COALESCE(i.output_truncated,false)
+      AND lower(i.tool_name) ~ '(^|[.])(write|edit|multiedit|apply_patch|filechange)$'
+      AND NOT COALESCE(i.input_truncated,false)
+      AND (NOT COALESCE(i.output_truncated,false) OR lower(i.tool_name) ~ '(^|[.])(edit|multiedit)$')
       AND ((i.kind='call' AND t.outcome='ok' AND t.ended_at IS NOT NULL) OR
            (i.kind='op' AND o.status='completed' AND o.completed_at IS NOT NULL
             AND o.is_error IS FALSE AND (o.exit_code IS NULL OR o.exit_code=0)))

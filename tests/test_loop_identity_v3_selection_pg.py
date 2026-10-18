@@ -122,3 +122,29 @@ def test_precomputed_projection_is_shared_by_both_writers(clean, monkeypatch):  
     v3.refresh_completion(clean, projected)
     v3.refresh_identity(clean, projected)
     assert count == 1
+
+
+def test_edit_with_truncated_output_still_blocks_an_earlier_write(clean):  # noqa: F811
+    root = history(clean, total=2)
+    closeout = CWD + "/codex/closeout-bounded-0-loop14.md"
+    clean.execute(
+        "INSERT INTO ah.tool_call(agent,call_uid,session_id,tool_name,started_at,ended_at,outcome,source_id,byte_offset) "
+        "VALUES('pi','bounded-edit',%s,'edit',%s,%s,'ok',0,0)",
+        (root, AT + timedelta(seconds=3), AT + timedelta(seconds=4)),
+    )
+    clean.execute(
+        "INSERT INTO ah.tool_io(agent,io_uid,session_id,namespace,profile,kind,tool_name,call_uid,ts,input_text,"
+        "output_truncated,source_id,byte_offset) "
+        "VALUES('pi','bounded-edit',%s,'pi-test','test','call','edit','bounded-edit',%s,%s,true,0,0)",
+        (root, AT + timedelta(seconds=3), json.dumps({"path": closeout, "edits": []})),
+    )
+    clean.commit()
+    assert v3.projections(clean)["bounded-0000"].end is None
+    clean.commit()
+    clean.execute(
+        "INSERT INTO ah.loop_run_metadata(machine,path,kind,sha256,line1,file_mtime,repo_origin) "
+        "VALUES('machine-a',%s,'closeout',%s,%s,%s,'example/project')",
+        (closeout, "e" * 64, HEADER, AT + timedelta(seconds=5)),
+    )
+    clean.commit()
+    assert v3.projections(clean)["bounded-0000"].end == AT + timedelta(seconds=4)
