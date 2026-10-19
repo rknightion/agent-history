@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.0](https://github.com/rknightion/agent-history/compare/v0.6.1...v0.7.0) (2026-10-19)
+
+
+### Features
+
+* **loops:** report the live tasks of each open loop through a scoped function ([6a55125](https://github.com/rknightion/agent-history/commit/6a551253ae990451941cbc01223ada67e52a6924))
+
 ## [0.6.1](https://github.com/rknightion/agent-history/compare/v0.6.0...v0.6.1) (2026-10-18)
 
 
