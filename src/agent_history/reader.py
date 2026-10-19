@@ -589,6 +589,31 @@ def loop_usage(ids: list[int]) -> str:
     return usage_markdown(summary, query(USAGE_ROWS_SQL.format(ids=array), {}), len(ids))
 
 
+def live_loops(repo: str | None, fmt: str) -> int:
+    """Print ah.live_loop_tasks(repo): the JSON document for --format json, else one line per loop
+    and one indented line per live task. A title is untrusted brief header text: the aligned form
+    replaces its non-printable characters (terminal escapes included) with spaces."""
+    from .live_loop_tasks import REPO_PATTERN
+
+    if not repo or not re.fullmatch(REPO_PATTERN, repo):
+        sys.exit("agent-history: loops --live needs --repo owner/repo")
+    rows = query("SELECT ah.live_loop_tasks(:'repo') AS live;", {"repo": repo})
+    document = json.loads(rows[0]["live"])
+    if fmt == "json":
+        print(json.dumps(document, ensure_ascii=False))
+        return 0
+    for loop in document["loops"]:
+        label = f"loop{loop['loop']}" if loop["loop"] is not None else "loop?"
+        fields = [label, loop["status"], loop["launched_at"], f"active lanes {loop['active_lanes']}"]
+        if loop.get("waiting_until"):
+            fields.append(f"waiting until {loop['waiting_until']}")
+        print("\t".join(str(field) for field in fields))
+        for task in loop["tasks"]:
+            title = "".join(ch if ch.isprintable() else " " for ch in task["title"])
+            print("\t" + task["id"] + "\t" + title)
+    return 0
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="agent-history", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -618,9 +643,12 @@ def build_parser():
         default=None,
         help="override the vector RRF weight (default: 0.35 short/identifier-shaped, 0.7 otherwise)",
     )
-    p = sub.add_parser("loops", help="recent loop runs")
-    p.add_argument("--repo")
+    p = sub.add_parser("loops", help="recent loop runs, or with --live the open loops of --repo and their live tasks")
+    p.add_argument("--repo", help="owner/repo; required with --live")
     p.add_argument("--limit", type=int, default=20)
+    p.add_argument(
+        "--live", action="store_true", help="open loops of --repo and their live lanes' tasks (ah.live_loop_tasks)"
+    )
     p = sub.add_parser("loop", help="one loop: summary and lanes, or --usage for its closeout")
     p.add_argument("id", help="numeric loop_run_id, or the run's absolute closeout path")
     p.add_argument(
@@ -760,6 +788,8 @@ def execute(args) -> int:
             variables,
             fmt,
         )
+    if args.cmd == "loops" and args.live:
+        return live_loops(args.repo, fmt)
     if args.cmd == "loops":
         repo = ":'repo'" if args.repo else "NULL"
         return run(

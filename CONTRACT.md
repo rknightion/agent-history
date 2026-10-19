@@ -63,7 +63,8 @@ loses them. Keep your own copies if you want history to survive that.
 Not truncated by `rebuild`: `ah.change_log`, `ah.refresh_log`, `ah.embedding` (a paid cache keyed by
 model and input hash) and the collector tables (`git_commit`, `git_commit_file`, `ci_run`,
 `backlog_task`, `backlog_done_event`, `backlog_done_scan`, `collector_mutation_audit`, `task_prefix`,
-`installed_feature`, `permission_log`, `loop_receipt`, `loop_run_metadata`, `loop_state`, `session_summary`, `session_topic`).
+`installed_feature`, `permission_log`, `loop_receipt`, `loop_run_metadata`, `loop_state`, `session_summary`, `session_topic`)
+and the operator-written `live_loop_tasks_scope`.
 
 ### Rebuild reader boundary
 
@@ -112,6 +113,19 @@ the role on every connection and refuses a superuser, the owner or a member of t
 schema or any of its tables, a role with INSERT/UPDATE/DELETE/TRUNCATE on any `ah` table or CREATE
 on the schema, a member of `pg_execute_server_program`, `pg_write_server_files` or
 `pg_read_server_files`, and a role whose default transactions are not read-only.
+
+`sql/live_loop_tasks_role.sql`, run as a superuser after `roles.sql`, creates `ah_loop_tasks`
+for a consumer that calls `ah.live_loop_tasks` for named repositories and must read nothing else: LOGIN without a password
+(set one with `\password`), `default_transaction_read_only = on`, a 30 s statement timeout,
+CONNECT on the database, USAGE on schema `ah` and EXECUTE on that one function. It holds no
+privilege on any table, view or sequence and is a member of no role. It may still execute
+other `ah` functions through the default PUBLIC grant, but those run with the caller's rights and
+fail on the first table they read. The script is idempotent, grants EXECUTE whether it runs
+before or after migration 043, and fails if the role can reach any `ah` relation or column, for
+example through a grant to PUBLIC. psql's `-v repo=owner/repo` adds that repository (lowercased) to
+the role's scope; it needs migration 043 applied and is run once per repository. Without the
+variable the script adds no scope, and the role can then call the function for no repository.
+Scope is keyed on the login role exactly: membership of `ah_loop_tasks` does not confer its scope.
 
 ## Schema changes
 
@@ -975,6 +989,67 @@ history and other table grants stay unchanged. Paid tables have no
 loop/session foreign keys, so derived-data rebuild cannot cascade into them. Identity,
 collector-key and paid-embedding-cache contracts are unchanged. Lifecycle uses the additional
 exactly attributed collected-state close evidence above.
+
+## Live loop tasks (`ah.live_loop_tasks`)
+
+Migration `043_live_loop_tasks.sql` adds `ah.live_loop_tasks(repo text) RETURNS jsonb`, a
+SECURITY DEFINER function with `search_path` pinned to `pg_catalog, pg_temp`, for a consumer that
+must not read the catalogue itself. It is migration-owned, not part of the re-applied analytics
+files, so EXECUTE grants survive analytics re-application and rebuild. EXECUTE is revoked from
+PUBLIC; the migration grants it to `ah_reader` and `ah_loop_tasks` when they exist, and
+`roles.sql` grants it to `ah_reader` when it runs after the migration.
+
+`repo` must be an `owner/repo` slug (otherwise SQLSTATE `22023`) and is compared
+case-insensitively with `ah.loops.repo`; a loop whose repository identity is unknown is never
+returned. The function then admits the caller by its login role, `session_user`, which SET ROLE
+cannot change (inside the function `current_user` is the owner): a member of `ah_reader` or of the
+schema owner, which can read every row anyway, or a role with a row for that repository in
+`ah.live_loop_tasks_scope (role_name name, repo text)`, compared case-insensitively. Anyone else
+gets SQLSTATE `42501`, including a login that holds EXECUTE only by switching to a scoped role.
+The scope table is migration-owned, revoked from PUBLIC and written by the role script below; no
+consumer role can read or write it, and rebuild does not truncate it. While
+`ah.meta.rebuild_in_progress` is present the function raises SQLSTATE `55000`.
+The result has one entry per `ah.loops` row of that repository whose status is `running`,
+`waiting` or `paused`, ordered by launch:
+
+```json
+{"loops": [{"loop": 7, "launched_at": "2026-10-19T09:00:00.000000Z", "status": "waiting",
+            "waiting_until": "2026-10-19T12:00:00.000000Z", "observed_at": "2026-10-19T10:00:00.000000Z",
+            "active_lanes": 3, "tasks": [{"id": "ABC-0123", "title": "Fix the widget"}]}]}
+```
+
+`loop` is the number in `ah.loops.loop` (NULL when unknown). Timestamps use the RFC3339
+microsecond UTC profile; `waiting_until` is JSON null unless the loop is waiting. `observed_at` is
+the last refresh that evaluated the loop: these are observations as of that refresh, not process
+liveness. Nothing else is emitted: no session or call ids, paths, hosts, models, costs or
+transcript text other than each task's id and title.
+
+A lane is one `subagent_brief` message in the loop's root, or in a session exactly linked to the
+run as a relaunch, timestamped at or after `launch_ts`. `active_lanes` counts those whose return
+is not recorded. A brief whose first line is exactly
+`Lane: <id> · Task: <ID> (<title>) · Tier: routine|guarded` names a task (`ah.lane_brief_task`;
+the ID is a tracker ID as defined for state counts and the title at most 500 characters). Any other
+brief is a live lane with no task: no task is read from any other line or text. `tasks` lists the
+distinct task IDs of live lanes in order of first dispatch, each with the title of its latest
+brief. The title is untrusted header text; consumers escape it.
+
+A brief is linked to its dispatching tool call and from there to what the catalogue records:
+
+| Harness | Brief to dispatch | Return recorded when |
+|---|---|---|
+| Claude Code | brief `event_uid` is `<call_uid>:brief` of the `Agent` call | the spawn row (`spawn_uid` = call) has a completion (a completed foreground result or a task notification), or its child lane holds a `lane-return` |
+| Codex | the `spawn_agent` call on the brief's own source line (same session, source and byte offset) | the spawn row has completion from `sub_agent_activity` (`completed` or `interrupted`) or `launch_status = 'error'`, or its child lane holds a `lane-return` |
+| pi | brief `event_uid` is `<session>:<entry>:brief:<call_uid>:<index>` of the `subagent` call | an async single launch's spawn row (`spawn_uid` = call) has completion from its notice; a foreground call has ended (its children finished); or, for an asynchronous parallel or workflow run, as many child spawn rows of that run as the call has briefs record completion |
+
+In every harness a dispatch call whose outcome is `error`, `denied`, `interrupted` or `timeout`
+started no running lane. Missing evidence is not a return: a brief whose dispatch or completion
+is not yet indexed stays live. Known limits: the children of an asynchronous pi parallel or
+workflow run return together, because completed children cannot be matched to individual
+briefs; Codex lanes spawned from inside a code-mode `exec` script have no brief row and are not
+counted; a lane resumed after a recorded return is not live again; and a lane whose process died
+without any recorded end stays live until its loop leaves the open statuses.
+
+`sql/live_loop_tasks_role.sql` provisions the consumer role `ah_loop_tasks` (see Roles).
 
 ## Efficiency classifier
 

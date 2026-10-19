@@ -154,6 +154,32 @@ read queries remain; deterministic projection can still run. This retirement doe
 optional corpus embeddings or unrelated collectors. See [CONTRACT.md](CONTRACT.md) for exact
 evidence and historical compatibility rules.
 
+### Live loop tasks for a narrow consumer
+
+`ah.live_loop_tasks('owner/repo')` returns a JSON document listing that repository's running,
+waiting and paused loops, each with its number, launch time, status, `waiting_until`, the count of
+lanes whose return is not yet recorded and the tasks those lanes are on. A lane's task comes only
+from the first line of the root's brief, `Lane: <id> · Task: <ID> (<title>) · Tier: routine|guarded`;
+a brief without it is a live lane with no task. The document carries nothing else from the
+catalogue. Linking and the per-harness limits are in [CONTRACT.md](CONTRACT.md).
+
+The function runs with its owner's rights, so a role that can execute it needs no table access,
+and it answers a narrow role only for the repositories that role is scoped to. To give a build job
+such a role on an existing catalogue, let the indexer apply migration 043 (any `agent-history index`
+or `init` does), then as a superuser:
+
+```sh
+psql -X -v ON_ERROR_STOP=1 -d agent_history -v repo=owner/repo -f src/agent_history/sql/live_loop_tasks_role.sql
+psql -X -d agent_history -c '\password ah_loop_tasks'
+```
+
+Run the first command again with another `-v repo` to add a repository; without `-v repo` it adds
+none. The migration also grants EXECUTE to the role if it already exists. The script refuses to
+finish if the role could read any `ah` relation. Connect as `ah_loop_tasks` and run
+`SELECT ah.live_loop_tasks('owner/repo')`; another repository is refused with SQLSTATE 42501 and
+anything else in `ah` is refused. `agent-history loops --live --repo owner/repo` prints the same
+document with `--format json`, or one line per loop and task otherwise.
+
 ## Metrics
 
 The container image runs two periodic processes from the same image: `index --every 60` indexes the
