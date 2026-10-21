@@ -14,6 +14,6 @@ jobs:
       packages: read
       actions: read
       contents: read
-    uses: rknightion/.github/.github/workflows/codeql.yml@0f4847f833f096c1f03284481d7e6b19c2f81c30 # v1.25.8
+    uses: rknightion/.github/.github/workflows/codeql.yml@5d0de41efd56d620e1e9e7e45a844cdb4828b120 # v1.25.12
     with:
       languages: '[{"language":"python","build-mode":"none"},{"language":"actions","build-mode":"none"}]'
