@@ -32,7 +32,7 @@ jobs:
       - name: Set up just
         uses: rknightion/.github/.github/actions/setup-just@25774fddcf21225cd249db33e61f1c3fa092da83 # v1.25.24
       - name: Set up uv
-        uses: astral-sh/setup-uv@18d369b23da25a81e9458561248e1aafff6a70fa # v10.3.1
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
       - name: Install the leak-gate hooks (just check verifies them)
         run: just hooks
       - name: just ci
