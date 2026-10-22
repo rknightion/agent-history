@@ -5,7 +5,7 @@ WORKDIR /app
 COPY pyproject.toml README.md LICENSE ./
 COPY src/ ./src/
 # Use the builder's pip to populate a pip-free virtualenv.
-RUN python -c 'import sys; assert sys.version_info[:2] == (3, 14)' && \
+RUN python -c 'import sys; assert sys.version_info[:2] == (3, 15)' && \
     python -m venv --without-pip /opt/venv && \
     python -m pip --python /opt/venv install --no-cache-dir ".[otel]" && \
     mkdir -p /state /var/lib/alloy/textfile-agent-history && \
