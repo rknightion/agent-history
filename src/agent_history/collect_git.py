@@ -1086,11 +1086,14 @@ def upsert(
         return 0, 0
     names = [c for c, _ in cols]
     data = [c for c in names if c not in key]
-    # unnest() flattens a text[][], so array-valued columns travel as jsonb and are rebuilt per row.
+    # unnest() flattens a text[][], so array-valued columns travel as jsonb and are rebuilt per row;
+    # a None value stays SQL NULL rather than becoming an empty array.
     arg_types = ["jsonb" if t == "text[]" else t for _, t in cols]
     unnest = sql.SQL(", ").join(sql.SQL("{}::{}").format(sql.Placeholder(), sql.SQL(t + "[]")) for t in arg_types)
     select = sql.SQL(", ").join(
-        sql.SQL("ARRAY(SELECT jsonb_array_elements_text(u.{}))").format(sql.Identifier(c))
+        sql.SQL("CASE WHEN u.{0} IS NOT NULL THEN ARRAY(SELECT jsonb_array_elements_text(u.{0})) END").format(
+            sql.Identifier(c)
+        )
         if t == "text[]"
         else sql.SQL("u.{}").format(sql.Identifier(c))
         for c, t in cols
@@ -1116,7 +1119,7 @@ def upsert(
     )
     from psycopg.types.json import Jsonb
 
-    params = [[Jsonb(r[c]) if t == "text[]" else r[c] for r in rows] for c, t in cols]
+    params = [[Jsonb(r[c]) if t == "text[]" and r[c] is not None else r[c] for r in rows] for c, t in cols]
     cur.execute(stmt, params)
     flags = [r[0] for r in cur.fetchall()]
     return sum(1 for f in flags if f), sum(1 for f in flags if not f)

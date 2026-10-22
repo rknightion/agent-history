@@ -27,12 +27,16 @@ GRANT SELECT ON ALL TABLES IN SCHEMA ah TO ah_reader;
 ALTER DEFAULT PRIVILEGES FOR ROLE ah_writer IN SCHEMA ah GRANT SELECT ON TABLES TO ah_reader;
 -- The BM25 search functions read ParadeDB's own schema.
 GRANT USAGE ON SCHEMA paradedb TO ah_reader;
--- ah.live_loop_tasks (migration 043) is not executable by PUBLIC; a reader created or re-provisioned
--- after that migration gets EXECUTE here. Before the schema exists the migration grants it instead.
+-- ah.live_loop_tasks (migration 043) and ah.live_loop_detail (044) are not executable by PUBLIC; a
+-- reader created or re-provisioned after those migrations gets EXECUTE here. Before the schema
+-- exists the migrations grant it instead.
 DO $$
 BEGIN
     IF to_regprocedure('ah.live_loop_tasks(text)') IS NOT NULL THEN
         GRANT EXECUTE ON FUNCTION ah.live_loop_tasks(text) TO ah_reader;
+    END IF;
+    IF to_regprocedure('ah.live_loop_detail(text)') IS NOT NULL THEN
+        GRANT EXECUTE ON FUNCTION ah.live_loop_detail(text) TO ah_reader;
     END IF;
     IF to_regprocedure('ah.lane_brief_task(text)') IS NOT NULL THEN
         GRANT EXECUTE ON FUNCTION ah.lane_brief_task(text) TO ah_reader;

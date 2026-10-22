@@ -46,6 +46,7 @@ REPLAYED = (
     "041_closeout_counts.sql",
     "042_reproject_closeout_edits.sql",
     "043_live_loop_tasks.sql",
+    "044_live_loop_detail.sql",
 )
 
 

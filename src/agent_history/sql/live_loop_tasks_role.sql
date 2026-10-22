@@ -1,7 +1,8 @@
--- The narrow consumer role for ah.live_loop_tasks(text). It may connect, name schema `ah` and
--- execute that one function, which runs as its owner, for the repositories it is scoped to; it holds
--- no privilege on any table, view or sequence, so it cannot read a transcript. Run as a superuser in
--- the catalogue database after roles.sql. Re-running it is harmless.
+-- The narrow consumer role for ah.live_loop_tasks(text) and ah.live_loop_detail(text). It may
+-- connect, name schema `ah` and execute those two functions, which run as their owner, for the
+-- repositories it is scoped to; it holds no privilege on any table, view or sequence, so it cannot
+-- read a transcript. Run as a superuser in the catalogue database after roles.sql. Re-running it is
+-- harmless, and re-running it after migration 044 grants the second function to an existing role.
 --
 --   psql -X -v ON_ERROR_STOP=1 -d agent_history -v repo=owner/repo -f live_loop_tasks_role.sql
 --   psql -X -d agent_history -c '\password ah_loop_tasks'
@@ -39,6 +40,9 @@ DO $$
 BEGIN
     IF to_regprocedure('ah.live_loop_tasks(text)') IS NOT NULL THEN
         GRANT EXECUTE ON FUNCTION ah.live_loop_tasks(text) TO ah_loop_tasks;
+    END IF;
+    IF to_regprocedure('ah.live_loop_detail(text)') IS NOT NULL THEN
+        GRANT EXECUTE ON FUNCTION ah.live_loop_detail(text) TO ah_loop_tasks;
     END IF;
 END
 $$;

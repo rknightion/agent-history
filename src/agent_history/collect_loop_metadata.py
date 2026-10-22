@@ -1,8 +1,9 @@
 """Collect charter/closeout identity metadata, never document bodies or receipt state.
 
 A qualified closeout also yields two integers, the distinct task IDs under its `## Landed` and
-`## Parked` headings. The body is counted in memory while it is hashed and then discarded; only
-the integers leave this module.
+`## Parked` headings. A charter yields the ordered task IDs that open the rows under its
+`## First wave` heading. The body is read in memory while it is hashed and then discarded; only
+the integers and the IDs leave this module.
 """
 
 from __future__ import annotations
@@ -29,13 +30,14 @@ COLS = [
     ("repo_origin", "text"),
     ("landed_count", "integer"),
     ("parked_count", "integer"),
+    ("task_ids", "text[]"),
 ]
 KEY = ["machine", "kind", "path"]
 SOURCE_NAME = re.compile(r"(charter|closeout)-[\w.-]*-loop[0-9]+\.md")
 MAX_LINE1_BYTES = 4096
 CHUNK_BYTES = 1024 * 1024
-# Closeouts are a few kilobytes; a larger file is not counted (both counts NULL), so no
-# unbounded body is ever held in memory.
+# Closeouts and charters are a few kilobytes; a larger file is not counted (both counts or the
+# task IDs NULL), so no unbounded body is ever held in memory.
 MAX_COUNT_BYTES = 1024 * 1024
 TASK_ID = re.compile(r"(?<![A-Za-z0-9_.-])[A-Z][A-Z0-9]*-[0-9]+(?:\.[0-9]+)*(?![A-Za-z0-9_-]|\.[0-9])")
 HEADING2 = re.compile(r" {0,3}##(?!#)(?:[ \t]+(.*?))?[ \t]*")
@@ -43,6 +45,35 @@ FENCE = re.compile(r" {0,3}(```|~~~)")
 # A counted entry is a list item or table row that opens with its task ID, optionally in bold or
 # code; IDs elsewhere in an entry or in prose are references, not entries.
 ENTRY = re.compile(r"\s*(?:[-*+]|[0-9]+[.)]|\|)\s*(?:\*\*|__|`)?(" + TASK_ID.pattern + ")")
+# A first-wave ID must also have this exact bounded shape; a longer token is skipped, not cut.
+STRICT_TASK_ID = re.compile(r"[A-Z][A-Z0-9]{0,15}-[0-9]{1,6}(?:\.[0-9]{1,4}){0,3}")
+MAX_CHARTER_TASK_IDS = 200
+
+
+def _sections(body: str, kinds: tuple[str, ...]) -> dict[str, list[str] | None]:
+    """Task IDs opening an entry under each level-2 heading whose text starts with a kind.
+
+    A section runs from its heading to the next level-2 heading; level-3 headings, bullets and
+    tables stay inside it. Headings inside fenced code blocks are not headings and entries inside
+    them are code. IDs keep first-seen order; a missing section is None.
+    """
+    found: dict[str, list[str] | None] = dict.fromkeys(kinds)
+    current: str | None = None
+    fence: str | None = None
+    for line in body.splitlines():
+        marker = FENCE.match(line)
+        if marker and (fence is None or marker[1] == fence):
+            fence = None if fence else marker[1]
+        elif fence is None and (heading := HEADING2.fullmatch(line)):
+            title = (heading[1] or "").lower()
+            current = next((kind for kind in kinds if title.startswith(kind)), None)
+            if current is not None and found[current] is None:
+                found[current] = []
+            continue
+        if current is not None:
+            if fence is None and (entry := ENTRY.match(line)):
+                found[current].append(entry[1])
+    return found
 
 
 def closeout_counts(body: str) -> tuple[int | None, int | None]:
@@ -53,23 +84,25 @@ def closeout_counts(body: str) -> tuple[int | None, int | None]:
     a present section without IDs is 0. Repeated sections of one kind are counted together.
     Headings inside fenced code blocks are not headings.
     """
-    found: dict[str, set[str] | None] = {"landed": None, "parked": None}
-    current: str | None = None
-    fence: str | None = None
-    for line in body.splitlines():
-        marker = FENCE.match(line)
-        if marker and (fence is None or marker[1] == fence):
-            fence = None if fence else marker[1]
-        elif fence is None and (heading := HEADING2.fullmatch(line)):
-            title = (heading[1] or "").lower()
-            current = next((kind for kind in found if title.startswith(kind)), None)
-            if current is not None and found[current] is None:
-                found[current] = set()
-            continue
-        if current is not None:
-            if fence is None and (entry := ENTRY.match(line)):
-                found[current].add(entry[1])
-    return tuple(None if ids is None else len(ids) for ids in found.values())
+    found = _sections(body, ("landed", "parked"))
+    return tuple(None if ids is None else len(set(ids)) for ids in found.values())
+
+
+def charter_task_ids(body: str) -> list[str]:
+    """Ordered distinct task IDs opening a row under the charter's `## First wave` heading(s).
+
+    A row is a list item or table row whose first token is the ID, optionally in bold or code;
+    a first table cell such as `ID (short note)` yields the ID only. IDs later in a row, in prose
+    or under any other heading are references and are not collected. Only IDs of the strict
+    bounded shape count, and at most MAX_CHARTER_TASK_IDS are kept. No section yields [].
+    """
+    ids: list[str] = []
+    for task in _sections(body, ("first wave",))["first wave"] or []:
+        if STRICT_TASK_ID.fullmatch(task) and task not in ids:
+            ids.append(task)
+            if len(ids) == MAX_CHARTER_TASK_IDS:
+                break
+    return ids
 
 
 class Changed(OSError):
@@ -142,8 +175,8 @@ def _snapshot(
         # including the bounded prefix, through the same open descriptor.
         first = handle.readline(MAX_LINE1_BYTES)
         digest = hashlib.sha256(first)
-        # A closeout's body is counted from the same descriptor and snapshot it is hashed from.
-        body = bytearray() if kind == "closeout" and before.st_size <= MAX_COUNT_BYTES else None
+        # A body is counted from the same descriptor and snapshot it is hashed from.
+        body = bytearray() if before.st_size <= MAX_COUNT_BYTES else None
         remaining = max(0, before.st_size - len(first))
         while remaining:
             chunk = handle.read(min(CHUNK_BYTES, remaining))
@@ -168,12 +201,17 @@ def _snapshot(
         # A full-size prefix without a newline is incomplete, even if it resembles a header.
         if (len(first) < MAX_LINE1_BYTES or first.endswith(b"\n")) and CLOSEOUT_HEADER.fullmatch(candidate):
             line1 = candidate
-    landed = parked = None
-    if line1 is not None and body is not None:
+    landed = parked = task_ids = None
+    if body is not None:
         try:
-            landed, parked = closeout_counts(body.decode("utf-8"))
+            text = (bytes(first) + bytes(body)).decode("utf-8")
         except UnicodeDecodeError:
-            pass
+            text = None
+        if text is not None and kind == "closeout" and line1 is not None:
+            landed, parked = closeout_counts(text)
+        elif text is not None and kind == "charter":
+            task_ids = charter_task_ids(text)
+        del text
     del body
     return {
         "machine": machine,
@@ -185,6 +223,7 @@ def _snapshot(
         "repo_origin": origin,
         "landed_count": landed,
         "parked_count": parked,
+        "task_ids": task_ids,
     }
 
 

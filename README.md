@@ -180,6 +180,13 @@ finish if the role could read any `ah` relation. Connect as `ah_loop_tasks` and 
 anything else in `ah` is refused. `agent-history loops --live --repo owner/repo` prints the same
 document with `--format json`, or one line per loop and task otherwise.
 
+`ah.live_loop_detail('owner/repo')` (migration 044) returns a richer document for the same role
+and scope: per open loop, lane counts, the charter's first-wave tasks and every other task the
+loop's lanes name, each with a state (`landed`, `running`, `blocked`, `returned` or `planned`),
+the 20 newest lane events and the 10 newest commits that land one of the loop's tasks. Re-run the
+role script once after migration 044 if the role predates it and the migration did not grant it.
+The exact shape is in [CONTRACT.md](CONTRACT.md).
+
 ## Metrics
 
 The container image runs two periodic processes from the same image: `index --every 60` indexes the
@@ -307,7 +314,9 @@ Independently of that classification, it collects `codex/charter-*-loop<N>.md` a
 `codex/closeout-*-loop<N>.md` into the metadata-only `ah.loop_run_metadata` table: whole-file
 hash, qualified closeout line 1, mtime and explicit checkout origin, never document bodies. A
 qualified closeout also records two integers, the distinct task IDs opening a list item or table row
-under its `## Landed` and `## Parked` headings (migration 041); titles and IDs are not stored.
+under its `## Landed` and `## Parked` headings (migration 041); titles and those IDs are not stored.
+A charter records the ordered task IDs opening the rows under its `## First wave` heading
+(migration 044) and nothing else from its body.
 Migration 038 adds this table and the narrow metadata grants for an existing `ah_ingest` role;
 provision those grants separately when creating the role later. Exact state JSONL snapshots
 continue to populate `ah.loop_state`. This does not copy charter or closeout bodies to a transcript

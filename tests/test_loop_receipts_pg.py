@@ -811,7 +811,7 @@ def ingest_role(clean):
     )
     clean.execute(
         "DELETE FROM ah.meta WHERE key IN ('migration:025_loop_receipts.sql', 'migration:038_loop_run_metadata.sql', "
-        "'migration:041_closeout_counts.sql')"
+        "'migration:041_closeout_counts.sql', 'migration:044_live_loop_detail.sql')"
     )
     clean.commit()
     load.apply_schema(clean, force=True)

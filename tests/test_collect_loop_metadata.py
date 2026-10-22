@@ -46,6 +46,7 @@ def test_metadata_only_stream_hash_and_origin(repo):
         "repo_origin",
         "landed_count",
         "parked_count",
+        "task_ids",
     }
     assert {name for name, _ in cm.COLS} == expected
     assert cm.KEY == ["machine", "kind", "path"]
@@ -56,6 +57,8 @@ def test_metadata_only_stream_hash_and_origin(repo):
         raw = charter if row["kind"] == "charter" else closeout
         assert row["sha256"] == hashlib.sha256(raw).hexdigest()
         assert row["line1"] == (None if row["kind"] == "charter" else header)
+        # The oversize charter is not read for task IDs; a closeout never carries them.
+        assert row["task_ids"] is None
     match = cm.CLOSEOUT_HEADER.fullmatch(header)
     assert match.groups() == ("sample/project", "loop12", "a" * 64)
     subprocess.run(["git", "-C", str(repo), "remote", "remove", "origin"], check=True)
@@ -241,3 +244,101 @@ def test_oversize_or_undecodable_closeout_is_not_counted(repo):
     write(repo, "closeout-project-loop12.md", f"{HEADER}\n{body}".encode())
     row = next(cm.metadata(repo, "test-machine"))
     assert (row["landed_count"], row["parked_count"]) == (1, 0)
+
+
+CHARTER = """# Charter: sample/project loop12
+
+## Goal
+
+Land APP-0001 and the rest of the first wave.
+
+## First wave
+
+Ordered as dispatched; every row names its task first.
+
+| Task | Scope | Route | Note |
+|---|---|---|---|
+| APP-2433 (short title) | paths | worker | depends on APP-0002 |
+| APP-1895.19 (dotted id) | paths | worker | |
+| **APP-0003** | paths | senior | bold |
+| `APP-0004` | paths | worker | code |
+| APP-2433 (repeated) | paths | worker | |
+| not-an-id | paths | worker | |
+| see APP-0005 | paths | worker | id later in the row |
+
+- APP-0006 as a list item
+1. APP-0007 numbered
+Prose naming APP-0008 is a reference.
+
+### Sub-heading stays inside the section
+
+- APP-0009.1.2.3 (three dot parts)
+- APP-0010.1.2.3.4 (four dot parts: too many)
+- APP-1234567 (seven digits: too long)
+- ABCDEFGHIJKLMNOPQ-1 (seventeen-character prefix: too long)
+- app-0011 (lower case)
+
+```
+| APP-0012 | inside a fence |
+```
+
+## Next heading
+
+| APP-0013 (after the section) | paths | worker | |
+- APP-0014 outside the first wave
+
+## First wave (continued)
+
+- APP-0015 joins the earlier section
+- APP-0003 repeated
+"""
+
+
+def test_charter_first_wave_ids_in_order():
+    assert cm.charter_task_ids(CHARTER) == [
+        "APP-2433",
+        "APP-1895.19",
+        "APP-0003",
+        "APP-0004",
+        "APP-0006",
+        "APP-0007",
+        "APP-0009.1.2.3",
+        "APP-0015",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        ("# Charter\n\n## Goal\n\n- APP-0001\n", []),
+        ("## First wave\n\nNo rows yet.\n", []),
+        ("### First wave\n- APP-0001\n", []),
+        ("## first WAVE\n- APP-0001\n", ["APP-0001"]),
+        ("## Notes\n```\n## First wave\n- APP-0001\n```\n- APP-0002\n", []),
+    ],
+)
+def test_charter_task_ids_only_from_first_wave_rows(body, expected):
+    assert cm.charter_task_ids(body) == expected
+
+
+def test_charter_task_ids_are_capped_after_dedupe():
+    rows = "".join(f"- APP-{n} (row)\n- APP-{n} (again)\n" for n in range(1, cm.MAX_CHARTER_TASK_IDS + 50))
+    ids = cm.charter_task_ids("## First wave\n" + rows)
+    assert len(ids) == cm.MAX_CHARTER_TASK_IDS == 200
+    assert ids[:2] == ["APP-1", "APP-2"] and ids[-1] == f"APP-{cm.MAX_CHARTER_TASK_IDS}"
+
+
+def test_collected_charter_keeps_only_first_wave_ids(repo):
+    write(repo, "charter-project-loop12.md", CHARTER.encode())
+    write(repo, "closeout-project-loop12.md", f"{HEADER}\n{CHARTER}".encode())
+    rows = {row["kind"]: row for row in cm.metadata(repo, "test-machine")}
+    assert rows["charter"]["task_ids"] == cm.charter_task_ids(CHARTER)
+    assert rows["closeout"]["task_ids"] is None
+    # Nothing else from the body leaves the module.
+    assert not any("short title" in str(value) or "Goal" in str(value) for value in rows["charter"].values())
+    write(repo, "charter-project-loop12.md", b"# Charter\n\nNo first wave.\n")
+    assert next(cm.metadata(repo, "test-machine"))["task_ids"] == []
+    write(repo, "charter-project-loop12.md", CHARTER.encode() + b"\xff\n")
+    assert next(cm.metadata(repo, "test-machine"))["task_ids"] is None
+    write(repo, "charter-project-loop12.md", CHARTER.encode() + b"x" * cm.MAX_COUNT_BYTES)
+    assert next(cm.metadata(repo, "test-machine"))["task_ids"] is None

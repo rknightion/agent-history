@@ -117,11 +117,12 @@ on the schema, a member of `pg_execute_server_program`, `pg_write_server_files` 
 `sql/live_loop_tasks_role.sql`, run as a superuser after `roles.sql`, creates `ah_loop_tasks`
 for a consumer that calls `ah.live_loop_tasks` for named repositories and must read nothing else: LOGIN without a password
 (set one with `\password`), `default_transaction_read_only = on`, a 30 s statement timeout,
-CONNECT on the database, USAGE on schema `ah` and EXECUTE on that one function. It holds no
+CONNECT on the database, USAGE on schema `ah` and EXECUTE on that function and on
+`ah.live_loop_detail` (migration 044). It holds no
 privilege on any table, view or sequence and is a member of no role. It may still execute
 other `ah` functions through the default PUBLIC grant, but those run with the caller's rights and
 fail on the first table they read. The script is idempotent, grants EXECUTE whether it runs
-before or after migration 043, and fails if the role can reach any `ah` relation or column, for
+before or after migrations 043 and 044, and fails if the role can reach any `ah` relation or column, for
 example through a grant to PUBLIC. psql's `-v repo=owner/repo` adds that repository (lowercased) to
 the role's scope; it needs migration 043 applied and is run once per repository. Without the
 variable the script adds no scope, and the role can then call the function for no repository.
@@ -320,7 +321,7 @@ Migration `038_loop_run_metadata.sql` adds the collector table `ah.loop_run_meta
 `(machine, kind, path)`. For explicitly configured checkouts it records `charter` and `closeout`
 files directly below `codex/`, named `charter-*-loop<N>.md` and `closeout-*-loop<N>.md`.
 Rows retain only whole-file `sha256`, `file_mtime`, `repo_origin`, `seen_at` and nullable `line1`,
-plus the key. Charter line 1 is always NULL. Closeout line 1 is retained only when the bounded
+plus the key, and the closeout counts and charter task IDs described below. Charter line 1 is always NULL. Closeout line 1 is retained only when the bounded
 4096-byte read contains the complete qualified header:
 
 ```text
@@ -339,6 +340,17 @@ and does not count. Repeats count once. A missing section is NULL and a section 
 Charters, unqualified closeouts, files over 1 MiB and non-UTF-8 bodies are NULL. The body is
 counted from the same descriptor and snapshot it is hashed from and is not retained; only the two
 integers are stored. Rows collected before this migration stay NULL until collected again.
+
+Migration `044_live_loop_detail.sql` adds nullable `task_ids text[]`. For a charter it holds the
+ordered distinct task IDs that open a row under its `## First wave` heading: level-2 headings whose
+text starts with `First wave` in any case, sections and fences bounded exactly as for the closeout
+counts, and rows that are list items or table rows whose first token is the ID, optionally in bold
+or code, so a first table cell such as `ID (short note)` yields the ID only. IDs must match
+`^[A-Z][A-Z0-9]{0,15}-[0-9]{1,6}(\.[0-9]{1,4}){0,3}$`; a longer token is skipped rather than cut.
+At most 200 IDs are kept, in first-seen order. IDs later in a row, in prose or under any other
+heading, and every other part of the body (titles, notes, scope, routes) are not stored. A
+readable charter without that section stores `[]`; closeouts, charters over 1 MiB and non-UTF-8
+charters store NULL, as do rows collected before this migration until they are collected again.
 
 No charter or closeout body or `## Data` is stored by this collector, and there is no body-copy
 step to a transcript archive or NAS. Hashing reads the whole stable file without retaining its
@@ -1051,6 +1063,62 @@ without any recorded end stays live until its loop leaves the open statuses.
 
 `sql/live_loop_tasks_role.sql` provisions the consumer role `ah_loop_tasks` (see Roles).
 
+## Live loop detail (`ah.live_loop_detail`)
+
+Migration `044_live_loop_detail.sql` adds `ah.live_loop_detail(repo text) RETURNS jsonb`, a richer
+deploy-time snapshot for the same narrow consumer. It is migration-owned, SECURITY DEFINER, STABLE
+and pinned to `search_path = pg_catalog, pg_temp`; EXECUTE is revoked from PUBLIC and granted to
+exactly the roles `ah.live_loop_tasks` is granted to (`ah_reader` and `ah_loop_tasks` when they
+exist, and later by `roles.sql` and `sql/live_loop_tasks_role.sql`). Its slug check (`22023`),
+admission by login role against `ah.live_loop_tasks_scope` (`42501`) and rebuild check (`55000`)
+are those of `ah.live_loop_tasks`, which is unchanged. Lanes, their dispatch and the recorded-return
+test are also that function's, with briefs bounded above by the loop window below.
+
+```json
+{"schema": 1, "loops": [{"loop": 7, "status": "running", "launched_at": "2026-10-19T09:00:00.000000Z",
+  "waiting_until": null, "observed_at": "2026-10-19T10:00:00.000000Z", "last_activity_at": null,
+  "lanes": {"total": 3, "running": 1, "returned": 2, "blocked": 1}, "tasks_landed": 1, "commits": 2,
+  "tasks": [{"id": "ABC-0123", "title": "Fix the widget", "planned": true, "state": "running"}],
+  "events": [{"at": "2026-10-19T09:30:00.000000Z", "lane": "w1", "role": "worker",
+              "task_id": "ABC-0123", "kind": "returned", "status": "complete"}],
+  "landings": [{"sha": "0123abc", "subject": "feat: widget", "at": "2026-10-19T09:40:00.000000Z",
+                "task_ids": ["ABC-0122"]}]}]}
+```
+
+Every key is always present and no other key is emitted. `loops` holds the 20 most recently
+launched open (`running`, `waiting`, `paused`) loops of the repository, ordered by launch.
+Timestamps use the RFC3339 microsecond UTC profile; `waiting_until` and `last_activity_at` may be
+null. `tasks_landed` and `commits` are `ah.loops`' columns.
+
+The loop window runs from launch to the earlier of the recorded loop end and the next launch on
+the same root or exact report path. `lanes.running` counts lanes without a recorded return,
+`returned` those with one, `blocked` returned lanes whose `ah.lane.return_status` is `blocked` or
+`partial`, and `total` is their sum. A lane's catalogue row is the `ah.lane` of the child session
+its spawn row links to; its role class is `ah.lane.role` after the last `:`. A returned lane is for
+the task its lane-return's `task` names when that is a valid ID, otherwise its brief header's.
+
+`tasks` lists the run's first-wave IDs in charter order, then the other IDs named by brief headers
+or lane-returns in order of first brief, at most 200. The charter is the newest
+`loop_run_metadata` charter row (by `file_mtime`) of the run's exact `goal_path` whose `task_ids`
+is not NULL and whose `repo_origin` (ignoring a `github.com/` prefix, case-insensitive) is the
+requested repository, so a copy from a collector without the column never hides one that has it
+and a same-path copy from another repository or with no origin is never used. IDs match
+`^[A-Z][A-Z0-9]{0,15}-[0-9]{1,6}(\.[0-9]{1,4}){0,3}$`. `title` is the latest brief header title for
+the ID, or null. `planned` is true for first-wave IDs. `state` is the first that applies: `landed`
+(the ID is in the Task trailers of a landing below), `running` (a live lane's header names it),
+`blocked` or `returned` (a returned lane for it whose role class starts with `worker` or `senior`
+exists: `blocked` when the latest one's `return_status` is `blocked`/`partial`, otherwise `returned`,
+including a null or other status), otherwise `planned`.
+
+`events` are the 20 newest lane events: a `dispatched` event at each brief and a `returned` event
+at each recorded return (spawn completion, else the lane session's last event), each with the lane
+name (the lane row's, else the brief header's, or null), role class, task ID and, for returns only,
+the raw `return_status`. Nothing else from `lane_return` is read. `landings` are the 10 newest
+on-default `ah.git_commit` rows of the repository, compared after dropping a leading `github.com/`
+slug component, committed inside the loop window, whose Task trailers intersect the loop's task
+IDs; machine and slug copies count once. Each carries the first seven SHA characters, the first
+subject line cut to 200 characters, the commit time and the commit's valid trailer IDs sorted.
+
 ## Efficiency classifier
 
 `ah.efficiency_calls(namespaces, session_uid, agent_id)` returns one row per model call with its
@@ -1076,8 +1144,9 @@ never identity or inferred lifecycle root activity.
 Author emails are compared to configured identities but only `author_is_owner` is stored.
 Permission logs contribute timestamps, line hashes, tool names, command verbs, classifier reasons
 and sub-agent flags, never command arguments or target text. New run metadata contributes only
-hashes, qualified closeout line 1, mtime, origin and two closeout task counts alongside its key,
-never charter/closeout bodies, titles or task IDs.
+hashes, qualified closeout line 1, mtime, origin, two closeout task counts and a charter's ordered
+first-wave task IDs (the IDs opening rows under its `## First wave` heading, and nothing else from
+the body) alongside its key, never charter/closeout bodies, titles, notes or any other task IDs.
 Legacy `loop_receipt` rows retain receipt text, qualified report line 1, hashes and origin for
 historical reads; new receipt collection is retired globally. These metadata fields may themselves
 be sensitive. Protect collector homes, configuration and the catalogue accordingly.
