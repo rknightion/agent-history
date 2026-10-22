@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.8.0](https://github.com/rknightion/agent-history/compare/v0.7.0...v0.8.0) (2026-10-22)
+
+
+### Features
+
+* **loops:** collect charter first-wave task ids and add ah.live_loop_detail ([4121780](https://github.com/rknightion/agent-history/commit/4121780ae415b41c5ecba5bdd631d08d4f5524ff))
+
+
+### Bug Fixes
+
+* **deps:** update certifi to 2026.10.19 ([546cccb](https://github.com/rknightion/agent-history/commit/546cccbce6857972166d58599db14bc32d7550df))
+* **docker:** expect Python 3.15 from the Chainguard base ([fd88e8e](https://github.com/rknightion/agent-history/commit/fd88e8e7fd62abc90a1a60339f73ff5c244ce70f))
+
 ## [0.7.0](https://github.com/rknightion/agent-history/compare/v0.6.1...v0.7.0) (2026-10-19)
 
 
