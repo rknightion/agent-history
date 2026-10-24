@@ -2768,8 +2768,11 @@ def efficiency_emit_stalls(
     for relative, file_state in files.items():
         if file_state.get("role") == "root" and file_state.get("proto") in EFFICIENCY_PROTOCOLS - {"none"}:
             roots[relative] = file_state
-            if file_state.get("tid"):
-                by_thread[(relative.split("/", 1)[0], file_state["tid"])] = relative
+            namespace = relative.split("/", 1)[0]
+            thread = pi_format().lineage(relative).get("root") if namespace.startswith("pi-") else None
+            thread = thread or file_state.get("tid")
+            if thread:
+                by_thread[(namespace, thread)] = relative
     children: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for relative, file_state in files.items():
         if file_state.get("role") != "worker":
@@ -2777,6 +2780,9 @@ def efficiency_emit_stalls(
         namespace = relative.split("/", 1)[0]
         if namespace.startswith("claude-"):
             parent = relative.rsplit("/subagents/", 1)[0] + ".jsonl" if "/subagents/" in relative else None
+        elif namespace.startswith("pi-"):
+            # A pi lane records no parent id; its path under the root's run directory names the root.
+            parent = by_thread.get((namespace, pi_format().lineage(relative).get("root")))
         else:
             parent = by_thread.get((namespace, file_state.get("parent")))
         if parent in roots:

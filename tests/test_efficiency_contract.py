@@ -1961,6 +1961,49 @@ def test_pi_root_children_wait_status_spawn_and_loop(eff: Harness):
     assert sum(pi_hot) == 3
 
 
+def test_stalled_loop_pi_lanes_are_children(eff: Harness):
+    """A pi lane's file sits under its root's run directory; that path, not a parent field, links them."""
+    now = eff.now
+    eff.baseline = now - 7200
+    directory = eff.hot / PI / "sessions" / "-synthetic-"
+    directory.mkdir(parents=True)
+    tasks = {"tasks": [{"agent": "reviewer", "task": "review"}]}
+    results = {"results": [{"agent": "reviewer", "index": 0, "sessionFile": "/h/s/run-0/session.jsonl"}]}
+    (directory / f"{PI_ROOT_BASE}.jsonl").write_text(
+        "".join(
+            [
+                pi_record(now - 3000, "session", id=PI_ROOT, cwd="/synthetic/cwd", version=3),
+                pi_message(now - 2999, "u1", "user", content=[{"type": "text", "text": "go\nContract: loop-v2.1"}]),
+                pi_call(now - 2990, "a1", "r1", "spawn", "subagent", tasks),
+                pi_result(now - 2989, "s1", "spawn", "subagent", details=results),
+                pi_message(now - 2800, "u2", "user", content=[{"type": "text", "text": "carry on"}]),
+                pi_call(now - 60, "a2", "r2", "wait", "subagent", {"action": "wait"}),  # blocked, in task
+            ]
+        ),
+        encoding="utf-8",
+    )
+    lane_dir = directory / PI_ROOT_BASE / PI_CHILDREN[0] / "run-0"
+    lane_dir.mkdir(parents=True)
+    lane = lane_dir / "session.jsonl"
+    lane.write_text(
+        pi_record(now - 2988, "session", id=PI_CHILDREN[0], cwd="/synthetic/cwd", version=3)
+        + pi_message(now - 2987, "u1", "user", content=[{"type": "text", "text": "synthetic revived lane brief"}])
+        + pi_call(now - 100, "a1", "c1", "t1", "bash", {"command": "ls -la /tmp/far/away/dir"}),
+        encoding="utf-8",
+    )
+    v = lambda samples, name: value(samples, name, agent="pi", namespace=PI)
+    samples = eff.collect(now)
+    assert v(samples, "agent_efficiency_roots_without_lanes") == 0
+    assert v(samples, "agent_efficiency_root_no_lane_seconds") == 0
+    # The lane ends its turn: the live root now has no lane in flight, counted from the lane's last event.
+    with lane.open("a", encoding="utf-8") as handle:
+        handle.write(pi_result(now - 90, "t1r", "t1", "bash"))
+        handle.write(pi_call(now - 80, "a2", "c2"))
+    samples = eff.collect(now)
+    assert v(samples, "agent_efficiency_roots_without_lanes") == 1
+    assert v(samples, "agent_efficiency_root_no_lane_seconds") == pytest.approx(80, abs=0.01)
+
+
 def test_pi_single_async_run_is_counted_from_its_background_task_notify(eff: Harness):
     start = eff.now - 500
     eff.baseline = start - 10
