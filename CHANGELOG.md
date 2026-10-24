@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.1](https://github.com/rknightion/agent-history/compare/v0.8.0...v0.8.1) (2026-10-24)
+
+
+### Bug Fixes
+
+* **efficiency:** link pi lanes to their root in the stall gauge ([b88e221](https://github.com/rknightion/agent-history/commit/b88e2211df5602a74b03e130d95197b5bfcbfb9b))
+
 ## [0.8.0](https://github.com/rknightion/agent-history/compare/v0.7.0...v0.8.0) (2026-10-22)
 
 
