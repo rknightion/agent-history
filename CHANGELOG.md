@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.9.0](https://github.com/rknightion/agent-history/compare/v0.8.1...v0.9.0) (2026-10-25)
+
+
+### Features
+
+* **collector:** support exact repositories and explicit read branches ([0b53292](https://github.com/rknightion/agent-history/commit/0b53292b39600c943b6ca82584eef6206caaacca))
+* **collector:** warn on unconfigured allowlisted loop checkouts ([96cbda5](https://github.com/rknightion/agent-history/commit/96cbda591dcb7733f0107832c4cb0b0b1b6d8095))
+* **metrics:** add isolated completed-loop health observations ([b74dbdd](https://github.com/rknightion/agent-history/commit/b74dbdd44a127011733cd32c45d26b4ca42f4b74))
+
+
+### Bug Fixes
+
+* **metrics:** isolate catalogue query failures ([05924a9](https://github.com/rknightion/agent-history/commit/05924a93ae64dbcf8288b2e2b184ec6b9f6ac81a))
+* **reader:** route dedicated resume hints to their own home ([e9f1954](https://github.com/rknightion/agent-history/commit/e9f1954e9c5cc4450badd74e451f790709c1585f))
+
 ## [0.8.1](https://github.com/rknightion/agent-history/compare/v0.8.0...v0.8.1) (2026-10-25)
 
 
