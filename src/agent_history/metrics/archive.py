@@ -7,6 +7,7 @@ import os
 import re
 import time
 from pathlib import Path
+from stat import S_ISREG
 
 from agent_history.config import MetricsLabels
 
@@ -35,38 +36,57 @@ def namespace_labels(namespace: str, trusted: MetricsLabels = MetricsLabels()) -
     return {"namespace": namespace, "agent": agent, "profile": profile, "machine": machine}
 
 
+ADMIN_DIRS = frozenset({".versions", ".archive-receipts"})
+
+
+def scan_jsonl(top: str, prefix: str = "", prune: frozenset[str] = frozenset()):
+    """Yield (relative path, lstat) for every regular, non-symlink `*.jsonl` file below `top`.
+
+    Never follows a symlink and skips directories named in `prune` at any depth. An unreadable
+    directory below `top` is skipped, as os.walk does. Runs on every metrics refresh over ~10^5
+    files, partly on NFS, so it uses scandir entries and plain strings: one lstat per file and no
+    pathlib objects.
+    """
+    stack = [(top, prefix)]
+    while stack:
+        folder, rel = stack.pop()
+        try:
+            entries = list(os.scandir(folder))
+        except OSError:
+            continue
+        for entry in entries:
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    if entry.name not in prune:
+                        stack.append((entry.path, rel + entry.name + "/"))
+                elif entry.name.endswith(".jsonl") and not entry.is_symlink():
+                    stat = entry.stat(follow_symlinks=False)
+                    if S_ISREG(stat.st_mode):
+                        yield rel + entry.name, stat
+            except OSError:  # An active transcript can vanish between the directory and file reads.
+                continue
+
+
 def walk_jsonl(root: Path | None, *, exclude_admin: bool = False) -> dict[str, tuple[int, int]]:
     files = {}
     if root is None or root.is_symlink() or not root.is_dir():
         return files
-    for namespace in sorted(root.iterdir()):
-        # Root-level JSONL files also contribute to archive totals, but not namespace labels.
-        if namespace.suffix == ".jsonl" and not namespace.is_symlink() and namespace.is_file():
-            try:
-                stat = namespace.stat()
-            except (FileNotFoundError, PermissionError):
+    prune = ADMIN_DIRS if exclude_admin else frozenset()
+    for entry in sorted(os.scandir(root), key=lambda e: e.name):
+        try:
+            if entry.is_symlink():
                 continue
-            files[namespace.name] = (stat.st_size, stat.st_mtime_ns)
+            # Root-level JSONL files also contribute to archive totals, but not namespace labels.
+            if entry.name.endswith(".jsonl") and len(entry.name) > len(".jsonl") and entry.is_file():
+                stat = entry.stat()
+                files[entry.name] = (stat.st_size, stat.st_mtime_ns)
+                continue
+            if not NAMESPACE.fullmatch(entry.name) or not entry.is_dir():
+                continue
+        except (FileNotFoundError, PermissionError):
             continue
-        if not NAMESPACE.fullmatch(namespace.name) or namespace.is_symlink() or not namespace.is_dir():
-            continue
-        for folder, dirs, names in os.walk(namespace, followlinks=False):
-            dirs[:] = [
-                name
-                for name in dirs
-                if not (Path(folder) / name).is_symlink()
-                and (not exclude_admin or name not in {".versions", ".archive-receipts"})
-            ]
-            for name in names:
-                path = Path(folder) / name
-                if not name.endswith(".jsonl") or path.is_symlink():
-                    continue
-                try:
-                    stat = path.stat(follow_symlinks=False)
-                except (FileNotFoundError, PermissionError):
-                    continue
-                if path.is_file():
-                    files[str(path.relative_to(root))] = (stat.st_size, stat.st_mtime_ns)
+        for rel, stat in scan_jsonl(entry.path, entry.name + "/", prune):
+            files[rel] = (stat.st_size, stat.st_mtime_ns)
     return files
 
 
@@ -181,8 +201,13 @@ class ArchiveCollector:
             }
         )[:64]  # Hard cap even if an untrusted mount grows arbitrary namespace directories.
         for tier, files in by_tier.items():
-            for namespace in namespaces:
-                values = [(size, mtime) for path, (size, mtime) in files.items() if path.startswith(namespace + "/")]
+            # One pass over the files, not one per namespace: a namespace name holds no "/".
+            by_namespace: dict[str, list[tuple[int, int]]] = {namespace: [] for namespace in namespaces}
+            for path, value in files.items():
+                head, slash, _ = path.partition("/")
+                if slash and head in by_namespace:
+                    by_namespace[head].append(value)
+            for namespace, values in by_namespace.items():
                 labels = {"tier": tier, **namespace_labels(namespace, self.labels)}
                 groups["files"].append((labels, len(values)))
                 groups["bytes"].append((labels, sum(size for size, _ in values)))
@@ -297,19 +322,10 @@ class ArchiveCollector:
         newest = 0.0
         if versions and versions.is_dir():
             snapshots = sum(p.is_dir() and not p.is_symlink() for p in versions.iterdir())
-            for folder, dirs, names in os.walk(versions, followlinks=False):
-                dirs[:] = [name for name in dirs if not (Path(folder) / name).is_symlink()]
-                for name in names:
-                    path = Path(folder) / name
-                    if not name.endswith(".jsonl") or path.is_symlink():
-                        continue
-                    try:
-                        stat = path.stat(follow_symlinks=False)
-                    except (FileNotFoundError, PermissionError):
-                        continue
-                    version_files += 1
-                    version_bytes += stat.st_size
-                    newest = max(newest, stat.st_mtime)
+            for _rel, stat in scan_jsonl(str(versions)):
+                version_files += 1
+                version_bytes += stat.st_size
+                newest = max(newest, stat.st_mtime)
         result.extend(
             (
                 gauge(
@@ -344,15 +360,7 @@ class ArchiveCollector:
             available.append(({"tier": tier}, int(ok)))
             file_sizes = [size for size, _ in by_tier[tier].values()] if tier in by_tier else []
             if ok and tier not in by_tier:
-                for folder, dirs, names in os.walk(root, followlinks=False):
-                    dirs[:] = [n for n in dirs if not (Path(folder) / n).is_symlink()]
-                    for n in names:
-                        p = Path(folder) / n
-                        if n.endswith(".jsonl") and p.is_file() and not p.is_symlink():
-                            try:
-                                file_sizes.append(p.stat().st_size)
-                            except (FileNotFoundError, PermissionError):
-                                continue
+                file_sizes = [stat.st_size for _rel, stat in scan_jsonl(str(root))]
             counts.append(({"tier": tier}, len(file_sizes)))
             sizes.append(({"tier": tier}, sum(file_sizes)))
         all_receipts = (

@@ -1,6 +1,7 @@
 """The public seam counts complete lines exactly once, including after process restart."""
 
 import json
+import os
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -296,21 +297,35 @@ def test_disappearing_transcript_does_not_block_other_sources(tmp_path: Path, mo
     good.write_text(content)
     injected = False
     if failure == "stat":
-        original = Path.stat
-        is_file, is_symlink = Path.is_file, Path.is_symlink
-        # Discovery is not the rotation boundary. Isolate its predicates so this
-        # fault fires at the collector's explicit metadata read on every Python.
-        monkeypatch.setattr(Path, "is_file", lambda self: True if self == bad else is_file(self))
-        monkeypatch.setattr(Path, "is_symlink", lambda self: False if self == bad else is_symlink(self))
+        # Discovery lists the file, then its metadata read fails: the transcript rotated away.
+        real_scandir = os.scandir
 
-        def rotating_stat(self, *args, **kwargs):
-            nonlocal injected
-            if self == bad:
+        class Rotated:
+            def __init__(self, entry):
+                self._entry = entry
+
+            def __getattr__(self, name):
+                return getattr(self._entry, name)
+
+            def stat(self, *args, **kwargs):
+                nonlocal injected
                 injected = True
                 raise FileNotFoundError("synthetic rotation")
-            return original(self, *args, **kwargs)
 
-        monkeypatch.setattr(Path, "stat", rotating_stat)
+        class Listing:
+            def __init__(self, path):
+                self._it = real_scandir(path)
+
+            def __iter__(self):
+                return (Rotated(e) if e.path == str(bad) else e for e in self._it)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                self._it.close()
+
+        monkeypatch.setattr(os, "scandir", Listing)
     else:
         original = Path.open
 

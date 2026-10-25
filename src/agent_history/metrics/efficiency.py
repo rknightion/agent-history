@@ -14,6 +14,7 @@ from agent_history import telemetry
 from agent_history.config import Config
 from agent_history.efficiency import parser as rules
 from agent_history.metrics import Family, Sample
+from agent_history.metrics.archive import scan_jsonl
 
 
 class _Series:
@@ -98,14 +99,10 @@ class EfficiencyCollector:
             # A missing home must not erase its offsets. Reject symlinked transcript files.
             if not home.is_dir():
                 continue
-            for file in home.rglob("*.jsonl"):
-                try:
-                    if file.is_symlink() or "subagent-artifacts" in file.parts or not file.is_file():
-                        continue
-                    stat = file.stat()
-                except OSError:  # An active transcript can disappear between directory and file reads.
-                    continue
-                parts = file.relative_to(home).parts
+            # Every metrics refresh walks every home: scandir with string paths, not rglob and
+            # relative_to, which cost seconds of CPU per refresh on a large archive.
+            for rel_path, stat in scan_jsonl(str(home), prune=frozenset({"subagent-artifacts"})):
+                parts = tuple(rel_path.split("/"))
                 agent = namespace.split("-", 1)[0]
                 if agent == "claude" and not self._claude_transcript(parts):
                     continue
@@ -117,8 +114,7 @@ class EfficiencyCollector:
                     or not (len(parts) == 3 or (len(parts) >= 6 and parts[-2].startswith("run-")))
                 ):
                     continue
-                rel = namespace + "/" + file.relative_to(home).as_posix()
-                sources[rel] = (file, stat.st_size, stat.st_mtime_ns)
+                sources[namespace + "/" + rel_path] = (home / rel_path, stat.st_size, stat.st_mtime_ns)
         retired = rules.efficiency_prune_loops(state, now)
         fresh_loop_map = None
         self.section_health = {}

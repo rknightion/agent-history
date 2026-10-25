@@ -140,14 +140,15 @@ def test_archive_counts_jsonl_and_reuses_storage_walk(tmp_path, monkeypatch):
     (hot / "pi-fixture").mkdir(parents=True)
     (hot / "pi-fixture" / "one.jsonl").write_text("abc")
     (hot / "pi-fixture" / "note.txt").write_text("not transcript")
-    original = archive.os.walk
+    original = archive.os.scandir
     walks = []
 
-    def walk(root, **kwargs):
-        walks.append(root)
-        return original(root, **kwargs)
+    def scandir(path):
+        if str(path) == str(hot / "pi-fixture"):
+            walks.append(path)  # a second walk of the hot tier lists this namespace again
+        return original(path)
 
-    monkeypatch.setattr(archive.os, "walk", walk)
+    monkeypatch.setattr(archive.os, "scandir", scandir)
     families = {f.name: f for f in ArchiveCollector(hot, None, None, None).collect()}
     assert families["agent_sessions_archive_files"].samples[0].value == 1
     assert families["agent_sessions_archive_bytes"].samples[0].value == 3
