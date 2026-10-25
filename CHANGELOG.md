@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.8.1](https://github.com/rknightion/agent-history/compare/v0.8.0...v0.8.1) (2026-10-25)
+
+
+### Bug Fixes
+
+* **efficiency:** link pi lanes to their root in the stall gauge ([b88e221](https://github.com/rknightion/agent-history/commit/b88e2211df5602a74b03e130d95197b5bfcbfb9b))
+
+
+### Performance Improvements
+
+* **catalogue:** stop three post-pass and embed queries rescanning the catalogue ([cb09150](https://github.com/rknightion/agent-history/commit/cb09150d1ae8ff11c1e61d8501d5986a6998707e))
+* **metrics:** walk the archive with scandir instead of pathlib ([a64a09e](https://github.com/rknightion/agent-history/commit/a64a09e3b0f84fd23ac369b818b83c7a4db8ac8d))
+
 ## [0.8.0](https://github.com/rknightion/agent-history/compare/v0.7.0...v0.8.0) (2026-10-22)
 
 
