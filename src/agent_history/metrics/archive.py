@@ -6,6 +6,8 @@ import json
 import os
 import re
 import time
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from pathlib import Path
 from stat import S_ISREG
 
@@ -39,7 +41,103 @@ def namespace_labels(namespace: str, trusted: MetricsLabels = MetricsLabels()) -
 ADMIN_DIRS = frozenset({".versions", ".archive-receipts"})
 
 
-def scan_jsonl(top: str, prefix: str = "", prune: frozenset[str] = frozenset()):
+@dataclass
+class DiscoveryBudget:
+    """Optional shared discovery bound; default archive/efficiency scans remain unchanged.
+
+    Memory charges conservatively include path payload and container overhead, cumulatively
+    across roots, queued directories and emitted files. No directory is materialised at once.
+    A filesystem operation already in progress cannot be interrupted by this cooperative clock.
+    """
+
+    deadline: float
+    monotonic: Callable[[], float] = time.monotonic
+    max_entries: int = 8192
+    max_dirs: int = 256
+    max_files: int = 1024
+    max_memory: int = 1024 * 1024
+    entries: int = 0
+    directories: int = 0
+    files: int = 0
+    memory: int = 0
+    complete: bool = True
+    errors: set[str] = field(default_factory=set)
+
+    def fail(self, reason):
+        self.complete = False
+        self.errors.add(reason)
+
+    def check(self):
+        if self.monotonic() >= self.deadline:
+            self.fail("deadline")
+            return False
+        return True
+
+    def reserve(self, *paths):
+        # Charge more than a Python path tuple/dictionary entry, not just its string bytes.
+        amount = 512 + sum(len(os.fsencode(path)) for path in paths)
+        if self.memory + amount > self.max_memory:
+            self.fail("memory")
+            return False
+        self.memory += amount
+        return True
+
+
+def _bounded_scan_jsonl(top, prefix, prune, budget):
+    if not budget.check() or not budget.reserve(top, prefix):
+        return
+    pending = [(top, prefix)]
+    while pending and budget.check():
+        if budget.directories >= budget.max_dirs:
+            budget.fail("directories")
+            return
+        folder, rel = pending.pop()
+        budget.directories += 1
+        try:
+            with os.scandir(folder) as entries:
+                while budget.check():
+                    if budget.entries >= budget.max_entries:
+                        budget.fail("entries")
+                        return
+                    try:
+                        entry = next(entries)
+                    except StopIteration:
+                        break
+                    budget.entries += 1
+                    if not budget.check():
+                        return
+                    try:
+                        is_directory = entry.is_dir(follow_symlinks=False)
+                        if not budget.check():
+                            return
+                        if is_directory:
+                            if entry.name not in prune:
+                                child = rel + entry.name + "/"
+                                if not budget.reserve(entry.path, child):
+                                    return
+                                pending.append((entry.path, child))
+                        elif entry.name.endswith(".jsonl") and not entry.is_symlink():
+                            if not budget.check():
+                                return
+                            stat = entry.stat(follow_symlinks=False)
+                            if not budget.check():
+                                return
+                            if S_ISREG(stat.st_mode):
+                                if budget.files >= budget.max_files:
+                                    budget.fail("files")
+                                    return
+                                name = rel + entry.name
+                                if not budget.reserve(entry.path, name):
+                                    return
+                                budget.files += 1
+                                yield name, stat
+                    except OSError:
+                        budget.fail("filesystem")
+        except OSError:
+            budget.fail("filesystem")
+
+
+def scan_jsonl(top: str, prefix: str = "", prune: frozenset[str] = frozenset(), *, budget=None):
     """Yield (relative path, lstat) for every regular, non-symlink `*.jsonl` file below `top`.
 
     Never follows a symlink and skips directories named in `prune` at any depth. An unreadable
@@ -47,6 +145,9 @@ def scan_jsonl(top: str, prefix: str = "", prune: frozenset[str] = frozenset()):
     files, partly on NFS, so it uses scandir entries and plain strings: one lstat per file and no
     pathlib objects.
     """
+    if budget is not None:
+        yield from _bounded_scan_jsonl(top, prefix, prune, budget)
+        return
     stack = [(top, prefix)]
     while stack:
         folder, rel = stack.pop()

@@ -30,6 +30,8 @@ STORED = {
     "agent_sessions_metrics_section_success": "agent_sessions_metrics_section_success_ratio",
     "agent_sessions_metrics_collection_duration_seconds": "agent_sessions_metrics_collection_duration_seconds",
     "agent_history_exporter_collection_errors_total": "agent_history_exporter_collection_errors_total",
+    "agent_history_loop_checkout_unconfigured": "agent_history_loop_checkout_unconfigured",
+    "agent_history_loop_checkout_observation_complete": "agent_history_loop_checkout_observation_complete_ratio",
     "agent_history_last_success_timestamp_seconds": "agent_history_last_success_timestamp_seconds",
     "agent_history_run_success": "agent_history_run_success_ratio",
     "agent_history_lag_bytes": "agent_history_lag_bytes",
@@ -65,7 +67,8 @@ ARCHIVE_STALE_SECONDS = 129600
 
 
 def stored(name: str) -> str:
-    return STORED[name] + f"{{{JOB}}}"
+    job = 'job="agent-history-collect"' if name.startswith("agent_history_loop_checkout_") else JOB
+    return STORED[name] + f"{{{job}}}"
 
 
 RUN_SUCCESS = stored("agent_history_embed_run_success")
@@ -122,6 +125,8 @@ SECTION_FAILING = (
     f"max by (section) ("
     f"(min by (section) ({SECTION_SUCCESS}) < bool 1) == 1"
     f' or label_replace((sum by (collector) (increase({COLLECTOR_ERRORS}[30m])) > bool 0) == 1, "section", "$1", "collector", "(.*)")'
+    f' or label_replace((max(last_over_time({stored("agent_history_loop_checkout_unconfigured")}[2h])) > bool 0) == 1, "section", "loop_checkout", "", ".*")'
+    f' or label_replace((min(last_over_time({stored("agent_history_loop_checkout_observation_complete")}[2h])) < bool 1) == 1, "section", "loop_checkout_observation", "", ".*")'
     f")"
 )
 # Seconds since the last successful index pass, while it exceeds INDEX_STALE_SECONDS. The series
@@ -204,7 +209,12 @@ RULES = [
             "agent_sessions_metrics_section_success_ratio is below 1 for this section, or"
             " agent_history_exporter_collection_errors_total increased for its collector in the last 30"
             " minutes. Sections are isolated: the others keep updating while this one fails. Read the"
-            " indexer logs for the section's error."
+            " indexer logs for the section's error. loop_checkout means an observed v3 root has an"
+            " allowlisted Git origin but its checkout is absent from git.repos; the hourly collector"
+            " summary names unconfigured_allowlisted_checkout. loop_checkout_observation means the"
+            " bounded observation is partial, not evidence that every checkout is configured. These"
+            " two sections use the latest hourly agent-history-collect observation over two hours;"
+            " the collector must have OTLP metrics enabled through its existing telemetry environment."
         ),
         "expr": SECTION_FAILING,
         "for": "30m",
@@ -593,6 +603,23 @@ def indexer_fixtures() -> dict:
         SECTION_FAILING,
         "45m",
         one(1, '{section="loops"}'),
+    )
+    checkout = stored("agent_history_loop_checkout_unconfigured")
+    observed = stored("agent_history_loop_checkout_observation_complete")
+    case("loop checkout configured", [(checkout, "0x60"), (observed, "1x60")], SECTION_FAILING, "45m", [])
+    case(
+        "loop checkout unconfigured",
+        [(checkout, "1x60"), (observed, "1x60")],
+        SECTION_FAILING,
+        "45m",
+        one(1, '{section="loop_checkout"}'),
+    )
+    case(
+        "loop checkout observation partial",
+        [(checkout, "0x60"), (observed, "0x60")],
+        SECTION_FAILING,
+        "45m",
+        one(1, '{section="loop_checkout_observation"}'),
     )
     # Protocol is deliberately not a metric label here. The transcript collector
     # emits the same bounded gauge for v3 and legacy roots and suppresses quiet

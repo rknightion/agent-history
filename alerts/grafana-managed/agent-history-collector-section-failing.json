@@ -12,7 +12,7 @@
   },
   "spec": {
     "annotations": {
-      "description": "agent_sessions_metrics_section_success_ratio is below 1 for this section, or agent_history_exporter_collection_errors_total increased for its collector in the last 30 minutes. Sections are isolated: the others keep updating while this one fails. Read the indexer logs for the section's error.",
+      "description": "agent_sessions_metrics_section_success_ratio is below 1 for this section, or agent_history_exporter_collection_errors_total increased for its collector in the last 30 minutes. Sections are isolated: the others keep updating while this one fails. Read the indexer logs for the section's error. loop_checkout means an observed v3 root has an allowlisted Git origin but its checkout is absent from git.repos; the hourly collector summary names unconfigured_allowlisted_checkout. loop_checkout_observation means the bounded observation is partial, not evidence that every checkout is configured. These two sections use the latest hourly agent-history-collect observation over two hours; the collector must have OTLP metrics enabled through its existing telemetry environment.",
       "summary": "The {{ $labels.section }} metric collector section is failing"
     },
     "execErrState": "Error",
@@ -24,7 +24,7 @@
             "type": "prometheus",
             "uid": "grafanacloud-prom"
           },
-          "expr": "max by (section) ((min by (section) (agent_sessions_metrics_section_success_ratio{job=\"agent-history-index\"}) < bool 1) == 1 or label_replace((sum by (collector) (increase(agent_history_exporter_collection_errors_total{job=\"agent-history-index\"}[30m])) > bool 0) == 1, \"section\", \"$1\", \"collector\", \"(.*)\"))",
+          "expr": "max by (section) ((min by (section) (agent_sessions_metrics_section_success_ratio{job=\"agent-history-index\"}) < bool 1) == 1 or label_replace((sum by (collector) (increase(agent_history_exporter_collection_errors_total{job=\"agent-history-index\"}[30m])) > bool 0) == 1, \"section\", \"$1\", \"collector\", \"(.*)\") or label_replace((max(last_over_time(agent_history_loop_checkout_unconfigured{job=\"agent-history-collect\"}[2h])) > bool 0) == 1, \"section\", \"loop_checkout\", \"\", \".*\") or label_replace((min(last_over_time(agent_history_loop_checkout_observation_complete_ratio{job=\"agent-history-collect\"}[2h])) < bool 1) == 1, \"section\", \"loop_checkout_observation\", \"\", \".*\"))",
           "instant": true,
           "range": false,
           "refId": "A"

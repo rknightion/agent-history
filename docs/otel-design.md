@@ -291,6 +291,34 @@ Sources: `metrics/catalogue.py:34-56,133-217`, `metrics/self.py:100-115`, `metri
 | `agent_history_exporter_collection_duration_seconds` | G | `s` | `collector` |
 | `agent_history_exporter_collection_errors_total` | C | `{error}` | `collector` |
 | `agent_history_cold_tier_available` | G | `1` | none |
+| `agent_history_loop_checkout_unconfigured` | G | `{checkout}` | none |
+| `agent_history_loop_checkout_observation_complete` | G | `1` | none |
+
+The checkout gauges come from the hourly `agent-history-collect` lifecycle, not the remote
+indexer's filesystem. The existing section-failing alert reads their latest observation over
+two hours. The count is a lower bound when completeness is 0. No cwd, origin, document body or
+session identifier is exported. Local metadata offsets resume at most 4 MiB across 64 files
+per pass from the shared efficiency inventory, with 1 MiB records. Only actual source/home
+tables in an existing configuration file authorise this observer; missing files, absent tables
+and programmatic/default source values do not opt in. A shared cooperative five-second budget
+starts before discovery and includes parsing/Git (64 cwd probes, one second per Git read).
+The observer-only streaming inventory also caps 8192 entries, 256 directories, 1024 JSONL files
+and 1 MiB of conservative cumulative path/container memory charges, across all explicit roots.
+The default efficiency/archive scans are unchanged. Filesystem omissions or exhausted bounds
+leave observation partial and preserve cached evidence missing from that partial inventory;
+only a complete inventory can withdraw missing entries. Metadata offsets resume, but large
+directory inventories can remain partial across passes rather than claiming complete coverage.
+Already-running filesystem calls cannot be pre-empted by the cooperative clock. Inputs older
+than the existing efficiency `first_parse_days` window are not observed.
+Observation uses the same pure admission predicate as collection: `[identities] git_owners`
+admits an owner, while `git_repos` admits only its exact host/owner/repository, never siblings.
+Repository aliases do not confer admission. Observation passes its own configured identities
+without changing the hourly collector's module configuration. Both owner and exact-repository
+admission sets are included in the diagnostic snapshot fingerprint, so changing either makes
+an older snapshot unavailable until observed again.
+The collector summary names `unconfigured_allowlisted_checkout`, with a count, and reports
+observation as `complete`, `partial` or `unavailable`. Without an existing OTLP environment,
+summary reporting works but metric alerting is unavailable; no endpoint or credential is added.
 The run families describe the latest run, not lifetime totals. Keep them as gauges.
 The embed-backlog family retains its existing name and value even though its name says “messages” and the catalogue collector counts chunks. Do not change its meaning in this telemetry change.
 ### Archive and storage families

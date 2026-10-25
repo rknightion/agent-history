@@ -244,7 +244,7 @@
         {
           "eval_time": "45m",
           "exp_samples": [],
-          "expr": "max by (section) ((min by (section) (agent_sessions_metrics_section_success_ratio{job=\"agent-history-index\"}) < bool 1) == 1 or label_replace((sum by (collector) (increase(agent_history_exporter_collection_errors_total{job=\"agent-history-index\"}[30m])) > bool 0) == 1, \"section\", \"$1\", \"collector\", \"(.*)\"))"
+          "expr": "max by (section) ((min by (section) (agent_sessions_metrics_section_success_ratio{job=\"agent-history-index\"}) < bool 1) == 1 or label_replace((sum by (collector) (increase(agent_history_exporter_collection_errors_total{job=\"agent-history-index\"}[30m])) > bool 0) == 1, \"section\", \"$1\", \"collector\", \"(.*)\") or label_replace((max(last_over_time(agent_history_loop_checkout_unconfigured{job=\"agent-history-collect\"}[2h])) > bool 0) == 1, \"section\", \"loop_checkout\", \"\", \".*\") or label_replace((min(last_over_time(agent_history_loop_checkout_observation_complete_ratio{job=\"agent-history-collect\"}[2h])) < bool 1) == 1, \"section\", \"loop_checkout_observation\", \"\", \".*\"))"
         }
       ]
     },
@@ -270,7 +270,7 @@
               "value": 1
             }
           ],
-          "expr": "max by (section) ((min by (section) (agent_sessions_metrics_section_success_ratio{job=\"agent-history-index\"}) < bool 1) == 1 or label_replace((sum by (collector) (increase(agent_history_exporter_collection_errors_total{job=\"agent-history-index\"}[30m])) > bool 0) == 1, \"section\", \"$1\", \"collector\", \"(.*)\"))"
+          "expr": "max by (section) ((min by (section) (agent_sessions_metrics_section_success_ratio{job=\"agent-history-index\"}) < bool 1) == 1 or label_replace((sum by (collector) (increase(agent_history_exporter_collection_errors_total{job=\"agent-history-index\"}[30m])) > bool 0) == 1, \"section\", \"$1\", \"collector\", \"(.*)\") or label_replace((max(last_over_time(agent_history_loop_checkout_unconfigured{job=\"agent-history-collect\"}[2h])) > bool 0) == 1, \"section\", \"loop_checkout\", \"\", \".*\") or label_replace((min(last_over_time(agent_history_loop_checkout_observation_complete_ratio{job=\"agent-history-collect\"}[2h])) < bool 1) == 1, \"section\", \"loop_checkout_observation\", \"\", \".*\"))"
         }
       ]
     },
@@ -296,7 +296,80 @@
               "value": 1
             }
           ],
-          "expr": "max by (section) ((min by (section) (agent_sessions_metrics_section_success_ratio{job=\"agent-history-index\"}) < bool 1) == 1 or label_replace((sum by (collector) (increase(agent_history_exporter_collection_errors_total{job=\"agent-history-index\"}[30m])) > bool 0) == 1, \"section\", \"$1\", \"collector\", \"(.*)\"))"
+          "expr": "max by (section) ((min by (section) (agent_sessions_metrics_section_success_ratio{job=\"agent-history-index\"}) < bool 1) == 1 or label_replace((sum by (collector) (increase(agent_history_exporter_collection_errors_total{job=\"agent-history-index\"}[30m])) > bool 0) == 1, \"section\", \"$1\", \"collector\", \"(.*)\") or label_replace((max(last_over_time(agent_history_loop_checkout_unconfigured{job=\"agent-history-collect\"}[2h])) > bool 0) == 1, \"section\", \"loop_checkout\", \"\", \".*\") or label_replace((min(last_over_time(agent_history_loop_checkout_observation_complete_ratio{job=\"agent-history-collect\"}[2h])) < bool 1) == 1, \"section\", \"loop_checkout_observation\", \"\", \".*\"))"
+        }
+      ]
+    },
+    {
+      "input_series": [
+        {
+          "series": "agent_history_loop_checkout_unconfigured{job=\"agent-history-collect\"}",
+          "values": "0x60"
+        },
+        {
+          "series": "agent_history_loop_checkout_observation_complete_ratio{job=\"agent-history-collect\"}",
+          "values": "1x60"
+        }
+      ],
+      "interval": "1m",
+      "name": "loop checkout configured",
+      "promql_expr_test": [
+        {
+          "eval_time": "45m",
+          "exp_samples": [],
+          "expr": "max by (section) ((min by (section) (agent_sessions_metrics_section_success_ratio{job=\"agent-history-index\"}) < bool 1) == 1 or label_replace((sum by (collector) (increase(agent_history_exporter_collection_errors_total{job=\"agent-history-index\"}[30m])) > bool 0) == 1, \"section\", \"$1\", \"collector\", \"(.*)\") or label_replace((max(last_over_time(agent_history_loop_checkout_unconfigured{job=\"agent-history-collect\"}[2h])) > bool 0) == 1, \"section\", \"loop_checkout\", \"\", \".*\") or label_replace((min(last_over_time(agent_history_loop_checkout_observation_complete_ratio{job=\"agent-history-collect\"}[2h])) < bool 1) == 1, \"section\", \"loop_checkout_observation\", \"\", \".*\"))"
+        }
+      ]
+    },
+    {
+      "input_series": [
+        {
+          "series": "agent_history_loop_checkout_unconfigured{job=\"agent-history-collect\"}",
+          "values": "1x60"
+        },
+        {
+          "series": "agent_history_loop_checkout_observation_complete_ratio{job=\"agent-history-collect\"}",
+          "values": "1x60"
+        }
+      ],
+      "interval": "1m",
+      "name": "loop checkout unconfigured",
+      "promql_expr_test": [
+        {
+          "eval_time": "45m",
+          "exp_samples": [
+            {
+              "labels": "{section=\"loop_checkout\"}",
+              "value": 1
+            }
+          ],
+          "expr": "max by (section) ((min by (section) (agent_sessions_metrics_section_success_ratio{job=\"agent-history-index\"}) < bool 1) == 1 or label_replace((sum by (collector) (increase(agent_history_exporter_collection_errors_total{job=\"agent-history-index\"}[30m])) > bool 0) == 1, \"section\", \"$1\", \"collector\", \"(.*)\") or label_replace((max(last_over_time(agent_history_loop_checkout_unconfigured{job=\"agent-history-collect\"}[2h])) > bool 0) == 1, \"section\", \"loop_checkout\", \"\", \".*\") or label_replace((min(last_over_time(agent_history_loop_checkout_observation_complete_ratio{job=\"agent-history-collect\"}[2h])) < bool 1) == 1, \"section\", \"loop_checkout_observation\", \"\", \".*\"))"
+        }
+      ]
+    },
+    {
+      "input_series": [
+        {
+          "series": "agent_history_loop_checkout_unconfigured{job=\"agent-history-collect\"}",
+          "values": "0x60"
+        },
+        {
+          "series": "agent_history_loop_checkout_observation_complete_ratio{job=\"agent-history-collect\"}",
+          "values": "0x60"
+        }
+      ],
+      "interval": "1m",
+      "name": "loop checkout observation partial",
+      "promql_expr_test": [
+        {
+          "eval_time": "45m",
+          "exp_samples": [
+            {
+              "labels": "{section=\"loop_checkout_observation\"}",
+              "value": 1
+            }
+          ],
+          "expr": "max by (section) ((min by (section) (agent_sessions_metrics_section_success_ratio{job=\"agent-history-index\"}) < bool 1) == 1 or label_replace((sum by (collector) (increase(agent_history_exporter_collection_errors_total{job=\"agent-history-index\"}[30m])) > bool 0) == 1, \"section\", \"$1\", \"collector\", \"(.*)\") or label_replace((max(last_over_time(agent_history_loop_checkout_unconfigured{job=\"agent-history-collect\"}[2h])) > bool 0) == 1, \"section\", \"loop_checkout\", \"\", \".*\") or label_replace((min(last_over_time(agent_history_loop_checkout_observation_complete_ratio{job=\"agent-history-collect\"}[2h])) < bool 1) == 1, \"section\", \"loop_checkout_observation\", \"\", \".*\"))"
         }
       ]
     },

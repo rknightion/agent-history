@@ -83,6 +83,8 @@ agent_history_embed_pending_messages {chunk} -
 agent_history_embed_failed_inputs {input} -
 agent_history_embed_vectors {vector} -
 agent_history_exporter_collection_duration_seconds s collector
+agent_history_loop_checkout_unconfigured {checkout} -
+agent_history_loop_checkout_observation_complete 1 -
 agent_history_cold_tier_available 1 -
 agent_sessions_storage_root_available 1 tier
 agent_sessions_filesystem_bytes By tier,kind

@@ -75,6 +75,46 @@ def receiver(monkeypatch):
         capture.close()
 
 
+def test_hourly_checkout_warning_reaches_otlp(tmp_path, receiver, monkeypatch):
+    from test_checkout_observer import _explicit, _git, _source
+    from agent_history import collect_git
+    from agent_history.config import Config
+
+    repo = _git(tmp_path / "checkout")
+    home = tmp_path / "home"
+    session_dir = home / "sessions" / "example"
+    session_dir.mkdir(parents=True)
+    source, _, _ = _source(
+        session_dir,
+        "root.jsonl",
+        [
+            {"type": "session", "cwd": str(repo)},
+            {
+                "type": "message",
+                "message": {"role": "user", "content": "You are the root. Write codex/closeout-widget-loop1.md"},
+            },
+        ],
+    )
+    assert source.is_file()
+    config = Config()
+    config.sources = {"pi-example": home}
+    _explicit(config, tmp_path)
+    config.identities.git_owners = ["github.com/example"]
+    config.exporter.state_dir = tmp_path / "state"
+    config.collector.lock_file = tmp_path / "collect.lock"
+    monkeypatch.setattr("agent_history.config.load_config", lambda _: config)
+    monkeypatch.setattr(collect_git, "machine_name", lambda: ("example-machine", "example-machine"))
+    monkeypatch.setattr(collect_git.Collector, "repositories", lambda _: None)
+    monkeypatch.setattr(collect_git.Collector, "homes", lambda *args: None)
+    assert collect_git.main(["--dry-run"]) == 0
+    bodies = [body for path, body in receiver.requests if path == "/v1/metrics"]
+    assert bodies, "hourly collector did not export its warning"
+    decoded = otlp_parity.decode(bodies[-1])
+    assert decoded["agent_history_loop_checkout_unconfigured"]["points"] == {(): 1.0}
+    assert decoded["agent_history_loop_checkout_observation_complete"]["points"] == {(): 1.0}
+    assert str(repo).encode() not in bodies[-1]
+
+
 def make_collection(tmp_path, collectors, bridge, refresh=0):
     return Collection(collectors, State(tmp_path), refresh, bridge=bridge)
 

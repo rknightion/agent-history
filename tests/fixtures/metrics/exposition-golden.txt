@@ -691,6 +691,12 @@ agent_history_last_success_timestamp_seconds 0.142857142857
 # HELP agent_history_lock_held Synthetic agent_history_lock_held.
 # TYPE agent_history_lock_held gauge
 agent_history_lock_held 0.142857142857
+# HELP agent_history_loop_checkout_observation_complete Synthetic agent_history_loop_checkout_observation_complete.
+# TYPE agent_history_loop_checkout_observation_complete gauge
+agent_history_loop_checkout_observation_complete 0.142857142857
+# HELP agent_history_loop_checkout_unconfigured Synthetic agent_history_loop_checkout_unconfigured.
+# TYPE agent_history_loop_checkout_unconfigured gauge
+agent_history_loop_checkout_unconfigured 0.142857142857
 # HELP agent_history_parse_issues_total Synthetic agent_history_parse_issues_total.
 # TYPE agent_history_parse_issues_total gauge
 agent_history_parse_issues_total{kind="json_error"} 0.142857142857
@@ -1756,6 +1762,12 @@ agent_history_last_success_timestamp_seconds 0.142857142857
 # HELP agent_history_lock_held Synthetic agent_history_lock_held.
 # TYPE agent_history_lock_held gauge
 agent_history_lock_held 0.142857142857
+# HELP agent_history_loop_checkout_observation_complete Synthetic agent_history_loop_checkout_observation_complete.
+# TYPE agent_history_loop_checkout_observation_complete gauge
+agent_history_loop_checkout_observation_complete 0.142857142857
+# HELP agent_history_loop_checkout_unconfigured Synthetic agent_history_loop_checkout_unconfigured.
+# TYPE agent_history_loop_checkout_unconfigured gauge
+agent_history_loop_checkout_unconfigured 0.142857142857
 # HELP agent_history_parse_issues_total Synthetic agent_history_parse_issues_total.
 # TYPE agent_history_parse_issues_total gauge
 agent_history_parse_issues_total{kind="json_error"} 0.142857142857
@@ -2930,6 +2942,12 @@ agent_history_last_success_timestamp_seconds 0.142857142857
 # HELP agent_history_lock_held Synthetic agent_history_lock_held.
 # TYPE agent_history_lock_held gauge
 agent_history_lock_held 0.142857142857
+# HELP agent_history_loop_checkout_observation_complete Synthetic agent_history_loop_checkout_observation_complete.
+# TYPE agent_history_loop_checkout_observation_complete gauge
+agent_history_loop_checkout_observation_complete 0.142857142857
+# HELP agent_history_loop_checkout_unconfigured Synthetic agent_history_loop_checkout_unconfigured.
+# TYPE agent_history_loop_checkout_unconfigured gauge
+agent_history_loop_checkout_unconfigured 0.142857142857
 # HELP agent_history_parse_issues_total Synthetic agent_history_parse_issues_total.
 # TYPE agent_history_parse_issues_total gauge
 agent_history_parse_issues_total{kind="json_error"} 0.142857142857

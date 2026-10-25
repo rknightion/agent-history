@@ -1766,11 +1766,26 @@ def _main(argv: list[str] | None = None, dsn=None) -> int:
                 return 0
             detected, hostname = machine_name()
             machine = MACHINE or detected
-            summary: dict[str, Any] = {"ok": True, "machine": machine, "dry_run": args.dry_run}
+            from .metrics import checkout
+
+            summary: dict[str, Any] = {
+                "ok": True,
+                "machine": machine,
+                "dry_run": args.dry_run,
+                "loop_checkout_observation": "unavailable",
+                "warnings": [],
+            }
             conn = None
             try:
+                observation_error = None
+                try:
+                    summary.update(checkout.collect(config))
+                except Exception as error:
+                    observation_error = type(error).__name__
                 conn = None if args.dry_run else connect(dsn, config)
                 collector = Collector(conn, args.dry_run, started + RUNTIME_LIMIT_S, args.rescan_days)
+                if observation_error:
+                    collector.errors.append({"step": "loop_checkout", "error": observation_error})
                 try:
                     from .collect_receipts import collect as collect_receipts
 

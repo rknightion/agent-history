@@ -90,18 +90,18 @@ class EfficiencyCollector:
             and parts[6].startswith("agent-")
         )
 
-    def collect(self) -> tuple[Family, ...]:
-        now = time.time()
-        path = self.state_dir / "efficiency-state.json"
-        state = rules.read_efficiency_state(path, self.config.efficiency.baseline_ts)
+    def inventory(self, *, budget=None) -> dict[str, tuple[Path, int, int]]:
+        """Shared harness filters; only the optional observer path bounds discovery."""
         sources: dict[str, tuple[Path, int, int]] = {}
         for namespace, home in self.config.sources.items():
             # A missing home must not erase its offsets. Reject symlinked transcript files.
-            if not home.is_dir():
+            if budget is None and not home.is_dir():
                 continue
+            if budget is not None and not budget.check():
+                break
             # Every metrics refresh walks every home: scandir with string paths, not rglob and
             # relative_to, which cost seconds of CPU per refresh on a large archive.
-            for rel_path, stat in scan_jsonl(str(home), prune=frozenset({"subagent-artifacts"})):
+            for rel_path, stat in scan_jsonl(str(home), prune=frozenset({"subagent-artifacts"}), budget=budget):
                 parts = tuple(rel_path.split("/"))
                 agent = namespace.split("-", 1)[0]
                 if agent == "claude" and not self._claude_transcript(parts):
@@ -115,6 +115,13 @@ class EfficiencyCollector:
                 ):
                     continue
                 sources[namespace + "/" + rel_path] = (home / rel_path, stat.st_size, stat.st_mtime_ns)
+        return sources
+
+    def collect(self) -> tuple[Family, ...]:
+        now = time.time()
+        path = self.state_dir / "efficiency-state.json"
+        state = rules.read_efficiency_state(path, self.config.efficiency.baseline_ts)
+        sources = self.inventory()
         retired = rules.efficiency_prune_loops(state, now)
         fresh_loop_map = None
         self.section_health = {}
