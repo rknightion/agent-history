@@ -67,15 +67,34 @@ pi-local = "~/.pi/agent"
 
 # Who you are, for `agent-history collect-git`: commits whose author email is listed are marked as
 # yours (ah.git_commit.author_is_owner). Emails are compared, never stored. git_owners, when set,
-# limits ingestion to remotes under these host/owner prefixes.
+# limits ingestion to remotes under these host/owner prefixes. git_repos adds exact host/owner/name
+# entries without admitting siblings under their owner. These are source admission, not aliases.
 [identities]
 owner_emails = []
 # git_owners = ["github.com/your-user"]
+# git_repos = ["github.com/example-team/widget"]
 
 # Local checkouts whose default-branch history `collect-git` ingests.
 [git]
 repos = []
 days = 180
+# Explicit additional read branches. The collector fetches these exact heads, never all branches,
+# and refuses a repo pass if one is unavailable. Commits/files and Done history are unioned by
+# natural key; on_default still means the actual default branch. Task snapshots choose the latest
+# updated_date across tips; task removal is not inferred for multi-branch repositories.
+# [git.extra_branches]
+# "github.com/example-team/widget" = ["staging"]
+
+# Explicit reader identity after a transfer. Slugs are owner/repo (host is not part of loop
+# identity). Use a flat old -> final map, with no chains, cycles or self aliases. Admission still
+# checks each actual origin against git_owners/git_repos before collection.
+# The writer's `agent-history collect-git` publishes these mappings to ah.meta. Publish before
+# refreshing loops; the hourly ingest role cannot publish them. Missing config on another copy
+# preserves mappings; a conflicting retained mapping refuses rather than rewriting history.
+# Old collector rows and transcript identities are retained. canonical_repo and loop Done/trailer
+# counts resolve both names; narrow scoped live-reader admission remains exact, not aliased.
+# [git.repo_aliases]
+# "old-team/widget" = "example-team/widget"
 
 # Embeddings are off by default. When on, `agent-history embed` sends message chunks, session
 # summaries and tool-error excerpts, including a cwd/project basename header, to an external

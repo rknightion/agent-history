@@ -131,6 +131,7 @@ class LoopLive:
 class Identities:
     owner_emails: frozenset[str] = frozenset()
     git_owners: frozenset[str] = frozenset()  # "host/owner", e.g. "github.com/example-org"
+    git_repos: frozenset[str] = frozenset()  # Exact "host/owner/name" admission, independent of aliases.
 
     def is_owner(self, email: str) -> bool:
         return email.strip().lower() in self.owner_emails
@@ -231,6 +232,8 @@ class Config:
     identities: Identities = field(default_factory=Identities)
     git_repos: list[Path] = field(default_factory=list)
     git_days: int = 180
+    git_extra_branches: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    git_repo_aliases: dict[str, str] = field(default_factory=dict)
     collector: CollectorConfig = field(default_factory=CollectorConfig)
     embedding: Embedding = field(default_factory=Embedding)
     loop_live: LoopLive = field(default_factory=LoopLive)
@@ -252,6 +255,58 @@ def _table(data: dict[str, Any], key: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ConfigError(f"[{key}] must be a table", key=key)
     return value
+
+
+def _repo_name(value: Any, *, hosted: bool, key: str) -> str:
+    """Validate explicit slugs, never URLs or owner-wide selectors."""
+    if not isinstance(value, str):
+        raise ConfigError("repository names must be strings", key=key)
+    value = value.strip().lower().rstrip("/")
+    pattern = r"[a-z0-9][a-z0-9.-]*/" if hosted else ""
+    if not re.fullmatch(pattern + r"[a-z0-9._-]+/[a-z0-9._-]+", value) or any(
+        part in (".", "..") for part in value.split("/")
+    ):
+        raise ConfigError("repository names must be exact slugs", key=key)
+    return value
+
+
+def _read_branches(value: Any) -> dict[str, tuple[str, ...]]:
+    if not isinstance(value, dict):
+        raise ConfigError("git.extra_branches must be a table", key="git")
+    out = {}
+    for slug, branches in value.items():
+        slug = _repo_name(slug, hosted=True, key="git")
+        if not isinstance(branches, list) or not all(
+            isinstance(b, str)
+            and b
+            and not b.startswith(("-", "/"))
+            and not b.endswith(("/", "."))
+            and not any(c in b for c in ("..", "@{", "//"))
+            and not re.search(r"[\x00-\x20\x7f~^:?*\[\\\\]", b)
+            and all(not p.startswith(".") and not p.endswith(".lock") for p in b.split("/"))
+            for b in branches
+        ):
+            raise ConfigError("git.extra_branches requires lists of valid branch names", key="git")
+        if slug in out:
+            raise ConfigError("duplicate git.extra_branches repository", key="git")
+        out[slug] = tuple(dict.fromkeys(branches))
+    return out
+
+
+def _repo_aliases(value: Any) -> dict[str, str]:
+    if not isinstance(value, dict):
+        raise ConfigError("git.repo_aliases must be a table", key="git")
+    aliases = {}
+    for old, new in value.items():
+        old = _repo_name(old, hosted=False, key="git")
+        new = _repo_name(new, hosted=False, key="git")
+        if old in aliases or old == new:
+            raise ConfigError("duplicate or self-referencing git.repo_aliases", key="git")
+        aliases[old] = new
+    # Store a flat map. A transfer chain must explicitly name its final identity for every alias.
+    if set(aliases) & set(aliases.values()):
+        raise ConfigError("git.repo_aliases cannot contain chains or cycles", key="git")
+    return aliases
 
 
 def parse_config(data: dict[str, Any], path: Path | None = None) -> Config:
@@ -311,6 +366,7 @@ def parse_config(data: dict[str, Any], path: Path | None = None) -> Config:
     identities = Identities(
         owner_emails=frozenset(e.strip().lower() for e in ident.get("owner_emails", [])),
         git_owners=frozenset(o.strip().lower().rstrip("/") for o in ident.get("git_owners", [])),
+        git_repos=frozenset(_repo_name(r, hosted=True, key="identities") for r in ident.get("git_repos", [])),
     )
     git = _table(data, "git")
     col = _table(data, "collector")
@@ -464,6 +520,8 @@ def parse_config(data: dict[str, Any], path: Path | None = None) -> Config:
         identities=identities,
         git_repos=[Path(p).expanduser() for p in git.get("repos", [])],
         git_days=int(git.get("days", 180)),
+        git_extra_branches=_read_branches(git.get("extra_branches", {})),
+        git_repo_aliases=_repo_aliases(git.get("repo_aliases", {})),
         collector=collector,
         embedding=embedding,
         loop_live=loop_live,

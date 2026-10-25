@@ -614,13 +614,16 @@ lifecycle meanings above are unchanged; consumers should still inspect `observed
 Migration `026_loop_planner_signals.sql` adds the collector tables `ah.backlog_done_event`, primary key
 `(repo_slug, task_key, sha)`, and `ah.backlog_done_scan`, and three nullable `ah.loops` columns:
 
-- `backlog_done_event`: one row per first-parent commit of the default branch (a merge counts at the
-  merge, not at the branch's own commits) whose backlog task file has frontmatter `status` Done where
+- `backlog_done_event`: one row per first-parent commit of each explicitly configured read branch
+  (the default plus `git.extra_branches`). A merge counts at the merge on that branch, not at its
+  second-parent commits. Common `(repo_slug, task_key, sha)` rows count once across branches.
+  The backlog task file has frontmatter `status` Done where
   its first parent had another status. Only frontmatter counts; a `status:` line in a task body does
   not. A task file created as Done, or moved while already Done, is not a flip. The collector reads
   the same window as `git_commit`, widens it once per repo to every stored commit (recorded in the
   collector table `ah.backlog_done_scan`, `repo_slug` and `widened_at`), and removes rows in the
-  window whose commit the clone proves is no longer on the default branch. Rebuild keeps both tables.
+  window only when the clone proves the commit is off every configured read branch. A failed extra
+  branch fetch refuses the repository pass rather than reconciling a partial scope. Rebuild keeps both tables.
 - `tasks_done bigint`: distinct tasks with a Done flip in the loop's `repo` between `launch_ts` and
   `end_ts`, whatever session made the change. Running/waiting/paused windows are open; a stale loop's
   ends at its `end_ts`, the root's last observed activity. NULL when `repo` is unknown or the collector
@@ -1151,7 +1154,35 @@ Legacy `loop_receipt` rows retain receipt text, qualified report line 1, hashes 
 historical reads; new receipt collection is retired globally. These metadata fields may themselves
 be sensitive. Protect collector homes, configuration and the catalogue accordingly.
 
-Repositories and homes are explicitly configured. A failed CI query is an attributable collection
+Repositories and homes are explicitly configured. `identities.git_repos` admits exact
+`host/owner/name` origins in addition to `git_owners`; admitting one repo never admits or enumerates
+its owner's siblings. Fork checks for exact GitHub entries query only those repositories.
+The writer's `collect-git` also enforces exact-only admission when no owner is configured,
+and reads the explicitly configured extra branches through the same commit/file path.
+`git.extra_branches` maps exact origins to additional branch names. Only those heads are fetched,
+into remote-tracking refs; local branches and the checkout are unchanged. Commit/file rows are
+unioned by natural key and `on_default` retains its literal default-branch meaning. Ordinary
+upserts can insert new extra-only commits as false, but preserve existing true flags; only a
+successful default fetch followed by atomic audited reconciliation can demote them. That
+reconciliation compares default membership, not the observed branch union. Tracker tip
+snapshots choose the newest task `updated_at`, default first on ties, and conflicting tracker
+configurations refuse the step. Multi-branch snapshots do not infer task removals. When adding a
+branch to an already scanned repo, use an explicit `--rescan-days` covering the desired historical
+window; adding a branch does not reset its existing scan receipt.
+
+`git.repo_aliases` declares flat `owner/repo` transfers for readers, never source admission.
+The writer's `collect-git` publishes the map to the retained `ah.meta.git_repo_aliases` value (key
+`git_repo_aliases`); the hourly ingest role receives no new privilege and cannot publish it.
+Publication is additive: missing configuration preserves prior mappings and conflicting, chained
+or cyclic mappings refuse. Old collector rows, scan receipts and transcript identities are never
+rewritten or deleted by alias publication. `ah.canonical_repo(text)` returns the final owner/repo
+from either a collector slug or owner/repo; as with existing loop joins, host is not part of that
+reader identity. Loop Done counts and v3 Task-trailer counts use this seam, deduplicating exact
+task IDs across old/new rows and branches. This does not change identity evidence rules, stored
+loop repo values or exact admission in the narrow SECURITY DEFINER live-reader functions. Other
+direct-table readers must explicitly use the canonical seam when grouping transfers.
+
+A failed CI query is an attributable collection
 error, not a failed or successful CI run. Other repositories continue independently. New metadata
 or state inputs that cannot be read or change during collection are skipped, reported in the
 run's `errors` and retried next run; like other step errors they do not fail the run (only

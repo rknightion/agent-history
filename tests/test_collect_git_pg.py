@@ -86,6 +86,78 @@ def test_commits_are_ingested_with_owner_flag_and_no_email(clean, repo):  # noqa
     clean.rollback()
 
 
+def test_writer_entrypoint_publishes_aliases_but_hourly_does_not(clean):  # noqa: F811
+    from agent_history import collect_git as C
+    import json
+    import time
+
+    config = parse_config({"git": {"repo_aliases": {"example/project": "new-team/project"}}})
+    try:
+        clean.execute("DELETE FROM ah.meta WHERE key='git_repo_aliases'")
+        clean.commit()
+        assert collect(clean, config)["repos"] == 0
+        assert clean.execute("SELECT ah.canonical_repo('example/project')").fetchone() == ("new-team/project",)
+        config.git_repo_aliases = {"example/project": "other/project"}
+        C.configure(config)
+        C.Collector(clean, False, time.monotonic() + 30).repositories()
+        # Even a configured hourly pass must not publish or replace the writer-owned map.
+        value = clean.execute("SELECT value FROM ah.meta WHERE key='git_repo_aliases'").fetchone()[0]
+        assert json.loads(value) == {"example/project": "new-team/project"}
+    finally:
+        clean.rollback()
+        clean.execute("DELETE FROM ah.meta WHERE key='git_repo_aliases'")
+        clean.commit()
+
+
+@pytest.mark.parametrize("include_sibling", [False, True])
+def test_writer_entrypoint_exact_only_admission_and_extra_branch(clean, repo, tmp_path, monkeypatch, include_sibling):  # noqa: F811
+    from agent_history import collect_git as C
+
+    slug = "github.com/example-org/widget"
+    git(repo, "checkout", "-qb", "staging")
+    (repo / "side.txt").write_text("extra branch only\n")
+    git(repo, "add", "side.txt")
+    git(repo, "commit", "-qm", "side commit")
+    git(repo, "checkout", "-q", "main")
+    origin = tmp_path / "origin.git"
+    git(tmp_path, "clone", "--bare", str(repo), str(origin))
+    git(repo, "update-ref", "refs/remotes/origin/main", "main")
+    git(repo, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+    sibling = tmp_path / "sibling"
+    git(tmp_path, "clone", str(origin), str(sibling))
+    git(sibling, "remote", "set-url", "origin", "https://github.com/example-org/sibling.git")
+    outbound = C._outbound_run
+
+    def local_fetch(name, args, **kwargs):
+        if name == "git.fetch":
+            args = [str(origin) if arg == "origin" else arg for arg in args]
+        return outbound(name, args, **kwargs)
+
+    monkeypatch.setattr(C, "_outbound_run", local_fetch)
+    config = parse_config(
+        {
+            "identities": {"git_repos": [slug]},
+            "git": {
+                "repos": [str(repo)] + ([str(sibling)] if include_sibling else []),
+                "extra_branches": {slug: ["staging"]},
+            },
+        }
+    )
+    result = collect(clean, config)
+    assert result["repos"] == 1
+    if include_sibling:
+        assert len(result["skipped"]) == 1 and result["skipped"][0].startswith("sibling:")
+    else:
+        assert result["skipped"] == []
+    rows = clean.execute(
+        "SELECT subject,on_default FROM ah.git_commit WHERE repo_slug=%s ORDER BY subject", (slug,)
+    ).fetchall()
+    assert rows == [("add a", True), ("extend a", True), ("side commit", False)]
+    assert clean.execute("SELECT path FROM ah.git_commit_file WHERE path='side.txt'").fetchall() == [("side.txt",)]
+    assert clean.execute("SELECT count(*) FROM ah.git_commit WHERE repo_slug<>%s", (slug,)).fetchone() == (0,)
+    assert subprocess.check_output(["git", "-C", str(repo), "branch", "--show-current"], text=True).strip() == "main"
+
+
 def test_owner_allowlist_skips_other_owners(clean, repo):  # noqa: F811
     config = parse_config({"identities": {"git_owners": ["github.com/someone-else"]}, "git": {"repos": [str(repo)]}})
     result = collect(clean, config)
@@ -253,6 +325,89 @@ def reconcile_off_default(db, info, table, dry_run=False):
         return collector
     collector._backlog_done(info, 4)
     return collector
+
+
+def test_extra_read_branch_protects_done_history_from_off_branch_deletion(clean, off_default_repo):  # noqa: F811
+    import time
+
+    from agent_history.collect_git import Collector
+
+    info, side, _, _ = off_default_repo
+    info["refs"] = [info["ref"], "side"]
+    collector = Collector(clean, False, time.monotonic() + 60)
+    collector._reconcile_off_branch(info, "backlog_done_event", 30, [])
+    assert clean.execute(
+        "SELECT count(*) FROM ah.backlog_done_event WHERE repo_slug = %s AND sha = %s", (info["slug"], side)
+    ).fetchone() == (2,)
+    assert clean.execute("SELECT count(*) FROM ah.collector_mutation_audit").fetchone() == (0,)
+    clean.rollback()
+
+
+@pytest.mark.parametrize("fetched", [False, True])
+def test_extra_only_commit_demotion_requires_default_fetch_and_prior_audit(
+    clean,  # noqa: F811
+    off_default_repo,
+    mutation_guard,
+    fetched,
+):
+    """A real branch union must not let ordinary upsert bypass the default-fetch/audit fence."""
+    from agent_history import collect_git
+
+    info, side, tip, unknown = off_default_repo
+    # A new extra-only commit must insert false even when an older extra-only commit is still
+    # retained as true pending successful-default-fetch reconciliation.
+    git(info["path"], "checkout", "-q", "side")
+    (info["path"] / "extra.txt").write_text("new extra-only evidence\n")
+    git(info["path"], "add", "extra.txt")
+    git(info["path"], "commit", "-q", "-m", "new extra-only commit", "-m", "Task: EX-0099")
+    extra = collect_git.git(info["path"], "rev-parse", "HEAD").strip()
+    git(info["path"], "checkout", "-q", "main")
+    info.update(refs=[info["ref"], "side"], fetched=fetched)
+    before_files = clean.execute(
+        "SELECT * FROM ah.git_commit_file WHERE repo_slug=%s ORDER BY sha,path", (info["slug"],)
+    ).fetchall()
+    before_commit = clean.execute(
+        "SELECT committed_at,subject,task_ids,insertions,deletions FROM ah.git_commit WHERE repo_slug=%s AND sha=%s",
+        (info["slug"], side),
+    ).fetchone()
+    clean.commit()
+    if fetched:
+        mutation_guard("git_commit")
+    collector = reconcile_off_default(clean, info, "git_commit")
+    assert not collector.errors
+    assert clean.execute(
+        "SELECT on_default FROM ah.git_commit WHERE repo_slug=%s AND sha=%s", (info["slug"], side)
+    ).fetchone() == (not fetched,)
+    assert clean.execute(
+        "SELECT on_default,task_ids FROM ah.git_commit WHERE repo_slug=%s AND sha=%s", (info["slug"], extra)
+    ).fetchone() == (False, ["EX-0099"])
+    assert clean.execute(
+        "SELECT on_default FROM ah.git_commit WHERE repo_slug=%s AND sha=%s", (info["slug"], unknown)
+    ).fetchone() == (True,)
+    assert (
+        clean.execute(
+            "SELECT committed_at,subject,task_ids,insertions,deletions FROM ah.git_commit WHERE repo_slug=%s AND sha=%s",
+            (info["slug"], side),
+        ).fetchone()
+        == before_commit
+    )
+    after_files = clean.execute(
+        "SELECT * FROM ah.git_commit_file WHERE repo_slug=%s AND sha<>%s ORDER BY sha,path", (info["slug"], extra)
+    ).fetchall()
+    assert after_files == before_files
+    assert clean.execute(
+        "SELECT path,insertions FROM ah.git_commit_file WHERE repo_slug=%s AND sha=%s", (info["slug"], extra)
+    ).fetchall() == [("extra.txt", 1)]
+    audits = clean.execute(
+        "SELECT operation,row_key,ref,ref_sha FROM ah.collector_mutation_audit WHERE table_name='git_commit'"
+    ).fetchall()
+    expected = [("off_default", {"repo_slug": info["slug"], "sha": side}, info["ref"], tip)] if fetched else []
+    assert audits == expected
+    clean.commit()
+    # Repeated collection neither rewrites the retained true row nor adds duplicate audit rows.
+    assert not reconcile_off_default(clean, info, "git_commit").errors
+    assert clean.execute("SELECT count(*) FROM ah.collector_mutation_audit").fetchone() == (len(expected),)
+    clean.rollback()
 
 
 @pytest.fixture

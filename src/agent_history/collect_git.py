@@ -36,6 +36,8 @@ LONDON = ZoneInfo("Europe/London")
 CONTEXT = "default"
 REPO_CONTEXTS = {}
 ALLOWED_OWNERS = set()
+ALLOWED_REPOS = set()
+EXTRA_BRANCHES = {}
 GITHUB_OWNERS = []
 
 
@@ -129,14 +131,18 @@ def slug_host(slug: str | None) -> str | None:
     return slug.split("/", 1)[0] if slug else None
 
 
-def allowlisted(slug: str | None) -> bool:
+def repo_admitted(slug: str | None, owners: Iterable[str], repositories: Iterable[str]) -> bool:
+    """Pure admission shared by collection and observation; aliases never confer access."""
     if not slug:
         return False
-    parts = slug.split("/")
+    parts = slug.lower().split("/")
     if len(parts) != 3 or not all(parts):
         return False
-    host, owner, _ = parts
-    return (host, owner.lower()) in ALLOWED_OWNERS
+    return "/".join(parts) in repositories or "/".join(parts[:2]) in owners
+
+
+def allowlisted(slug: str | None) -> bool:
+    return repo_admitted(slug, {"/".join(owner) for owner in ALLOWED_OWNERS}, ALLOWED_REPOS)
 
 
 def is_owner(email: str, extra: Iterable[str] = ()) -> bool:
@@ -502,24 +508,62 @@ def classify_repo(repo: Path, forks: set[str] | None) -> tuple[dict[str, Any] | 
     fetched = (
         _outbound_run(
             "git.fetch",
-            ["git", "-C", str(repo), "fetch", "--quiet", "--no-tags", "origin", branch],
+            [
+                "git",
+                "-C",
+                str(repo),
+                "fetch",
+                "--quiet",
+                "--no-tags",
+                "origin",
+                f"+refs/heads/{branch}:refs/remotes/origin/{branch}",
+            ],
             capture_output=True,
             env=GIT_ENV,
             timeout=60,
         ).returncode
         == 0
     )
-    remote = f"origin/{branch}"
-    has_remote = bool(git(repo, "rev-parse", "-q", "--verify", f"refs/remotes/{remote}", check=False).strip())
+    remote = f"refs/remotes/origin/{branch}"
+    has_remote = bool(git(repo, "rev-parse", "-q", "--verify", remote, check=False).strip())
+    refs = read_refs(repo, slug, remote if has_remote else branch)
     emails = {git(repo, "config", "user.email", check=False).strip()}
     return {
         "path": repo,
         "slug": slug,
         "branch": branch,
         "ref": remote if has_remote else branch,
+        "refs": refs,
         "fetched": fetched and has_remote,
         "emails": emails,
     }, None
+
+
+def read_refs(repo: Path, slug: str, default_ref: str) -> list[str]:
+    """Fetch only explicitly configured extra branches into exact remote-tracking refs.
+
+    A missing or failed extra fetch refuses the repo pass, rather than reconciling against a
+    partial repository scope. The local checkout and its branches are never changed.
+    """
+    refs = [default_ref]
+    for branch in EXTRA_BRANCHES.get(slug, ()):
+        ref = f"refs/remotes/origin/{branch}"
+        result = _outbound_run(
+            "git.fetch",
+            ["git", "-C", str(repo), "fetch", "--quiet", "--no-tags", "origin", f"+refs/heads/{branch}:{ref}"],
+            capture_output=True,
+            env=GIT_ENV,
+            timeout=60,
+        )
+        if result.returncode or not git(repo, "rev-parse", "--verify", f"{ref}^{{commit}}", check=False).strip():
+            raise RuntimeError("explicit read branch unavailable")
+        if ref not in refs:
+            refs.append(ref)
+    return refs
+
+
+def branch_infos(info: dict[str, Any]) -> list[dict[str, Any]]:
+    return [dict(info, ref=ref) for ref in info.get("refs", [info["ref"]])]
 
 
 def off_branch(repo: Path, sha: str, ref: str) -> bool:
@@ -564,6 +608,27 @@ def github_forks() -> set[str] | None:
         for r in json.loads(out.stdout or "[]"):
             if r.get("isFork"):
                 forks.add(f"{GITHUB_HOST}/{r['nameWithOwner']}".lower())
+    # Exact-repository admission must not enumerate or admit its entire owner.
+    for slug in sorted(ALLOWED_REPOS):
+        if slug_host(slug) != GITHUB_HOST or slug.split("/")[1] in GITHUB_OWNERS:
+            continue
+        try:
+            out = _outbound_run(
+                "github.repository",
+                ["gh", "repo", "view", slug.split("/", 1)[1], "--json", "isFork"],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            if out.returncode:
+                return None
+            fork = json.loads(out.stdout)["isFork"]
+            if not isinstance(fork, bool):
+                return None
+            if fork:
+                forks.add(slug)
+        except (OSError, subprocess.TimeoutExpired, ValueError, KeyError, TypeError):
+            return None
     return forks
 
 
@@ -583,6 +648,16 @@ def commit_snapshot(repo: Path, ref: str, days: int) -> tuple[str, str]:
 
 
 def git_commits(info: dict[str, Any], days: int) -> list[dict[str, Any]]:
+    """Union explicit read branches by SHA, preserving the literal on-default flag."""
+    rows = {}
+    for i, branch in enumerate(branch_infos(info)):
+        for row in _git_commits_one(branch, days):
+            row["on_default"] = i == 0
+            rows.setdefault(row["sha"], row)
+    return list(rows.values())
+
+
+def _git_commits_one(info: dict[str, Any], days: int) -> list[dict[str, Any]]:
     repo = info["path"]
     # Every query reads the same immutable commit and the same absolute cutoff. A relative
     # `N.days.ago` is re-evaluated per git call, and a branch can move between calls.
@@ -638,6 +713,14 @@ def git_commits(info: dict[str, Any], days: int) -> list[dict[str, Any]]:
 
 
 def git_commit_files(info: dict[str, Any], days: int) -> list[dict[str, Any]]:
+    rows = {}
+    for branch in branch_infos(info):
+        for row in _git_commit_files_one(branch, days):
+            rows.setdefault((row["sha"], row["path"]), row)
+    return list(rows.values())
+
+
+def _git_commit_files_one(info: dict[str, Any], days: int) -> list[dict[str, Any]]:
     """Per-file rows for every commit `git_commits` would list in the same window, one repo at a time."""
     repo, branch = info["path"], info["ref"]
     since = f"--since={days}.days.ago"
@@ -738,6 +821,25 @@ def cat_files(repo: Path, specs: list[str]) -> dict[str, str]:
 
 
 def backlog(info: dict[str, Any]) -> tuple[dict[str, Any] | None, list[dict[str, Any]], datetime | None]:
+    """Union explicit branch tips, choosing the newest task metadata, default first on ties."""
+    prefix, tasks, tip = None, {}, None
+    for branch in branch_infos(info):
+        current, rows, when = _backlog_one(branch)
+        if current is None:
+            continue
+        if prefix is not None and current != prefix:
+            raise RuntimeError("conflicting tracker configuration across read branches")
+        prefix = current
+        tip = max(tip, when) if tip else when
+        for row in rows:
+            previous = tasks.get(row["task_key"])
+            minimum = datetime.min.replace(tzinfo=timezone.utc)
+            if previous is None or (row["updated_at"] or minimum) > (previous["updated_at"] or minimum):
+                tasks[row["task_key"]] = row
+    return prefix, list(tasks.values()), tip
+
+
+def _backlog_one(info: dict[str, Any]) -> tuple[dict[str, Any] | None, list[dict[str, Any]], datetime | None]:
     """(task_prefix row, task rows, tip commit time) from the default-branch tip; (None, [], None) if no tracker."""
     repo, branch = info["path"], info["ref"]
     config_spec = f"{branch}:backlog/config.yml"
@@ -838,6 +940,14 @@ def done_events_from(
 
 
 def backlog_done_events(info: dict[str, Any], days: int, pad: int | None) -> list[dict[str, Any]]:
+    rows = {}
+    for branch in branch_infos(info):
+        for row in _backlog_done_events_one(branch, days, pad):
+            rows.setdefault((row["task_key"], row["sha"]), row)
+    return list(rows.values())
+
+
+def _backlog_done_events_one(info: dict[str, Any], days: int, pad: int | None) -> list[dict[str, Any]]:
     """Done transitions of the repo's backlog tasks in the same window `git_commits` uses.
 
     Walks first-parent history with merge diffs against the first parent, so a transition merged in counts
@@ -1100,6 +1210,16 @@ def upsert(
     )
     target = sql.Identifier("ah", table)
     tbl = sql.Identifier(table)
+    # Extra-only evidence may insert false, but it cannot demote a retained true row. Only the
+    # successful-default-fetch reconciliation may do that, with its audit and mutation atomic.
+    incoming = {
+        c: sql.SQL("CASE WHEN {}.{} IS TRUE THEN true ELSE EXCLUDED.{} END").format(
+            tbl, sql.Identifier(c), sql.Identifier(c)
+        )
+        if table == "git_commit" and c == "on_default"
+        else sql.SQL("EXCLUDED.{}").format(sql.Identifier(c))
+        for c in data
+    }
     stmt = sql.SQL(
         "INSERT INTO {target} AS {tbl} ({cols}) SELECT {select} FROM unnest({unnest}) AS u({cols}) "
         "ON CONFLICT ({key}) DO UPDATE SET {sets}{touch} "
@@ -1112,9 +1232,9 @@ def upsert(
         cols=sql.SQL(", ").join(map(sql.Identifier, names)),
         unnest=unnest,
         key=sql.SQL(", ").join(map(sql.Identifier, key)),
-        sets=sql.SQL(", ").join(sql.SQL("{} = EXCLUDED.{}").format(sql.Identifier(c), sql.Identifier(c)) for c in data),
+        sets=sql.SQL(", ").join(sql.SQL("{} = {}").format(sql.Identifier(c), incoming[c]) for c in data),
         old=sql.SQL(", ").join(sql.SQL("{}.{}").format(tbl, sql.Identifier(c)) for c in data),
-        new=sql.SQL(", ").join(sql.SQL("EXCLUDED.{}").format(sql.Identifier(c)) for c in data),
+        new=sql.SQL(", ").join(incoming[c] for c in data),
         guard=sql.SQL(" AND (" + guard + ")") if guard else sql.SQL(""),
     )
     from psycopg.types.json import Jsonb
@@ -1284,7 +1404,9 @@ class Collector:
             days = self.rescan_days or (RESCAN_DAYS if known else FIRST_RUN_DAYS)
             rows = git_commits(info, days)
             self.write("git_commit", GIT_COLS, ["repo_slug", "sha"], rows)
-            self._reconcile_off_branch(info, "git_commit", days, [r["sha"] for r in rows])
+            # The branch union includes extra-only commits. They are observed but not on the
+            # default branch, so they must remain candidates for audited off-default demotion.
+            self._reconcile_off_branch(info, "git_commit", days, [r["sha"] for r in rows if r["on_default"]])
         except Exception as error:  # one repo never stops the run
             self.rollback()
             self.errors.append({"repo": slug, "step": "git_commit", "error": type(error).__name__})
@@ -1339,7 +1461,14 @@ class Collector:
             return
         # Prove against an immutable commit, not a ref another fetch could move during this scan.
         ref_sha = git(info["path"], "rev-parse", "--verify", f"{info['ref']}^{{commit}}").strip()
-        gone = [sha for sha in candidates if off_branch(info["path"], sha, ref_sha)]
+        # Done history remains valid on any configured read branch. A commit's on_default flag
+        # still describes the actual default branch only, not an extra landing branch.
+        refs = [ref_sha]
+        if table == "backlog_done_event":
+            refs = [
+                git(info["path"], "rev-parse", "--verify", f"{b['ref']}^{{commit}}").strip() for b in branch_infos(info)
+            ]
+        gone = [sha for sha in candidates if all(off_branch(info["path"], sha, ref) for ref in refs)]
         if not gone:
             return
         with self.conn.transaction(), self.conn.cursor() as cur:
@@ -1402,7 +1531,9 @@ class Collector:
         self.write("task_prefix", PREFIX_COLS, ["prefix"], [prefix])
         self.write("backlog_task", TASK_COLS, ["task_key"], tasks, TASK_GUARD)
         self._backlog_done(info, prefix["zero_pad"])
-        if not self.dry_run and info["fetched"]:
+        if not self.dry_run and info["fetched"] and len(info.get("refs", [info["ref"]])) == 1:
+            # Multi-branch snapshots deliberately do not infer removal: branch tip times are not
+            # a single authoritative task-removal timeline.
             # Keys gone from origin's tip become 'removed', only after a successful fetch and only when
             # the tip is newer than the task, so a stale Mac never removes a task it has not seen.
             with self.conn.transaction(), self.conn.cursor() as cur:
@@ -1485,10 +1616,12 @@ class Collector:
 
 
 def configure(config) -> None:
-    global REPOSITORIES, ALLOWED_OWNERS, GITHUB_OWNERS, OWNER_IDENTITIES
+    global REPOSITORIES, ALLOWED_OWNERS, ALLOWED_REPOS, EXTRA_BRANCHES, GITHUB_OWNERS, OWNER_IDENTITIES
     global CONTEXT, REPO_CONTEXTS, HOMES, HOME_NAMESPACES, MACHINE, LOCK_FILE
     REPOSITORIES = config.git_repos
     ALLOWED_OWNERS = {tuple(owner.split("/", 1)) for owner in config.identities.git_owners}
+    ALLOWED_REPOS = set(config.identities.git_repos)
+    EXTRA_BRANCHES = config.git_extra_branches
     GITHUB_OWNERS = sorted(owner for host, owner in ALLOWED_OWNERS if host == GITHUB_HOST)
     OWNER_IDENTITIES = set(config.identities.owner_emails)
     setting = config.collector
@@ -1500,21 +1633,49 @@ def configure(config) -> None:
     LOCK_FILE = setting.lock_file
 
 
+def publish_repo_aliases(conn, config) -> None:
+    """Writer-only publication of explicit reader identity, without rewriting source history.
+
+    The hourly ingest role cannot write ah.meta. Publish once with the writer's collect-git
+    command before the following index refresh. Absent configuration preserves prior mappings;
+    conflicting or chained historical mappings refuse rather than silently reattribute history.
+    """
+    if not config.git_repo_aliases:
+        return
+    from .config import _repo_aliases
+
+    with conn.transaction():
+        conn.execute("SELECT pg_advisory_xact_lock(hashtext('agent-history.repo-aliases'))")
+        row = conn.execute("SELECT value FROM ah.meta WHERE key = 'git_repo_aliases'").fetchone()
+        aliases = _repo_aliases(json.loads(row[0]) if row else {})
+        for old, new in config.git_repo_aliases.items():
+            if old in aliases and aliases[old] != new:
+                raise ValueError("conflicting retained repository alias")
+            aliases[old] = new
+        aliases = _repo_aliases(aliases)
+        conn.execute(
+            "INSERT INTO ah.meta (key, value) VALUES ('git_repo_aliases', %s) "
+            "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+            (json.dumps(aliases, sort_keys=True),),
+        )
+
+
 @telemetry.instrument_pass("collect_git.pass")
 def collect(conn, config, context=None):
     """Compatibility entry point for collect-git, using the common commit/file parser."""
     configure(config)
+    publish_repo_aliases(conn, config)
     result = {"repos": 0, "skipped": [], "commits": 0, "files": 0}
     for repo in config.git_repos:
         if not (repo / ".git").exists():
             result["skipped"].append(f"{repo.name}: not a git checkout")
             continue
         slug = repo_slug(git(repo, "remote", "get-url", "origin", check=False)) or f"local/{repo.name.lower()}"
-        if config.identities.git_owners and not allowlisted(slug):
+        if (config.identities.git_owners or config.identities.git_repos) and not allowlisted(slug):
             result["skipped"].append(f"{repo.name}: owner not in [identities] git_owners")
             continue
         ref = git(repo, "rev-parse", "--verify", "--quiet", "refs/remotes/origin/HEAD", check=False).strip() or "HEAD"
-        info = {"path": repo, "slug": slug, "ref": ref, "emails": set()}
+        info = {"path": repo, "slug": slug, "ref": ref, "refs": read_refs(repo, slug, ref), "emails": set()}
         rows = git_commits(info, config.git_days)
         for row in rows:
             row["context"] = context or config.default_context

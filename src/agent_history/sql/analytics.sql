@@ -61,6 +61,21 @@ RETURNS text LANGUAGE sql IMMUTABLE AS $$
                   '^(?:[a-z+]+://)?(?:[^@/]+@)?([^:/]+)(?::[0-9]+)?[:/]+', '\1/')), '')
 $$;
 
+-- Explicit repository transfers for readers. The writer publishes a validated flat owner/repo
+-- map in ah.meta; raw collector slugs and transcript identity are never rewritten. Like the loop
+-- catalogue's historical joins, host is not part of this reader identity. This is not admission:
+-- narrow SECURITY DEFINER readers keep their exact repository scope checks unchanged.
+CREATE OR REPLACE FUNCTION ah.canonical_repo(slug text)
+RETURNS text LANGUAGE sql STABLE AS $$
+    WITH named AS (
+        SELECT lower(CASE WHEN slug ~ '^[^/]+/[^/]+/[^/]+$'
+                          THEN regexp_replace(slug, '^[^/]+/', '') ELSE slug END) AS repo
+    )
+    SELECT COALESCE((SELECT value::jsonb ->> named.repo FROM ah.meta WHERE key = 'git_repo_aliases'),
+                    named.repo)
+    FROM named
+$$;
+
 -- Project label from a cwd: the ~/repos/<name> checkout, else the directory name.
 CREATE OR REPLACE FUNCTION ah.project_of(cwd text)
 RETURNS text LANGUAGE sql IMMUTABLE AS $$

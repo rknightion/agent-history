@@ -903,12 +903,12 @@ def _refresh_tasks_done(conn: psycopg.Connection) -> None:
     """
     conn.execute("""
         WITH tracked AS (
-            SELECT DISTINCT lower(regexp_replace(repo_slug, '^[^/]+/', '')) AS slug FROM ah.backlog_done_scan
+            SELECT DISTINCT ah.canonical_repo(repo_slug) AS slug FROM ah.backlog_done_scan
         ), counted AS (
             SELECT l.launch_uid,
-                   CASE WHEN EXISTS (SELECT 1 FROM tracked r WHERE r.slug = lower(l.repo))
+                   CASE WHEN EXISTS (SELECT 1 FROM tracked r WHERE r.slug = ah.canonical_repo(l.repo))
                         THEN (SELECT count(DISTINCT d.task_key) FROM ah.backlog_done_event d
-                              WHERE lower(regexp_replace(d.repo_slug, '^[^/]+/', '')) = lower(l.repo)
+                              WHERE ah.canonical_repo(d.repo_slug) = ah.canonical_repo(l.repo)
                                 AND d.done_at >= l.launch_ts
                                 AND d.done_at < COALESCE(l.end_ts, 'infinity'))
                    END AS n
@@ -964,17 +964,17 @@ def _refresh_trailer_lands(conn: psycopg.Connection, state_qualified: list[str])
                          (r.report_path IS NOT NULL AND n.report_path = r.report_path))
               )
         ), repos AS (
-            SELECT launch_uid, lower(repo) AS repo FROM target
+            SELECT launch_uid, ah.canonical_repo(repo) AS repo FROM target
             WHERE repo ~ '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'
             UNION
-            SELECT t.launch_uid, regexp_replace(ah.remote_slug(g.remote_url), '^[^/]+/', '')
+            SELECT t.launch_uid, ah.canonical_repo(ah.remote_slug(g.remote_url))
             FROM target t JOIN ah.session s ON s.id = t.root_session_id OR s.loop_run_id = t.id
             JOIN ah.git_event g ON g.session_id = s.id
             WHERE g.ts >= t.launch_ts AND g.ts < COALESCE(t.cutoff, 'infinity')
               AND ah.remote_slug(g.remote_url) ~ '^[^/]+/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'
         ), observed AS (
             SELECT t.launch_uid, c.task_ids FROM target t JOIN repos p USING (launch_uid)
-            JOIN ah.git_commit c ON lower(regexp_replace(c.repo_slug, '^[^/]+/', '')) = p.repo
+            JOIN ah.git_commit c ON ah.canonical_repo(c.repo_slug) = p.repo
             WHERE c.on_default AND c.committed_at >= t.launch_ts
               AND c.committed_at < COALESCE(t.cutoff, 'infinity')
         ), counted AS (
