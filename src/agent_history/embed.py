@@ -391,11 +391,16 @@ class EmbedStats:
     gc: dict | None = None    # set when this run also garbage-collected orphan vectors (see gc())
 
 
+# `length(m.text) >= 30` without decompressing every long message: UTF-8 is at most four bytes a
+# character, so 120 or more bytes always holds 30 characters, and a shorter text is stored inline,
+# where length() is cheap. A plain length() detoasted ~500k messages on every embed run.
+LONG_MESSAGE_SQL = "(octet_length(m.text) >= 120 OR length(m.text) >= 30)"
+
 MESSAGE_SQL = """
 SELECT m.id, m.content_sha256, m.namespace, m.session_id, m.ts, m.message_class, s.cwd, m.text
 FROM ah.message m
 JOIN ah.session s ON s.id = m.session_id
-WHERE m.message_class = ANY(%(classes)s) AND length(m.text) >= 30
+WHERE m.message_class = ANY(%(classes)s) AND """ + LONG_MESSAGE_SQL + """
   AND NOT EXISTS (SELECT 1 FROM ah.chunk c WHERE c.message_id = m.id AND c.model = %(model)s
                   AND c.source_sha256 = m.content_sha256)
 ORDER BY m.id DESC
@@ -691,7 +696,7 @@ def write_metrics(conn: psycopg.Connection, stats: EmbedStats, success: bool, pa
         model = conn.execute("SELECT value FROM ah.meta WHERE key = 'embedding_model'").fetchone()
         if model:
             pending = conn.execute(
-                "SELECT count(*) FROM ah.message m WHERE m.message_class = ANY(%s) AND length(m.text) >= 30 "
+                "SELECT count(*) FROM ah.message m WHERE m.message_class = ANY(%s) AND " + LONG_MESSAGE_SQL + " "
                 "AND NOT EXISTS (SELECT 1 FROM ah.chunk c WHERE c.message_id = m.id AND c.model = %s "
                 "AND c.source_sha256 = m.content_sha256)", (list(EMBED_CLASSES), model[0])).fetchone()[0]
             failed = conn.execute("SELECT count(*) FROM ah.embed_failure WHERE model = %s AND attempts >= %s",
@@ -739,7 +744,7 @@ GC_DELETE_SQL = ("DELETE FROM ah.embedding d USING (SELECT e.model, e.input_sha2
 BACKLOG_SQL = """
 SELECT EXISTS (
     SELECT 1 FROM ah.message m
-    WHERE m.message_class = ANY(%(classes)s) AND length(m.text) >= 30
+    WHERE m.message_class = ANY(%(classes)s) AND """ + LONG_MESSAGE_SQL + """
       AND NOT EXISTS (SELECT 1 FROM ah.chunk c WHERE c.message_id = m.id AND c.model = %(model)s
                       AND c.source_sha256 = m.content_sha256))
     OR EXISTS (

@@ -1054,8 +1054,11 @@ def _link_pi_lineage(conn: psycopg.Connection) -> None:
     # `run-0/session.jsonl`) kept that path in its parser state. The parent is the one session
     # whose indexed file ends with that path, below the namespace directory; a path matching no
     # file, or more than one session, resolves nothing and leaves the directory fallback below.
+    # MATERIALIZED makes the planner find the (usually empty) set of unresolved children first.
+    # Inlined, it started from every candidate parent file and rescanned the namespace's source
+    # files for each one: ~40 s on every pass, to update nothing.
     conn.execute("""
-        WITH hdr AS (
+        WITH hdr AS MATERIALIZED (
             SELECT c.id, c.namespace, sf.parser_state->>'parent_file' AS parent_file
             FROM ah.session c JOIN ah.source_file sf
               ON sf.agent='pi' AND sf.file_role='subagent' AND sf.namespace=c.namespace
@@ -1215,7 +1218,7 @@ ON CONFLICT (session_id) DO UPDATE SET computed_at = EXCLUDED.computed_at, turns
 """
 
 
-TASK_REF_SQL = """
+TASK_MENTION_SQL = """
 WITH prefixes AS (SELECT string_agg(prefix, '|') AS alt FROM ah.task_prefix),
 hits AS (
     SELECT m.session_id, m.ts, m.message_class, upper(x.match[1]) AS prefix, x.match[2]::int AS num
@@ -1233,32 +1236,62 @@ keyed AS (
                                    ELSE lpad(h.num::text, tp.zero_pad, '0') END AS task_key
     FROM hits h JOIN ah.task_prefix tp ON tp.prefix = h.prefix
 )
-INSERT INTO ah.task_ref (session_id, task_key, first_ts, last_ts, mentions, in_human, in_brief)
+INSERT INTO ah.task_mention (session_id, task_key, first_ts, last_ts, mentions, in_human, in_brief)
 SELECT k.session_id, k.task_key, min(k.ts), max(k.ts), count(*),
        bool_or(k.message_class IN ('human_prompt', 'queued_prompt')), bool_or(k.message_class = 'subagent_brief')
 FROM keyed k
-WHERE EXISTS (SELECT 1 FROM ah.backlog_task b WHERE b.task_key = k.task_key AND b.status IS DISTINCT FROM 'removed')
 GROUP BY k.session_id, k.task_key
-ON CONFLICT (session_id, task_key) DO UPDATE SET first_ts = EXCLUDED.first_ts, last_ts = EXCLUDED.last_ts,
-    mentions = EXCLUDED.mentions, in_human = EXCLUDED.in_human, in_brief = EXCLUDED.in_brief
 """
+
+# ah.task_ref is ah.task_mention restricted to known, unremoved tasks. These three statements bring
+# it to exactly that within {scope} and write only the rows that differ, so a task created or
+# removed on a board touches its own refs, not all ~10^5 of them.
+_KNOWN = ("EXISTS (SELECT 1 FROM ah.backlog_task b WHERE b.task_key = {k}.task_key "
+          "AND b.status IS DISTINCT FROM 'removed')")
+TASK_REF_SYNC_SQL = (
+    "DELETE FROM ah.task_ref r WHERE r.session_id IN {scope} AND NOT (" + _KNOWN.format(k="r") + " AND EXISTS ("
+    "SELECT 1 FROM ah.task_mention k WHERE k.session_id = r.session_id AND k.task_key = r.task_key))",
+    "UPDATE ah.task_ref r SET first_ts = k.first_ts, last_ts = k.last_ts, mentions = k.mentions, "
+    "in_human = k.in_human, in_brief = k.in_brief FROM ah.task_mention k "
+    "WHERE r.session_id IN {scope} AND k.session_id = r.session_id AND k.task_key = r.task_key "
+    "AND (r.first_ts, r.last_ts, r.mentions, r.in_human, r.in_brief) "
+    "IS DISTINCT FROM (k.first_ts, k.last_ts, k.mentions, k.in_human, k.in_brief)",
+    "INSERT INTO ah.task_ref (session_id, task_key, first_ts, last_ts, mentions, in_human, in_brief) "
+    "SELECT k.session_id, k.task_key, k.first_ts, k.last_ts, k.mentions, k.in_human, k.in_brief "
+    "FROM ah.task_mention k WHERE k.session_id IN {scope} AND " + _KNOWN.format(k="k") + " "
+    "AND NOT EXISTS (SELECT 1 FROM ah.task_ref r WHERE r.session_id = k.session_id AND r.task_key = k.task_key)",
+)
 
 
 def task_refs(conn: psycopg.Connection) -> str:
-    """Incremental over dirty_now; a full rescan whenever the known prefix/task set changes."""
-    current = conn.execute(
+    """Mentions incremental over dirty_now, rescanning message text only when the prefixes change.
+
+    A change to the known task set (a task created or removed on a board, many times a day) only
+    re-derives task_ref from the stored mentions. Returns "full" for a message rescan, else
+    "incremental".
+    """
+    prefixes, tasks = conn.execute(
         "SELECT md5(COALESCE((SELECT string_agg(prefix || ':' || COALESCE(zero_pad, 0), ',' ORDER BY prefix) "
-        "FROM ah.task_prefix), '') || COALESCE((SELECT string_agg(task_key, ',' ORDER BY task_key) "
-        "FROM ah.backlog_task WHERE status IS DISTINCT FROM 'removed'), ''))").fetchone()[0]
-    stored = conn.execute("SELECT value FROM ah.meta WHERE key = 'task_ref_hash'").fetchone()
-    if stored is None or stored[0] != current:
-        conn.execute("DELETE FROM ah.task_ref")
-        conn.execute(TASK_REF_SQL.format(sessions="(SELECT id AS session_id FROM ah.session WHERE NOT is_stub)"))
-        conn.execute("INSERT INTO ah.meta VALUES ('task_ref_hash', %s) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
-                     (current,))
-        return "full"
-    conn.execute(TASK_REF_SQL.format(sessions="dirty_now"))
-    return "incremental"
+        "FROM ah.task_prefix), '')), md5(COALESCE((SELECT string_agg(task_key, ',' ORDER BY task_key) "
+        "FROM ah.backlog_task WHERE status IS DISTINCT FROM 'removed'), ''))").fetchone()
+    stored = dict(conn.execute(
+        "SELECT key, value FROM ah.meta WHERE key IN ('task_mention_hash', 'task_ref_hash')").fetchall())
+    dirty = "(SELECT session_id FROM dirty_now)"
+    if stored.get("task_mention_hash") != prefixes:
+        conn.execute("DELETE FROM ah.task_mention")
+        conn.execute(TASK_MENTION_SQL.format(sessions="(SELECT id AS session_id FROM ah.session WHERE NOT is_stub)"))
+        scope, mode = "(SELECT id FROM ah.session)", "full"
+    else:
+        conn.execute("DELETE FROM ah.task_mention WHERE session_id IN " + dirty)
+        conn.execute(TASK_MENTION_SQL.format(sessions="dirty_now"))
+        scope = "(SELECT id FROM ah.session)" if stored.get("task_ref_hash") != tasks else dirty
+        mode = "incremental"
+    for statement in TASK_REF_SYNC_SQL:
+        conn.execute(statement.format(scope=scope))
+    for key, value in (("task_mention_hash", prefixes), ("task_ref_hash", tasks)):
+        conn.execute("INSERT INTO ah.meta VALUES (%s, %s) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+                     (key, value))
+    return mode
 
 
 @telemetry.instrument_pass("postpass.pass")
@@ -1814,7 +1847,7 @@ def rebuild(conn: psycopg.Connection, hot: Path | None = HOT_ROOT, cold: Path | 
                 conn.execute(f"UPDATE ah.{table} SET session_id = NULL WHERE session_id IS NOT NULL")
             conn.execute("TRUNCATE " + ", ".join(f"ah.{t}" for t in DATA_TABLES) + " RESTART IDENTITY CASCADE")
             # Derived enrichment is re-derived from scratch; collector-owned tables are kept.
-            conn.execute("DELETE FROM ah.meta WHERE key IN ('task_ref_hash', 'loops_links_projection_v1', 'loops_links_projection_v2', 'loops_links_projection_v3', 'loops_identity_v3_projection_v1')")
+            conn.execute("DELETE FROM ah.meta WHERE key IN ('task_ref_hash', 'task_mention_hash', 'loops_links_projection_v1', 'loops_links_projection_v2', 'loops_links_projection_v3', 'loops_identity_v3_projection_v1')")
             # The embedder skips while this is set (it never holds the refresh lock across API calls).
             conn.execute("INSERT INTO ah.meta (key, value) VALUES ('rebuild_in_progress', now()::text) "
                          "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value")
