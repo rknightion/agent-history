@@ -232,7 +232,20 @@ PARSE_ISSUE_KINDS = frozenset(
     }
 )
 COLLECTORS = frozenset({"archive", "catalogue", "runs", "efficiency", "self"})
-SECTIONS = COLLECTORS | {"storage", "loops"}
+SECTIONS = COLLECTORS | {
+    "storage",
+    "loops",
+    "catalogue_refresh",
+    "catalogue_sources",
+    "catalogue_lag",
+    "catalogue_parse_issues",
+    "catalogue_links",
+    "catalogue_dirty",
+    "catalogue_rows",
+    "catalogue_embed_pending",
+    "catalogue_embed_failures",
+    "catalogue_embed_vectors",
+}
 TIERS = frozenset({"hot", "cold", "incoming", "conflicts"})
 EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max", "inherit", "other"})
 SEVERITIES = frozenset({"critical", "major", "minor", "trivial", "info"})

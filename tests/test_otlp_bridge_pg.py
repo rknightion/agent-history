@@ -20,6 +20,15 @@ pytestmark = pytest.mark.skipif("agent_history_test" not in DSN, reason="disposa
 def test_real_catalogue_collection_agrees_and_its_database_calls_are_spans(tmp_path, receiver):  # noqa: F811
     with load.connect(DSN) as conn:
         load.apply_schema(conn, force=True)
+        # Exercise the mapped parse-issue family even on a freshly initialised catalogue.
+        source = conn.execute(
+            "INSERT INTO ah.source_file (rel_path, namespace, agent, profile, file_role, tier) "
+            "VALUES ('synthetic/parity.jsonl','synthetic','pi','local','main','hot') "
+            "ON CONFLICT (rel_path) DO UPDATE SET tier = 'hot' RETURNING id"
+        ).fetchone()[0]
+        conn.execute(
+            "INSERT INTO ah.parse_issue (source_id, byte_offset, kind) VALUES (%s, 0, 'json_error')", (source,)
+        )
         conn.commit()
     telemetry.setup("agent-history-index")
     bridge = otlp.Bridge.create()

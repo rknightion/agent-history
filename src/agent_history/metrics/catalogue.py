@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import re
+import time
+from contextlib import contextmanager
 from pathlib import Path
 
 from agent_history import telemetry
@@ -131,89 +133,121 @@ class CatalogueCollector:
 
     def __init__(self, dsn: str):
         self.dsn = dsn
+        self.section_health: dict[str, tuple[float, bool]] = {}
+
+    @contextmanager
+    def section(self, conn, result, name):
+        """Publish a whole section or none, rolling back before the next query."""
+        start = time.monotonic()
+        first = len(result)
+        failed = False
+        try:
+            with conn.transaction():
+                conn.execute("SET LOCAL statement_timeout = '5s'")
+                yield
+        except Exception:
+            # No partial family, stale value or false zero for an unknown section.
+            del result[first:]
+            failed = True
+        finally:
+            self.section_health[f"catalogue_{name}"] = (time.monotonic() - start, failed)
 
     def collect(self):
+        self.section_health = {}
         # The shared factory is psycopg.connect unchanged unless telemetry is enabled.
-        with telemetry.db_connect(self.dsn, application_name="agent-history-metrics", autocommit=True) as conn:
+        with telemetry.db_connect(
+            self.dsn, application_name="agent-history-metrics", autocommit=True, connect_timeout=5
+        ) as conn:
             conn.read_only = True
             result = []
-            success = conn.execute(
-                "SELECT extract(epoch FROM max(finished_at)) FROM ah.refresh_log WHERE ok"
-            ).fetchone()[0]
-            if success is not None:
+            with self.section(conn, result, "refresh"):
+                success = conn.execute(
+                    "SELECT extract(epoch FROM max(finished_at)) FROM ah.refresh_log WHERE ok"
+                ).fetchone()[0]
+                if success is not None:
+                    result.append(
+                        gauge("agent_history_last_success_timestamp_seconds", "Last successful index refresh.", success)
+                    )
+            with self.section(conn, result, "sources"):
+                statuses = dict(conn.execute("SELECT status, count(*) FROM ah.source_file GROUP BY status"))
                 result.append(
-                    gauge("agent_history_last_success_timestamp_seconds", "Last successful index refresh.", success)
+                    Family(
+                        "agent_history_sources",
+                        "gauge",
+                        "Catalogue source files by status.",
+                        tuple(Sample((("status", status),), statuses.get(status, 0)) for status in STATUSES),
+                    )
                 )
-            statuses = dict(conn.execute("SELECT status, count(*) FROM ah.source_file GROUP BY status"))
-            result.append(
-                Family(
-                    "agent_history_sources",
-                    "gauge",
-                    "Catalogue source files by status.",
-                    tuple(Sample((("status", status),), statuses.get(status, 0)) for status in STATUSES),
+            with self.section(conn, result, "lag"):
+                lag = conn.execute(
+                    "SELECT COALESCE(sum(GREATEST(size_bytes-indexed_offset,0)),0) "
+                    "FROM ah.source_file WHERE status <> 'unavailable'"
+                ).fetchone()[0]
+                result.append(gauge("agent_history_lag_bytes", "Unindexed source bytes.", lag))
+            with self.section(conn, result, "parse_issues"):
+                issues = dict(conn.execute("SELECT kind, count(*) FROM ah.parse_issue GROUP BY kind"))
+                # Parser kinds are implementation-defined and finite, but never expose arbitrary input.
+                result.append(
+                    Family(
+                        "agent_history_parse_issues_total",
+                        "gauge",
+                        "Current parse issues by kind.",
+                        tuple(
+                            Sample((("kind", kind),), value)
+                            for kind, value in sorted(issues.items())
+                            if kind.isidentifier() and len(kind) <= 64
+                        ),
+                    )
                 )
-            )
-            lag = conn.execute(
-                "SELECT COALESCE(sum(GREATEST(size_bytes-indexed_offset,0)),0) "
-                "FROM ah.source_file WHERE status <> 'unavailable'"
-            ).fetchone()[0]
-            result.append(gauge("agent_history_lag_bytes", "Unindexed source bytes.", lag))
-            issues = dict(conn.execute("SELECT kind, count(*) FROM ah.parse_issue GROUP BY kind"))
-            # Parser kinds are implementation-defined and finite in the schema, but never expose arbitrary input.
-            result.append(
-                Family(
-                    "agent_history_parse_issues_total",
-                    "gauge",
-                    "Current parse issues by kind.",
-                    tuple(
-                        Sample((("kind", kind),), value)
-                        for kind, value in sorted(issues.items())
-                        if kind.isidentifier() and len(kind) <= 64
-                    ),
+            with self.section(conn, result, "links"):
+                unresolved = conn.execute(
+                    "SELECT count(*) FROM ah.subagent_spawn WHERE child_session_id IS NULL "
+                    "AND (child_agent_id IS NOT NULL OR child_task_name IS NOT NULL)"
+                ).fetchone()[0]
+                orphans = conn.execute(
+                    "SELECT count(*) FROM ah.session WHERE NOT is_stub AND root_session_id IS NULL"
+                ).fetchone()[0]
+                result.append(
+                    Family(
+                        "agent_history_unresolved_links",
+                        "gauge",
+                        "Unresolved catalogue links.",
+                        (Sample((("kind", "spawn_child"),), unresolved), Sample((("kind", "session_root"),), orphans)),
+                    )
                 )
-            )
-            unresolved = conn.execute(
-                "SELECT count(*) FROM ah.subagent_spawn WHERE child_session_id IS NULL "
-                "AND (child_agent_id IS NOT NULL OR child_task_name IS NOT NULL)"
-            ).fetchone()[0]
-            orphans = conn.execute(
-                "SELECT count(*) FROM ah.session WHERE NOT is_stub AND root_session_id IS NULL"
-            ).fetchone()[0]
-            result.append(
-                Family(
-                    "agent_history_unresolved_links",
-                    "gauge",
-                    "Unresolved catalogue links.",
-                    (Sample((("kind", "spawn_child"),), unresolved), Sample((("kind", "session_root"),), orphans)),
+            with self.section(conn, result, "dirty"):
+                dirty = conn.execute("SELECT count(*) FROM ah.dirty_session").fetchone()[0]
+                result.append(gauge("agent_history_dirty_sessions", "Sessions awaiting post-pass.", dirty))
+            with self.section(conn, result, "rows"):
+                estimates = [
+                    (
+                        table,
+                        conn.execute(
+                            "SELECT GREATEST(reltuples::bigint,0) FROM pg_class WHERE oid = %s::regclass",
+                            (f"ah.{table}",),
+                        ).fetchone()[0],
+                    )
+                    for table in TABLES
+                ]
+                result.append(
+                    Family(
+                        "agent_history_rows",
+                        "gauge",
+                        "Estimated catalogue rows.",
+                        tuple(Sample((("table", table),), count) for table, count in estimates),
+                    )
                 )
-            )
-            dirty = conn.execute("SELECT count(*) FROM ah.dirty_session").fetchone()[0]
-            result.append(gauge("agent_history_dirty_sessions", "Sessions awaiting post-pass.", dirty))
-            estimates = [
-                (
-                    table,
-                    conn.execute(
-                        "SELECT GREATEST(reltuples::bigint,0) FROM pg_class WHERE oid = %s::regclass", (f"ah.{table}",)
-                    ).fetchone()[0],
-                )
-                for table in TABLES
-            ]
-            result.append(
-                Family(
-                    "agent_history_rows",
-                    "gauge",
-                    "Estimated catalogue rows.",
-                    tuple(Sample((("table", table),), count) for table, count in estimates),
-                )
-            )
-            pending = conn.execute(
-                "SELECT count(*) FROM ah.chunk c WHERE NOT EXISTS "
-                "(SELECT 1 FROM ah.embedding e WHERE e.model = c.model "
-                "AND e.input_sha256 = c.input_sha256)"
-            ).fetchone()[0]
-            result.append(gauge("agent_history_embed_pending_messages", "Chunks awaiting embeddings.", pending))
-            failures = conn.execute("SELECT count(*) FROM ah.embed_failure").fetchone()[0]
-            result.append(gauge("agent_history_embed_failed_inputs", "Inputs with embedding failures.", failures))
-            vectors = conn.execute("SELECT count(*) FROM ah.embedding").fetchone()[0]
-            result.append(gauge("agent_history_embed_vectors", "Stored embedding vectors.", vectors))
+            with self.section(conn, result, "embed_pending"):
+                pending = conn.execute(
+                    "SELECT count(*) FROM ah.chunk c WHERE NOT EXISTS "
+                    "(SELECT 1 FROM ah.embedding e WHERE e.model = c.model "
+                    "AND e.input_sha256 = c.input_sha256)"
+                ).fetchone()[0]
+                result.append(gauge("agent_history_embed_pending_messages", "Chunks awaiting embeddings.", pending))
+            with self.section(conn, result, "embed_failures"):
+                failures = conn.execute("SELECT count(*) FROM ah.embed_failure").fetchone()[0]
+                result.append(gauge("agent_history_embed_failed_inputs", "Inputs with embedding failures.", failures))
+            with self.section(conn, result, "embed_vectors"):
+                vectors = conn.execute("SELECT count(*) FROM ah.embedding").fetchone()[0]
+                result.append(gauge("agent_history_embed_vectors", "Stored embedding vectors.", vectors))
             return result
