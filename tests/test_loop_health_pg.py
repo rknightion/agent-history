@@ -1,11 +1,10 @@
 """Real catalogue -> exporter -> Prometheus proof text and local OTLP receiver."""
 
-import os
 import time
 from datetime import datetime, timedelta, timezone
 
-import psycopg
 import pytest
+from scratch_catalogue import scratch_catalogue, scratch_conn as conn, table_fault  # noqa: F401 - guarded fixtures
 
 from agent_history import telemetry
 from agent_history.metrics import otlp, otlp_parity
@@ -13,11 +12,9 @@ from agent_history.metrics.catalogue import CatalogueCollector
 from agent_history.metrics.collection import Collection, State
 from agent_history.metrics.loop_health import PREFIX, QUERY
 from agent_history.metrics.self import SelfCollector
-from test_loop_identity_pg import TEST_DB, clean, conn  # noqa: F401 - disposable database fixtures
+from test_loop_identity_pg import clean  # noqa: F401 - cleanup uses the locally bound conn fixture
 from test_otlp_bridge import receiver  # noqa: F401 - loopback OTLP, never a real endpoint
 
-DSN = os.environ.get("AGENT_HISTORY_TEST_DSN", "")
-pytestmark = pytest.mark.skipif(TEST_DB != "agent_history_test", reason="exact disposable catalogue required")
 AT = datetime(2030, 1, 1, tzinfo=timezone.utc)
 
 
@@ -76,7 +73,7 @@ def call(connection, root, source, key, start, end, *, reason=None):
     )
 
 
-def test_exporter_latest_completed_health_and_otlp(clean, tmp_path, receiver):  # noqa: F811
+def test_exporter_latest_completed_health_and_otlp(clean, scratch_catalogue, tmp_path, receiver):  # noqa: F811
     root, run, source = seed(clean)
     for i, text in enumerate(
         ("Owner question: which option?", "Parked pending review. For-ratification: proceed.", "Working.", "Finished.")
@@ -114,7 +111,8 @@ def test_exporter_latest_completed_health_and_otlp(clean, tmp_path, receiver):  
 
     telemetry.setup("agent-history-index")
     bridge = otlp.Bridge.create()
-    collection = Collection([CatalogueCollector(DSN)], State(tmp_path), refresh=0, bridge=bridge)
+    collector = CatalogueCollector(scratch_catalogue.writer)
+    collection = Collection([collector], State(tmp_path), refresh=0, bridge=bridge)
     text = collection.metrics()
     decoded = receiver.flush()
     parity = otlp_parity.compare(text, decoded, rejected=bridge.rejected)
@@ -160,18 +158,15 @@ def test_exporter_latest_completed_health_and_otlp(clean, tmp_path, receiver):  
         assert PREFIX + field + "{" not in text
     clean.execute("INSERT INTO ah.meta (key,value) VALUES ('rebuild_in_progress','synthetic')")
     clean.commit()
-    assert all(not family.samples for family in CatalogueCollector(DSN).collect() if family.name.startswith(PREFIX))
+    assert all(not family.samples for family in collector.collect() if family.name.startswith(PREFIX))
+    assert collector.section_health["catalogue_loop_health"][1] is False
     clean.execute("DELETE FROM ah.meta WHERE key='rebuild_in_progress'")
     clean.commit()
 
 
 @pytest.mark.parametrize("fault", ["permission", "lock"])
-def test_health_fault_isolation_and_recovery(clean, tmp_path, receiver, fault):  # noqa: F811
+def test_health_fault_isolation_and_recovery(clean, scratch_catalogue, tmp_path, receiver, fault):  # noqa: F811
     """A real health-query failure retires only health; its 60s budget stays local."""
-    reader = os.environ.get("AGENT_HISTORY_TEST_READER_DSN", "")
-    admin_dsn = os.environ.get("AGENT_HISTORY_TEST_ADMIN_DSN", "")
-    if not reader or not admin_dsn:
-        pytest.skip("disposable reader and admin required")
     _, _, source = seed(clean)
     clean.execute("INSERT INTO ah.parse_issue (source_id,byte_offset,kind) VALUES (%s,0,'json_error')", (source,))
     clean.execute("DELETE FROM ah.refresh_log")
@@ -183,7 +178,7 @@ def test_health_fault_isolation_and_recovery(clean, tmp_path, receiver, fault): 
     telemetry.setup("agent-history-index")
     bridge = otlp.Bridge.create()
     health = SelfCollector()
-    collector = CatalogueCollector(reader)
+    collector = CatalogueCollector(scratch_catalogue.reader)
     collection = Collection([collector, health], State(tmp_path), refresh=0, bridge=bridge)
 
     def collect():
@@ -198,35 +193,26 @@ def test_health_fault_isolation_and_recovery(clean, tmp_path, receiver, fault): 
     clean.execute("UPDATE ah.refresh_log SET finished_at=to_timestamp(200)")
     clean.execute("UPDATE ah.loops SET tasks_done=3")
     clean.commit()
-    with psycopg.connect(admin_dsn, autocommit=True) as admin:
-        if fault == "permission":
-            admin.execute("REVOKE SELECT ON ah.loop_run FROM ah_reader")
-        else:
-            admin.execute("BEGIN")
-            admin.execute("LOCK TABLE ah.loop_run IN ACCESS EXCLUSIVE MODE")
-        try:
-            started = time.monotonic()
-            failed, decoded = collect()
-            elapsed = time.monotonic() - started
-            assert elapsed < (70 if fault == "lock" else 10)
-            if fault == "lock":
-                assert elapsed >= 59  # Health retains its intended 60s, not the ordinary 5s.
-            assert PREFIX not in failed
-            assert not any(name.startswith(PREFIX) for name in decoded)
-            assert "agent_history_last_success_timestamp_seconds 200" in failed
-            assert "agent_history_sources{" in failed
-            assert "agent_history_embed_vectors 0" in failed
-            assert health.success["catalogue_loop_health"] == 0
-            assert health.errors["catalogue_loop_health"] == 1
-            assert "agent_sessions_metrics_collection_success 0" in failed
-            assert 'agent_sessions_metrics_section_success{section="catalogue_loop_health"} 0' in failed
-            assert "permission denied" not in failed
-            assert "statement timeout" not in failed
-        finally:
-            if fault == "permission":
-                admin.execute("GRANT SELECT ON ah.loop_run TO ah_reader")
-            else:
-                admin.execute("ROLLBACK")
+    vectors = clean.execute("SELECT count(*) FROM ah.embedding").fetchone()[0]
+    clean.commit()
+    with table_fault(scratch_catalogue, "loop_run", fault):
+        started = time.monotonic()
+        failed, decoded = collect()
+        elapsed = time.monotonic() - started
+        assert elapsed < (70 if fault == "lock" else 10)
+        if fault == "lock":
+            assert elapsed >= 59  # Health retains its intended 60s, not the ordinary 5s.
+        assert PREFIX not in failed
+        assert not any(name.startswith(PREFIX) for name in decoded)
+        assert "agent_history_last_success_timestamp_seconds 200" in failed
+        assert "agent_history_sources{" in failed
+        assert f"agent_history_embed_vectors {vectors}\n" in failed  # Independent current cache observation.
+        assert health.success["catalogue_loop_health"] == 0
+        assert health.errors["catalogue_loop_health"] == 1
+        assert "agent_sessions_metrics_collection_success 0" in failed
+        assert 'agent_sessions_metrics_section_success{section="catalogue_loop_health"} 0' in failed
+        assert "permission denied" not in failed
+        assert "statement timeout" not in failed
 
     recovered, _ = collect()
     assert PREFIX + 'tasks_done{harness="pi",repo="example/project"} 3' in recovered
@@ -235,20 +221,15 @@ def test_health_fault_isolation_and_recovery(clean, tmp_path, receiver, fault): 
     assert not health.collection_failed
     # A later embedding fault must still use 5s after the health transaction used 60s.
     if fault == "lock":
-        with psycopg.connect(admin_dsn, autocommit=True) as admin:
-            admin.execute("BEGIN")
-            admin.execute("LOCK TABLE ah.embed_failure IN ACCESS EXCLUSIVE MODE")
-            try:
-                started = time.monotonic()
-                failed, decoded = collect()
-                assert 4 <= time.monotonic() - started < 10
-                assert "agent_history_embed_failed_inputs" not in failed
-                assert "agent_history_embed_failed_inputs" not in decoded
-                assert PREFIX + 'tasks_done{harness="pi",repo="example/project"} 3' in failed
-                assert health.success["catalogue_embed_failures"] == 0
-                assert health.success["catalogue_loop_health"] == 1
-            finally:
-                admin.execute("ROLLBACK")
+        with table_fault(scratch_catalogue, "embed_failure", "lock"):
+            started = time.monotonic()
+            failed, decoded = collect()
+            assert 4 <= time.monotonic() - started < 10
+            assert "agent_history_embed_failed_inputs" not in failed
+            assert "agent_history_embed_failed_inputs" not in decoded
+            assert PREFIX + 'tasks_done{harness="pi",repo="example/project"} 3' in failed
+            assert health.success["catalogue_embed_failures"] == 0
+            assert health.success["catalogue_loop_health"] == 1
         final, _ = collect()
         assert "agent_history_embed_failed_inputs 0" in final
         assert not health.collection_failed
