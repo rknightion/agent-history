@@ -697,6 +697,72 @@ agent_history_loop_checkout_observation_complete 0.142857142857
 # HELP agent_history_loop_checkout_unconfigured Synthetic agent_history_loop_checkout_unconfigured.
 # TYPE agent_history_loop_checkout_unconfigured gauge
 agent_history_loop_checkout_unconfigured 0.142857142857
+# HELP agent_history_loop_health_completed_timestamp_seconds Synthetic agent_history_loop_health_completed_timestamp_seconds.
+# TYPE agent_history_loop_health_completed_timestamp_seconds gauge
+agent_history_loop_health_completed_timestamp_seconds{harness="claude",repo="example/project"} 3.75
+agent_history_loop_health_completed_timestamp_seconds{harness="claude",repo="example/widget"} 5
+agent_history_loop_health_completed_timestamp_seconds{harness="pi",repo="example/project"} 0.142857142857
+agent_history_loop_health_completed_timestamp_seconds{harness="pi",repo="example/widget"} 2.5
+# HELP agent_history_loop_health_estimated_cost_usd Synthetic agent_history_loop_health_estimated_cost_usd.
+# TYPE agent_history_loop_health_estimated_cost_usd gauge
+agent_history_loop_health_estimated_cost_usd{harness="claude",repo="example/project"} 3.75
+agent_history_loop_health_estimated_cost_usd{harness="claude",repo="example/widget"} 5
+agent_history_loop_health_estimated_cost_usd{harness="pi",repo="example/project"} 0.142857142857
+agent_history_loop_health_estimated_cost_usd{harness="pi",repo="example/widget"} 2.5
+# HELP agent_history_loop_health_lane_complete_rate Synthetic agent_history_loop_health_lane_complete_rate.
+# TYPE agent_history_loop_health_lane_complete_rate gauge
+agent_history_loop_health_lane_complete_rate{harness="claude",repo="example/project"} 3.75
+agent_history_loop_health_lane_complete_rate{harness="claude",repo="example/widget"} 5
+agent_history_loop_health_lane_complete_rate{harness="pi",repo="example/project"} 0.142857142857
+agent_history_loop_health_lane_complete_rate{harness="pi",repo="example/widget"} 2.5
+# HELP agent_history_loop_health_owner_parks_per_1k_root_messages Synthetic agent_history_loop_health_owner_parks_per_1k_root_messages.
+# TYPE agent_history_loop_health_owner_parks_per_1k_root_messages gauge
+agent_history_loop_health_owner_parks_per_1k_root_messages{harness="claude",repo="example/project"} 3.75
+agent_history_loop_health_owner_parks_per_1k_root_messages{harness="claude",repo="example/widget"} 5
+agent_history_loop_health_owner_parks_per_1k_root_messages{harness="pi",repo="example/project"} 0.142857142857
+agent_history_loop_health_owner_parks_per_1k_root_messages{harness="pi",repo="example/widget"} 2.5
+# HELP agent_history_loop_health_owner_questions_per_1k_root_messages Synthetic agent_history_loop_health_owner_questions_per_1k_root_messages.
+# TYPE agent_history_loop_health_owner_questions_per_1k_root_messages gauge
+agent_history_loop_health_owner_questions_per_1k_root_messages{harness="claude",repo="example/project"} 3.75
+agent_history_loop_health_owner_questions_per_1k_root_messages{harness="claude",repo="example/widget"} 5
+agent_history_loop_health_owner_questions_per_1k_root_messages{harness="pi",repo="example/project"} 0.142857142857
+agent_history_loop_health_owner_questions_per_1k_root_messages{harness="pi",repo="example/widget"} 2.5
+# HELP agent_history_loop_health_ratification_rulings Synthetic agent_history_loop_health_ratification_rulings.
+# TYPE agent_history_loop_health_ratification_rulings gauge
+agent_history_loop_health_ratification_rulings{harness="claude",repo="example/project"} 3.75
+agent_history_loop_health_ratification_rulings{harness="claude",repo="example/widget"} 5
+agent_history_loop_health_ratification_rulings{harness="pi",repo="example/project"} 0.142857142857
+agent_history_loop_health_ratification_rulings{harness="pi",repo="example/widget"} 2.5
+# HELP agent_history_loop_health_root_messages Synthetic agent_history_loop_health_root_messages.
+# TYPE agent_history_loop_health_root_messages gauge
+agent_history_loop_health_root_messages{harness="claude",repo="example/project"} 3.75
+agent_history_loop_health_root_messages{harness="claude",repo="example/widget"} 5
+agent_history_loop_health_root_messages{harness="pi",repo="example/project"} 0.142857142857
+agent_history_loop_health_root_messages{harness="pi",repo="example/widget"} 2.5
+# HELP agent_history_loop_health_root_model_calls Synthetic agent_history_loop_health_root_model_calls.
+# TYPE agent_history_loop_health_root_model_calls gauge
+agent_history_loop_health_root_model_calls{harness="claude",repo="example/project"} 3.75
+agent_history_loop_health_root_model_calls{harness="claude",repo="example/widget"} 5
+agent_history_loop_health_root_model_calls{harness="pi",repo="example/project"} 0.142857142857
+agent_history_loop_health_root_model_calls{harness="pi",repo="example/widget"} 2.5
+# HELP agent_history_loop_health_root_model_time_share Synthetic agent_history_loop_health_root_model_time_share.
+# TYPE agent_history_loop_health_root_model_time_share gauge
+agent_history_loop_health_root_model_time_share{harness="claude",repo="example/project"} 3.75
+agent_history_loop_health_root_model_time_share{harness="claude",repo="example/widget"} 5
+agent_history_loop_health_root_model_time_share{harness="pi",repo="example/project"} 0.142857142857
+agent_history_loop_health_root_model_time_share{harness="pi",repo="example/widget"} 2.5
+# HELP agent_history_loop_health_root_model_timed_calls Synthetic agent_history_loop_health_root_model_timed_calls.
+# TYPE agent_history_loop_health_root_model_timed_calls gauge
+agent_history_loop_health_root_model_timed_calls{harness="claude",repo="example/project"} 3.75
+agent_history_loop_health_root_model_timed_calls{harness="claude",repo="example/widget"} 5
+agent_history_loop_health_root_model_timed_calls{harness="pi",repo="example/project"} 0.142857142857
+agent_history_loop_health_root_model_timed_calls{harness="pi",repo="example/widget"} 2.5
+# HELP agent_history_loop_health_tasks_done Synthetic agent_history_loop_health_tasks_done.
+# TYPE agent_history_loop_health_tasks_done gauge
+agent_history_loop_health_tasks_done{harness="claude",repo="example/project"} 3.75
+agent_history_loop_health_tasks_done{harness="claude",repo="example/widget"} 5
+agent_history_loop_health_tasks_done{harness="pi",repo="example/project"} 0.142857142857
+agent_history_loop_health_tasks_done{harness="pi",repo="example/widget"} 2.5
 # HELP agent_history_parse_issues_total Synthetic agent_history_parse_issues_total.
 # TYPE agent_history_parse_issues_total gauge
 agent_history_parse_issues_total{kind="json_error"} 0.142857142857
@@ -1768,6 +1834,72 @@ agent_history_loop_checkout_observation_complete 0.142857142857
 # HELP agent_history_loop_checkout_unconfigured Synthetic agent_history_loop_checkout_unconfigured.
 # TYPE agent_history_loop_checkout_unconfigured gauge
 agent_history_loop_checkout_unconfigured 0.142857142857
+# HELP agent_history_loop_health_completed_timestamp_seconds Synthetic agent_history_loop_health_completed_timestamp_seconds.
+# TYPE agent_history_loop_health_completed_timestamp_seconds gauge
+agent_history_loop_health_completed_timestamp_seconds{harness="claude",repo="example/project"} 3.75
+agent_history_loop_health_completed_timestamp_seconds{harness="claude",repo="example/widget"} 5
+agent_history_loop_health_completed_timestamp_seconds{harness="pi",repo="example/project"} 0.142857142857
+agent_history_loop_health_completed_timestamp_seconds{harness="pi",repo="example/widget"} 2.5
+# HELP agent_history_loop_health_estimated_cost_usd Synthetic agent_history_loop_health_estimated_cost_usd.
+# TYPE agent_history_loop_health_estimated_cost_usd gauge
+agent_history_loop_health_estimated_cost_usd{harness="claude",repo="example/project"} 3.75
+agent_history_loop_health_estimated_cost_usd{harness="claude",repo="example/widget"} 5
+agent_history_loop_health_estimated_cost_usd{harness="pi",repo="example/project"} 0.142857142857
+agent_history_loop_health_estimated_cost_usd{harness="pi",repo="example/widget"} 2.5
+# HELP agent_history_loop_health_lane_complete_rate Synthetic agent_history_loop_health_lane_complete_rate.
+# TYPE agent_history_loop_health_lane_complete_rate gauge
+agent_history_loop_health_lane_complete_rate{harness="claude",repo="example/project"} 3.75
+agent_history_loop_health_lane_complete_rate{harness="claude",repo="example/widget"} 5
+agent_history_loop_health_lane_complete_rate{harness="pi",repo="example/project"} 0.142857142857
+agent_history_loop_health_lane_complete_rate{harness="pi",repo="example/widget"} 2.5
+# HELP agent_history_loop_health_owner_parks_per_1k_root_messages Synthetic agent_history_loop_health_owner_parks_per_1k_root_messages.
+# TYPE agent_history_loop_health_owner_parks_per_1k_root_messages gauge
+agent_history_loop_health_owner_parks_per_1k_root_messages{harness="claude",repo="example/project"} 3.75
+agent_history_loop_health_owner_parks_per_1k_root_messages{harness="claude",repo="example/widget"} 5
+agent_history_loop_health_owner_parks_per_1k_root_messages{harness="pi",repo="example/project"} 0.142857142857
+agent_history_loop_health_owner_parks_per_1k_root_messages{harness="pi",repo="example/widget"} 2.5
+# HELP agent_history_loop_health_owner_questions_per_1k_root_messages Synthetic agent_history_loop_health_owner_questions_per_1k_root_messages.
+# TYPE agent_history_loop_health_owner_questions_per_1k_root_messages gauge
+agent_history_loop_health_owner_questions_per_1k_root_messages{harness="claude",repo="example/project"} 3.75
+agent_history_loop_health_owner_questions_per_1k_root_messages{harness="claude",repo="example/widget"} 5
+agent_history_loop_health_owner_questions_per_1k_root_messages{harness="pi",repo="example/project"} 0.142857142857
+agent_history_loop_health_owner_questions_per_1k_root_messages{harness="pi",repo="example/widget"} 2.5
+# HELP agent_history_loop_health_ratification_rulings Synthetic agent_history_loop_health_ratification_rulings.
+# TYPE agent_history_loop_health_ratification_rulings gauge
+agent_history_loop_health_ratification_rulings{harness="claude",repo="example/project"} 3.75
+agent_history_loop_health_ratification_rulings{harness="claude",repo="example/widget"} 5
+agent_history_loop_health_ratification_rulings{harness="pi",repo="example/project"} 0.142857142857
+agent_history_loop_health_ratification_rulings{harness="pi",repo="example/widget"} 2.5
+# HELP agent_history_loop_health_root_messages Synthetic agent_history_loop_health_root_messages.
+# TYPE agent_history_loop_health_root_messages gauge
+agent_history_loop_health_root_messages{harness="claude",repo="example/project"} 3.75
+agent_history_loop_health_root_messages{harness="claude",repo="example/widget"} 5
+agent_history_loop_health_root_messages{harness="pi",repo="example/project"} 0.142857142857
+agent_history_loop_health_root_messages{harness="pi",repo="example/widget"} 2.5
+# HELP agent_history_loop_health_root_model_calls Synthetic agent_history_loop_health_root_model_calls.
+# TYPE agent_history_loop_health_root_model_calls gauge
+agent_history_loop_health_root_model_calls{harness="claude",repo="example/project"} 3.75
+agent_history_loop_health_root_model_calls{harness="claude",repo="example/widget"} 5
+agent_history_loop_health_root_model_calls{harness="pi",repo="example/project"} 0.142857142857
+agent_history_loop_health_root_model_calls{harness="pi",repo="example/widget"} 2.5
+# HELP agent_history_loop_health_root_model_time_share Synthetic agent_history_loop_health_root_model_time_share.
+# TYPE agent_history_loop_health_root_model_time_share gauge
+agent_history_loop_health_root_model_time_share{harness="claude",repo="example/project"} 3.75
+agent_history_loop_health_root_model_time_share{harness="claude",repo="example/widget"} 5
+agent_history_loop_health_root_model_time_share{harness="pi",repo="example/project"} 0.142857142857
+agent_history_loop_health_root_model_time_share{harness="pi",repo="example/widget"} 2.5
+# HELP agent_history_loop_health_root_model_timed_calls Synthetic agent_history_loop_health_root_model_timed_calls.
+# TYPE agent_history_loop_health_root_model_timed_calls gauge
+agent_history_loop_health_root_model_timed_calls{harness="claude",repo="example/project"} 3.75
+agent_history_loop_health_root_model_timed_calls{harness="claude",repo="example/widget"} 5
+agent_history_loop_health_root_model_timed_calls{harness="pi",repo="example/project"} 0.142857142857
+agent_history_loop_health_root_model_timed_calls{harness="pi",repo="example/widget"} 2.5
+# HELP agent_history_loop_health_tasks_done Synthetic agent_history_loop_health_tasks_done.
+# TYPE agent_history_loop_health_tasks_done gauge
+agent_history_loop_health_tasks_done{harness="claude",repo="example/project"} 3.75
+agent_history_loop_health_tasks_done{harness="claude",repo="example/widget"} 5
+agent_history_loop_health_tasks_done{harness="pi",repo="example/project"} 0.142857142857
+agent_history_loop_health_tasks_done{harness="pi",repo="example/widget"} 2.5
 # HELP agent_history_parse_issues_total Synthetic agent_history_parse_issues_total.
 # TYPE agent_history_parse_issues_total gauge
 agent_history_parse_issues_total{kind="json_error"} 0.142857142857
@@ -2948,6 +3080,72 @@ agent_history_loop_checkout_observation_complete 0.142857142857
 # HELP agent_history_loop_checkout_unconfigured Synthetic agent_history_loop_checkout_unconfigured.
 # TYPE agent_history_loop_checkout_unconfigured gauge
 agent_history_loop_checkout_unconfigured 0.142857142857
+# HELP agent_history_loop_health_completed_timestamp_seconds Synthetic agent_history_loop_health_completed_timestamp_seconds.
+# TYPE agent_history_loop_health_completed_timestamp_seconds gauge
+agent_history_loop_health_completed_timestamp_seconds{harness="claude",repo="example/project"} 3.75
+agent_history_loop_health_completed_timestamp_seconds{harness="claude",repo="example/widget"} 5
+agent_history_loop_health_completed_timestamp_seconds{harness="pi",repo="example/project"} 0.142857142857
+agent_history_loop_health_completed_timestamp_seconds{harness="pi",repo="example/widget"} 2.5
+# HELP agent_history_loop_health_estimated_cost_usd Synthetic agent_history_loop_health_estimated_cost_usd.
+# TYPE agent_history_loop_health_estimated_cost_usd gauge
+agent_history_loop_health_estimated_cost_usd{harness="claude",repo="example/project"} 3.75
+agent_history_loop_health_estimated_cost_usd{harness="claude",repo="example/widget"} 5
+agent_history_loop_health_estimated_cost_usd{harness="pi",repo="example/project"} 0.142857142857
+agent_history_loop_health_estimated_cost_usd{harness="pi",repo="example/widget"} 2.5
+# HELP agent_history_loop_health_lane_complete_rate Synthetic agent_history_loop_health_lane_complete_rate.
+# TYPE agent_history_loop_health_lane_complete_rate gauge
+agent_history_loop_health_lane_complete_rate{harness="claude",repo="example/project"} 3.75
+agent_history_loop_health_lane_complete_rate{harness="claude",repo="example/widget"} 5
+agent_history_loop_health_lane_complete_rate{harness="pi",repo="example/project"} 0.142857142857
+agent_history_loop_health_lane_complete_rate{harness="pi",repo="example/widget"} 2.5
+# HELP agent_history_loop_health_owner_parks_per_1k_root_messages Synthetic agent_history_loop_health_owner_parks_per_1k_root_messages.
+# TYPE agent_history_loop_health_owner_parks_per_1k_root_messages gauge
+agent_history_loop_health_owner_parks_per_1k_root_messages{harness="claude",repo="example/project"} 3.75
+agent_history_loop_health_owner_parks_per_1k_root_messages{harness="claude",repo="example/widget"} 5
+agent_history_loop_health_owner_parks_per_1k_root_messages{harness="pi",repo="example/project"} 0.142857142857
+agent_history_loop_health_owner_parks_per_1k_root_messages{harness="pi",repo="example/widget"} 2.5
+# HELP agent_history_loop_health_owner_questions_per_1k_root_messages Synthetic agent_history_loop_health_owner_questions_per_1k_root_messages.
+# TYPE agent_history_loop_health_owner_questions_per_1k_root_messages gauge
+agent_history_loop_health_owner_questions_per_1k_root_messages{harness="claude",repo="example/project"} 3.75
+agent_history_loop_health_owner_questions_per_1k_root_messages{harness="claude",repo="example/widget"} 5
+agent_history_loop_health_owner_questions_per_1k_root_messages{harness="pi",repo="example/project"} 0.142857142857
+agent_history_loop_health_owner_questions_per_1k_root_messages{harness="pi",repo="example/widget"} 2.5
+# HELP agent_history_loop_health_ratification_rulings Synthetic agent_history_loop_health_ratification_rulings.
+# TYPE agent_history_loop_health_ratification_rulings gauge
+agent_history_loop_health_ratification_rulings{harness="claude",repo="example/project"} 3.75
+agent_history_loop_health_ratification_rulings{harness="claude",repo="example/widget"} 5
+agent_history_loop_health_ratification_rulings{harness="pi",repo="example/project"} 0.142857142857
+agent_history_loop_health_ratification_rulings{harness="pi",repo="example/widget"} 2.5
+# HELP agent_history_loop_health_root_messages Synthetic agent_history_loop_health_root_messages.
+# TYPE agent_history_loop_health_root_messages gauge
+agent_history_loop_health_root_messages{harness="claude",repo="example/project"} 3.75
+agent_history_loop_health_root_messages{harness="claude",repo="example/widget"} 5
+agent_history_loop_health_root_messages{harness="pi",repo="example/project"} 0.142857142857
+agent_history_loop_health_root_messages{harness="pi",repo="example/widget"} 2.5
+# HELP agent_history_loop_health_root_model_calls Synthetic agent_history_loop_health_root_model_calls.
+# TYPE agent_history_loop_health_root_model_calls gauge
+agent_history_loop_health_root_model_calls{harness="claude",repo="example/project"} 3.75
+agent_history_loop_health_root_model_calls{harness="claude",repo="example/widget"} 5
+agent_history_loop_health_root_model_calls{harness="pi",repo="example/project"} 0.142857142857
+agent_history_loop_health_root_model_calls{harness="pi",repo="example/widget"} 2.5
+# HELP agent_history_loop_health_root_model_time_share Synthetic agent_history_loop_health_root_model_time_share.
+# TYPE agent_history_loop_health_root_model_time_share gauge
+agent_history_loop_health_root_model_time_share{harness="claude",repo="example/project"} 3.75
+agent_history_loop_health_root_model_time_share{harness="claude",repo="example/widget"} 5
+agent_history_loop_health_root_model_time_share{harness="pi",repo="example/project"} 0.142857142857
+agent_history_loop_health_root_model_time_share{harness="pi",repo="example/widget"} 2.5
+# HELP agent_history_loop_health_root_model_timed_calls Synthetic agent_history_loop_health_root_model_timed_calls.
+# TYPE agent_history_loop_health_root_model_timed_calls gauge
+agent_history_loop_health_root_model_timed_calls{harness="claude",repo="example/project"} 3.75
+agent_history_loop_health_root_model_timed_calls{harness="claude",repo="example/widget"} 5
+agent_history_loop_health_root_model_timed_calls{harness="pi",repo="example/project"} 0.142857142857
+agent_history_loop_health_root_model_timed_calls{harness="pi",repo="example/widget"} 2.5
+# HELP agent_history_loop_health_tasks_done Synthetic agent_history_loop_health_tasks_done.
+# TYPE agent_history_loop_health_tasks_done gauge
+agent_history_loop_health_tasks_done{harness="claude",repo="example/project"} 3.75
+agent_history_loop_health_tasks_done{harness="claude",repo="example/widget"} 5
+agent_history_loop_health_tasks_done{harness="pi",repo="example/project"} 0.142857142857
+agent_history_loop_health_tasks_done{harness="pi",repo="example/widget"} 2.5
 # HELP agent_history_parse_issues_total Synthetic agent_history_parse_issues_total.
 # TYPE agent_history_parse_issues_total gauge
 agent_history_parse_issues_total{kind="json_error"} 0.142857142857

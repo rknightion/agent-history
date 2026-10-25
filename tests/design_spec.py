@@ -9,7 +9,7 @@ from pathlib import Path
 
 DESIGN = Path(__file__).resolve().parents[1] / "docs" / "otel-design.md"
 STORAGE = ("tier", "namespace", "agent", "profile", "machine")
-ROW = re.compile(r"^\| `(?P<name>[a-z_]+)` \| (?P<kind>[GC]) \| `(?P<unit>[^`]+)` \| (?P<attrs>.+) \|$")
+ROW = re.compile(r"^\| `(?P<name>[a-z_][a-z0-9_]*)` \| (?P<kind>[GC]) \| `(?P<unit>[^`]+)` \| (?P<attrs>.+) \|$")
 HISTOGRAM_ROW = re.compile(r"^\| `(?P<name>[a-z_]+)` \| `(?P<attrs>[^`]+)` \| `(?P<bounds>[0-9,]+)` \|$")
 
 

@@ -288,6 +288,17 @@ Sources: `metrics/catalogue.py:34-56,133-217`, `metrics/self.py:100-115`, `metri
 | `agent_history_embed_pending_messages` | G | `{chunk}` | none |
 | `agent_history_embed_failed_inputs` | G | `{input}` | none |
 | `agent_history_embed_vectors` | G | `{vector}` | none |
+| `agent_history_loop_health_completed_timestamp_seconds` | G | `s` | `harness,repo` |
+| `agent_history_loop_health_root_model_time_share` | G | `1` | `harness,repo` |
+| `agent_history_loop_health_root_model_calls` | G | `{call}` | `harness,repo` |
+| `agent_history_loop_health_root_model_timed_calls` | G | `{call}` | `harness,repo` |
+| `agent_history_loop_health_root_messages` | G | `{message}` | `harness,repo` |
+| `agent_history_loop_health_owner_questions_per_1k_root_messages` | G | `{match}` | `harness,repo` |
+| `agent_history_loop_health_owner_parks_per_1k_root_messages` | G | `{match}` | `harness,repo` |
+| `agent_history_loop_health_ratification_rulings` | G | `{match}` | `harness,repo` |
+| `agent_history_loop_health_lane_complete_rate` | G | `1` | `harness,repo` |
+| `agent_history_loop_health_tasks_done` | G | `{task}` | `harness,repo` |
+| `agent_history_loop_health_estimated_cost_usd` | G | `{USD}` | `harness,repo` |
 | `agent_history_exporter_collection_duration_seconds` | G | `s` | `collector` |
 | `agent_history_exporter_collection_errors_total` | C | `{error}` | `collector` |
 | `agent_history_cold_tier_available` | G | `1` | none |

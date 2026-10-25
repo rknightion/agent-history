@@ -26,6 +26,8 @@ PARSE_KINDS = (
     "late_session_header",
 )
 POOLS = {
+    "harness": ("pi", "claude"),
+    "repo": ("example/project", "example/widget"),
     "agent": ("claude", "codex"),
     "namespace": ("claude-personal", "codex-personal"),
     "loop": ("loop1", "loop2"),

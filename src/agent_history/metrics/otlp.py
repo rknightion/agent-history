@@ -82,6 +82,17 @@ agent_history_rows {row} table
 agent_history_embed_pending_messages {chunk} -
 agent_history_embed_failed_inputs {input} -
 agent_history_embed_vectors {vector} -
+agent_history_loop_health_completed_timestamp_seconds s harness,repo
+agent_history_loop_health_root_model_time_share 1 harness,repo
+agent_history_loop_health_root_model_calls {call} harness,repo
+agent_history_loop_health_root_model_timed_calls {call} harness,repo
+agent_history_loop_health_root_messages {message} harness,repo
+agent_history_loop_health_owner_questions_per_1k_root_messages {match} harness,repo
+agent_history_loop_health_owner_parks_per_1k_root_messages {match} harness,repo
+agent_history_loop_health_ratification_rulings {match} harness,repo
+agent_history_loop_health_lane_complete_rate 1 harness,repo
+agent_history_loop_health_tasks_done {task} harness,repo
+agent_history_loop_health_estimated_cost_usd {USD} harness,repo
 agent_history_exporter_collection_duration_seconds s collector
 agent_history_loop_checkout_unconfigured {checkout} -
 agent_history_loop_checkout_observation_complete 1 -
@@ -245,6 +256,7 @@ SECTIONS = COLLECTORS | {
     "catalogue_embed_pending",
     "catalogue_embed_failures",
     "catalogue_embed_vectors",
+    "catalogue_loop_health",
 }
 TIERS = frozenset({"hot", "cold", "incoming", "conflicts"})
 EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max", "inherit", "other"})

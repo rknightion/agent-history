@@ -39,6 +39,13 @@ printed one in a command's output, the secret is in the catalogue.
   (service `agent-history-index`). The package serves no metrics endpoint and writes no Prometheus
   textfile for a scraper; the worker run snapshots under `/var/lib/alloy/textfile-agent-history` are
   an internal hand-off read by that collection.
+- Completed-loop health gauges select the latest finished loop per canonical repository and root
+  harness, with exactly `repo` and `harness` attributes and no loop/session identity labels.
+  Missing evidence removes a sample rather than publishing zero or retaining an older known field.
+  Root timing requires complete persisted pi assistant request coverage; compaction and lane time
+  are excluded. Questions, parks and ratification mentions are approximate root-text heuristics,
+  not authoritative owner actions. See [completed-loop health](docs/loop-health.md) for window,
+  coverage, count and cost definitions and the sampling limitations.
 
 Treat the database like the transcript directories it was built from: local, access-controlled,
 and never exposed to a network you do not trust. There is no row-level security.

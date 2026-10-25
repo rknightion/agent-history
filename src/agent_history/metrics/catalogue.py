@@ -10,6 +10,7 @@ from pathlib import Path
 from agent_history import telemetry
 
 from . import Family, Sample
+from . import loop_health
 
 TABLES = (
     "session",
@@ -143,7 +144,9 @@ class CatalogueCollector:
         failed = False
         try:
             with conn.transaction():
-                conn.execute("SET LOCAL statement_timeout = '5s'")
+                # The heavier health query has its own budget, never a session-wide override.
+                timeout = "60s" if name == "loop_health" else "5s"
+                conn.execute("SELECT set_config('statement_timeout', %s, true)", (timeout,))
                 yield
         except Exception:
             # No partial family, stale value or false zero for an unknown section.
@@ -250,4 +253,6 @@ class CatalogueCollector:
             with self.section(conn, result, "embed_vectors"):
                 vectors = conn.execute("SELECT count(*) FROM ah.embedding").fetchone()[0]
                 result.append(gauge("agent_history_embed_vectors", "Stored embedding vectors.", vectors))
+            with self.section(conn, result, "loop_health"):
+                result.extend(loop_health.collect(conn))
             return result

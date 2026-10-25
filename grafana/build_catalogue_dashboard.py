@@ -4724,7 +4724,126 @@ tab(
     ],
 )
 
+# Completed-loop health is an observation history, not a per-loop series. Dedicated filters
+# use canonical owner/repo and harness; namespace and the short-slug Repo filter do not apply.
+HEALTH = AH + ',repo=~"${health_repo:regex}",harness=~"${health_harness:regex}"'
+HEALTH_DESC = (
+    "Latest completed loop per canonical repository and root harness, held until the next completion. "
+    "Not every completion is observable between index passes. Missing evidence is a gap, never zero. "
+    "Uses only Loop health repo/harness filters, not namespace or the short-slug Repo filter. "
+    "Repository names are shown as recorded, including in presentation mode. "
+)
+HEALTH_PANELS = [
+    (
+        "root_model_time_share_ratio",
+        "Root model-time share",
+        "percentunit",
+        "Sum of clipped persisted pi assistant request intervals / catalogue launch-to-end wall time, capped at one. "
+        "Includes linked relaunch roots, excludes lane and compaction time. Incomplete timing omits the share; "
+        "coverage is plotted separately. Tool, review, wait and idle time remain in the denominator.",
+    ),
+    (
+        "owner_questions_per_1k_root_messages",
+        "Approximate owner questions / 1k root messages",
+        "short",
+        "Text heuristic: root assistant text messages containing owner question, question(s) for (the) owner, "
+        "or owner/you followed within 160 characters on the same line by a question mark. "
+        "At most one match per message, divided by root assistant text messages, times 1000. Not verified owner interventions.",
+    ),
+    (
+        "owner_parks_per_1k_root_messages",
+        "Approximate owner parks / 1k root messages",
+        "short",
+        "Text heuristic: root assistant text messages containing the word park, parked, parks or parking. "
+        "At most one match per message, divided by root assistant text messages, times 1000. "
+        "Mentions, quoted text and negations can match; not the authoritative closeout/state park count.",
+    ),
+    (
+        "ratification_rulings",
+        "Approximate for-ratification rulings",
+        "short",
+        "Text heuristic: number of root assistant text messages containing for-ratification or for ratification. "
+        "Multiple rulings in one message count once; mentions are not verified rulings.",
+    ),
+    (
+        "lane_complete_rate_ratio",
+        "Lane complete rate",
+        "percentunit",
+        "Indexed lanes whose latest return status is complete / all indexed lanes. Missing returns do not count as complete. "
+        "No indexed lanes is unknown. A complete return is not root acceptance or publication.",
+    ),
+    (
+        "tasks_done",
+        "Tasks done",
+        "short",
+        "Catalogue tasks_done, with its existing closeout/state/Done-flip precedence. Unknown delivery counts are omitted.",
+    ),
+    (
+        "estimated_cost_usd",
+        "Estimated loop cost",
+        "currencyUSD",
+        "Catalogue list-price estimate for root and linked lanes, not an invoice or recorded provider cost. "
+        "Missing token components or prices omit the estimate rather than publishing a subtotal.",
+    ),
+]
+for index, (metric, title, unit, desc) in enumerate(HEALTH_PANELS):
+    timeseries(
+        f"health_{index}",
+        title,
+        HEALTH_DESC + desc,
+        [prom(f"agent_history_loop_health_{metric}{{{HEALTH}}}", legend="{{repo}} / {{harness}}")],
+        unit=unit,
+        minv=0,
+    )
+timeseries(
+    "health_coverage",
+    "Root model-time coverage",
+    HEALTH_DESC + "Timed root assistant calls versus all root assistant calls, excluding compaction and usage records. "
+    "Only valid ended pi progress linked by response identity supplies timing; other harnesses remain unsupported.",
+    [
+        prom(
+            f"agent_history_loop_health_root_model_{part}{{{HEALTH}}}",
+            ref=ref,
+            legend="{{repo}} / {{harness}} " + label,
+        )
+        for ref, part, label in (("A", "calls", "calls"), ("B", "timed_calls", "timed"))
+    ],
+    minv=0,
+)
+timeseries(
+    "health_completed",
+    "Completed-loop observation age",
+    HEALTH_DESC
+    + "Seconds since the latest observed completion, not index freshness. Gauge values are repeated, not new loop completions.",
+    [
+        prom(
+            f"time() - agent_history_loop_health_completed_timestamp_seconds{{{HEALTH}}}",
+            legend="{{repo}} / {{harness}}",
+        )
+    ],
+    unit="s",
+    minv=0,
+)
+tab(
+    "Loop health",
+    [(8, [(f"health_{i}", 12), (f"health_{i + 1}", 12)]) for i in (0, 2, 4)]
+    + [(8, [("health_6", 12), ("health_coverage", 12)]), (6, [("health_completed", 24)])],
+)
+
 VARIABLES = [
+    sqlvar(
+        "health_repo",
+        "Loop health repo",
+        "SELECT DISTINCT ah.canonical_repo(repo) FROM ah.loops WHERE status = 'finished' "
+        "AND ah.canonical_repo(repo) IS NOT NULL ORDER BY 1",
+        all_value=".*",
+    ),
+    sqlvar(
+        "health_harness",
+        "Loop health harness",
+        "SELECT DISTINCT agent FROM ah.session WHERE agent IN ('pi','claude','codex') ORDER BY 1",
+        all_value=".*",
+    ),
     customvar("redact", "Redact", ["off", "on"], "off", hide="hideVariable"),
     sqlvar(
         "namespace",
