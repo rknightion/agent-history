@@ -308,12 +308,13 @@ def resume_command(row: dict[str, str]) -> tuple[str | None, list[str]]:
     """
     warnings: list[str] = []
     agent, _, ctx = row["namespace"].partition("-")
-    if agent not in ("claude", "codex") or ctx not in ("personal", "work"):
+    if (agent not in ("claude", "codex") or ctx not in ("personal", "work")) and row["namespace"] != "codex-flash":
         return None, [f"namespace {row['namespace']} has no live home (retired or standalone); cannot resume"]
     var = "CLAUDE_CONFIG_DIR" if agent == "claude" else "CODEX_HOME"
     native_ctx = os.environ.get("AGENT_HISTORY_NATIVE_CONTEXT", context())
     native, named = Path.home() / f".{agent}", Path.home() / f".{agent}-{ctx}"
-    if ctx == native_ctx and native.is_dir():
+    # Flash owns an independent home, even if configured as the native search context.
+    if ctx != "flash" and ctx == native_ctx and native.is_dir():
         env = f"env -u {var}"
     elif named.is_dir():
         env = f"{var}={shlex.quote(str(named))}"
