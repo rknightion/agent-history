@@ -13,6 +13,7 @@ version = "0.9.0"
 source = { editable = "." }
 dependencies = [
     { name = "psycopg", extra = ["binary"] },
+    { name = "tzdata" },
 ]
 
 [package.optional-dependencies]
@@ -42,6 +43,7 @@ requires-dist = [
     { name = "opentelemetry-exporter-otlp-proto-http", marker = "extra == 'otel'", specifier = ">=1.39,<2" },
     { name = "opentelemetry-sdk", marker = "extra == 'otel'", specifier = ">=1.39,<2" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.2" },
+    { name = "tzdata", specifier = ">=2026.2" },
 ]
 provides-extras = ["mcp", "otel"]
 

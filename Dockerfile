@@ -8,6 +8,7 @@ COPY src/ ./src/
 RUN python -c 'import sys; assert sys.version_info[:2] == (3, 15)' && \
     python -m venv --without-pip /opt/venv && \
     python -m pip --python /opt/venv install --no-cache-dir ".[otel]" && \
+    PYTHONTZPATH="" /opt/venv/bin/python -c 'from zoneinfo import ZoneInfo; ZoneInfo("Europe/London"); import agent_history.collect_git' && \
     mkdir -p /state /var/lib/alloy/textfile-agent-history && \
     chown 10001:10001 /state /var/lib/alloy/textfile-agent-history
 
