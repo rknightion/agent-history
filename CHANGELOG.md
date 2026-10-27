@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.2](https://github.com/rknightion/agent-history/compare/v0.9.1...v0.9.2) (2026-10-27)
+
+
+### Bug Fixes
+
+* **parser:** recognise Claude request-capture and tools-used records ([6b4144d](https://github.com/rknightion/agent-history/commit/6b4144dc5aa75edf393dd04cbc80730e84732545))
+
 ## [0.9.1](https://github.com/rknightion/agent-history/compare/v0.9.0...v0.9.1) (2026-10-26)
 
 
