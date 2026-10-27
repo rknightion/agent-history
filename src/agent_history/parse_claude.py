@@ -132,6 +132,9 @@ KNOWN_TYPES = {
     "file-history-snapshot", "file-history-delta", "pr-link", "cost-state", "agent-name",
     "agent-setting", "frame-link", "artifact-comment-monitor", "artifact-autoreact-ledger",
     "fork-context-ref", "summary", "tag", "worktree-state", "continued-in",
+    # Request capture (deduplicated request bodies, shapes and params) and per-turn tool lists:
+    # recognised and counted in record_type_seen, not indexed into their own tables.
+    "api-request", "api-request-blob", "api-request-shape", "tools-used",
 }
 SPAWN_TOOLS = {"Agent", "Task"}
 COLLAB_TOOLS = {"Agent", "Task", "SendMessage", "SubagentHandback", "StructuredOutput", "Workflow",
