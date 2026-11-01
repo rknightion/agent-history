@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.3](https://github.com/rknightion/agent-history/compare/v0.9.2...v0.9.3) (2026-11-01)
+
+
+### Bug Fixes
+
+* **codex:** recognise tool and configuration response notices ([55a118c](https://github.com/rknightion/agent-history/commit/55a118c9e9a4e3686f18d96c07dc981c0e746a51))
+
 ## [0.9.2](https://github.com/rknightion/agent-history/compare/v0.9.1...v0.9.2) (2026-10-27)
 
 
