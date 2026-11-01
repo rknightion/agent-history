@@ -124,7 +124,7 @@ model call to the event that last changed the agent's state before it: `user`, `
 polling instead of waiting on events. It classifies Claude Code, Codex and pi. Exact per-call
 ordering needs result offsets and Claude record origins populated by a rebuild; older catalogue rows
 without them cannot establish the same-millisecond ordering. A rebuild cannot recover transcripts
-that have already been deleted (see CONTRACT.md). Optional `[cold_sources]` preserves cold-only history on rebuild; run `agent-history rebuild-check` for read-only tier counts and refusal decisions before rebuilding.
+that have already been deleted (see CONTRACT.md). Optional `[cold_sources]` preserves cold-only history on rebuild; run `agent-history rebuild-check` for read-only tier counts and refusal decisions before rebuilding. `agent-history reclassify-prompts` (with `--dry-run` first) re-applies the current prompt classifier to historical sessions without a rebuild (see CONTRACT.md).
 
 The package ships the catalogue, search, classifier and application container. The Compose
 template is for local deployment.

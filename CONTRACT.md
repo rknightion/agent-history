@@ -102,6 +102,26 @@ leaves the existing generation and any existing marker unchanged. Incremental in
 index creation never clears a failed rebuild's marker: correct the failure, keep consumers stopped,
 and run a complete source-preserving rebuild. Never remove the marker to reopen a partial load.
 
+The reader-boundary proofs in `tests/test_rebuild_generation_boundary_pg.py` read only these two
+surfaces as `ah_reader`. They cover the old, marked, failed and completed generations and a paged
+read admitted before the marker that resumes from its cursor after completion. With unchanged
+sources that resumed read equals a single-generation read, because `seq` is deterministic; with
+changed sources it does not, which is why the drain above remains the operational precondition.
+
+### Prompt reclassification
+
+`agent-history reclassify-prompts` corrects stored `human_prompt` and `queued_prompt` rows that an
+older prompt classifier left unsplit (harness wrappers and legacy peer envelopes), without a
+rebuild or a parser-version change. It selects Claude and Codex sessions whose stored prompt text
+the current classifier would split, then reparses every source contributing to them from byte zero
+in one transaction under the writer lock, followed by the post-pass. Readers see the previous
+complete rows or the new complete rows, never a partial transcript, and the rebuild marker is not
+used. Session human-activity bounds are reset before the reparse so they are recomputed. Each
+reparsed session gets a `content` change-log row; its `content_fingerprint` changes only when a
+lossless split adds a row. It refuses before writing while a rebuild is marked, while another run
+holds the lock, or when a required source is missing, unreadable, not fully indexed, indexed by
+another parser version or no longer matches its indexed prefix. `--dry-run` reports counts only. A second run finds nothing to do.
+
 ## Namespaces and contexts
 
 Each source is a namespace `<agent>-<profile>` (`claude-local`, `codex-client`, `pi-lab`). Every

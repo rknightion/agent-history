@@ -11,6 +11,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -763,6 +764,15 @@ def _process_source(conn: psycopg.Connection, writer: Writer, entry: SourceEntry
                 conn.commit()
             offset, line_base, state = 0, 0, {}
 
+    _parse_batches(conn, writer, path, ctx, source_id, stat, tier_cols, parser_cls, parser_version,
+                   offset, line_base, state, stats)
+
+
+def _parse_batches(conn: psycopg.Connection, writer: Writer, path: Path, ctx: FileContext, source_id: int,
+                   stat: os.stat_result, tier_cols: tuple[Any, ...], parser_cls, parser_version: str,
+                   offset: int, line_base: int, state: dict[str, Any], stats: RunStats, *,
+                   commit: bool = True) -> None:
+    """Parse `path` from `offset` and write each batch; `commit=False` keeps the caller's transaction."""
     parser = parser_cls(ctx, dict(state))
     stats.files_parsed += 1
     for batch in read_batches(path, offset, line_base):
@@ -798,14 +808,16 @@ def _process_source(conn: psycopg.Connection, writer: Writer, entry: SourceEntry
                 "head_sha256=%s, parser_version=%s, parser_state=%s, status=%s, indexed_at=now() WHERE id=%s",
                 (*tier_cols, end, last.line_number, start, tail, head, parser_version,
                  Jsonb(new_state), "indexed" if end >= stat.st_size else "partial", source_id))
-        conn.commit()
+        if commit:
+            conn.commit()
         stats.lines += len(batch)
         stats.bytes += end - batch[0][1].byte_offset
         stats.rows += len(rows)
     if offset == 0 and stat.st_size == 0:
         conn.execute("UPDATE ah.source_file SET status='indexed', parser_version=%s, indexed_at=now() WHERE id=%s",
                      (parser_version, source_id))
-        conn.commit()
+        if commit:
+            conn.commit()
 
 
 def _process_progress_source(conn: psycopg.Connection, writer: Writer, entry: SourceEntry, stats: RunStats) -> None:
@@ -1893,4 +1905,139 @@ def rebuild(conn: psycopg.Connection, hot: Path | None = HOT_ROOT, cold: Path | 
             conn.execute("DELETE FROM ah.meta WHERE key = 'rebuild_in_progress'")
         return stats
     finally:
+        unlock(conn)
+
+
+# --- prompt reclassification -------------------------------------------------------------------
+
+# Parsers whose prompt rows the shared prompt classifier splits (common.split_prompt_injections).
+RECLASSIFY_AGENTS = ("claude", "codex")
+# Tables whose rows name the source that contributed them to a session.
+_SESSION_SOURCE_TABLES = ("message", "llm_call", "tool_call", "tool_op", "turn", "session_event",
+                          "hook_event", "compaction")
+
+
+def reclassify_candidates(conn: psycopg.Connection) -> list[int]:
+    """Sessions holding a stored prompt row that the current prompt classifier would split.
+
+    Read-only. A cheap text prefilter bounds the scan; the classifier itself decides. The
+    stored text carries no record provenance, so this may over-select a typed prompt: its
+    reparse is then a no-op. The reparse, not this selection, is authoritative."""
+    from .common import LEGACY_PEER_PREFIX, PROMPT_INJECTION_CLASSES, split_prompt_injections
+
+    tags = "|".join(re.escape(tag) for tag in PROMPT_INJECTION_CLASSES)
+    sessions: set[int] = set()
+    with conn.cursor(name="reclassify_candidates") as cur:
+        cur.execute(
+            "SELECT m.session_id, m.text FROM ah.message m JOIN ah.session s ON s.id = m.session_id "
+            "WHERE s.agent = ANY(%s) AND m.message_class IN ('human_prompt', 'queued_prompt') "
+            "AND (strpos(m.text, %s) > 0 OR m.text ~ %s)",
+            (list(RECLASSIFY_AGENTS), LEGACY_PEER_PREFIX.rstrip("\n"), f"</?({tags})[\\s>]"))
+        for session_id, text in cur:
+            if session_id not in sessions and text and split_prompt_injections(text, legacy_peer=True)[1]:
+                sessions.add(session_id)
+    conn.commit()
+    return sorted(sessions)
+
+
+def _prompt_rows(conn: psycopg.Connection, sessions: list[int]) -> int:
+    return conn.execute("SELECT count(*) FROM ah.message WHERE session_id = ANY(%s) "
+                        "AND message_class IN ('human_prompt', 'queued_prompt')", (sessions,)).fetchone()[0]
+
+
+def reclassify_prompts(conn: psycopg.Connection, hot: Path | None = HOT_ROOT, cold: Path | None = COLD_ROOT,
+                       *, sources: dict[str, Path] | None = None, cold_sources: dict[str, Path] | None = None,
+                       dry_run: bool = False, log=print) -> dict[str, int]:
+    """Reparse, from their unchanged sources, the sessions whose stored prompts predate the classifier.
+
+    Historical prompt rows keep the class an older classifier gave them; an incremental index never
+    revisits indexed bytes. This reparses every source contributing to an affected session from
+    byte zero with the current parser and runs the post-pass, in ONE transaction under the writer
+    lock: readers see the old complete rows or the new complete rows, never a partial transcript,
+    and no rebuild marker is involved. Each changed session gets a `content` change_log row and a
+    new fingerprint. Refuses before any write while a rebuild is marked, when another run holds the
+    lock, or when any required source is missing, unreadable or no longer matches its indexed
+    prefix. Session human-activity bounds are reset first so they are recomputed, not merged."""
+    if conn.execute("SELECT EXISTS (SELECT 1 FROM ah.meta WHERE key = 'rebuild_in_progress')").fetchone()[0]:
+        conn.rollback()
+        raise SystemExit("reclassify refused: catalogue rebuild in progress")
+    conn.commit()
+    if not try_lock(conn):
+        raise SystemExit("reclassify refused: another index run holds the lock")
+    try:
+        if conn.execute("SELECT EXISTS (SELECT 1 FROM ah.meta WHERE key = 'rebuild_in_progress')").fetchone()[0]:
+            raise SystemExit("reclassify refused: catalogue rebuild in progress")
+        sessions = reclassify_candidates(conn)
+        union = " UNION ".join(f"SELECT source_id FROM ah.{t} WHERE session_id = ANY(%(s)s)"
+                               for t in _SESSION_SOURCE_TABLES)
+        columns = ("id", "rel_path", "indexed_offset", "line_count", "checkpoint_start", "checkpoint_sha256",
+                   "head_sha256", "parser_version", "parser_state", "status", "mtime_ns", "tier")
+        existing = [dict(zip(columns, row)) for row in conn.execute(
+            f"SELECT {', '.join(columns)} FROM ah.source_file WHERE id IN ({union}) ORDER BY rel_path",
+            {"s": sessions})]
+        before = _prompt_rows(conn, sessions)
+        conn.commit()
+        report = {"sessions": len(sessions), "sources": len(existing), "prompt_rows_before": before,
+                  "refused_sources": 0}
+        if sources is not None:
+            entries = check_rebuild_sources(conn, sources, cold_sources)[0] if cold_sources else inventory_map(sources)
+        else:
+            entries = inventory(hot, cold)
+        conn.commit()
+        plan: list[tuple[dict[str, Any], SourceEntry, os.stat_result]] = []
+        for row in existing:
+            entry = entries.get(row["rel_path"])
+            stat = None
+            if entry is not None:
+                try:
+                    stat = entry.path.stat()
+                except OSError:
+                    stat = None
+            if (entry is None or stat is None or entry.role == "pi_progress" or entry.agent not in RECLASSIFY_AGENTS
+                    or row["status"] != "indexed" or stat.st_size < (row["indexed_offset"] or 0)
+                    # A parser upgrade needs a rebuild (see _process_source); never mix versions here.
+                    or row["parser_version"] != parser_for(entry.agent, entry.role)[1]
+                    or not prefix_verified(row, entry.path) or not _readable_through(entry.path, stat.st_size)):
+                report["refused_sources"] += 1
+                continue
+            plan.append((row, entry, stat))
+        if report["refused_sources"]:
+            log(json.dumps(report))
+            raise SystemExit(f"reclassify refused: {report['refused_sources']} source(s) missing, "
+                             "unreadable or changed since indexing; index them first")
+        if dry_run or not sessions:
+            log(json.dumps({**report, "dry_run": dry_run}))
+            return report
+        stats = RunStats()
+        writer = Writer(conn)
+        with conn.transaction():
+            refresh_id = new_refresh(conn, "refresh")
+            conn.execute("UPDATE ah.session SET first_human_at = NULL, last_human_at = NULL WHERE id = ANY(%s)",
+                         (sessions,))
+            conn.execute("INSERT INTO ah.dirty_session (session_id) SELECT unnest(%s::bigint[]) "
+                         "ON CONFLICT DO NOTHING", (sessions,))
+            for row, entry, stat in plan:
+                source_id = row["id"]
+                purge_source(conn, source_id)
+                parser_cls, parser_version = parser_for(entry.agent, entry.role)
+                ctx = FileContext(str(entry.path), entry.rel_path, entry.namespace, entry.agent, entry.profile,
+                                  entry.machine, entry.role)
+                tier_cols = (entry.tier, entry.hot is not None, entry.cold is not None, stat.st_size, stat.st_mtime_ns)
+                _parse_batches(conn, writer, entry.path, ctx, source_id, stat, tier_cols, parser_cls, parser_version,
+                               0, 0, {}, stats, commit=False)
+                conn.execute(
+                    "INSERT INTO ah.parse_issue (source_id, byte_offset, kind, detail) VALUES (%s,-1,'prompt_reclassified',%s) "
+                    "ON CONFLICT (source_id, byte_offset, kind) DO UPDATE SET detail = EXCLUDED.detail, created_at = now()",
+                    (source_id, parser_version))
+            post_passes(conn, refresh_id)
+            finish_refresh(conn, refresh_id, True)
+            report["prompt_rows_after"] = _prompt_rows(conn, sessions)
+            report["change_log_rows"] = conn.execute(
+                "SELECT count(*) FROM ah.change_log WHERE refresh_id = %s", (refresh_id,)).fetchone()[0]
+            report["refresh_id"] = refresh_id
+        conn.commit()
+        log(json.dumps(report))
+        return report
+    finally:
+        conn.rollback()
         unlock(conn)

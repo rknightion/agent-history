@@ -1,6 +1,6 @@
 """agent-history: index agent transcripts into ParadeDB and query them.
 
-Writer commands (init, index, rebuild, create-indexes, postpass, embed, collect-git) connect with
+Writer commands (init, index, rebuild, reclassify-prompts, create-indexes, postpass, embed, collect-git) connect with
 the writer DSN: --dsn, else $AGENT_HISTORY_DSN, else `dsn` in the config file. Reader commands
 (search, efficiency) use the reader DSN when one is configured, else the writer DSN.
 """
@@ -37,6 +37,7 @@ WORKER_COMMANDS = frozenset(
         "init",
         "seed-pricing",
         "rebuild",
+        "reclassify-prompts",
         "create-indexes",
         "embed-gc",
         "create-vector-index",
@@ -200,6 +201,12 @@ def main(argv: list[str] | None = None) -> int:
 
     reb = sub.add_parser("rebuild", help="empty every derived table and re-index from the sources")
     reb.add_argument("--source", action="append", metavar="NAMESPACE=DIR")
+    recl = sub.add_parser(
+        "reclassify-prompts",
+        help="reparse, in one transaction, sessions whose stored prompts the current classifier would split",
+    )
+    recl.add_argument("--source", action="append", metavar="NAMESPACE=DIR")
+    recl.add_argument("--dry-run", action="store_true", help="report counts only; write nothing")
     check = sub.add_parser("rebuild-check", help="read-only source-tier counts and rebuild refusal decision")
     check.add_argument("--source", action="append", metavar="NAMESPACE=DIR")
 
@@ -549,6 +556,16 @@ def _dispatch(args, parser, argv, reader_commands):
                 conn, None, None, None, sources=_sources(config, args.source), cold_sources=config.cold_sources
             )
             return 1 if stats.errors else 0
+        if args.command == "reclassify-prompts":
+            load.reclassify_prompts(
+                conn,
+                None,
+                None,
+                sources=_sources(config, args.source),
+                cold_sources=config.cold_sources,
+                dry_run=args.dry_run,
+            )
+            return 0
         if args.command == "stats":
             print(json.dumps(load.stats_report(conn), indent=2, default=str))
             return 0
