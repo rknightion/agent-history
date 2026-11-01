@@ -531,6 +531,40 @@ def _refresh_completion_receipts(conn: psycopg.Connection, v3_projected: dict[st
 
 UNKNOWN = {"repo": None, "loop": None, "goal_sha256": None}
 
+# The repository a launch is attributable to when exact identity (receipts, collected charter and
+# closeout origins, the launch text) names none: the checkout holding its report path, else its
+# root session's repository. A repository the collector only knew as `local/<name>` has no
+# owner/name and never counts. `%s` is the launch uid. A NULL repo reads as "every repo" to the
+# readers that arm per-repository work (the factory lease), so a known checkout must not leave it NULL.
+REPO_FALLBACK_SQL = r"""(
+    SELECT pick.repo FROM (
+        SELECT 1 AS rank, lower(regexp_replace(r.slug, '^[^/]+/', '')) AS repo
+        FROM ah.loop_run lr JOIN ah.repo r ON r.local_root = ah.repo_root(lr.report_path)
+        WHERE lr.launch_uid = %s AND r.slug ~ '^[^/]+/[^/]+/[^/]+$'
+        UNION ALL
+        SELECT 2, lower(regexp_replace(r.slug, '^[^/]+/', ''))
+        FROM ah.loop_run lr JOIN ah.session s ON s.id = lr.root_session_id
+        JOIN ah.repo r ON r.id = s.repo_id
+        WHERE lr.launch_uid = %s AND r.slug ~ '^[^/]+/[^/]+/[^/]+$'
+    ) pick
+    WHERE pick.repo ~ '^[a-z0-9_.-]+/[a-z0-9_.-]+$'
+    ORDER BY pick.rank LIMIT 1
+)"""
+
+
+def refresh_repo_fallback(conn: psycopg.Connection) -> None:
+    """Attribute every still-unattributed launch whose checkout or root session names a repository.
+
+    The identity passes only revisit selected launches, so this is also the backfill for finished
+    rows that were left NULL. It only fills NULL, so exact identity is never overwritten.
+    """
+    conn.execute(
+        "UPDATE ah.loops l SET repo = f.repo FROM ("
+        "SELECT launch_uid, " + REPO_FALLBACK_SQL.replace("%s", "u.launch_uid") + " AS repo "
+        "FROM ah.loops u WHERE u.repo IS NULL) f "
+        "WHERE l.launch_uid = f.launch_uid AND f.repo IS NOT NULL"
+    )
+
 
 def _start_identity(
     conn: psycopg.Connection, goal_path: str | None, label: str | None, launch_ts: Any
@@ -738,14 +772,19 @@ def _refresh_identity(
             conn, uid, goal_path, f"loop{number}" if number is not None else None, fields, started
         )
         conn.execute(
-            "UPDATE ah.loops SET repo = %s, loop = %s, goal_sha256 = %s WHERE launch_uid = %s "
-            "AND (repo, loop, goal_sha256) IS DISTINCT FROM (%s, %s, %s)",
+            "UPDATE ah.loops SET repo = COALESCE(%s, " + REPO_FALLBACK_SQL + "), loop = %s, goal_sha256 = %s "
+            "WHERE launch_uid = %s AND (repo, loop, goal_sha256) IS DISTINCT FROM "
+            "(COALESCE(%s, " + REPO_FALLBACK_SQL + "), %s, %s)",
             (
                 fields["repo"],
+                uid,
+                uid,
                 fields["loop"],
                 fields["goal_sha256"],
                 uid,
                 fields["repo"],
+                uid,
+                uid,
                 fields["loop"],
                 fields["goal_sha256"],
             ),
@@ -769,6 +808,7 @@ def _refresh_identity(
     from .loop_identity_v3 import refresh_identity
 
     refresh_identity(conn, v3_projected)
+    refresh_repo_fallback(conn)
 
 
 PROGRESS_SELECTION_SQL = """

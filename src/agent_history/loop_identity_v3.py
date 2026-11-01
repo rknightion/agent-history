@@ -479,19 +479,26 @@ def refresh_completion(conn, projected: Mapping[str, Projection] | None = None) 
 
 def refresh_identity(conn, projected: Mapping[str, Projection] | None = None) -> None:
     """Compatibility: goal_sha256 holds the v3 charter digest, not a new redundant column."""
+    from .loops import REPO_FALLBACK_SQL
+
     if projected is None:
         projected = projections(conn)
     for uid, value in projected.items():
         fields = value.fields
         conn.execute(
-            "UPDATE ah.loops SET repo=%s,loop=%s,goal_sha256=%s WHERE launch_uid=%s "
-            "AND (repo,loop,goal_sha256) IS DISTINCT FROM (%s,%s,%s)",
+            "UPDATE ah.loops SET repo=COALESCE(%s," + REPO_FALLBACK_SQL + "),loop=%s,goal_sha256=%s "
+            "WHERE launch_uid=%s AND (repo,loop,goal_sha256) IS DISTINCT FROM "
+            "(COALESCE(%s," + REPO_FALLBACK_SQL + "),%s,%s)",
             (
                 fields["repo"],
+                uid,
+                uid,
                 fields["loop"],
                 fields["goal_sha256"],
                 uid,
                 fields["repo"],
+                uid,
+                uid,
                 fields["loop"],
                 fields["goal_sha256"],
             ),

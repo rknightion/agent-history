@@ -375,6 +375,13 @@ or eligible git-event remotes can supply origin; conflicting or malformed collec
 cannot be bypassed with a convenient remote. Missing pieces stay NULL; conflicting copies are not
 chosen by mtime or proximity. No new state log establishes identity by itself.
 
+Checkout fallback: a launch whose identity above leaves `ah.loops.repo` NULL is attributed to the
+`owner/repo` of the checkout holding its report path, else of its root session's repository
+(`ah.repo.slug` minus its host, never a `local/<name>` slug). This is inference, not collected
+evidence: it never overrides an identity-derived repo and is re-applied on every refresh, which also
+backfills finished rows. Because `ah.loops.repo` then feeds `tasks_done`, `tasks_landed` and the
+repo-scoped live-task reader, those projections count against the inferred repository.
+
 A qualified exact-path closeout can finish the run with `end_evidence = 'closeout'`. Its mtime
 must be in the half-open launch window bounded by the next launch on the same root or exact
 closeout path. Equal-time attribution is ambiguous. Repo, loop and charter must be known and
