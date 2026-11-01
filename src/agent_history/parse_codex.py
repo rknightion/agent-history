@@ -155,7 +155,8 @@ KNOWN_TOP = {"session_meta", "turn_context", "response_item", "event_msg", "toke
              "compacted", "world_state", "inter_agent_communication_metadata"}
 KNOWN_RESPONSE = {"message", "reasoning", "function_call", "function_call_output", "custom_tool_call",
                   "custom_tool_call_output", "agent_message", "tool_search_call", "tool_search_output",
-                  "web_search_call", "local_shell_call", "image_generation_call"}
+                  "web_search_call", "local_shell_call", "image_generation_call",
+                  "additional_tools", "configuration_update"}
 KNOWN_EVENT = {"token_count", "item_completed", "item_started", "task_started", "task_complete",
                "turn_aborted", "user_message", "agent_message", "agent_reasoning", "sub_agent_activity",
                "patch_apply_end", "mcp_tool_call_end", "thread_settings_applied", "context_compacted",
@@ -927,13 +928,15 @@ class CodexParser:
         self.s["cur"] = turn_id
         self.s["own_turns"] += 1
         turn = self._turn(turn_id, ts)
+        if self.s.get("effort_configured"):
+            turn["ef"] = turn["ef"] or self.s["effort"]
         turn["timing_open"] = True
         cw = as_int(p.get("model_context_window"))
         turn["cw"] = cw or turn["cw"]
         origin = None
         if self.s["sub"] and self.s["own_turns"] == 1:
             origin, turn["o"] = "subagent_brief", True
-        return [TurnRow(key, turn_id, pos.byte_offset, origin=origin,
+        return [TurnRow(key, turn_id, pos.byte_offset, origin=origin, effort=turn["ef"],
                         started_at=parse_ts(p.get("started_at")) or ts, status="open", context_window=cw,
                         collaboration_mode=as_str(p.get("collaboration_mode_kind")),
                         trace_id=as_str(p.get("trace_id")), root_turn_key=as_str(p.get("root_turn_id")))]
@@ -1315,6 +1318,17 @@ class CodexParser:
 
     def _response_item(self, ptype: str, p: dict[str, Any], ts: datetime | None, pos: LinePos,
                        uid: str) -> list[Row]:
+        if ptype == "additional_tools":
+            # Recognised inventory notice: the catalogue has no tool-definition inventory field.
+            return []
+        if ptype == "configuration_update":
+            # Index effort in existing session state; subsequent turns inherit it at task_started.
+            reasoning = p.get("reasoning")
+            effort = as_str(reasoning.get("effort")) if isinstance(reasoning, dict) else None
+            if effort:
+                self.s["effort"] = effort
+                self.s["effort_configured"] = True
+            return []
         key = self._key()
         if key is None or ts is None:
             return []

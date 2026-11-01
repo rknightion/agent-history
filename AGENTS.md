@@ -105,3 +105,11 @@ proofs outside this public tree when they import private consumers.
 
 British English. No em dashes, en dashes or double hyphens as punctuation in prose, commit
 messages included.
+
+## Codex response notices
+
+`additional_tools` is recognised without storing a tool-definition inventory; the schema has no
+inventory field. `configuration_update.reasoning.effort` updates existing session state for later
+turns, with explicit turn context taking precedence. These additive records retain parser version
+10 for incremental compatibility; existing stored issues and historical effort rows are not repaired
+retroactively. No SQL migration or baseline-ledger change is needed.

@@ -960,3 +960,57 @@ def test_command_text_is_skipped_when_output_matched_or_the_command_failed(tmp_p
     assert [e[2] for e in _ce1_events(matched)] == ["output_regex", "output_regex"]
     failed = _with_ce1(tmp_path, ["/bin/zsh", "-lc", "git commit -qm x"], "nothing to commit", exit_code=1)
     assert _ce1_events(failed) == []
+
+
+@pytest.mark.parametrize("item", [
+    {"type": "additional_tools", "id": "at_synthetic", "role": "developer", "tools": [
+        {"type": "function", "name": "lookup", "parameters": {"type": "object"}},
+        {"type": "function", "name": "clock", "parameters": {"type": "object"}},
+    ]},
+    {"type": "configuration_update", "reasoning": {"effort": "xhigh"}},
+], ids=["additional_tools", "configuration_update"])
+def test_mid_session_response_items_are_known(tmp_path, item):
+    store = load_records(tmp_path, [
+        {"type": "session_meta", "payload": {"id": P}},
+        {"type": "response_item", "payload": item},
+    ])
+    assert not [issue for issue in store.issues if issue.kind == "unknown_type"]
+    assert not store.rows("message")
+    assert not store.rows("tool_call")
+
+
+@pytest.mark.parametrize("timestamped", [True, False])
+def test_configuration_update_effort_reaches_next_turn(tmp_path, timestamped):
+    def record(kind, payload):
+        return {"timestamp": "2026-01-01T00:00:00Z", "type": kind, "payload": payload}
+
+    records = [record("session_meta", {"id": P})]
+    records += [
+        record("event_msg", {"type": "task_started", "turn_id": "before"}),
+        record("turn_context", {"turn_id": "before", "effort": "medium"}),
+        record("event_msg", {"type": "task_complete", "turn_id": "before"}),
+        record("response_item", {"type": "configuration_update", "reasoning": {"effort": "xhigh"}}),
+        record("event_msg", {"type": "task_started", "turn_id": "after"}),
+        record("turn_context", {"turn_id": "after"}),
+        record("token_usage_record", {"turn_id": "after", "usage": {"input_tokens": 1}}),
+        record("event_msg", {"type": "task_started", "turn_id": "explicit"}),
+        record("turn_context", {"turn_id": "explicit", "effort": "low"}),
+    ]
+    if not timestamped:
+        records[4].pop("timestamp")
+    # A malformed update must not clear the last valid effort.
+    records.insert(5, record("response_item", {"type": "configuration_update", "reasoning": None}))
+    store = load_records(tmp_path, records)
+    assert one(store, "turn", turn_key="before")["effort"] == "medium"
+    assert one(store, "turn", turn_key="after")["effort"] == "xhigh"
+    assert one(store, "llm_call", turn_key="after")["effort"] == "xhigh"
+    assert one(store, "turn", turn_key="explicit")["effort"] == "low"
+
+
+def test_unknown_response_item_still_reports_issue(tmp_path):
+    store = load_records(tmp_path, [
+        {"type": "session_meta", "payload": {"id": P}},
+        {"type": "response_item", "payload": {"type": "synthetic_future_item"}},
+    ])
+    assert [(issue.kind, issue.detail) for issue in store.issues] == [
+        ("unknown_type", "response_item/synthetic_future_item")]
