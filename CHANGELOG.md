@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.9.4](https://github.com/rknightion/agent-history/compare/v0.9.3...v0.9.4) (2026-11-02)
+
+
+### Performance Improvements
+
+* **journal:** sync session topics and summaries only when they change ([08f62f1](https://github.com/rknightion/agent-history/commit/08f62f1227dcb66ce057012fad6cc5ee9dede2c5))
+* **loops:** write ah.loops and loop_run rows only when a value changes ([c4c8351](https://github.com/rknightion/agent-history/commit/c4c83513731aa6b5a4a90c88d2d772a2d7c46f5b))
+* **metrics:** recompute heavy catalogue sections only when their tables change ([6a8ce59](https://github.com/rknightion/agent-history/commit/6a8ce59974ea2e54b18f89f1fe1ff184d80afa1a))
+* **schema:** index subagent_spawn child sessions for the link pass ([977d864](https://github.com/rknightion/agent-history/commit/977d864561d899ec4a70b1917640d13e6ccfbd8e))
+
 ## [0.9.3](https://github.com/rknightion/agent-history/compare/v0.9.2...v0.9.3) (2026-11-01)
 
 
