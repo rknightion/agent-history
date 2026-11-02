@@ -87,4 +87,6 @@ suffix.
 Gauges repeat until a newer completion is observed. Several loops completing between collection
 passes can be missed; this is a low-cardinality visual trend, not an event ledger or a substitute
 for direct catalogue queries. Text matching stays in PostgreSQL; no text is returned to metrics.
-The read-only query has the catalogue collector's 60-second statement timeout.
+The read-only query has the catalogue collector's 60-second statement timeout. It is recomputed only when
+one of the tables it reads has changed (at most once a minute, and at least every 15 minutes); the
+collector's docstring and the README's Metrics section describe the gating.

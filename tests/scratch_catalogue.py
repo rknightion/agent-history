@@ -125,3 +125,21 @@ def table_fault(target, table, fault):
             finally:
                 admin.execute("RESET ROLE")
             assert _acl(admin, table) == before
+
+
+class Clock:
+    """Injected collector clock: gating tests advance it instead of sleeping."""
+
+    def __init__(self, now=1000.0):
+        self.now = now
+
+    def __call__(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += seconds
+
+
+def flush_stats(connection):
+    """Publish this backend's pending table counters at its next commit, which gating tokens read."""
+    connection.execute("SELECT pg_stat_force_next_flush()")

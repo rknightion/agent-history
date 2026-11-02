@@ -4,7 +4,13 @@ import time
 from datetime import datetime, timedelta, timezone
 
 import pytest
-from scratch_catalogue import scratch_catalogue, scratch_conn as conn, table_fault  # noqa: F401 - guarded fixtures
+from scratch_catalogue import (  # noqa: F401 - guarded fixtures
+    Clock,
+    flush_stats,
+    scratch_catalogue,
+    scratch_conn as conn,
+    table_fault,
+)
 
 from agent_history import telemetry
 from agent_history.metrics import otlp, otlp_parity
@@ -111,7 +117,8 @@ def test_exporter_latest_completed_health_and_otlp(clean, scratch_catalogue, tmp
 
     telemetry.setup("agent-history-index")
     bridge = otlp.Bridge.create()
-    collector = CatalogueCollector(scratch_catalogue.writer)
+    clock = Clock()
+    collector = CatalogueCollector(scratch_catalogue.writer, clock=clock)
     collection = Collection([collector], State(tmp_path), refresh=0, bridge=bridge)
     text = collection.metrics()
     decoded = receiver.flush()
@@ -138,7 +145,9 @@ def test_exporter_latest_completed_health_and_otlp(clean, scratch_catalogue, tmp
     # Lost timing is unknown, never a zero or a partial full-loop share. The real exporter
     # and the OTLP callback must retire the previous known gauge without a restart.
     clean.execute("DELETE FROM ah.request_progress WHERE request_uid = 'second'")
+    flush_stats(clean)
     clean.commit()
+    clock.advance(61)  # Past the minimum recompute interval; the changed token then decides.
     text = collection.metrics()
     assert PREFIX + "root_model_time_share{" not in text
     assert PREFIX + "root_model_time_share" not in receiver.flush()
@@ -146,7 +155,9 @@ def test_exporter_latest_completed_health_and_otlp(clean, scratch_catalogue, tmp
     # A newer completed loop with missing evidence must replace every old field, not select
     # the latest known value separately per family. No messages/lanes/cost means unknown.
     seed(clean, key="newest", at=AT + timedelta(hours=2), tasks=None, cost=None)
+    flush_stats(clean)
     clean.commit()
+    clock.advance(61)
     text = collection.metrics()
     for field in (
         "tasks_done",
@@ -157,7 +168,9 @@ def test_exporter_latest_completed_health_and_otlp(clean, scratch_catalogue, tmp
     ):
         assert PREFIX + field + "{" not in text
     clean.execute("INSERT INTO ah.meta (key,value) VALUES ('rebuild_in_progress','synthetic')")
+    flush_stats(clean)
     clean.commit()
+    clock.advance(61)
     assert all(not family.samples for family in collector.collect() if family.name.startswith(PREFIX))
     assert collector.section_health["catalogue_loop_health"][1] is False
     clean.execute("DELETE FROM ah.meta WHERE key='rebuild_in_progress'")
@@ -178,10 +191,12 @@ def test_health_fault_isolation_and_recovery(clean, scratch_catalogue, tmp_path,
     telemetry.setup("agent-history-index")
     bridge = otlp.Bridge.create()
     health = SelfCollector()
-    collector = CatalogueCollector(scratch_catalogue.reader)
+    clock = Clock()
+    collector = CatalogueCollector(scratch_catalogue.reader, clock=clock)
     collection = Collection([collector, health], State(tmp_path), refresh=0, bridge=bridge)
 
     def collect():
+        clock.advance(61)  # Past the minimum recompute interval; gating stays on and tokens decide.
         text = collection.metrics()
         decoded = receiver.flush()
         parity = otlp_parity.compare(text, decoded, rejected=bridge.rejected)
@@ -192,6 +207,7 @@ def test_health_fault_isolation_and_recovery(clean, scratch_catalogue, tmp_path,
     assert PREFIX + 'tasks_done{harness="pi",repo="example/project"} 2' in before
     clean.execute("UPDATE ah.refresh_log SET finished_at=to_timestamp(200)")
     clean.execute("UPDATE ah.loops SET tasks_done=3")
+    flush_stats(clean)
     clean.commit()
     vectors = clean.execute("SELECT count(*) FROM ah.embedding").fetchone()[0]
     clean.commit()

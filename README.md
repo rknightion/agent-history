@@ -205,6 +205,17 @@ start, the indexer keeps indexing, prints `metric collection disabled (config)` 
 `telemetry.configuration.invalid` OTLP log; the `agent-history-metrics-stale` alert rule catches a
 collection that is absent or no longer completes runs.
 
+The catalogue collector runs its cheap sections (refresh, dirty sessions, row estimates) on every
+refresh, but the table-scanning ones (sources, lag, parse issues, links, embedding counts and loop
+health) recompute only when a table they read has changed. Change is detected from each table's file
+node and its insert, update and delete counters in the database statistics, read before the section
+queries run. An unchanged section republishes its last values after a zero-row probe of every table
+it reads, so a lost permission or a held exclusive lock still fails it. A changed section recomputes
+at most once every 60 seconds, and any section recomputes after 15 minutes regardless. Values can
+therefore lag a committed change by up to a minute or so (statistics flush delay plus the 60-second
+floor), and by 15 minutes at worst for a change the statistics never reflect; the cadence of the published samples is
+unchanged.
+
 Each periodic iteration prints one line: `<command> succeeded`, or `<command> failed (<category>);
 retrying`, where the category is fixed (`config: <key>` names the config key at fault, e.g.
 `config: dsn_file`, never its value or path; then `database`, `io`, `provider`, `status` or `error`).

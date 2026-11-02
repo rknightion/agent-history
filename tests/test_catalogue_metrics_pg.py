@@ -3,7 +3,13 @@
 import time
 
 import pytest
-from scratch_catalogue import scratch_catalogue, scratch_conn, table_fault  # noqa: F401 - shared guarded fixtures
+from scratch_catalogue import (  # noqa: F401 - shared guarded fixtures
+    Clock,
+    flush_stats,
+    scratch_catalogue,
+    scratch_conn,
+    table_fault,
+)
 
 from agent_history import load, telemetry
 from agent_history.metrics import otlp, otlp_parity
@@ -57,10 +63,12 @@ def test_catalogue_section_fault_and_recovery(
     telemetry.setup("agent-history-index")
     bridge = otlp.Bridge.create()
     health = SelfCollector()
-    collector = CatalogueCollector(scratch_catalogue.reader)
+    clock = Clock()
+    collector = CatalogueCollector(scratch_catalogue.reader, clock=clock)
     collection = Collection([collector, health], State(tmp_path), refresh=0, bridge=bridge)
 
     def collect():
+        clock.advance(61)  # Past the minimum recompute interval; gating stays on and tokens decide.
         text = collection.metrics()
         decoded = receiver.flush()
         report = otlp_parity.compare(text, decoded, rejected=bridge.rejected)
@@ -72,6 +80,7 @@ def test_catalogue_section_fault_and_recovery(
     assert "agent_history_embed_failed_inputs 1" in before
     conn.execute("UPDATE ah.refresh_log SET finished_at = to_timestamp(200)")
     conn.execute("INSERT INTO ah.embed_failure (model, input_sha256) VALUES ('synthetic', 'b')")
+    flush_stats(conn)
     conn.commit()
     vectors = conn.execute("SELECT count(*) FROM ah.embedding").fetchone()[0]
     conn.commit()
