@@ -463,8 +463,9 @@ def refresh_completion(conn, projected: Mapping[str, Projection] | None = None) 
         if value.end is not None:
             conn.execute(
                 "UPDATE ah.loop_run SET end_ts=%s,end_evidence='closeout' WHERE launch_uid=%s "
-                "AND (end_evidence IS NULL OR end_evidence IN ('root_last_event','closeout','state_close'))",
-                (value.end, uid),
+                "AND (end_evidence IS NULL OR end_evidence IN ('root_last_event','closeout','state_close')) "
+                "AND (end_ts,end_evidence) IS DISTINCT FROM (%s::timestamptz,'closeout')",
+                (value.end, uid, value.end),
             )
         else:
             conn.execute(

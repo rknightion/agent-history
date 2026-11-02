@@ -128,6 +128,24 @@ STRUCTURED = (
 )
 
 
+# The ah.loops column types the structured projection compares against.
+LOOP_COLUMN_TYPES = {
+    "live_phase": "text",
+    "active_lanes": "jsonb",
+    "last_gate": "jsonb",
+    "parks_total": "bigint",
+    "last_park": "jsonb",
+    "tasks_admitted": "bigint",
+    "tasks_landed": "bigint",
+    "last_judgement": "text",
+    "last_judgement_at": "timestamptz",
+    "ops_state": "jsonb",
+    "phase_since": "timestamptz",
+    "jev_phase": "text",
+    "jev_phase_probs": "jsonb",
+}
+
+
 def _iso(value: datetime | None) -> str | None:
     return value.isoformat() if value else None
 
@@ -1448,11 +1466,20 @@ def refresh(conn: psycopg.Connection) -> None:
         since = previous[1] if previous[0] == state["live_phase"] else now if state["live_phase"] else None
         json_fields = {"active_lanes", "last_gate", "last_park", "ops_state"}
         values = [Jsonb(state[k]) if k in json_fields and state[k] is not None else state[k] for k in STRUCTURED]
+        probs_value = Jsonb(probs) if probs is not None else None
+        columns = (*STRUCTURED, "phase_since", "jev_phase", "jev_phase_probs")
+        projected = (*values, since, jev_phase, probs_value)
+        # Write only when a projected value differs; the cast names each column's type so a NULL or a
+        # JSON parameter compares as that type (jsonb equality ignores key order and whitespace).
         conn.execute(
             "UPDATE ah.loops SET "
-            + ",".join(f"{k}=%s" for k in STRUCTURED)
-            + ",phase_since=%s,jev_phase=%s,jev_phase_probs=%s WHERE launch_uid=%s",
-            (*values, since, jev_phase, Jsonb(probs) if probs is not None else None, uid),
+            + ",".join(f"{k}=%s" for k in columns)
+            + " WHERE launch_uid=%s AND ("
+            + ",".join(columns)
+            + ") IS DISTINCT FROM ("
+            + ",".join(f"%s::{LOOP_COLUMN_TYPES[k]}" for k in columns)
+            + ")",
+            (*projected, uid, *projected),
         )
         summary = conn.execute(
             "SELECT response,generated_at,model,final_summary FROM ah.loop_live_cache "
@@ -1469,12 +1496,17 @@ def refresh(conn: psycopg.Connection) -> None:
             else:
                 headline = content["headline"]
                 conn.execute(
-                    "UPDATE ah.loops SET headline=%s,summary=%s,summary_generated_at=%s,summary_model=%s,final_summary=%s WHERE launch_uid=%s",
-                    (headline, content["summary"], *summary[1:], uid),
+                    "UPDATE ah.loops SET headline=%s,summary=%s,summary_generated_at=%s,summary_model=%s,final_summary=%s "
+                    "WHERE launch_uid=%s AND (headline,summary,summary_generated_at,summary_model,final_summary) "
+                    "IS DISTINCT FROM (%s::text,%s::text,%s::timestamptz,%s::text,%s::boolean)",
+                    (headline, content["summary"], *summary[1:], uid, headline, content["summary"], *summary[1:]),
                 )
         error = config_error or _public_error(cache_error) or _public_error(observed_job[4] if observed_job else None)
         # Paid admission is retired even for previously enabled configurations and new closes.
-        conn.execute("UPDATE ah.loops SET summary_error=%s WHERE launch_uid=%s", (error, uid))
+        conn.execute(
+            "UPDATE ah.loops SET summary_error=%s WHERE launch_uid=%s AND summary_error IS DISTINCT FROM %s::text",
+            (error, uid, error),
+        )
         if observed_job and (observed_job[3] is not None or observed_job[6] is not None):
             conn.execute(
                 "UPDATE ah.loop_live_job SET applied_at=now() WHERE launch_uid=%s AND digest_sha256=%s "

@@ -521,8 +521,9 @@ def _refresh_completion_receipts(conn: psycopg.Connection, v3_projected: dict[st
     if ends:
         with conn.cursor() as cur:
             cur.executemany(
-                "UPDATE ah.loop_run SET end_ts = %s, end_evidence = 'completion_receipt' WHERE launch_uid = %s",
-                [(when, uid) for uid, when in ends.items()],
+                "UPDATE ah.loop_run SET end_ts = %s, end_evidence = 'completion_receipt' WHERE launch_uid = %s "
+                "AND (end_ts, end_evidence) IS DISTINCT FROM (%s::timestamptz, 'completion_receipt')",
+                [(when, uid, when) for uid, when in ends.items()],
             )
     from .loop_identity_v3 import refresh_completion
 
@@ -911,15 +912,30 @@ def _refresh_progress(conn: psycopg.Connection) -> None:
                 SELECT NULLIF(count(*), 0) AS total,
                        NULLIF(count(*) FILTER (WHERE lane_return IS NOT NULL), 0) AS returned
                 FROM ah.lane WHERE loop_run_id = (SELECT id FROM target)
+            ), proj AS (
+                SELECT lanes.total AS lanes_total, lanes.returned AS lanes_returned,
+                       (SELECT max(last_event_at) FROM members) AS last_activity_at,
+                       usage.llm_calls, usage.input_uncached, usage.cache_read, usage.cache_write,
+                       usage.output, costs.cost AS priced_cost_usd, tools.errors AS tool_errors,
+                       usage.api_errors, git.commits, git.pushes,
+                       (SELECT agent FROM ah.session WHERE id = (SELECT root_session_id FROM target)) AS root_agent
+                FROM usage, costs, tools, git, lanes
             )
-            UPDATE ah.loops SET lanes_total = lanes.total, lanes_returned = lanes.returned,
-                last_activity_at = (SELECT max(last_event_at) FROM members),
-                llm_calls = usage.llm_calls, input_uncached = usage.input_uncached,
-                cache_read = usage.cache_read, cache_write = usage.cache_write, output = usage.output,
-                priced_cost_usd = costs.cost, tool_errors = tools.errors, api_errors = usage.api_errors,
-                commits = git.commits, pushes = git.pushes,
-                root_agent = (SELECT agent FROM ah.session WHERE id = (SELECT root_session_id FROM target))
-            FROM usage, costs, tools, git, lanes WHERE launch_uid = %s
+            UPDATE ah.loops l SET lanes_total = proj.lanes_total, lanes_returned = proj.lanes_returned,
+                last_activity_at = proj.last_activity_at,
+                llm_calls = proj.llm_calls, input_uncached = proj.input_uncached,
+                cache_read = proj.cache_read, cache_write = proj.cache_write, output = proj.output,
+                priced_cost_usd = proj.priced_cost_usd, tool_errors = proj.tool_errors,
+                api_errors = proj.api_errors, commits = proj.commits, pushes = proj.pushes,
+                root_agent = proj.root_agent
+            FROM proj WHERE l.launch_uid = %s
+              AND (l.lanes_total, l.lanes_returned, l.last_activity_at, l.llm_calls, l.input_uncached,
+                   l.cache_read, l.cache_write, l.output, l.priced_cost_usd, l.tool_errors, l.api_errors,
+                   l.commits, l.pushes, l.root_agent) IS DISTINCT FROM
+                  (proj.lanes_total, proj.lanes_returned, proj.last_activity_at, proj.llm_calls,
+                   proj.input_uncached, proj.cache_read, proj.cache_write, proj.output,
+                   proj.priced_cost_usd, proj.tool_errors, proj.api_errors, proj.commits, proj.pushes,
+                   proj.root_agent)
         """,
             (uid, uid),
         )
@@ -1479,8 +1495,9 @@ def _refresh_state_counts(conn: psycopg.Connection) -> None:
         admitted, published, parks = state_outcomes(cohorts)
         conn.execute(
             "UPDATE ah.loops SET lanes_accepted=%s,tasks_admitted=%s,tasks_landed=%s,parks_total=%s "
-            "WHERE launch_uid=%s",
-            (accepted, admitted, published, parks, uid),
+            "WHERE launch_uid=%s AND (lanes_accepted,tasks_admitted,tasks_landed,parks_total) IS DISTINCT FROM "
+            "(%s::bigint,%s::bigint,%s::bigint,%s::bigint)",
+            (accepted, admitted, published, parks, uid, accepted, admitted, published, parks),
         )
         # All copies must agree at shared sequence positions before a close is terminal.
         closes = []
@@ -1496,16 +1513,21 @@ def _refresh_state_counts(conn: psycopg.Connection) -> None:
             # Only a valid closed log supersedes the separately recomputed Done-flip fallback.
             # Share exact tracker/root publication semantics with tasks_landed, not alias lands
             # or worker observations. Receipt/replacement lifecycle precedence is independent.
-            conn.execute("UPDATE ah.loops SET tasks_done=%s WHERE launch_uid=%s", (published, uid))
+            conn.execute(
+                "UPDATE ah.loops SET tasks_done=%s WHERE launch_uid=%s AND tasks_done IS DISTINCT FROM %s::bigint",
+                (published, uid, published),
+            )
             closed = min(closes)
             conn.execute(
                 "UPDATE ah.loop_run SET end_ts=%s,end_evidence='state_close' "
-                "WHERE launch_uid=%s AND end_evidence IN ('root_last_event','state_close')",
-                (closed, uid),
+                "WHERE launch_uid=%s AND end_evidence IN ('root_last_event','state_close') "
+                "AND (end_ts,end_evidence) IS DISTINCT FROM (%s::timestamptz,'state_close')",
+                (closed, uid, closed),
             )
+            # An already finished row keeps its end_ts, so only a row that is not yet finished changes.
             conn.execute(
                 "UPDATE ah.loops SET status='finished',end_ts=CASE WHEN status='finished' THEN end_ts ELSE %s END "
-                "WHERE launch_uid=%s",
+                "WHERE launch_uid=%s AND status IS DISTINCT FROM 'finished'",
                 (closed, uid),
             )
     _refresh_trailer_lands(conn, [uid for uid, cohorts in qualified.items() if _state_blocks_trailer_lands(cohorts)])
