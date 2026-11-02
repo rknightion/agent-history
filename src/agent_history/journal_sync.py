@@ -154,6 +154,47 @@ def _session_map(conn: psycopg.Connection) -> dict[tuple[str, str, str], tuple[i
     return out
 
 
+def _sync_topics(
+    conn: psycopg.Connection,
+    conv: str,
+    sid: int | None,
+    topics: list[tuple[str, str | None, float | None]],
+) -> None:
+    """Make ah.session_topic hold exactly `topics` for one conversation, writing only what differs.
+
+    The first occurrence of a slug wins, as the (journal_conversation_id, topic) key with ON
+    CONFLICT DO NOTHING always made it. The comparison is done in SQL, never in Python: confidence
+    is numeric, so a Decimal read back from Postgres never equals the float parsed from JSON. A row
+    is updated in place, not deleted and reinserted, so the session_agent/session_uid/
+    session_agent_id columns a rebuild stashes survive; they are cleared only when the row moves to
+    a different session_id, the same as a fresh insert would have left them.
+    """
+    wanted: dict[str, tuple[str | None, float | None]] = {}
+    for slug, provenance, confidence in topics:
+        wanted.setdefault(slug, (provenance, confidence))
+    for slug, (provenance, confidence) in wanted.items():
+        conn.execute(
+            "INSERT INTO ah.session_topic AS t (journal_conversation_id, topic, session_id, provenance, "
+            "confidence) VALUES (%s,%s,%s,%s,%s) "
+            "ON CONFLICT (journal_conversation_id, topic) DO UPDATE SET "
+            "session_agent = CASE WHEN t.session_id IS DISTINCT FROM EXCLUDED.session_id "
+            "THEN NULL ELSE t.session_agent END, "
+            "session_uid = CASE WHEN t.session_id IS DISTINCT FROM EXCLUDED.session_id "
+            "THEN NULL ELSE t.session_uid END, "
+            "session_agent_id = CASE WHEN t.session_id IS DISTINCT FROM EXCLUDED.session_id "
+            "THEN NULL ELSE t.session_agent_id END, "
+            "session_id = EXCLUDED.session_id, provenance = EXCLUDED.provenance, "
+            "confidence = EXCLUDED.confidence "
+            "WHERE (t.session_id, t.provenance, t.confidence) IS DISTINCT FROM "
+            "(EXCLUDED.session_id, EXCLUDED.provenance, EXCLUDED.confidence)",
+            (conv, slug, sid, provenance, confidence),
+        )
+    conn.execute(
+        "DELETE FROM ah.session_topic WHERE journal_conversation_id = %s AND topic <> ALL(%s)",
+        (conv, list(wanted)),
+    )
+
+
 @telemetry.instrument_pass("journal_sync.pass")
 def sync(conn: psycopg.Connection, db_path: Path = APP_DB) -> dict[str, Any]:
     result: dict[str, Any] = {
@@ -327,7 +368,17 @@ def _sync_rows(conn, rows, result, reset, full_pass, current_instance, since):
                     "outcomes = EXCLUDED.outcomes, unfinished = EXCLUDED.unfinished, "
                     "classification = EXCLUDED.classification, project = EXCLUDED.project, model = EXCLUDED.model, "
                     "analysed_at = EXCLUDED.analysed_at "
-                    "WHERE session_summary.analysed_at <= EXCLUDED.analysed_at",
+                    "WHERE session_summary.analysed_at <= EXCLUDED.analysed_at "
+                    "AND (session_summary.session_id, session_summary.journal_revision_id, "
+                    "session_summary.namespace, session_summary.agent, session_summary.session_uid, "
+                    "session_summary.agent_id, session_summary.app_instance_id, session_summary.title, "
+                    "session_summary.objective, session_summary.narrative, session_summary.outcomes, "
+                    "session_summary.unfinished, session_summary.classification, session_summary.project, "
+                    "session_summary.model, session_summary.analysed_at) IS DISTINCT FROM "
+                    "(EXCLUDED.session_id, EXCLUDED.journal_revision_id, EXCLUDED.namespace, EXCLUDED.agent, "
+                    "EXCLUDED.session_uid, EXCLUDED.agent_id, EXCLUDED.app_instance_id, EXCLUDED.title, "
+                    "EXCLUDED.objective, EXCLUDED.narrative, EXCLUDED.outcomes, EXCLUDED.unfinished, "
+                    "EXCLUDED.classification, EXCLUDED.project, EXCLUDED.model, EXCLUDED.analysed_at)",
                     (
                         conv,
                         sid,
@@ -348,13 +399,7 @@ def _sync_rows(conn, rows, result, reset, full_pass, current_instance, since):
                         analysed_ts,
                     ),
                 )
-                conn.execute("DELETE FROM ah.session_topic WHERE journal_conversation_id = %s", (conv,))
-                for slug, provenance, confidence in topics or []:
-                    conn.execute(
-                        "INSERT INTO ah.session_topic (journal_conversation_id, topic, session_id, provenance, "
-                        "confidence) VALUES (%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING",
-                        (conv, slug, sid, provenance, confidence),
-                    )
+                _sync_topics(conn, conv, sid, topics or [])
 
     if full_pass:
         ids = list(seen_ids)
