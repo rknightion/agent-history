@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.5](https://github.com/rknightion/agent-history/compare/v0.9.4...v0.9.5) (2026-11-02)
+
+
+### Performance Improvements
+
+* **load:** read a source's parser state only when it resumes ([7ebc92a](https://github.com/rknightion/agent-history/commit/7ebc92a7f85baa85b0d8996001eb68347f204382))
+
 ## [0.9.4](https://github.com/rknightion/agent-history/compare/v0.9.3...v0.9.4) (2026-11-02)
 
 

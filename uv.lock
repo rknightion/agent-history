@@ -9,7 +9,7 @@ resolution-markers = [
 
 [[package]]
 name = "agent-history"
-version = "0.9.4"
+version = "0.9.5"
 source = { editable = "." }
 dependencies = [
     { name = "psycopg", extra = ["binary"] },
