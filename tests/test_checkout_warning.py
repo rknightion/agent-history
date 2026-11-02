@@ -150,6 +150,8 @@ def test_implicit_default_sources_are_not_observed(tmp_path, monkeypatch, capsys
     path = tmp_path / "config.toml"
     if existing:
         path.write_text(f'[collector]\nlock_file = "{tmp_path / "lock"}"\n')
+    # The default lock lives under HOME: never contend with a real collector holding it.
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
     monkeypatch.setattr(collect_git, "machine_name", lambda: ("example-machine", "example-machine"))
     monkeypatch.setattr(collect_git.Collector, "repositories", lambda _: None)
     monkeypatch.setattr(collect_git.Collector, "homes", lambda *args: None)
