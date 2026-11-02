@@ -148,6 +148,36 @@ def test_append_in_two_runs_equals_one_shot(clean, tmp_path):
     assert snapshot(clean) == full
 
 
+def test_parser_state_is_read_only_for_a_resuming_file(clean, tmp_path, monkeypatch):
+    hot, cold = build_tree(tmp_path)
+    refresh(clean, hot, cold)
+    full = snapshot(clean)
+    clean.execute("TRUNCATE " + ", ".join(f"ah.{t}" for t in load.DATA_TABLES) + " RESTART IDENTITY CASCADE")
+    clean.commit()
+    big = max(hot.rglob("*.jsonl"), key=lambda p: p.stat().st_size)
+    data = big.read_bytes()
+    cut = data.index(b"\n", len(data) // 2) + 1
+    big.write_bytes(data[:cut])
+    refresh(clean, hot, cold)
+    with big.open("ab") as handle:
+        handle.write(data[cut:])
+    seen = []
+    real = clean.execute
+
+    def recording(query, *args, **kwargs):
+        seen.append(str(query))
+        return real(query, *args, **kwargs)
+
+    monkeypatch.setattr(clean, "execute", recording)
+    stats = refresh(clean, hot, cold)
+    monkeypatch.undo()
+    reads = [q for q in seen if "parser_state" in q and q.lstrip().upper().startswith("SELECT")]
+    # The bulk inventory read carries no resume state; the one resuming file reads its own, once.
+    assert not [q for q in reads if "FROM ah.source_file" in q and "WHERE" not in q]
+    assert len([q for q in reads if "WHERE id = %s" in q]) == stats.files_parsed == 1
+    assert snapshot(clean) == full
+
+
 def test_rewritten_file_is_purged_and_reparsed(clean, tmp_path):
     hot, cold = build_tree(tmp_path)
     refresh(clean, hot, cold)

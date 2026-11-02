@@ -681,6 +681,14 @@ def purge_source(conn: psycopg.Connection, source_id: int) -> None:
                  "rewrite_count = rewrite_count + 1 WHERE id = %s", (source_id,))
 
 
+def _parser_state(conn: psycopg.Connection, existing: dict[str, Any]) -> dict[str, Any]:
+    """The stored resume state of a source: the row's own value when the caller loaded it, else read now."""
+    if "parser_state" in existing:
+        return existing["parser_state"] or {}
+    row = conn.execute("SELECT parser_state FROM ah.source_file WHERE id = %s", (existing["id"],)).fetchone()
+    return (row[0] if row else None) or {}
+
+
 def _process_source(conn: psycopg.Connection, writer: Writer, entry: SourceEntry,
                     existing: dict[str, Any] | None, stats: RunStats) -> None:
     if entry.role == "pi_progress":
@@ -750,7 +758,7 @@ def _process_source(conn: psycopg.Connection, writer: Writer, entry: SourceEntry
                 conn.commit()
                 stats.files_tier_only += 1
                 return
-            line_base, state = existing["line_count"], existing["parser_state"] or {}
+            line_base, state = existing["line_count"], _parser_state(conn, existing)
         else:
             # Rewritten or truncated: drop what this source contributed and reparse from zero.
             if offset:
@@ -1617,12 +1625,14 @@ def refresh(conn: psycopg.Connection, hot: Path | None = HOT_ROOT, cold: Path | 
         entries = (source_entries if source_entries is not None else
                    inventory_map(sources) if sources is not None else
                    inventory(hot, cold if cold_ok else None, namespaces))
+        # parser_state is fetched per file, only for a file that resumes: carried for every source it
+        # was hundreds of megabytes read on every pass for the few files that actually grew.
         existing = {r[1]: dict(zip(("id", "rel_path", "indexed_offset", "line_count", "checkpoint_start",
-                                     "checkpoint_sha256", "head_sha256", "parser_version", "parser_state",
+                                     "checkpoint_sha256", "head_sha256", "parser_version",
                                      "status", "mtime_ns", "tier"), r))
                     for r in conn.execute(
                         "SELECT id, rel_path, indexed_offset, line_count, checkpoint_start, checkpoint_sha256, "
-                        "head_sha256, parser_version, parser_state, status, mtime_ns, tier FROM ah.source_file")}
+                        "head_sha256, parser_version, status, mtime_ns, tier FROM ah.source_file")}
         conn.commit()
         writer = Writer(conn)
         # Main files first so parents exist before children; stable order otherwise.
