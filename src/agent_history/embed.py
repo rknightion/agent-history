@@ -397,14 +397,29 @@ class EmbedStats:
 LONG_MESSAGE_SQL = "(octet_length(m.text) >= 120 OR length(m.text) >= 30)"
 
 MESSAGE_SQL = """
+WITH pending AS MATERIALIZED (
+    SELECT message_id FROM ah.embed_message_pending
+    WHERE model = %(model)s ORDER BY message_id DESC LIMIT %(lim)s
+)
 SELECT m.id, m.content_sha256, m.namespace, m.session_id, m.ts, m.message_class, s.cwd, m.text
-FROM ah.message m
+FROM pending p JOIN ah.message m ON m.id = p.message_id
 JOIN ah.session s ON s.id = m.session_id
 WHERE m.message_class = ANY(%(classes)s) AND """ + LONG_MESSAGE_SQL + """
   AND NOT EXISTS (SELECT 1 FROM ah.chunk c WHERE c.message_id = m.id AND c.model = %(model)s
                   AND c.source_sha256 = m.content_sha256)
 ORDER BY m.id DESC
 LIMIT %(lim)s
+"""
+
+# Before a model's first embed pass there is no seeded queue yet. Metrics and standalone GC
+# retain the source query in that case, never interpreting an uninitialised queue as no work.
+PENDING_COUNT_SQL = """
+SELECT CASE WHEN EXISTS (SELECT 1 FROM ah.embed_message_model WHERE model = %(model)s)
+THEN (SELECT count(*) FROM ah.embed_message_pending WHERE model = %(model)s)
+ELSE (SELECT count(*) FROM ah.message m
+      WHERE m.message_class = ANY(%(classes)s) AND """ + LONG_MESSAGE_SQL + """
+        AND NOT EXISTS (SELECT 1 FROM ah.chunk c WHERE c.message_id = m.id AND c.model = %(model)s
+                        AND c.source_sha256 = m.content_sha256)) END
 """
 
 SUMMARY_SQL = """
@@ -436,6 +451,24 @@ LIMIT %(lim)s
 
 def error_header(tool: str | None, error_class: str | None, cwd: str | None, namespace: str) -> str:
     return header(f"tool_error:{tool or 'unknown'}:{error_class or 'other'}", cwd, namespace)
+
+
+def _ensure_message_queue(conn: psycopg.Connection, model: str) -> None:
+    """Seed one model once; table locks close registration races with source writers."""
+    if conn.execute("SELECT 1 FROM ah.embed_message_model WHERE model = %s", (model,)).fetchone():
+        return
+    conn.execute("LOCK TABLE ah.message, ah.chunk IN SHARE ROW EXCLUSIVE MODE")
+    inserted = conn.execute("INSERT INTO ah.embed_message_model (model) VALUES (%s) "
+                            "ON CONFLICT DO NOTHING RETURNING model", (model,)).fetchone()
+    if inserted:
+        conn.execute("""
+            INSERT INTO ah.embed_message_pending (model, message_id)
+            SELECT %s, m.id FROM ah.message m
+            WHERE ah.embed_message_eligible(m.message_class, m.text)
+              AND NOT EXISTS (SELECT 1 FROM ah.chunk c WHERE c.message_id = m.id AND c.model = %s
+                              AND c.source_sha256 = m.content_sha256)
+            ON CONFLICT DO NOTHING
+        """, (model, model))
 
 
 def _items(conn: psycopg.Connection, model: str, lim: int) -> list[Item]:
@@ -489,7 +522,7 @@ def _write_chunks(conn: psycopg.Connection, model: str, item: Item) -> int:
     """Replace this item's chunks, guarded against a concurrent rebuild re-using the id."""
     with conn.transaction():
         if item.kind == "message":
-            ok = conn.execute("SELECT 1 FROM ah.message WHERE id = %s AND content_sha256 = %s",
+            ok = conn.execute("SELECT 1 FROM ah.message WHERE id = %s AND content_sha256 = %s FOR UPDATE",
                               (item.ref, item.source_sha)).fetchone()
             col = "message_id"
         elif item.kind == "summary":
@@ -556,11 +589,16 @@ def run(conn: psycopg.Connection, provider: Provider, cap_tokens: int = 3_000_00
         if not version or version[0] != INPUT_VERSION:
             # scrub/chunk/header changed: re-chunk everything. Unchanged inputs hit the cache, so only
             # inputs whose text actually changed are sent again.
+            # The loader locks message parents before deleting their chunks. Match that order
+            # before the chunk triggers lock parents, otherwise a concurrent purge can deadlock.
+            conn.execute("LOCK TABLE ah.message, ah.chunk IN SHARE ROW EXCLUSIVE MODE")
             conn.execute("DELETE FROM ah.chunk WHERE model = %s", (provider.model,))
             conn.execute("INSERT INTO ah.meta VALUES ('embed_input_version', %s) "
                          "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value", (INPUT_VERSION,))
             mark_chunks_reset(conn)   # same transaction as the DELETE: embed-gc waits 7 days
             log(f"embed: input version {version[0] if version else None} -> {INPUT_VERSION}, re-chunking")
+        conn.commit()
+        _ensure_message_queue(conn, provider.model)
         conn.commit()
         day_key = "embed_tokens_" + datetime.now(timezone.utc).strftime("%Y-%m-%d")
         row = conn.execute("SELECT value FROM ah.meta WHERE key = %s", (day_key,)).fetchone()
@@ -695,10 +733,8 @@ def write_metrics(conn: psycopg.Connection, stats: EmbedStats, success: bool, pa
             lines.append(f'agent_history_embed_last_failure_reason{{reason="{reason}"}} 1')
         model = conn.execute("SELECT value FROM ah.meta WHERE key = 'embedding_model'").fetchone()
         if model:
-            pending = conn.execute(
-                "SELECT count(*) FROM ah.message m WHERE m.message_class = ANY(%s) AND " + LONG_MESSAGE_SQL + " "
-                "AND NOT EXISTS (SELECT 1 FROM ah.chunk c WHERE c.message_id = m.id AND c.model = %s "
-                "AND c.source_sha256 = m.content_sha256)", (list(EMBED_CLASSES), model[0])).fetchone()[0]
+            pending = conn.execute(PENDING_COUNT_SQL,
+                                   {"classes": list(EMBED_CLASSES), "model": model[0]}).fetchone()[0]
             failed = conn.execute("SELECT count(*) FROM ah.embed_failure WHERE model = %s AND attempts >= %s",
                                   (model[0], MAX_ATTEMPTS)).fetchone()[0]
             vectors = conn.execute("SELECT count(*) FROM ah.embedding WHERE model = %s", (model[0],)).fetchone()[0]
@@ -742,11 +778,13 @@ GC_DELETE_SQL = ("DELETE FROM ah.embedding d USING (SELECT e.model, e.input_sha2
                  + "LIMIT %(max_rows)s) victim\n"
                  "WHERE d.model = victim.model AND d.input_sha256 = victim.input_sha256")
 BACKLOG_SQL = """
-SELECT EXISTS (
+SELECT (CASE WHEN EXISTS (SELECT 1 FROM ah.embed_message_model WHERE model = %(model)s)
+THEN EXISTS (SELECT 1 FROM ah.embed_message_pending WHERE model = %(model)s)
+ELSE EXISTS (
     SELECT 1 FROM ah.message m
     WHERE m.message_class = ANY(%(classes)s) AND """ + LONG_MESSAGE_SQL + """
       AND NOT EXISTS (SELECT 1 FROM ah.chunk c WHERE c.message_id = m.id AND c.model = %(model)s
-                      AND c.source_sha256 = m.content_sha256))
+                      AND c.source_sha256 = m.content_sha256)) END)
     OR EXISTS (
     SELECT 1 FROM ah.session_summary ss
     WHERE NOT EXISTS (SELECT 1 FROM ah.chunk c WHERE c.summary_id = ss.id AND c.model = %(model)s

@@ -96,49 +96,109 @@ CONTINUATION_SQL = [
 
 # --- ordering --------------------------------------------------------------------------------
 
+# The queue and watermark are derived data. Appends read only queued rows; changes
+# to an existing position or a late row invalidate that session's watermark.
 SEQ_SQL = [
-    "DROP TABLE IF EXISTS seq_now",
-    # Deterministic from source position: (file, byte offset, reasoning before text before calls before
-    # ops, uid). Every row of a session comes from its own source file, so this is stable across rebuild
-    # and new lines append. tool_io shares its call's or op's seq; unlinked tool_io rows get their own.
+    "INSERT INTO ah.session_sequence_state(session_id) SELECT session_id FROM dirty_now ON CONFLICT DO NOTHING",
+    "SELECT s.session_id FROM ah.session_sequence_state s JOIN dirty_now d USING (session_id) ORDER BY s.session_id FOR UPDATE OF s",
+    "DROP TABLE IF EXISTS seq_queue, seq_pending, seq_full, seq_now, seq_io_now",
     """
-    CREATE TEMP TABLE seq_now ON COMMIT DROP AS
+    CREATE TEMP TABLE seq_queue ON COMMIT DROP AS
+    SELECT q.* FROM ah.session_sequence_pending q JOIN dirty_now d USING (session_id)
+    """,
+    "ANALYZE seq_queue",
+    """
+    CREATE TEMP TABLE seq_pending ON COMMIT DROP AS
     WITH items AS (
         SELECT 1 AS t, m.id, m.session_id, m.source_id, m.byte_offset,
                CASE WHEN m.message_class = 'reasoning' THEN 0 ELSE 1 END AS r, m.event_uid AS u
-        FROM ah.message m JOIN dirty_now d ON d.session_id = m.session_id
+        FROM seq_queue q JOIN ah.message m ON q.row_type = 1 AND m.id = q.row_id
         UNION ALL
         SELECT 2, c.id, c.session_id, c.source_id, c.byte_offset, 2, c.call_uid
-        FROM ah.tool_call c JOIN dirty_now d ON d.session_id = c.session_id
+        FROM seq_queue q JOIN ah.tool_call c ON q.row_type = 2 AND c.id = q.row_id
         UNION ALL
         SELECT 3, o.id, o.session_id, o.source_id, o.byte_offset, 3, o.item_uid
-        FROM ah.tool_op o JOIN dirty_now d ON d.session_id = o.session_id
+        FROM seq_queue q JOIN ah.tool_op o ON q.row_type = 3 AND o.id = q.row_id
         UNION ALL
         SELECT 4, i.id, i.session_id, i.source_id, i.byte_offset, 2, i.io_uid
-        FROM ah.tool_io i JOIN dirty_now d ON d.session_id = i.session_id
+        FROM seq_queue q JOIN ah.tool_io i ON q.row_type = 4 AND i.id = q.row_id
         WHERE NOT (i.kind = 'call' AND EXISTS (SELECT 1 FROM ah.tool_call c WHERE c.agent = i.agent AND c.call_uid = i.call_uid))
           AND NOT (i.kind = 'op' AND EXISTS (SELECT 1 FROM ah.tool_op o WHERE o.agent = i.agent AND o.item_uid = i.item_uid)))
-    SELECT items.t, items.id,
-           row_number() OVER (PARTITION BY items.session_id ORDER BY f.rel_path, items.byte_offset, items.r, items.u, items.t) AS seq
-    FROM items JOIN ah.source_file f ON f.id = items.source_id
+    SELECT items.*, f.rel_path FROM items JOIN ah.source_file f ON f.id = items.source_id
+    """,
+    """
+    CREATE TEMP TABLE seq_full ON COMMIT DROP AS
+    SELECT s.session_id FROM ah.session_sequence_state s JOIN dirty_now d USING (session_id)
+    WHERE s.needs_full OR EXISTS (
+        SELECT 1 FROM seq_pending p WHERE p.session_id = s.session_id AND s.last_seq > 0
+          AND (p.rel_path, p.byte_offset, p.r, p.u, p.t)
+              <= (s.last_path, s.last_offset, s.last_rank, s.last_uid, s.last_type))
+    """,
+    "CREATE UNIQUE INDEX ON seq_full(session_id)",
+    "ANALYZE seq_full",
+    """
+    CREATE TEMP TABLE seq_now ON COMMIT DROP AS
+    WITH historical AS (
+        SELECT 1 AS t, m.id, m.session_id, m.source_id, m.byte_offset,
+               CASE WHEN m.message_class = 'reasoning' THEN 0 ELSE 1 END AS r, m.event_uid AS u
+        FROM seq_full d JOIN ah.message m ON d.session_id = m.session_id
+        UNION ALL
+        SELECT 2, c.id, c.session_id, c.source_id, c.byte_offset, 2, c.call_uid
+        FROM seq_full d JOIN ah.tool_call c ON d.session_id = c.session_id
+        UNION ALL
+        SELECT 3, o.id, o.session_id, o.source_id, o.byte_offset, 3, o.item_uid
+        FROM seq_full d JOIN ah.tool_op o ON d.session_id = o.session_id
+        UNION ALL
+        SELECT 4, i.id, i.session_id, i.source_id, i.byte_offset, 2, i.io_uid
+        FROM seq_full d JOIN ah.tool_io i ON d.session_id = i.session_id
+        WHERE NOT (i.kind = 'call' AND EXISTS (SELECT 1 FROM ah.tool_call c WHERE c.agent = i.agent AND c.call_uid = i.call_uid))
+          AND NOT (i.kind = 'op' AND EXISTS (SELECT 1 FROM ah.tool_op o WHERE o.agent = i.agent AND o.item_uid = i.item_uid))), items AS (
+        SELECT h.*, f.rel_path, 0::bigint AS base
+        FROM historical h JOIN ah.source_file f ON f.id = h.source_id
+        UNION ALL
+        SELECT p.*, s.last_seq FROM seq_pending p JOIN ah.session_sequence_state s USING (session_id)
+        WHERE NOT EXISTS (SELECT 1 FROM seq_full f WHERE f.session_id = p.session_id))
+    SELECT items.*,
+           base + row_number() OVER (PARTITION BY session_id ORDER BY rel_path, byte_offset, r, u, t) AS seq
+    FROM items
     """,
     "ANALYZE seq_now",
     "UPDATE ah.message m SET seq = n.seq FROM seq_now n WHERE n.t = 1 AND m.id = n.id AND m.seq IS DISTINCT FROM n.seq",
     "UPDATE ah.tool_call c SET seq = n.seq FROM seq_now n WHERE n.t = 2 AND c.id = n.id AND c.seq IS DISTINCT FROM n.seq",
     "UPDATE ah.tool_op o SET seq = n.seq FROM seq_now n WHERE n.t = 3 AND o.id = n.id AND o.seq IS DISTINCT FROM n.seq",
     "UPDATE ah.tool_io i SET seq = n.seq FROM seq_now n WHERE n.t = 4 AND i.id = n.id AND i.seq IS DISTINCT FROM n.seq",
+    # Refresh linked I/O only for pending rows, changed targets and full sessions.
+    """
+    CREATE TEMP TABLE seq_io_now ON COMMIT DROP AS
+    SELECT row_id AS id FROM seq_queue WHERE row_type = 4
+    UNION SELECT i.id FROM seq_full f JOIN ah.tool_io i USING (session_id)
+    UNION SELECT i.id FROM seq_now n JOIN ah.tool_call c ON n.t = 2 AND c.id = n.id
+          JOIN ah.tool_io i ON i.kind = 'call' AND i.agent = c.agent AND i.call_uid = c.call_uid
+    UNION SELECT i.id FROM seq_now n JOIN ah.tool_op o ON n.t = 3 AND o.id = n.id
+          JOIN ah.tool_io i ON i.kind = 'op' AND i.agent = o.agent AND i.item_uid = o.item_uid
+    """,
+    "ANALYZE seq_io_now",
     """
     UPDATE ah.tool_io i SET seq = c.seq
-    FROM dirty_now d, ah.tool_call c
-    WHERE i.session_id = d.session_id AND i.kind = 'call' AND c.agent = i.agent AND c.call_uid = i.call_uid
+    FROM seq_io_now n, ah.tool_call c
+    WHERE i.id = n.id AND i.kind = 'call' AND c.agent = i.agent AND c.call_uid = i.call_uid
       AND i.seq IS DISTINCT FROM c.seq
     """,
     """
     UPDATE ah.tool_io i SET seq = o.seq
-    FROM dirty_now d, ah.tool_op o
-    WHERE i.session_id = d.session_id AND i.kind = 'op' AND o.agent = i.agent AND o.item_uid = i.item_uid
+    FROM seq_io_now n, ah.tool_op o
+    WHERE i.id = n.id AND i.kind = 'op' AND o.agent = i.agent AND o.item_uid = i.item_uid
       AND i.seq IS DISTINCT FROM o.seq
     """,
+    """
+    UPDATE ah.session_sequence_state s SET needs_full = false, last_seq = COALESCE(n.seq, 0),
+        last_path = n.rel_path, last_offset = n.byte_offset, last_rank = n.r, last_uid = n.u, last_type = n.t
+    FROM dirty_now d LEFT JOIN (
+        SELECT DISTINCT ON (session_id) * FROM seq_now ORDER BY session_id, seq DESC) n USING (session_id)
+    WHERE s.session_id = d.session_id
+      AND (n.session_id IS NOT NULL OR EXISTS (SELECT 1 FROM seq_full f WHERE f.session_id = s.session_id))
+    """,
+    "DELETE FROM ah.session_sequence_pending p USING seq_queue q WHERE p.session_id = q.session_id AND p.row_type = q.row_type AND p.row_id = q.row_id",
 ]
 
 FIRST_PROMPT_SQL = """

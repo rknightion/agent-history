@@ -9,6 +9,8 @@ import hashlib
 import os
 import re
 import signal
+import time
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -107,6 +109,48 @@ def test_embed_is_incremental_and_rebuild_costs_nothing(db):
     assert changed.items == 1 and provider.inputs == 1
 
 
+
+def test_empty_candidate_lookup_does_not_visit_embedded_history(db):
+    conn, ids = db
+    provider = FakeProvider()
+    run(conn, provider)
+    conn.execute("""
+        INSERT INTO ah.message (agent, event_uid, session_id, namespace, profile, ts, role,
+                                message_class, text, content_sha256, source_id, byte_offset, byte_length)
+        SELECT m.agent, 'covered-history-' || n, m.session_id, m.namespace, m.profile, m.ts, m.role,
+               m.message_class, m.text, m.content_sha256, m.source_id, m.byte_offset + n, m.byte_length
+        FROM ah.message m CROSS JOIN generate_series(1, 4000) n WHERE m.id = %s
+    """, (ids["alloy"],))
+    conn.execute("""
+        INSERT INTO ah.chunk (message_id, session_id, namespace, ts, chunk_no, char_start, char_end,
+                              source_sha256, model, input_sha256)
+        SELECT id, session_id, namespace, ts, 0, 0, 0, content_sha256, %s, ''
+        FROM ah.message WHERE event_uid LIKE 'covered-history-%%'
+    """, (MODEL,))
+    conn.execute("ANALYZE ah.message")
+    conn.execute("ANALYZE ah.chunk")
+    conn.commit()
+    provider.inputs = 0
+    assert run(conn, provider).items == 0 and provider.inputs == 0
+    plan = conn.execute("EXPLAIN (ANALYZE, FORMAT JSON) " + embed.MESSAGE_SQL,
+                        {"classes": list(embed.EMBED_CLASSES), "model": MODEL, "lim": 2000}).fetchone()[0][0]
+
+    def message_visits(node):
+        own = 0
+        if node.get("Relation Name") == "message":
+            own = (node["Actual Rows"] + node.get("Rows Removed by Filter", 0)) * node["Actual Loops"]
+        return own + sum(message_visits(child) for child in node.get("Plans", []))
+
+    assert message_visits(plan["Plan"]) < 100, plan
+    # The daily GC guard also runs on an empty pass; it must not undo the candidate-query saving.
+    gc_plan = conn.execute("EXPLAIN (ANALYZE, FORMAT JSON) " + embed.BACKLOG_SQL,
+                           {"classes": list(embed.EMBED_CLASSES), "model": MODEL}).fetchone()[0][0]
+    assert message_visits(gc_plan["Plan"]) < 100, gc_plan
+    metric_plan = conn.execute("EXPLAIN (ANALYZE, FORMAT JSON) " + embed.PENDING_COUNT_SQL,
+                               {"classes": list(embed.EMBED_CLASSES), "model": MODEL}).fetchone()[0][0]
+    assert message_visits(metric_plan["Plan"]) < 100, metric_plan
+
+
 def test_a_drain_request_stops_embed_after_the_committed_batch(db):
     conn, _ = db
     stopper = Drain("embed")
@@ -125,6 +169,112 @@ def test_a_drain_request_stops_embed_after_the_committed_batch(db):
     assert provider.calls == 1  # the in-flight batch finished; no batch after the stop reached the provider
     assert stats.items >= 1 and stats.failed_inputs == 0
     assert run(conn, FakeProvider()).items > 0  # the rest is still pending for the next worker
+
+
+def test_message_queue_matches_source_after_registration_and_mutations(db):
+    conn, ids = db
+    provider = FakeProvider()
+    run(conn, provider)
+    # Upgrade registration must recognise existing coverage, including another model's work.
+    conn.execute("DELETE FROM ah.embed_message_model")
+    conn.commit()
+    provider.inputs = 0
+    assert run(conn, provider).items == 0 and provider.inputs == 0
+    other_model = MODEL + "-other"
+    embed._ensure_message_queue(conn, other_model)
+    conn.commit()
+
+    def check_selection():
+        for model in (MODEL, other_model):
+            expected = conn.execute("""
+                SELECT m.id FROM ah.message m
+                WHERE m.message_class = ANY(%s) AND """ + embed.LONG_MESSAGE_SQL + """
+                  AND NOT EXISTS (SELECT 1 FROM ah.chunk c WHERE c.message_id = m.id
+                                  AND c.model = %s AND c.source_sha256 = m.content_sha256)
+                ORDER BY m.id DESC
+            """, (list(embed.EMBED_CLASSES), model)).fetchall()
+            params = {"classes": list(embed.EMBED_CLASSES), "model": model, "lim": 10000}
+            assert [(r[0],) for r in conn.execute(embed.MESSAGE_SQL, params)] == expected
+            assert conn.execute(embed.PENDING_COUNT_SQL, params).fetchone()[0] == len(expected)
+
+    check_selection()
+    mid = ids["alloy"]
+    conn.execute("DELETE FROM ah.chunk WHERE message_id = %s", (mid,))
+    check_selection()
+    conn.execute("UPDATE ah.message SET message_class = 'reasoning' WHERE id = %s", (mid,))
+    check_selection()
+    conn.execute("UPDATE ah.message SET message_class = 'human_prompt', text = 'short' WHERE id = %s", (mid,))
+    check_selection()
+    text = TEXTS["alloy"] + " changed"
+    conn.execute("UPDATE ah.message SET text = %s, content_sha256 = %s WHERE id = %s",
+                 (text, embed.sha(text), mid))
+    check_selection()
+    conn.execute("UPDATE ah.chunk SET source_sha256 = 'stale' WHERE message_id = %s", (ids["photos"],))
+    check_selection()
+    conn.execute("DELETE FROM ah.message WHERE id = %s", (ids["traefik"],))
+    check_selection()
+    conn.execute("TRUNCATE ah.chunk")
+    check_selection()
+    conn.commit()
+    # Switching back to an existing model uses the paid cache for unchanged input.
+    conn.execute("UPDATE ah.meta SET value = %s WHERE key = 'embedding_model'", (other_model,))
+    conn.commit()
+    alternate = FakeProvider()
+    alternate.model = other_model
+    assert run(conn, alternate).api_inputs > 0
+    conn.execute("UPDATE ah.meta SET value = %s WHERE key = 'embedding_model'", (MODEL,))
+    conn.commit()
+    assert run(conn, provider).api_inputs == 1  # only the changed text
+    check_selection()
+
+
+@pytest.mark.parametrize("reset", [False, True])
+def test_chunk_completion_waits_for_a_concurrent_message_edit(db, reset):
+    conn, ids = db
+    run(conn, FakeProvider())
+    mid = ids["alloy"]
+    if reset:
+        conn.execute("UPDATE ah.meta SET value = 'old-input-version' WHERE key = 'embed_input_version'")
+    else:
+        conn.execute("DELETE FROM ah.chunk WHERE message_id = %s", (mid,))
+    conn.commit()
+    item = None if reset else next(
+        it for it in embed._items(conn, MODEL, 10000) if it.kind == "message" and it.ref == mid)
+    with load.connect(DSN) as editor, load.connect(DSN) as worker:
+        worker.execute("SET statement_timeout = '5s'")
+        worker.commit()
+        text = TEXTS["alloy"] + " concurrently edited"
+        editor.execute("SET lock_timeout = '1s'")
+        editor.execute("UPDATE ah.message SET text = %s, content_sha256 = %s WHERE id = %s",
+                       (text, embed.sha(text), mid))
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = (pool.submit(run, worker, FakeProvider()) if reset
+                      else pool.submit(embed._write_chunks, worker, MODEL, item))
+            try:
+                deadline = time.monotonic() + 3
+                while time.monotonic() < deadline:
+                    waiting = conn.execute("SELECT wait_event_type FROM pg_stat_activity WHERE pid = %s",
+                                           (worker.info.backend_pid,)).fetchone()
+                    conn.commit()
+                    if waiting and waiting[0] == "Lock":
+                        break
+                    time.sleep(0.01)
+                else:
+                    pytest.fail("chunk writer did not reach the locked message")
+                if reset:
+                    # The loader deletes the parent before cascading into its chunks. A reset
+                    # must not hold the chunk while waiting for that parent's lock.
+                    editor.execute("DELETE FROM ah.chunk WHERE message_id = %s", (mid,))
+            finally:
+                editor.commit()
+            result = future.result(timeout=6)
+            if reset:
+                assert result.items > 0
+                return
+            assert result == 0
+    assert conn.execute("SELECT count(*) FROM ah.chunk WHERE message_id = %s", (mid,)).fetchone()[0] == 0
+    conn.commit()
+    assert run(conn, FakeProvider()).items == 1
 
 
 def test_chunks_hold_offsets_not_text(db):

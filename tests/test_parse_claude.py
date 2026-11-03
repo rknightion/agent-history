@@ -857,7 +857,7 @@ def test_artifacts_and_hooks_and_cost(main_store):
     assert cost["start_time"] == datetime.fromtimestamp(1790000000, timezone.utc)
 
 
-def test_request_capture_and_tools_used_records_are_known(tmp_path):
+def test_request_capture_tools_used_and_session_owner_records_are_known(tmp_path):
     sid = "capture-session"
     records = [
         {"type": "api-request-shape", "sessionId": sid, "agentId": "a1", "shapeHash": "s" * 64,
@@ -869,11 +869,13 @@ def test_request_capture_and_tools_used_records_are_known(tmp_path):
          "timestamp": "2026-10-24T16:34:34.099Z", "version": "2.1.310", "shapeHash": "s" * 64,
          "params": {"model": "claude-opus-5-5", "max_tokens": 1000}, "keep": 0, "tail": ["b" * 64]},
         {"type": "tools-used", "tools": ["Bash"], "sessionId": sid},
+        {"type": "session-owner", "sessionId": sid,
+         "accountUuid": "synthetic-account", "organizationUuid": "synthetic-organization"},
     ]
     store = _load_telemetry_records(tmp_path, records)
     assert not [i.detail for i in store.issues if i.kind == "unknown_type"]
     types = {r["record_type"] for r in store.rows("record_type_seen")}
-    assert {"api-request", "api-request-blob", "api-request-shape", "tools-used"} <= types
+    assert {"api-request", "api-request-blob", "api-request-shape", "tools-used", "session-owner"} <= types
 
 
 def test_drift_rows(main_store):

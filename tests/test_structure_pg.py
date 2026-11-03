@@ -101,6 +101,129 @@ def test_seq_is_source_ordered_shared_with_tool_io_and_append_only(db):
     assert first == "u2"
 
 
+def test_seq_append_sorts_only_new_rows(db):
+    key = SessionKey("claude", "long-order-session")
+    write(db, [session_row(key), *[msg(key, f"history-{n}", n) for n in range(1, 2001)]])
+    load.post_passes(db, None)
+    db.commit()
+    before = db.execute("SELECT event_uid, seq FROM ah.message ORDER BY seq").fetchall()
+    write(db, [msg(key, "appended", 2001)])
+    db.execute("SELECT 1")  # keep the post-pass transaction open for its temporary relation
+    load.post_passes(db, None)
+    # seq_now is the input/output of the real PostgreSQL window ordering, before ON COMMIT DROP.
+    assert db.execute("SELECT count(*) FROM seq_now").fetchone()[0] == 1
+    assert db.execute("SELECT event_uid, seq FROM ah.message ORDER BY seq").fetchall() == before + [("appended", 2001)]
+    db.commit()
+
+    # All physical row kinds share the same append path; linked I/O adds no slot.
+    write(db, [ToolCallRow(agent="claude", call_uid="new-call", session=key, tool_name="Read", byte_offset=200200),
+               ToolIoRow(agent="claude", io_uid="new-call", session=key, ts=T0, byte_offset=200200,
+                         kind="call", call_uid="new-call", input_text="read"),
+               ToolOpRow(agent="claude", item_uid="new-op", session=key, item_type="Extension", byte_offset=200300),
+               ToolIoRow(agent="claude", io_uid="item:new-op", session=key, ts=T0, byte_offset=200300,
+                         kind="op", item_uid="new-op", output_text="done"),
+               ToolIoRow(agent="claude", io_uid="orphan", session=key, ts=T0, byte_offset=200400,
+                         kind="call", call_uid="orphan", output_text="unlinked")])
+    db.execute("SELECT 1")
+    load.post_passes(db, None)
+    assert db.execute("SELECT count(*) FROM seq_now").fetchone()[0] == 3
+    assert db.execute("SELECT io_uid, seq FROM ah.tool_io ORDER BY seq").fetchall() == [
+        ("new-call", 2002), ("item:new-op", 2003), ("orphan", 2004)]
+    db.commit()
+    # Later results update content but must not read/order the old I/O history.
+    write(db, [ToolIoRow(agent="claude", io_uid="new-call", session=key, ts=T0, byte_offset=200200,
+                        kind="call", call_uid="new-call", output_text="finished")])
+    db.execute("SELECT 1")
+    load.post_passes(db, None)
+    assert db.execute("SELECT count(*) FROM seq_now").fetchone()[0] == 0
+    assert db.execute("SELECT count(*) FROM seq_io_now").fetchone()[0] == 0
+    assert db.execute("SELECT seq FROM ah.tool_io WHERE io_uid = 'new-call'").fetchone()[0] == 2002
+    db.commit()
+
+
+def sequence_rows(db):
+    return dict(db.execute("""
+        SELECT 'message:' || event_uid, seq FROM ah.message
+        UNION ALL SELECT 'call:' || call_uid, seq FROM ah.tool_call
+        UNION ALL SELECT 'op:' || item_uid, seq FROM ah.tool_op
+        UNION ALL SELECT 'io:' || io_uid, seq FROM ah.tool_io
+    """))
+
+
+def test_seq_late_rows_mutations_and_source_rename_rederive(db):
+    key = SessionKey("claude", "reordered")
+    write(db, [session_row(key), msg(key, "a", 1), msg(key, "b", 3)])
+    load.post_passes(db, None)
+    db.commit()
+    assert sequence_rows(db) == {"message:a": 1, "message:b": 2}
+    write(db, [msg(key, "late", 2)])
+    load.post_passes(db, None)
+    db.commit()
+    assert sequence_rows(db) == {"message:a": 1, "message:late": 2, "message:b": 3}
+    # Equal byte offsets use reasoning first, then natural UID, not insertion order.
+    db.execute("UPDATE ah.message SET byte_offset = 200, message_class = 'reasoning' WHERE event_uid = 'b'")
+    load.post_passes(db, None)
+    db.commit()
+    assert sequence_rows(db) == {"message:a": 1, "message:b": 2, "message:late": 3}
+    db.execute("DELETE FROM ah.message WHERE event_uid = 'a'")
+    load.post_passes(db, None)
+    db.commit()
+    assert sequence_rows(db) == {"message:b": 1, "message:late": 2}
+    write(db, [msg(key, "other-file", 1)], rel="z.jsonl")
+    load.post_passes(db, None)
+    db.commit()
+    assert sequence_rows(db) == {"message:b": 1, "message:late": 2, "message:other-file": 3}
+    db.execute("UPDATE ah.source_file SET rel_path = 'claude-local/a.jsonl' WHERE rel_path = 'claude-local/z.jsonl'")
+    load.post_passes(db, None)
+    db.commit()
+    assert sequence_rows(db) == {"message:other-file": 1, "message:b": 2, "message:late": 3}
+    # Moving a row between source files changes the leading sort key too.
+    db.execute("UPDATE ah.message SET source_id = (SELECT id FROM ah.source_file WHERE rel_path = 'claude-local/a.jsonl') "
+               "WHERE event_uid = 'late'")
+    load.post_passes(db, None)
+    db.commit()
+    assert sequence_rows(db) == {"message:other-file": 1, "message:late": 2, "message:b": 3}
+    db.execute("TRUNCATE ah.message CASCADE")
+    load.post_passes(db, None)
+    db.commit()
+    write(db, [msg(key, "after-truncate", 8)])
+    load.post_passes(db, None)
+    db.commit()
+    assert sequence_rows(db) == {"message:after-truncate": 1}
+
+
+def test_seq_orphan_linkage_changes_and_rollback(db):
+    key = SessionKey("claude", "late-link")
+    write(db, [session_row(key), msg(key, "before", 1), msg(key, "after", 3),
+               ToolIoRow(agent="claude", io_uid="future", session=key, ts=T0, byte_offset=200,
+                         kind="call", call_uid="future", output_text="result")])
+    load.post_passes(db, None)
+    db.commit()
+    assert sequence_rows(db) == {"message:before": 1, "io:future": 2, "message:after": 3}
+    write(db, [ToolCallRow(agent="claude", call_uid="future", session=key, tool_name="Read", byte_offset=400)])
+    db.execute("SELECT 1")
+    load.post_passes(db, None)
+    assert sequence_rows(db) == {"message:before": 1, "message:after": 2, "call:future": 3, "io:future": 3}
+    db.rollback()
+    # A failed outer pass restores both the old order and the still-pending mutation.
+    assert sequence_rows(db) == {"message:before": 1, "io:future": 2, "message:after": 3, "call:future": None}
+    load.post_passes(db, None)
+    db.commit()
+    assert sequence_rows(db) == {"message:before": 1, "message:after": 2, "call:future": 3, "io:future": 3}
+    db.execute("UPDATE ah.tool_call SET call_uid = 'renamed' WHERE call_uid = 'future'")
+    load.post_passes(db, None)
+    db.commit()
+    assert sequence_rows(db) == {"message:before": 1, "io:future": 2, "message:after": 3, "call:renamed": 4}
+    db.execute("UPDATE ah.tool_io SET call_uid = 'renamed' WHERE io_uid = 'future'")
+    load.post_passes(db, None)
+    db.commit()
+    assert sequence_rows(db) == {"message:before": 1, "message:after": 2, "call:renamed": 3, "io:future": 3}
+    db.execute("DELETE FROM ah.tool_call WHERE call_uid = 'renamed'")
+    load.post_passes(db, None)
+    db.commit()
+    assert sequence_rows(db) == {"message:before": 1, "io:future": 2, "message:after": 3}
+
+
 def test_error_class_and_excerpt(db):
     k = SessionKey("claude", "s2")
     out = "building\n" * 50 + "Error: ENOENT: no such file or directory, open 'x.json'\nmore"

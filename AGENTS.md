@@ -113,3 +113,21 @@ inventory field. `configuration_update.reasoning.effort` updates existing sessio
 turns, with explicit turn context taking precedence. These additive records retain parser version
 10 for incremental compatibility; existing stored issues and historical effort rows are not repaired
 retroactively. No SQL migration or baseline-ledger change is needed.
+
+## Claude ownership records
+
+`session-owner` records are recognised and counted without indexing account or organisation
+identifiers. Parser version stays unchanged; existing parse issues remain historical evidence.
+
+## Incremental derived queues
+
+Message embedding work is tracked per model. Registration seeds existing coverage once under
+message-then-chunk table locks; ordinary mutations update the queue transactionally. The paid
+embedding cache is unchanged. Drain the old embedder before applying migration 047, then start
+the upgraded embedder: older chunk writers do not follow the new parent-first lock order.
+Manual chunk resets require quiescent writers or the same message-then-chunk table locks.
+
+Session ordering tracks pending source rows and a per-session last position. Ordinary appends
+sort only new rows; late rows, changed ordering keys, deletions and resolved orphan tool I/O
+invalidate that session for deterministic full derivation. Both queues are derived state and
+are cleared through their foreign keys during rebuild.

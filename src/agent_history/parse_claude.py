@@ -135,6 +135,8 @@ KNOWN_TYPES = {
     # Request capture (deduplicated request bodies, shapes and params) and per-turn tool lists:
     # recognised and counted in record_type_seen, not indexed into their own tables.
     "api-request", "api-request-blob", "api-request-shape", "tools-used",
+    # Account ownership metadata has no catalogue identity field.
+    "session-owner",
 }
 SPAWN_TOOLS = {"Agent", "Task"}
 COLLAB_TOOLS = {"Agent", "Task", "SendMessage", "SubagentHandback", "StructuredOutput", "Workflow",

@@ -49,6 +49,8 @@ REPLAYED = (
     "044_live_loop_detail.sql",
     "045_task_mention.sql",
     "046_subagent_spawn_child_session_idx.sql",
+    "047_embed_message_pending.sql",
+    "048_session_sequence_queue.sql",
 )
 
 
