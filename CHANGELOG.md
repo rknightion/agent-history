@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.6](https://github.com/rknightion/agent-history/compare/v0.9.5...v0.9.6) (2026-11-03)
+
+
+### Bug Fixes
+
+* queue derived catalogue work and recognise ownership records ([4fcda77](https://github.com/rknightion/agent-history/commit/4fcda776acd76ba0e4c1348542a87588db864f65))
+
 ## [0.9.5](https://github.com/rknightion/agent-history/compare/v0.9.4...v0.9.5) (2026-11-02)
 
 
