@@ -4,8 +4,8 @@ For loop task counts and the closed-state/Done-flip source precedence, see
 [Loop task count precedence](loop-counts.md).
 
 These PostgreSQL queries are single read-only SELECT statements for an `ah_reader`
-connection. They require migration `033_nullable_telemetry.sql` and the current
-analytics functions. They return metadata, not transcript text. Protect their output:
+connection. They require migration `033_nullable_telemetry.sql` (query 1 also
+`049_pi_cost_source.sql`) and the current analytics functions. They return metadata, not transcript text. Protect their output:
 recorded identifiers and provenance can still be sensitive.
 
 Each `params` CTE selects the last seven days, with an inclusive lower bound and
@@ -33,6 +33,10 @@ model or applicable price leave the comparison unknown. Recorded zero is known.
 `recorded_minus_priced_usd` is NULL unless both costs are known. A difference can
 reflect discounts, service tiers, provider accounting or price changes; it is not
 by itself a parser defect. API-error rows are retained and labelled.
+`cost_from_provider` says whether `cost_usd` is the provider's billed figure (true) or
+pi's own catalogue estimate (false); NULL means the transcript predates pi-ai 1.5.0.
+`cost_estimate_usd` keeps pi's catalogue estimate either way, so provider-billed calls
+can be compared with both pi's estimate and the seed price.
 
 ```sql
 WITH params AS (
@@ -43,6 +47,7 @@ WITH params AS (
     SELECT s.namespace, s.session_uid, s.agent_id,
            c.response_id, c.ts, c.model, c.provider, c.api,
            c.service_tier, c.is_api_error, c.cost_usd,
+           c.cost_from_provider, c.cost_estimate_usd,
            c.input_uncached, c.cache_read, c.cache_write_5m,
            c.cache_write_1h, c.output,
            CASE WHEN c.input_uncached IS NOT NULL

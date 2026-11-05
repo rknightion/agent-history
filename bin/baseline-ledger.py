@@ -51,6 +51,7 @@ REPLAYED = (
     "046_subagent_spawn_child_session_idx.sql",
     "047_embed_message_pending.sql",
     "048_session_sequence_queue.sql",
+    "049_pi_cost_source.sql",
 )
 
 

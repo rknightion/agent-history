@@ -240,6 +240,8 @@ class LlmCallRow(Row):
     duration_ms: int | None = None
     latency_basis: str | None = None
     cost_usd: Decimal | float | None = None
+    cost_from_provider: bool | None = None
+    cost_estimate_usd: Decimal | float | None = None
     thinking_ms: int | None = None
     raw_stop_reason: str | None = None
     api: str | None = None
@@ -273,6 +275,10 @@ class LlmCallRow(Row):
                 setattr(self, name, None)
             if self.cost_usd is not None and self.cost_usd == 0:
                 self.cost_usd = None
+            if self.cost_estimate_usd is not None and self.cost_estimate_usd == 0:
+                self.cost_estimate_usd = None
+            if self.cost_usd is None:
+                self.cost_from_provider = None   # no provenance for a cost that is not kept
         return self
 
 

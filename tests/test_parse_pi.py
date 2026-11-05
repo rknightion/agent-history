@@ -1114,3 +1114,82 @@ def test_child_header_parent_path_is_kept_only_when_the_basename_names_no_parent
     if kept:
         assert session["parent_session_uid"] is None   # the loader, not the parser, resolves the path
     assert parser_state.get("parent_file") == (parent_file if kept else None)
+
+
+# --- pi-ai 1.5.0 cost provenance: usage.cost.totalFromProvider beside the catalogue estimate ---
+
+def pi150_call(entry_id: str, response_id: str, cost: dict) -> dict:
+    """A 1.5.0 assistant entry: the recorded key layout, with invented values and no content."""
+    return {"type": "message", "id": entry_id, "parentId": None, "timestamp": "2026-10-01T10:00:02.500Z",
+            "message": {"role": "assistant", "content": [], "api": "synthetic-api", "provider": "synthetic-provider",
+                        "model": "synthetic-model", "responseId": response_id, "stopReason": "toolUse",
+                        "rawStopReason": "synthetic", "thinkingLevel": "high", "timestamp": REQUEST_MS,
+                        "durationMs": 2500, "loopPiTiming": {"attempts": 1, "processingMs": 10, "headers": {}},
+                        "usage": {"input": 1000, "output": 200, "cacheRead": 0, "cacheWrite": 0, "reasoning": 50,
+                                  "totalTokens": 1200, "cost": cost}}}
+
+
+def test_pi150_cost_provenance_is_stored_per_call(tmp_path):
+    # pi's catalogue pricing writes total = sum of components and totalFromProvider false; a provider
+    # that reports its billed cost replaces total and sets it true, leaving the components catalogue-derived.
+    estimate = {"input": 0.005, "output": 0.003, "cacheRead": 0, "cacheWrite": 0, "total": 0.008,
+                "totalFromProvider": False}
+    billed = {"input": 0.005, "output": 0.003, "cacheRead": 0, "cacheWrite": 0, "total": 0.0095,
+              "totalFromProvider": True}
+    older = {"input": 0.005, "output": 0.003, "cacheRead": 0, "cacheWrite": 0, "total": 0.008}
+    store = synth(tmp_path, [pi150_call("e1", "estimate-call", estimate), pi150_call("e2", "billed-call", billed),
+                             pi150_call("e3", "older-call", older)])
+    got = {c["response_id"]: (c["cost_usd"], c["cost_from_provider"], c["cost_estimate_usd"])
+           for c in store.rows("llm_call")}
+    assert got == {"estimate-call": (Decimal("0.008"), False, Decimal("0.008")),
+                   "billed-call": (Decimal("0.0095"), True, Decimal("0.008")),
+                   "older-call": (Decimal("0.008"), None, Decimal("0.008"))}
+    assert not store.issues
+
+
+@pytest.mark.parametrize("flag,expected", [
+    (True, True), (False, False), (None, None), (1, None), (0, None), ("true", None), ({}, None),
+])
+def test_cost_from_provider_is_a_recorded_boolean_only(tmp_path, flag, expected):
+    call = telemetry_call(tmp_path, usage={"input": 100, "output": 10,
+                                           "cost": {"total": 0.01, "totalFromProvider": flag}})
+    assert call["cost_from_provider"] is expected
+
+
+def test_absent_cost_provenance_is_null_not_false(tmp_path):
+    assert telemetry_call(tmp_path)["cost_from_provider"] is None
+    call = telemetry_call(tmp_path, usage={"input": 100, "output": 10, "cost": {"total": 0.01}})
+    assert (call["cost_from_provider"], call["cost_estimate_usd"]) == (None, None)
+
+
+@pytest.mark.parametrize("parts,expected", [
+    ((0.005, 0.003, 0, 0), Decimal("0.008")),
+    ((0, 0, 0, 0), Decimal(0)),
+    ((0.005, 0.003, 0, None), None),
+    ((0.005, 0.003, 0, -1), None),
+    ((0.005, True, 0, 0), None),
+    ((0.005, float("nan"), 0, 0), None),
+    ((0.005, "0.003", 0, 0), None),
+])
+def test_cost_estimate_needs_every_catalogue_component(tmp_path, parts, expected):
+    cost = dict(zip(("input", "output", "cacheRead", "cacheWrite"), parts))
+    cost = {k: v for k, v in cost.items() if v is not None}
+    call = telemetry_call(tmp_path, usage={"input": 100, "output": 10, "cost": {**cost, "total": 0.0095,
+                                                                                 "totalFromProvider": True}})
+    assert call["cost_estimate_usd"] == expected
+    assert (call["cost_usd"], call["cost_from_provider"]) == (Decimal("0.0095"), True)
+
+
+def test_all_zero_usage_without_stop_reason_also_forgets_the_zero_estimate_and_its_provenance():
+    from datetime import datetime, timezone
+
+    from agent_history.model import LlmCallRow
+
+    key = SessionKey("pi", "synthetic", "")
+    at = datetime(2026, 9, 20, tzinfo=timezone.utc)
+    zero = LlmCallRow("pi", "r1", key, at, 0, input_uncached=0, output=0, cost_usd=0.0,
+                      cost_estimate_usd=Decimal(0), cost_from_provider=False).unknown_if_zero()
+    assert (zero.cost_usd, zero.cost_estimate_usd, zero.cost_from_provider) == (None, None, None)
+    billed = LlmCallRow("pi", "r2", key, at, 0, input_uncached=0, output=0, cost_usd=Decimal("0.01"),
+                        cost_estimate_usd=Decimal(0), cost_from_provider=True).unknown_if_zero()
+    assert (billed.cost_usd, billed.cost_estimate_usd, billed.cost_from_provider) == (Decimal("0.01"), None, True)

@@ -59,7 +59,8 @@ LLM calls
   cache_write_5m = cacheWrite (pi has no TTL split; 0 stays 0 and cache_write_1h = 0, so loop
   aggregates and priced cost stay known), output (includes reasoning), reasoning; effort =
   message.thinkingLevel, falling back to session state. Nullable call telemetry comes only from
-  recorded assistant metadata, usage.cost.total and loopPiTiming; duration is request to entry,
+  recorded assistant metadata, usage.cost (total; totalFromProvider as cost_from_provider; the sum of
+  the four catalogue component costs as cost_estimate_usd) and loopPiTiming; duration is request to entry,
   never the parser's inherited timestamp. stopReason 'error' -> is_api_error, error_kind from
   errorMessage ("upstream_request_timeout: ..." -> upstream_request_timeout; "(400)" -> status 400).
   `usage` entries and compaction/branch_summary `usage` -> rows "pi:<uid>:<entry id>" with
@@ -305,13 +306,38 @@ def _interval_ms(start: datetime | None, end: datetime | None) -> int | None:
     return _recorded_int((end - start) // timedelta(milliseconds=1))
 
 
-def _recorded_cost(usage: Any) -> Decimal | None:
-    cost = usage.get("cost") if isinstance(usage, dict) else None
-    value = cost.get("total") if isinstance(cost, dict) else None
+def _usd(value: Any) -> Decimal | None:
     if type(value) not in (int, float):
         return None
     amount = Decimal(str(value))
     return amount if amount.is_finite() and amount >= 0 else None
+
+
+def _cost_block(usage: Any) -> dict[str, Any]:
+    cost = usage.get("cost") if isinstance(usage, dict) else None
+    return cost if isinstance(cost, dict) else {}
+
+
+def _recorded_cost(usage: Any) -> Decimal | None:
+    return _usd(_cost_block(usage).get("total"))
+
+
+COST_PARTS = ("input", "output", "cacheRead", "cacheWrite")
+
+
+def _recorded_cost_source(usage: Any) -> tuple[bool | None, Decimal | None]:
+    """pi-ai 1.5.0 cost provenance: (totalFromProvider, catalogue estimate).
+
+    `total` is the provider's billed cost when totalFromProvider is true, otherwise pi's catalogue
+    estimate. The four component costs are always catalogue-derived, so their sum keeps the estimate
+    when the provider's figure replaces the total. Only a JSON boolean is a recorded flag; absent
+    stays NULL (pi before 1.5.0 never wrote it). The estimate needs every component.
+    """
+    cost = _cost_block(usage)
+    flag = cost.get("totalFromProvider")
+    parts = [_usd(cost.get(name)) for name in COST_PARTS]
+    estimate = sum(parts, Decimal(0)) if all(part is not None for part in parts) else None
+    return (flag if isinstance(flag, bool) else None), estimate
 
 
 def _spawn_telemetry(details: dict[str, Any]) -> dict[str, Any]:
@@ -867,6 +893,7 @@ class PiParser:
         duration = _interval_ms(start, entry_ts)
         kind, status = self._error_kind(error) if error is not None or stop == "error" else (None, None)
         model = model or self.s["model"]
+        provider_cost, estimate = _recorded_cost_source(usage)
         write = as_int(usage.get("cacheWrite"))   # pi has no TTL split: all of it prices as the 5m write
         return [LlmCallRow(AGENT, response_id, self._key(), ts, pos.byte_offset,
                            turn_key=turn if turn is not None else self.s["cur"], model=model,
@@ -878,7 +905,8 @@ class PiParser:
                            request_id=as_str(headers.get("x-request-id")),
                            reasoning=as_int(usage.get("reasoning")), effort=as_str(m.get("thinkingLevel")) or self.s["effort"],
                            duration_ms=duration, latency_basis="pi_request_to_entry" if duration is not None else None,
-                           cost_usd=_recorded_cost(usage), raw_stop_reason=as_str(m.get("rawStopReason")),
+                           cost_usd=_recorded_cost(usage), cost_from_provider=provider_cost,
+                           cost_estimate_usd=estimate, raw_stop_reason=as_str(m.get("rawStopReason")),
                            api=as_str(m.get("api")), provider=as_str(m.get("provider")),
                            ttft_ms=_interval_ms(start, _recorded_epoch_ms(timing.get("firstTokenAt"))),
                            attempts=_recorded_int(timing.get("attempts")),

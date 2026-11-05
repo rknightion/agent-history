@@ -57,7 +57,9 @@ def snapshot(store: MemStore) -> dict:
 # --- nullable transcript telemetry --------------------------------------------------------------
 
 
-TELEMETRY = {"llm_call": {"duration_ms", "latency_basis", "service_tier"},
+# The pi-only cost provenance columns are never set by the Codex parser (asserted below).
+PI_ONLY = {"cost_from_provider", "cost_estimate_usd"}
+TELEMETRY = {"llm_call": {"duration_ms", "latency_basis", "service_tier", *PI_ONLY},
              "message": {"phase"}, "turn": {"reasoning_summary", "trace_id", "root_turn_key"},
              "tool_op": {"mcp_plugin_id", "mcp_read_only"}}
 
@@ -298,6 +300,7 @@ def test_telemetry_does_not_change_content_keys_or_classification():
     # Captured from the frozen pre-telemetry parser over this exact synthetic fixture. Comparing
     # the same bytes preserves offsets and MCP result_json, unlike removing metadata from input.
     store, _ = load("nullable_telemetry.jsonl", batch_lines=1)
+    assert all(row[name] is None for row in store.tables["llm_call"].values() for name in PI_ONLY)
     surface = {table: sorted(json.dumps({name: value for name, value in row.items()
                                         if name not in TELEMETRY.get(table, set())},
                                        sort_keys=True, default=str) for row in rows.values())

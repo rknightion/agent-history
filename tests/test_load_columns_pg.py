@@ -43,6 +43,8 @@ CASES = [
             "duration_ms": ("integer", 120, 0),
             "latency_basis": ("text", "pi_request_to_entry", "codex_prev_boundary_to_usage"),
             "cost_usd": ("numeric", Decimal("0.1234567890123456789"), Decimal("0")),
+            "cost_from_provider": ("boolean", True, False),
+            "cost_estimate_usd": ("numeric", Decimal("0.0080000000000000001"), Decimal("0")),
             "thinking_ms": ("integer", 60, 0),
             "raw_stop_reason": ("text", "toolUse", "stop"),
             "api": ("text", "synthetic-api", "synthetic-api-v2"),
