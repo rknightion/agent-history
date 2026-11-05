@@ -1,5 +1,5 @@
 # Build against the same Python and libc as the minimal runtime.
-FROM cgr.dev/chainguard/python:latest-dev@sha256:8a5780972067cfba4592b10e786a889807ed876c1100f89410fd0ed4e398992c AS builder
+FROM cgr.dev/chainguard/python:latest-dev@sha256:a41dd09d107afef6bdd9cc566e4663e504a90f5d5cb6ca7627928db5704631ad AS builder
 USER 0
 WORKDIR /app
 COPY pyproject.toml README.md LICENSE ./
@@ -12,7 +12,7 @@ RUN python -c 'import sys; assert sys.version_info[:2] == (3, 15)' && \
     mkdir -p /state /var/lib/alloy/textfile-agent-history && \
     chown 10001:10001 /state /var/lib/alloy/textfile-agent-history
 
-FROM cgr.dev/chainguard/python:latest@sha256:60e3c0d33ab77e50ace0850ccdf6eaec825ce89dad9b1ec2b0300a2070892b05
+FROM cgr.dev/chainguard/python:latest@sha256:f73b534b99afc3a17c9d7a863a688d9c2577de23e12af21d55ad7b3fdbaf83f0
 WORKDIR /app
 COPY --from=builder /opt/venv /opt/venv
 COPY --from=builder /app /app
