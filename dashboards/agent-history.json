@@ -12342,13 +12342,57 @@
                     },
                     "refId": "B"
                   }
+                },
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "hidden": false,
+                    "query": {
+                      "datasource": {
+                        "name": "grafanacloud-prom"
+                      },
+                      "group": "prometheus",
+                      "kind": "DataQuery",
+                      "spec": {
+                        "editorMode": "code",
+                        "expr": "agent_history_actionable_lag_bytes{job=\"agent-history-index\"}",
+                        "instant": false,
+                        "legendFormat": "actionable lag bytes",
+                        "range": true
+                      },
+                      "version": "v0"
+                    },
+                    "refId": "C"
+                  }
+                },
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "hidden": false,
+                    "query": {
+                      "datasource": {
+                        "name": "grafanacloud-prom"
+                      },
+                      "group": "prometheus",
+                      "kind": "DataQuery",
+                      "spec": {
+                        "editorMode": "code",
+                        "expr": "agent_history_nul_tail_bytes{job=\"agent-history-index\"}",
+                        "instant": false,
+                        "legendFormat": "NUL tail bytes",
+                        "range": true
+                      },
+                      "version": "v0"
+                    },
+                    "refId": "D"
+                  }
                 }
               ],
               "queryOptions": {},
               "transformations": []
             }
           },
-          "description": "Unindexed bytes and dirty sessions.",
+          "description": "Raw unindexed bytes, actionable bytes, confirmed NUL-only tails and dirty sessions. Original source bytes and indexed offsets are preserved.",
           "id": 282,
           "links": [],
           "title": "Lag and backlog",
@@ -12410,6 +12454,30 @@
                     "matcher": {
                       "id": "byName",
                       "options": "lag bytes"
+                    },
+                    "properties": [
+                      {
+                        "id": "unit",
+                        "value": "bytes"
+                      }
+                    ]
+                  },
+                  {
+                    "matcher": {
+                      "id": "byName",
+                      "options": "actionable lag bytes"
+                    },
+                    "properties": [
+                      {
+                        "id": "unit",
+                        "value": "bytes"
+                      }
+                    ]
+                  },
+                  {
+                    "matcher": {
+                      "id": "byName",
+                      "options": "NUL tail bytes"
                     },
                     "properties": [
                       {
@@ -19196,7 +19264,7 @@
               "transformations": []
             }
           },
-          "description": "agent_history_lag_bytes: transcript bytes on disk not yet parsed into the catalogue.",
+          "description": "agent_history_lag_bytes: all transcript bytes on disk not yet parsed, including confirmed NUL-only tails. The Indexer tab separates actionable lag from invalid tails.",
           "id": 5,
           "links": [],
           "title": "Unindexed bytes",

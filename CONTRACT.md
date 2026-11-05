@@ -208,6 +208,16 @@ pi artifact files replay from version `6` to `6-links1` in place, and pi progres
 this check. Any other indexed file whose parser version changed is refused (`status = 'error'`, kind
 `parser_upgraded`) until `agent-history rebuild`.
 
+Incomplete final records retain their original bytes and indexed offsets. A bounded, stable read
+of at most 1 MiB may diagnose an entirely NUL-filled tail as `nul_tail`, with only a byte count
+in the diagnostic. Classification is checked again on each partial-source pass; historical issues
+remain while the current byte count clears when the observation changes. Mixed, changing or oversized tails remain
+actionable. `agent_history_lag_bytes` always includes all unindexed bytes. Separate NUL-tail and
+actionable-lag metrics distinguish damaged padding from records the indexer can still process.
+Source tier and archive-availability metadata refresh even when no complete new record is parsed,
+without advancing parser state or the last indexed-content timestamp. Zero actionable lag does not
+assert that damaged source content has been recovered.
+
 - `message.prompt_origin` on prompts: `typed`, `pasted`, `slash_command`, `skill`, `local_command`,
   `launch_message` (a loop root's launch prompt) or `agent_message`.
 - `ah.tool_io`: one row per call (`kind = 'call'`) and per Codex executed operation (`kind = 'op'`),

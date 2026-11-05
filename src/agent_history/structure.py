@@ -9,6 +9,10 @@ Helper functions and views are in structure.sql.
 
 from __future__ import annotations
 
+import hashlib
+import re
+from pathlib import Path
+
 import psycopg
 
 # --- repos -----------------------------------------------------------------------------------
@@ -22,6 +26,10 @@ REPO_SQL = [
         SELECT DISTINCT ah.repo_root(CASE WHEN f.path LIKE '/%%' THEN f.path ELSE s.cwd || '/' || f.path END)
         FROM ah.file_touch f JOIN dirty_now d ON d.session_id = f.session_id JOIN ah.session s ON s.id = f.session_id
     ),
+    missing_roots AS MATERIALIZED (
+        SELECT root FROM roots r WHERE root IS NOT NULL
+          AND NOT EXISTS (SELECT 1 FROM ah.repo known WHERE known.local_root=r.root)
+    ),
     slugs AS (SELECT DISTINCT repo_slug FROM ah.git_commit),
     remotes AS (
         SELECT ah.repo_root(cwd) AS root, min(ah.remote_slug(git_remote_url)) AS slug
@@ -33,7 +41,7 @@ REPO_SQL = [
                     (SELECT x.slug FROM remotes x WHERE x.root = r.root),
                     'local/' || ah.repo_name(r.root)),
            NULL
-    FROM roots r WHERE r.root IS NOT NULL
+    FROM missing_roots r
     ON CONFLICT (local_root) DO NOTHING
     """,
     # Late slug resolution for roots first seen before their commits were collected.
@@ -226,14 +234,14 @@ ERROR_SQL = [
         FROM ah.tool_call c JOIN ah.tool_io i ON i.agent = c.agent AND i.io_uid = c.call_uid
         WHERE c.agent = 'codex' AND c.tool_name IN ('exec', 'wait')
           AND left(i.output_text, 28) = 'Script running with cell ID '
-          AND c.session_id IN (SELECT w.session_id FROM ah.tool_call w JOIN dirty_now d ON d.session_id = w.session_id
+          AND c.session_id IN (SELECT w.session_id FROM error_now q JOIN ah.tool_call w ON q.row_type=1 AND w.id=q.row_id
                                WHERE w.agent = 'codex' AND w.tool_name = 'wait'
                                  AND (COALESCE(w.is_error, false) OR w.outcome = 'error'))),
     x0 AS (
         SELECT c.id, c.session_id, c.agent, c.tool_name,
                ah.error_class_of(c.denial_kind, c.timed_out, c.interrupted, c.exit_code, c.is_error,
                                  c.outcome, e.excerpt) AS cls, e.excerpt
-        FROM ah.tool_call c JOIN dirty_now d ON d.session_id = c.session_id
+        FROM error_now q JOIN ah.tool_call c ON q.row_type=1 AND c.id=q.row_id
         LEFT JOIN ah.tool_io i ON i.agent = c.agent AND i.io_uid = c.call_uid
         CROSS JOIN LATERAL (SELECT CASE WHEN COALESCE(c.is_error, false) OR COALESCE(c.exit_code, 0) <> 0
                                              OR COALESCE(c.timed_out, false) OR COALESCE(c.interrupted, false)
@@ -258,7 +266,7 @@ ERROR_SQL = [
         SELECT o.id, ah.error_class_of(NULL, NULL, COALESCE(o.status = 'interrupted' OR o.exit_code = 130, false), o.exit_code,
                                        o.is_error, CASE WHEN o.status = 'failed' THEN 'error' END, e.excerpt) AS cls,
                e.excerpt
-        FROM ah.tool_op o JOIN dirty_now d ON d.session_id = o.session_id
+        FROM error_now q JOIN ah.tool_op o ON q.row_type=2 AND o.id=q.row_id
         LEFT JOIN ah.tool_io i ON i.agent = o.agent AND i.io_uid = 'item:' || o.item_uid
         CROSS JOIN LATERAL (SELECT CASE WHEN COALESCE(o.is_error, false) OR COALESCE(o.exit_code, 0) <> 0
                                              OR o.status IN ('failed', 'interrupted')
@@ -508,12 +516,54 @@ def session_embeddings(conn: psycopg.Connection) -> dict[str, int]:
     return {"session_embeddings": cur.rowcount or 0}
 
 
+def prepare_errors(conn: psycopg.Connection) -> None:
+    """Publish pending sessions before the post-pass early return, including retained catalogues.
+
+    A later classifier/helper change reclassifies existing rows once. Initial adoption preserves
+    existing classifications: the migration seeds dirty sessions. Source-row triggers handle parser
+    reparses and rebuilds; generation-checked acknowledgement preserves concurrent publications.
+    """
+    helpers = (Path(__file__).parent / "sql" / "structure.sql").read_text()
+    definitions = []
+    for name in ("error_excerpt", "error_class_of"):
+        match = re.search(rf"CREATE OR REPLACE FUNCTION ah\.{name}\(.*?\$\$;", helpers, re.S)
+        if match is None:
+            raise RuntimeError(f"missing classifier helper definition: {name}")
+        definitions.append(match.group())
+    definition = "".join(ERROR_SQL + definitions)
+    digest = hashlib.sha256(definition.encode()).hexdigest()
+    prior = conn.execute("SELECT value FROM ah.meta WHERE key='error_classification_hash'").fetchone()
+    if prior is not None and prior[0] != digest:
+        conn.execute("""
+            INSERT INTO ah.error_classification_pending(row_type,row_id,session_id)
+            SELECT 1,id,session_id FROM ah.tool_call
+            UNION ALL SELECT 2,id,session_id FROM ah.tool_op
+            ON CONFLICT (row_type,row_id) DO UPDATE SET generation=EXCLUDED.generation,
+                session_id=EXCLUDED.session_id
+        """)
+    if prior is None or prior[0] != digest:
+        conn.execute("INSERT INTO ah.meta(key,value) VALUES ('error_classification_hash',%s) "
+                     "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value", (digest,))
+    conn.execute("INSERT INTO dirty_now SELECT DISTINCT session_id FROM ah.error_classification_pending "
+                 "ON CONFLICT DO NOTHING")
+
+
+def classify_errors(conn: psycopg.Connection) -> None:
+    conn.execute("DROP TABLE IF EXISTS error_now")
+    conn.execute("CREATE TEMP TABLE error_now ON COMMIT DROP AS "
+                 "SELECT q.* FROM ah.error_classification_pending q JOIN dirty_now d USING(session_id)")
+    conn.execute("ANALYZE error_now")
+    for statement in ERROR_SQL:
+        conn.execute(statement)
+    conn.execute("DELETE FROM ah.error_classification_pending q USING error_now n "
+                 "WHERE q.row_type=n.row_type AND q.row_id=n.row_id AND q.generation=n.generation")
+
+
 def run(conn: psycopg.Connection, refresh_id: int) -> dict[str, int]:
     for statement in REPO_SQL + CONTINUATION_SQL + SEQ_SQL:
         conn.execute(statement)
     conn.execute(FIRST_PROMPT_SQL)
-    for statement in ERROR_SQL:
-        conn.execute(statement)
+    classify_errors(conn)
     conn.execute(ROLLUP_V4_SQL)
     for statement in ORCH_SQL:
         conn.execute(statement)

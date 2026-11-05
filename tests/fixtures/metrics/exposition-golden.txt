@@ -576,6 +576,9 @@ agent_efficiency_wait_timeout_ms_total{agent="claude",loop="loop2",namespace="co
 agent_efficiency_wait_timeout_ms_total{agent="claude",loop="loop2",namespace="codex-personal",role="root",tool="x2"} 14
 agent_efficiency_wait_timeout_ms_total{agent="claude",loop="loop2",namespace="codex-personal",role="worker",tool="x1"} 15
 agent_efficiency_wait_timeout_ms_total{agent="claude",loop="loop2",namespace="codex-personal",role="worker",tool="x2"} 2.28571428571
+# HELP agent_history_actionable_lag_bytes Synthetic agent_history_actionable_lag_bytes.
+# TYPE agent_history_actionable_lag_bytes gauge
+agent_history_actionable_lag_bytes 0.142857142857
 # HELP agent_history_cold_tier_available Synthetic agent_history_cold_tier_available.
 # TYPE agent_history_cold_tier_available gauge
 agent_history_cold_tier_available 0.142857142857
@@ -763,22 +766,26 @@ agent_history_loop_health_tasks_done{harness="claude",repo="example/project"} 3.
 agent_history_loop_health_tasks_done{harness="claude",repo="example/widget"} 5
 agent_history_loop_health_tasks_done{harness="pi",repo="example/project"} 0.142857142857
 agent_history_loop_health_tasks_done{harness="pi",repo="example/widget"} 2.5
+# HELP agent_history_nul_tail_bytes Synthetic agent_history_nul_tail_bytes.
+# TYPE agent_history_nul_tail_bytes gauge
+agent_history_nul_tail_bytes 0.142857142857
 # HELP agent_history_parse_issues_total Synthetic agent_history_parse_issues_total.
 # TYPE agent_history_parse_issues_total gauge
 agent_history_parse_issues_total{kind="json_error"} 0.142857142857
-agent_history_parse_issues_total{kind="late_session_header"} 17.5
-agent_history_parse_issues_total{kind="late_session_meta"} 10
-agent_history_parse_issues_total{kind="missing_call_id"} 12.5
-agent_history_parse_issues_total{kind="missing_field"} 5
-agent_history_parse_issues_total{kind="missing_item_id"} 15
-agent_history_parse_issues_total{kind="missing_session_header"} 16.25
-agent_history_parse_issues_total{kind="missing_session_meta"} 8.75
-agent_history_parse_issues_total{kind="not_object"} 2.5
-agent_history_parse_issues_total{kind="ordinal_not_monotonic"} 11.25
-agent_history_parse_issues_total{kind="orphan_output"} 1.57142857143
-agent_history_parse_issues_total{kind="parser_exception"} 3.75
-agent_history_parse_issues_total{kind="session_mismatch"} 0.857142857143
-agent_history_parse_issues_total{kind="unknown_type"} 6.25
+agent_history_parse_issues_total{kind="late_session_header"} 18.75
+agent_history_parse_issues_total{kind="late_session_meta"} 11.25
+agent_history_parse_issues_total{kind="missing_call_id"} 1.57142857143
+agent_history_parse_issues_total{kind="missing_field"} 6.25
+agent_history_parse_issues_total{kind="missing_item_id"} 16.25
+agent_history_parse_issues_total{kind="missing_session_header"} 17.5
+agent_history_parse_issues_total{kind="missing_session_meta"} 10
+agent_history_parse_issues_total{kind="not_object"} 3.75
+agent_history_parse_issues_total{kind="nul_tail"} 2.5
+agent_history_parse_issues_total{kind="ordinal_not_monotonic"} 12.5
+agent_history_parse_issues_total{kind="orphan_output"} 15
+agent_history_parse_issues_total{kind="parser_exception"} 5
+agent_history_parse_issues_total{kind="session_mismatch"} 8.75
+agent_history_parse_issues_total{kind="unknown_type"} 0.857142857143
 # HELP agent_history_rows Synthetic agent_history_rows.
 # TYPE agent_history_rows gauge
 agent_history_rows{table="attachment"} 15
@@ -1713,6 +1720,9 @@ agent_efficiency_wait_timeout_ms_total{agent="claude",loop="loop2",namespace="co
 agent_efficiency_wait_timeout_ms_total{agent="claude",loop="loop2",namespace="codex-personal",role="root",tool="x2"} 14
 agent_efficiency_wait_timeout_ms_total{agent="claude",loop="loop2",namespace="codex-personal",role="worker",tool="x1"} 15
 agent_efficiency_wait_timeout_ms_total{agent="claude",loop="loop2",namespace="codex-personal",role="worker",tool="x2"} 2.28571428571
+# HELP agent_history_actionable_lag_bytes Synthetic agent_history_actionable_lag_bytes.
+# TYPE agent_history_actionable_lag_bytes gauge
+agent_history_actionable_lag_bytes 0.142857142857
 # HELP agent_history_cold_tier_available Synthetic agent_history_cold_tier_available.
 # TYPE agent_history_cold_tier_available gauge
 agent_history_cold_tier_available 0.142857142857
@@ -1900,22 +1910,26 @@ agent_history_loop_health_tasks_done{harness="claude",repo="example/project"} 3.
 agent_history_loop_health_tasks_done{harness="claude",repo="example/widget"} 5
 agent_history_loop_health_tasks_done{harness="pi",repo="example/project"} 0.142857142857
 agent_history_loop_health_tasks_done{harness="pi",repo="example/widget"} 2.5
+# HELP agent_history_nul_tail_bytes Synthetic agent_history_nul_tail_bytes.
+# TYPE agent_history_nul_tail_bytes gauge
+agent_history_nul_tail_bytes 0.142857142857
 # HELP agent_history_parse_issues_total Synthetic agent_history_parse_issues_total.
 # TYPE agent_history_parse_issues_total gauge
 agent_history_parse_issues_total{kind="json_error"} 0.142857142857
-agent_history_parse_issues_total{kind="late_session_header"} 17.5
-agent_history_parse_issues_total{kind="late_session_meta"} 10
-agent_history_parse_issues_total{kind="missing_call_id"} 12.5
-agent_history_parse_issues_total{kind="missing_field"} 5
-agent_history_parse_issues_total{kind="missing_item_id"} 15
-agent_history_parse_issues_total{kind="missing_session_header"} 16.25
-agent_history_parse_issues_total{kind="missing_session_meta"} 8.75
-agent_history_parse_issues_total{kind="not_object"} 2.5
-agent_history_parse_issues_total{kind="ordinal_not_monotonic"} 11.25
-agent_history_parse_issues_total{kind="orphan_output"} 1.57142857143
-agent_history_parse_issues_total{kind="parser_exception"} 3.75
-agent_history_parse_issues_total{kind="session_mismatch"} 0.857142857143
-agent_history_parse_issues_total{kind="unknown_type"} 6.25
+agent_history_parse_issues_total{kind="late_session_header"} 18.75
+agent_history_parse_issues_total{kind="late_session_meta"} 11.25
+agent_history_parse_issues_total{kind="missing_call_id"} 1.57142857143
+agent_history_parse_issues_total{kind="missing_field"} 6.25
+agent_history_parse_issues_total{kind="missing_item_id"} 16.25
+agent_history_parse_issues_total{kind="missing_session_header"} 17.5
+agent_history_parse_issues_total{kind="missing_session_meta"} 10
+agent_history_parse_issues_total{kind="not_object"} 3.75
+agent_history_parse_issues_total{kind="nul_tail"} 2.5
+agent_history_parse_issues_total{kind="ordinal_not_monotonic"} 12.5
+agent_history_parse_issues_total{kind="orphan_output"} 15
+agent_history_parse_issues_total{kind="parser_exception"} 5
+agent_history_parse_issues_total{kind="session_mismatch"} 8.75
+agent_history_parse_issues_total{kind="unknown_type"} 0.857142857143
 # HELP agent_history_rows Synthetic agent_history_rows.
 # TYPE agent_history_rows gauge
 agent_history_rows{table="attachment"} 15
@@ -2962,6 +2976,9 @@ agent_efficiency_wait_timeout_ms_total{agent="claude",loop="loop2",namespace="co
 agent_efficiency_wait_timeout_ms_total{agent="claude",loop="loop2",namespace="codex-personal",role="root",tool="x2"} 21
 agent_efficiency_wait_timeout_ms_total{agent="claude",loop="loop2",namespace="codex-personal",role="worker",tool="x1"} 22.5
 agent_efficiency_wait_timeout_ms_total{agent="claude",loop="loop2",namespace="codex-personal",role="worker",tool="x2"} 3.42857142857
+# HELP agent_history_actionable_lag_bytes Synthetic agent_history_actionable_lag_bytes.
+# TYPE agent_history_actionable_lag_bytes gauge
+agent_history_actionable_lag_bytes 0.142857142857
 # HELP agent_history_cold_tier_available Synthetic agent_history_cold_tier_available.
 # TYPE agent_history_cold_tier_available gauge
 agent_history_cold_tier_available 0.142857142857
@@ -3146,22 +3163,26 @@ agent_history_loop_health_tasks_done{harness="claude",repo="example/project"} 3.
 agent_history_loop_health_tasks_done{harness="claude",repo="example/widget"} 5
 agent_history_loop_health_tasks_done{harness="pi",repo="example/project"} 0.142857142857
 agent_history_loop_health_tasks_done{harness="pi",repo="example/widget"} 2.5
+# HELP agent_history_nul_tail_bytes Synthetic agent_history_nul_tail_bytes.
+# TYPE agent_history_nul_tail_bytes gauge
+agent_history_nul_tail_bytes 0.142857142857
 # HELP agent_history_parse_issues_total Synthetic agent_history_parse_issues_total.
 # TYPE agent_history_parse_issues_total gauge
 agent_history_parse_issues_total{kind="json_error"} 0.142857142857
-agent_history_parse_issues_total{kind="late_session_header"} 17.5
-agent_history_parse_issues_total{kind="late_session_meta"} 10
-agent_history_parse_issues_total{kind="missing_call_id"} 12.5
-agent_history_parse_issues_total{kind="missing_field"} 5
-agent_history_parse_issues_total{kind="missing_item_id"} 15
-agent_history_parse_issues_total{kind="missing_session_header"} 16.25
-agent_history_parse_issues_total{kind="missing_session_meta"} 8.75
-agent_history_parse_issues_total{kind="not_object"} 2.5
-agent_history_parse_issues_total{kind="ordinal_not_monotonic"} 11.25
-agent_history_parse_issues_total{kind="orphan_output"} 1.57142857143
-agent_history_parse_issues_total{kind="parser_exception"} 3.75
-agent_history_parse_issues_total{kind="session_mismatch"} 0.857142857143
-agent_history_parse_issues_total{kind="unknown_type"} 6.25
+agent_history_parse_issues_total{kind="late_session_header"} 18.75
+agent_history_parse_issues_total{kind="late_session_meta"} 11.25
+agent_history_parse_issues_total{kind="missing_call_id"} 1.57142857143
+agent_history_parse_issues_total{kind="missing_field"} 6.25
+agent_history_parse_issues_total{kind="missing_item_id"} 16.25
+agent_history_parse_issues_total{kind="missing_session_header"} 17.5
+agent_history_parse_issues_total{kind="missing_session_meta"} 10
+agent_history_parse_issues_total{kind="not_object"} 3.75
+agent_history_parse_issues_total{kind="nul_tail"} 2.5
+agent_history_parse_issues_total{kind="ordinal_not_monotonic"} 12.5
+agent_history_parse_issues_total{kind="orphan_output"} 15
+agent_history_parse_issues_total{kind="parser_exception"} 5
+agent_history_parse_issues_total{kind="session_mismatch"} 8.75
+agent_history_parse_issues_total{kind="unknown_type"} 0.857142857143
 # HELP agent_history_rows Synthetic agent_history_rows.
 # TYPE agent_history_rows gauge
 agent_history_rows{table="attachment"} 15

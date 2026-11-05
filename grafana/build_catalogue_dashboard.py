@@ -713,7 +713,7 @@ stat(
 stat(
     "ov_lag",
     "Unindexed bytes",
-    "agent_history_lag_bytes: transcript bytes on disk not yet parsed into the catalogue.",
+    "agent_history_lag_bytes: all transcript bytes on disk not yet parsed, including confirmed NUL-only tails. The Indexer tab separates actionable lag from invalid tails.",
     [prom(f"agent_history_lag_bytes{{{AH}}}", instant=True)],
     unit="bytes",
     steps_=steps("green", (50e6, "yellow"), (500e6, "red")),
@@ -3966,13 +3966,20 @@ timeseries(
 timeseries(
     "ix_lag_ts",
     "Lag and backlog",
-    "Unindexed bytes and dirty sessions.",
+    "Raw unindexed bytes, actionable bytes, confirmed NUL-only tails and dirty sessions. Original source bytes and indexed offsets are preserved.",
     [
         prom(f"agent_history_lag_bytes{{{AH}}}", legend="lag bytes"),
         prom(f"agent_history_dirty_sessions{{{AH}}}", ref="B", legend="dirty sessions"),
+        prom(f"agent_history_actionable_lag_bytes{{{AH}}}", ref="C", legend="actionable lag bytes"),
+        prom(f"agent_history_nul_tail_bytes{{{AH}}}", ref="D", legend="NUL tail bytes"),
     ],
     overrides=[
         {"matcher": {"id": "byName", "options": "lag bytes"}, "properties": [{"id": "unit", "value": "bytes"}]},
+        {
+            "matcher": {"id": "byName", "options": "actionable lag bytes"},
+            "properties": [{"id": "unit", "value": "bytes"}],
+        },
+        {"matcher": {"id": "byName", "options": "NUL tail bytes"}, "properties": [{"id": "unit", "value": "bytes"}]},
         {
             "matcher": {"id": "byName", "options": "dirty sessions"},
             "properties": [{"id": "custom.axisPlacement", "value": "right"}],

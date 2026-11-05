@@ -131,3 +131,24 @@ Session ordering tracks pending source rows and a per-session last position. Ord
 sort only new rows; late rows, changed ordering keys, deletions and resolved orphan tool I/O
 invalidate that session for deterministic full derivation. Both queues are derived state and
 are cleared through their foreign keys during rebuild.
+
+
+## Source observations and error classification
+
+Incomplete tails retain original source bytes and indexed offsets. Only a stable all-NUL tail of
+at most 1 MiB is classified separately; raw lag still includes it. Source availability refreshes even
+without complete records. Keep actionable-lag alert fallback for collectors predating these metrics.
+
+Error classification uses a transactional per-row pending queue. Relevant call, operation and I/O
+mutations publish work; Codex cell-owner changes also invalidate dependent waits. A generation check
+prevents acknowledgement from deleting newer publications. Preserve the index/rebuild advisory-lock
+serialization for source writers: arbitrary concurrent source transactions can deadlock and require
+a full transaction retry. Migration 051 seeds only dirty sessions;
+subsequent classifier SQL/helper definition changes deliberately enqueue historical rows once.
+Known repository roots bypass discovery, while late slug enrichment remains independent.
+
+
+Completed-loop health first uses table-change tokens, then compares selected run windows, roots
+and row versions before repeating text classification. Cache reuse retains permission/lock probes
+and the original maximum age; unrelated writes must not renew that age. Selection CTEs are shared
+with the metric query. Keep dependency probes free of transcript text and scoped by session.

@@ -35,6 +35,7 @@ STORED = {
     "agent_history_last_success_timestamp_seconds": "agent_history_last_success_timestamp_seconds",
     "agent_history_run_success": "agent_history_run_success_ratio",
     "agent_history_lag_bytes": "agent_history_lag_bytes",
+    "agent_history_actionable_lag_bytes": "agent_history_actionable_lag_bytes",
     "agent_history_parse_issues_total": "agent_history_parse_issues_total",
     "agent_sessions_archive_receipt_timestamp_seconds": "agent_sessions_archive_receipt_timestamp_seconds",
     "agent_sessions_cold_nfs_mounted": "agent_sessions_cold_nfs_mounted_ratio",
@@ -83,6 +84,7 @@ COLLECTION_DURATION = stored("agent_sessions_metrics_collection_duration_seconds
 INDEX_LAST_SUCCESS = stored("agent_history_last_success_timestamp_seconds")
 INDEX_RUN_SUCCESS = stored("agent_history_run_success")
 LAG = stored("agent_history_lag_bytes")
+ACTIONABLE_LAG = stored("agent_history_actionable_lag_bytes")
 PARSE_ISSUES = stored("agent_history_parse_issues_total")
 ARCHIVE_RECEIPT = stored("agent_sessions_archive_receipt_timestamp_seconds")
 COLD_NFS = stored("agent_sessions_cold_nfs_mounted")
@@ -135,7 +137,9 @@ INDEX_STALE = f"time() - max({INDEX_LAST_SUCCESS}) > {INDEX_STALE_SECONDS}"
 # 1 while every current index run series reports failure.
 INDEX_RUN_FAILED = f"1 - max({INDEX_RUN_SUCCESS}) > 0"
 # The smallest lag in the window, while it never reached zero.
-LAG_STUCK = f"min_over_time(max({LAG})[{LAG_WINDOW}:1m]) > 0"
+# Older collectors publish only raw lag. Prefer actionable lag when it exists, including zero;
+# keep the raw fallback during rolling adoption so missing new telemetry never hides a backlog.
+LAG_STUCK = f"min_over_time((max({ACTIONABLE_LAG}) or on() max({LAG}))[{LAG_WINDOW}:1m]) > 0"
 # New parse issues per kind against the window start; a kind that first appears counts in full.
 PARSE_ISSUES_NEW = (
     f"(max by (kind) ({PARSE_ISSUES}) - max by (kind) ({PARSE_ISSUES} offset {PARSE_WINDOW}) > 0)"
@@ -263,9 +267,10 @@ RULES = [
         "title": "agent-history index lag not clearing",
         "summary": f"agent-history index lag has not reached zero in {LAG_WINDOW}",
         "description": (
-            f"agent_history_lag_bytes stayed above zero for the whole of the last {LAG_WINDOW}; its"
-            " smallest value is the alert value in bytes. Each pass normally clears the lag, so the"
-            " indexer is falling behind or skipping a source."
+            f"Actionable unindexed bytes stayed above zero for the whole of the last {LAG_WINDOW};"
+            " the smallest value is the alert value in bytes. Confirmed NUL-only tails remain visible"
+            " in raw lag and NUL-tail diagnostics but are excluded here. Older collectors fall back"
+            " to raw lag. The indexer may be falling behind or skipping a source."
         ),
         "expr": LAG_STUCK,
         "for": "5m",
@@ -581,6 +586,23 @@ def indexer_fixtures() -> dict:
     case("index run succeeding", [(INDEX_RUN_SUCCESS, "1x40")], INDEX_RUN_FAILED, "10m", [])
     case("lag never clears", [(LAG, "5x90")], LAG_STUCK, "80m", one(5))
     case("lag clears within the window", [(LAG, "5x40 0 5x50")], LAG_STUCK, "80m", [])
+    case(
+        "confirmed NUL tails are not actionable lag", [(LAG, "9000x90"), (ACTIONABLE_LAG, "0x90")], LAG_STUCK, "80m", []
+    )
+    case(
+        "valid backlog beside NUL tails still alerts",
+        [(LAG, "9021x90"), (ACTIONABLE_LAG, "21x90")],
+        LAG_STUCK,
+        "80m",
+        one(21),
+    )
+    case(
+        "actionable lag clears while raw tails remain",
+        [(LAG, "9005x90"), (ACTIONABLE_LAG, "5x40 0 5x50")],
+        LAG_STUCK,
+        "80m",
+        [],
+    )
     kind = PARSE_ISSUES.replace("{", '{kind="unknown_type",', 1)
     case("parse issues flat", [(kind, "10x400")], PARSE_ISSUES_NEW, "390m", [])
     case("parse issues rose", [(kind, "10x200 12x200")], PARSE_ISSUES_NEW, "390m", one(2, '{kind="unknown_type"}'))

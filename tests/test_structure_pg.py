@@ -507,3 +507,195 @@ def test_heuristic_loop_member_stays_a_descendant_whichever_side_is_dirty(db):
         got = db.execute("SELECT orchestration_kind, is_orchestration_descendant, root_session_uid "
                          "FROM ah.v_session_orchestration WHERE session_uid = 'exec-1'").fetchone()
         assert got == expected, dirty
+
+
+def count_classifier_calls(db):
+    """Instrument the real SQL function in a rollback-only test transaction."""
+    db.execute("CREATE TEMP TABLE classifier_calls (id integer)")
+    db.execute("ALTER FUNCTION ah.error_class_of(text,boolean,boolean,integer,boolean,text,text) "
+               "RENAME TO error_class_of_original")
+    db.execute("""
+        CREATE FUNCTION ah.error_class_of(text,boolean,boolean,integer,boolean,text,text)
+        RETURNS text LANGUAGE plpgsql VOLATILE AS $$
+        BEGIN
+            INSERT INTO classifier_calls VALUES (1);
+            RETURN ah.error_class_of_original($1,$2,$3,$4,$5,$6,$7);
+        END $$
+    """)
+
+
+def test_error_classification_does_not_revisit_unchanged_session_history(db):
+    key = SessionKey("claude", "error-history")
+    write(db, [session_row(key), *[
+        ToolCallRow(agent="claude", call_uid=f"old-{i}", session=key, tool_name="Read", byte_offset=i,
+                    outcome="ok") for i in range(500)]])
+    load.post_passes(db, None)
+    db.commit()
+    write(db, [ToolCallRow(agent="claude", call_uid="new-error", session=key, tool_name="Bash",
+                          byte_offset=501, outcome="error", exit_code=1)])
+    count_classifier_calls(db)
+    load.post_passes(db, None)
+    assert db.execute("SELECT error_class FROM ah.tool_call WHERE call_uid='new-error'").fetchone()[0] == "nonzero_exit"
+    assert db.execute("SELECT count(*) FROM classifier_calls").fetchone()[0] <= 3
+    db.rollback()  # also restores the immutable classifier
+
+
+def test_error_classification_late_io_status_and_cell_ownership(db):
+    key = SessionKey("codex", "error-invalidation")
+    write(db, [session_row(key), *codex_wait(key, "missing-cell", 10, "cell-a"),
+               ToolOpRow(agent="codex", item_uid="late-op", session=key, item_type="command_execution",
+                         byte_offset=20, status="failed", exit_code=1)], agent="codex")
+    load.post_passes(db, None)
+    db.commit()
+    assert db.execute("SELECT error_class FROM ah.tool_call WHERE call_uid='missing-cell'").fetchone()[0] == "fake_cell_wait"
+    # A late output on an already indexed op must enqueue it even without new source positions.
+    write(db, [ToolIoRow(agent="codex", io_uid="item:late-op", session=key, ts=T0, byte_offset=20,
+                         kind="op", item_uid="late-op", stderr_text="permission denied")], agent="codex")
+    load.post_passes(db, None)
+    db.commit()
+    assert db.execute("SELECT error_class FROM ah.tool_op WHERE item_uid='late-op'").fetchone()[0] == "permission"
+    # Owner arrives after the failed wait; both insertion orders (I/O then call) are supported.
+    write(db, [ToolIoRow(agent="codex", io_uid="owner", session=key, ts=T0, byte_offset=1, kind="call",
+                         call_uid="owner", output_text="Script running with cell ID cell-a\n")], agent="codex")
+    load.post_passes(db, None)
+    db.commit()
+    write(db, [ToolCallRow(agent="codex", call_uid="owner", session=key, tool_name="exec",
+                           byte_offset=1, outcome="ok")], agent="codex")
+    load.post_passes(db, None)
+    db.commit()
+    assert db.execute("SELECT error_class FROM ah.tool_call WHERE call_uid='missing-cell'").fetchone()[0] == "not_found"
+    # Content-only and status-only mutations must work without caller-maintained dirty markers.
+    db.execute("UPDATE ah.tool_io SET output_text='finished' WHERE io_uid='owner'")
+    db.execute("UPDATE ah.tool_op SET status='completed',exit_code=0,is_error=false WHERE item_uid='late-op'")
+    load.post_passes(db, None)
+    assert db.execute("SELECT error_class FROM ah.tool_call WHERE call_uid='missing-cell'").fetchone()[0] == "fake_cell_wait"
+    assert db.execute("SELECT error_class,error_excerpt FROM ah.tool_op WHERE item_uid='late-op'").fetchone() == (None, None)
+    db.rollback()
+    load.post_passes(db, None)
+    db.commit()
+    assert db.execute("SELECT error_class FROM ah.tool_call WHERE call_uid='missing-cell'").fetchone()[0] == "not_found"
+
+
+def test_known_repo_roots_skip_slug_resolution_and_late_commits_still_enrich(db):
+    key = SessionKey("claude", "repo-lookup")
+    write(db, [session_row(key, cwd="/home/test/repos/example")])
+    load.post_passes(db, None)
+    db.commit()
+    # Existing roots must not call the slug resolver again on an unrelated append.
+    write(db, [msg(key, "later", 1)])
+    db.execute("CREATE TEMP TABLE repo_lookups (id integer)")
+    db.execute("ALTER FUNCTION ah.repo_name(text) RENAME TO repo_name_original")
+    db.execute("""CREATE FUNCTION ah.repo_name(text) RETURNS text LANGUAGE plpgsql VOLATILE AS $$
+        BEGIN
+            INSERT INTO repo_lookups VALUES(1);
+            RETURN ah.repo_name_original($1);
+        END $$""")
+    # Only exercise discovery: late enrichment is deliberately a separate pass.
+    db.execute("CREATE TEMP TABLE IF NOT EXISTS dirty_now(session_id bigint PRIMARY KEY) ON COMMIT DELETE ROWS")
+    db.execute("INSERT INTO dirty_now SELECT id FROM ah.session")
+    db.execute(structure.REPO_SQL[0])
+    assert db.execute("SELECT count(*) FROM repo_lookups").fetchone()[0] == 0
+    db.rollback()
+    db.execute("INSERT INTO ah.git_commit(repo_slug,sha,context,committed_at) VALUES ('example/example',%s,'personal',now())", ('a' * 40,))
+    load.post_passes(db, None)
+    assert db.execute("SELECT slug FROM ah.repo WHERE local_root='/home/test/repos/example'").fetchone()[0] == "example/example"
+    db.rollback()
+
+
+def test_error_queue_keeps_late_publications_and_rolls_back_consumption(db):
+    key = SessionKey("claude", "error-generation")
+    write(db, [session_row(key), ToolCallRow(agent="claude",call_uid="changing",session=key,
+                                            tool_name="Bash",byte_offset=1,outcome="error",exit_code=1)])
+    db.execute("CREATE TEMP TABLE IF NOT EXISTS dirty_now(session_id bigint PRIMARY KEY) ON COMMIT DELETE ROWS")
+    structure.prepare_errors(db)
+
+    class LateSource:
+        def execute(self, query, *args):
+            result = db.execute(query, *args)
+            if query == "ANALYZE error_now":
+                # Another writer commits after the classifier takes its queue snapshot.
+                with psycopg.connect(DSN) as writer:
+                    writer.execute("SET LOCAL statement_timeout='3s'")
+                    writer.execute("UPDATE ah.tool_call SET timed_out=true WHERE call_uid='changing'")
+            return result
+
+    structure.classify_errors(LateSource())
+    assert db.execute("SELECT count(*) FROM ah.error_classification_pending").fetchone()[0] == 1
+    db.commit()
+    # Queue membership is sufficient to wake the pass; no source append is required.
+    db.execute("DELETE FROM ah.dirty_session")
+    db.commit()
+    db.execute("SELECT 1")
+    load.post_passes(db, None)
+    assert db.execute("SELECT count(*) FROM ah.error_classification_pending").fetchone()[0] == 0
+    db.rollback()
+    assert db.execute("SELECT count(*) FROM ah.error_classification_pending").fetchone()[0] == 1
+    load.post_passes(db, None)
+    db.commit()
+    assert db.execute("SELECT error_class FROM ah.tool_call WHERE call_uid='changing'").fetchone()[0] == "timeout"
+    assert db.execute("SELECT count(*) FROM ah.error_classification_pending").fetchone()[0] == 0
+
+
+def test_error_classifier_definition_change_revisits_existing_rows(db):
+    key = SessionKey("claude", "error-definition")
+    write(db, [session_row(key), ToolCallRow(agent="claude",call_uid="existing",session=key,
+                                            tool_name="Bash",byte_offset=1,outcome="error",exit_code=1)])
+    load.post_passes(db, None)
+    db.commit()
+    # Simulate retained classifications from an older classifier, without marking source dirty.
+    db.execute("UPDATE ah.tool_call SET error_class='old-class' WHERE call_uid='existing'")
+    db.execute("UPDATE ah.meta SET value='previous-definition' WHERE key='error_classification_hash'")
+    load.post_passes(db, None)
+    assert db.execute("SELECT error_class FROM ah.tool_call WHERE call_uid='existing'").fetchone()[0] == "nonzero_exit"
+    db.rollback()
+
+
+def test_error_cell_owner_deletion_and_changed_payload(db):
+    key = SessionKey("codex", "cell-deletion")
+    write(db, [session_row(key), *codex_wait(key,"waiting",10,"a"),
+               ToolCallRow(agent="codex",call_uid="owner",session=key,tool_name="exec",byte_offset=1,outcome="ok"),
+               ToolIoRow(agent="codex",io_uid="owner",session=key,ts=T0,byte_offset=1,kind="call",
+                         output_text="Script running with cell ID a\n")], agent="codex")
+    load.post_passes(db, None)
+    db.commit()
+    db.execute("DELETE FROM ah.tool_io WHERE io_uid='owner'")
+    load.post_passes(db, None)
+    assert db.execute("SELECT error_class FROM ah.tool_call WHERE call_uid='waiting'").fetchone()[0] == "fake_cell_wait"
+    db.execute("UPDATE ah.tool_io SET stderr_text='permission denied' WHERE io_uid='waiting'")
+    load.post_passes(db, None)
+    assert db.execute("SELECT error_class FROM ah.tool_call WHERE call_uid='waiting'").fetchone()[0] == "permission"
+    db.rollback()
+    db.execute("DELETE FROM ah.tool_call WHERE call_uid='owner'")
+    load.post_passes(db, None)
+    assert db.execute("SELECT error_class FROM ah.tool_call WHERE call_uid='waiting'").fetchone()[0] == "fake_cell_wait"
+    db.rollback()
+
+
+def test_error_queue_adoption_seeds_dirty_history_only(db):
+    clean, dirty = SessionKey("claude", "adopt-clean"), SessionKey("claude", "adopt-dirty")
+    write(db, [session_row(clean), ToolCallRow(agent="claude",call_uid="clean",session=clean,
+                                              tool_name="Read",byte_offset=1,outcome="ok")])
+    load.post_passes(db, None)
+    db.commit()
+    write(db, [session_row(dirty), ToolCallRow(agent="claude",call_uid="dirty",session=dirty,
+                                              tool_name="Bash",byte_offset=1,outcome="error",exit_code=1)])
+    # Recreate the exact migration over a retained, already classified catalogue.
+    for table, trigger in [('tool_call','tool_call_error_changed'), ('tool_op','tool_op_error_changed'),
+                           ('tool_io','tool_io_error_changed')]:
+        db.execute(f"DROP TRIGGER {trigger} ON ah.{table}")
+    for signature in ('error_tool_changed()', 'error_io_changed()', 'queue_error_io(text,text,boolean)',
+                      'queue_error_waits(bigint)', 'queue_error_classification(smallint,bigint,bigint)',
+                      'error_cell_id(text)'):
+        db.execute(f"DROP FUNCTION ah.{signature}")
+    db.execute("DROP TABLE ah.error_classification_pending")
+    db.execute("DROP SEQUENCE ah.error_classification_generation")
+    db.execute("DELETE FROM ah.meta WHERE key='error_classification_hash'")
+    db.execute((load.SQL_DIR / 'migrations' / '051_error_classification_queue.sql').read_text())
+    pending = db.execute("SELECT c.call_uid FROM ah.error_classification_pending q "
+                         "JOIN ah.tool_call c ON q.row_type=1 AND c.id=q.row_id").fetchall()
+    assert pending == [('dirty',)]
+    count_classifier_calls(db)
+    load.post_passes(db, None)
+    assert db.execute("SELECT count(*) FROM classifier_calls").fetchone()[0] <= 3
+    assert db.execute("SELECT error_class FROM ah.tool_call WHERE call_uid='dirty'").fetchone()[0] == 'nonzero_exit'
+    db.rollback()

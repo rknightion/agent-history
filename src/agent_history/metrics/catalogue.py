@@ -159,6 +159,7 @@ class _Cached:
     token: tuple
     computed_at: float
     families: tuple[Family, ...]
+    dependencies: object = None
 
 
 class _Gate:
@@ -186,6 +187,8 @@ class CatalogueCollector:
       (15 minutes, the backstop for counters that were reset or never flushed). If the token moved but
       the last computation is younger than `min_interval` (60 seconds), it is reused too, so a long
       multi-transaction pass cannot make the heavy queries run on every scrape.
+    * Completed-loop health additionally compares exact scoped row versions when broad tokens move.
+      Unrelated activity keeps its families without renewing the full-query maximum age.
     * A reused section still runs `SELECT 1 FROM ah.<table> WHERE false` for every table it reads,
       inside the section's own transaction and statement timeout. Permission loss or an
       ACCESS EXCLUSIVE lock therefore fails a reused section exactly as it would a recomputed one.
@@ -259,6 +262,23 @@ class CatalogueCollector:
                 timeout = "60s" if name == "loop_health" else "5s"
                 conn.execute("SELECT set_config('statement_timeout', %s, true)", (timeout,))
                 entry = self._reusable(name) if tables else None
+                dependencies = None
+                token = self._tokens.get(name)
+                if name == "loop_health" and entry is None and token is not None:
+                    try:
+                        # Table churn is only a reason to inspect this completed-loop scope.
+                        # Relation identity protects row versions across TRUNCATE/rewrite.
+                        dependencies = (tuple(t[0] for t in token), loop_health.dependencies(conn))
+                        previous = self.cache.get(name)
+                        if (
+                            previous is not None
+                            and 0 <= self._now - previous.computed_at < self.max_age
+                            and dependencies == previous.dependencies
+                        ):
+                            entry = _Cached(token, previous.computed_at, previous.families, dependencies)
+                    except Exception as exc:
+                        gate.reused = True
+                        gate.error = exc
                 if entry is not None:
                     # Same relations, same transaction, same timeout as the real query would touch.
                     gate.reused = True
@@ -278,7 +298,10 @@ class CatalogueCollector:
                     if token is None:
                         self.cache.pop(name, None)
                     else:
-                        self.cache[name] = _Cached(token, self._now, tuple(result[first:]))
+                        self.cache[name] = _Cached(token, self._now, tuple(result[first:]), dependencies)
+                elif entry is not None:
+                    # Accept the new broad token without renewing the full-query age.
+                    self.cache[name] = entry
         except Exception:
             # No partial family, stale value or false zero for an unknown section.
             del result[first:]
@@ -320,11 +343,25 @@ class CatalogueCollector:
                     )
             with self.section(conn, result, "lag") as gate:
                 if not gate.reused:
-                    lag = conn.execute(
-                        "SELECT COALESCE(sum(GREATEST(size_bytes-indexed_offset,0)),0) "
+                    lag, invalid = conn.execute(
+                        "SELECT COALESCE(sum(GREATEST(size_bytes-indexed_offset,0)),0), "
+                        "COALESCE(sum(CASE WHEN status='partial' THEN "
+                        "LEAST(nul_tail_bytes,GREATEST(size_bytes-indexed_offset,0)) ELSE 0 END),0) "
                         "FROM ah.source_file WHERE status <> 'unavailable'"
-                    ).fetchone()[0]
-                    result.append(gauge("agent_history_lag_bytes", "Unindexed source bytes.", lag))
+                    ).fetchone()
+                    result.append(
+                        gauge("agent_history_lag_bytes", "Unindexed source bytes, including invalid tails.", lag)
+                    )
+                    result.append(
+                        gauge("agent_history_nul_tail_bytes", "Observed NUL-only invalid tail bytes.", invalid)
+                    )
+                    result.append(
+                        gauge(
+                            "agent_history_actionable_lag_bytes",
+                            "Unindexed bytes excluding observed NUL-only tails.",
+                            lag - invalid,
+                        )
+                    )
             with self.section(conn, result, "parse_issues") as gate:
                 if not gate.reused:
                     issues = dict(conn.execute("SELECT kind, count(*) FROM ah.parse_issue GROUP BY kind"))

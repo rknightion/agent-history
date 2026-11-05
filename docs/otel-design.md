@@ -281,6 +281,8 @@ Sources: `metrics/catalogue.py:34-56,133-217`, `metrics/self.py:100-115`, `metri
 | `agent_history_last_success_timestamp_seconds` | G | `s` | none |
 | `agent_history_sources` | G | `{file}` | `status` |
 | `agent_history_lag_bytes` | G | `By` | none |
+| `agent_history_nul_tail_bytes` | G | `By` | none |
+| `agent_history_actionable_lag_bytes` | G | `By` | none |
 | `agent_history_parse_issues_total` | G | `{issue}` | `kind` |
 | `agent_history_unresolved_links` | G | `{link}` | `kind` |
 | `agent_history_dirty_sessions` | G | `{session}` | none |

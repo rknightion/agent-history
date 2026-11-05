@@ -52,6 +52,8 @@ REPLAYED = (
     "047_embed_message_pending.sql",
     "048_session_sequence_queue.sql",
     "049_pi_cost_source.sql",
+    "050_source_nul_tail.sql",
+    "051_error_classification_queue.sql",
 )
 
 

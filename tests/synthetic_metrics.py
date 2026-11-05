@@ -11,6 +11,7 @@ from agent_history.metrics.catalogue import EMBED_FAILURE_REASONS, RUN_REASONS, 
 
 PARSE_KINDS = (
     "json_error",
+    "nul_tail",
     "not_object",
     "parser_exception",
     "missing_field",

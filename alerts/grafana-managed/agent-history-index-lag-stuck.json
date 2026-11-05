@@ -12,7 +12,7 @@
   },
   "spec": {
     "annotations": {
-      "description": "agent_history_lag_bytes stayed above zero for the whole of the last 1h; its smallest value is the alert value in bytes. Each pass normally clears the lag, so the indexer is falling behind or skipping a source.",
+      "description": "Actionable unindexed bytes stayed above zero for the whole of the last 1h; the smallest value is the alert value in bytes. Confirmed NUL-only tails remain visible in raw lag and NUL-tail diagnostics but are excluded here. Older collectors fall back to raw lag. The indexer may be falling behind or skipping a source.",
       "summary": "agent-history index lag has not reached zero in 1h"
     },
     "execErrState": "Error",
@@ -24,7 +24,7 @@
             "type": "prometheus",
             "uid": "grafanacloud-prom"
           },
-          "expr": "min_over_time(max(agent_history_lag_bytes{job=\"agent-history-index\"})[1h:1m]) > 0",
+          "expr": "min_over_time((max(agent_history_actionable_lag_bytes{job=\"agent-history-index\"}) or on() max(agent_history_lag_bytes{job=\"agent-history-index\"}))[1h:1m]) > 0",
           "instant": true,
           "range": false,
           "refId": "A"

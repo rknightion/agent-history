@@ -260,3 +260,104 @@ def test_health_query_is_read_only_and_clips_before_capping(clean):  # noqa: F81
         clean.execute("SET TRANSACTION READ ONLY")
         row = clean.execute(QUERY).fetchone()
     assert row[3] == 1  # SUM overlaps, not interval union; clamp only the share.
+
+
+def test_completed_health_ignores_unrelated_writes_but_tracks_scoped_changes(clean, scratch_catalogue, monkeypatch):  # noqa: F811
+    """Observe real query reuse, then relevant inserts, edits, deletes and window changes."""
+    from agent_history.metrics import loop_health
+
+    clean.execute("DELETE FROM ah.meta WHERE key IN ('unrelated_counter','git_repo_aliases')")
+    root, run, source = seed(clean)
+    message(clean, root, source, "finished-text", "Finished work.")
+    call(clean, root, source, "finished-call", 10, 30)
+    active, _, active_source = seed(clean, key="active", at=AT + timedelta(hours=2), status="stale")
+    clean.execute("UPDATE ah.loops SET status='running',end_ts=NULL WHERE launch_uid='active'")
+    flush_stats(clean)
+    clean.commit()
+    calls = []
+    original = loop_health.collect
+
+    def measured(connection):
+        calls.append(1)
+        return original(connection)
+
+    monkeypatch.setattr(loop_health, "collect", measured)
+    clock = Clock()
+    collector = CatalogueCollector(scratch_catalogue.reader, clock=clock)
+
+    def observe():
+        flush_stats(clean)
+        clean.commit()
+        clock.advance(61)
+        return {f.name: f.samples for f in collector.collect() if f.name.startswith(PREFIX)}
+
+    first = observe()
+    assert len(calls) == 1
+    message(clean, active, active_source, "active-text", "Owner question: continue?", seconds=7400)
+    call(clean, active, active_source, "active-call", 7400, 7410)
+    clean.execute("UPDATE ah.session SET title='active title changed' WHERE id=%s", (active,))
+    clean.execute("INSERT INTO ah.meta(key,value) VALUES ('unrelated_counter','1')")
+    assert observe() == first
+    assert len(calls) == 1  # red before scoped dependencies: table writes rerun the full query
+
+    message(clean, root, source, "late-text", "Owner question: continue?", seconds=200)
+    changed = observe()
+    assert len(calls) == 2 and changed != first
+    clean.execute("UPDATE ah.message SET text='Parked for-ratification.' WHERE event_uid='late-text'")
+    assert observe() != changed
+    assert len(calls) == 3
+    clean.execute("DELETE FROM ah.message WHERE event_uid='late-text'")
+    assert observe() == first
+    assert len(calls) == 4
+
+    clean.execute("UPDATE ah.request_progress SET started_at=%s WHERE response_id='finished-call'", (AT,))
+    assert observe() != first
+    assert len(calls) == 5
+    clean.execute("UPDATE ah.llm_call SET stop_reason='compaction' WHERE response_id='finished-call'")
+    assert observe()[PREFIX + "root_model_calls"][0].value == 0
+    assert len(calls) == 6
+
+    relaunch = clean.execute(
+        "INSERT INTO ah.session(agent,session_uid,loop_run_id,loop_link_method) "
+        "VALUES ('pi','late-relaunch',%s,'lineage') RETURNING id",
+        (run,),
+    ).fetchone()[0]
+    message(clean, relaunch, source, "relaunch-text", "Owner question: resume?", seconds=300)
+    observe()
+    assert len(calls) == 6
+    clean.execute("UPDATE ah.session SET loop_link_method='relaunch' WHERE id=%s", (relaunch,))
+    observe()
+    assert len(calls) == 7
+    clean.execute(
+        "INSERT INTO ah.lane(loop_run_id,session_id,link_method,return_status) VALUES(%s,%s,'lineage','complete')",
+        (run, active),
+    )
+    observe()
+    assert len(calls) == 8
+
+    clean.execute(
+        "INSERT INTO ah.loop_run(launch_uid,root_session_id,launch_ts,report_path) VALUES ('next-window',%s,%s,'first')",
+        (root, AT + timedelta(seconds=250)),
+    )
+    narrowed = observe()
+    assert len(calls) == 9
+    assert narrowed[PREFIX + "root_messages"][0].value == 1
+    clean.execute(
+        "INSERT INTO ah.meta(key,value) VALUES ('git_repo_aliases','{\"example/project\":\"example/renamed\"}')"
+    )
+    renamed = observe()
+    assert len(calls) == 10
+    assert ("repo", "example/renamed") in renamed[PREFIX + "root_messages"][0].labels
+
+    # Even unchanged dependencies have the original bounded maximum age.
+    clock.advance(collector.max_age)
+    observe()
+    assert len(calls) == 11
+    clean.execute(
+        "UPDATE ah.loops SET status='finished',end_ts=%s WHERE launch_uid='active'", (AT + timedelta(hours=3),)
+    )
+    latest = observe()
+    assert len(calls) == 12
+    assert latest[PREFIX + "root_messages"][0].value == 1
+    clean.execute("DELETE FROM ah.meta WHERE key IN ('unrelated_counter','git_repo_aliases')")
+    clean.commit()

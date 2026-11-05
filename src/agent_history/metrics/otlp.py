@@ -75,6 +75,8 @@ agent_history_embed_gc_skipped 1 reason
 agent_history_last_success_timestamp_seconds s -
 agent_history_sources {file} status
 agent_history_lag_bytes By -
+agent_history_nul_tail_bytes By -
+agent_history_actionable_lag_bytes By -
 agent_history_parse_issues_total {issue} kind
 agent_history_unresolved_links {link} kind
 agent_history_dirty_sessions {session} -
@@ -227,6 +229,7 @@ COMPONENT_UNITS = {"_bucket": "{observation}", "_count": "{observation}", "_sum"
 PARSE_ISSUE_KINDS = frozenset(
     {
         "json_error",
+        "nul_tail",
         "not_object",
         "parser_exception",
         "missing_field",

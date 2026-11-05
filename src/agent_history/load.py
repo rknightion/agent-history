@@ -599,6 +599,33 @@ def parser_for(agent: str, role: str | None = None) -> tuple[type, str]:
     return CodexParser, model.PARSER_VERSION_CODEX
 
 
+NUL_TAIL_LIMIT = 1024 * 1024
+
+
+def nul_tail_bytes(path: Path, offset: int, observed: os.stat_result) -> int:
+    """Classify only a bounded, stable, wholly NUL tail, without consuming or repairing it.
+
+    Unknown, changed, mixed and ordinary unfinished JSON tails remain actionable lag. Checking
+    the opened inode and the path again prevents a replacement from inheriting this observation.
+    """
+    length = observed.st_size - offset
+    if not 0 < length <= NUL_TAIL_LIMIT:
+        return 0
+    def identity(st):
+        return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+    try:
+        with path.open("rb") as handle:
+            if identity(os.fstat(handle.fileno())) != identity(observed):
+                return 0
+            handle.seek(offset)
+            tail = handle.read(length + 1)
+            stable = identity(os.fstat(handle.fileno())) == identity(observed)
+        stable = stable and identity(path.stat()) == identity(observed)
+    except OSError:
+        return 0
+    return length if stable and len(tail) == length and not any(tail) else 0
+
+
 def read_batches(path: Path, offset: int, line_base: int) -> Iterator[list[tuple[bytes, LinePos]]]:
     with path.open("rb") as handle:
         handle.seek(offset)
@@ -678,7 +705,7 @@ def purge_source(conn: psycopg.Connection, source_id: int) -> None:
         conn.execute(f"DELETE FROM ah.{table} WHERE source_id = %s", (source_id,))
     conn.execute("UPDATE ah.source_file SET indexed_offset = 0, line_count = 0, checkpoint_start = 0, "
                  "checkpoint_sha256 = NULL, head_sha256 = NULL, parser_state = '{}', status = 'pending', "
-                 "rewrite_count = rewrite_count + 1 WHERE id = %s", (source_id,))
+                 "nul_tail_bytes = 0, rewrite_count = rewrite_count + 1 WHERE id = %s", (source_id,))
 
 
 def _parser_state(conn: psycopg.Connection, existing: dict[str, Any]) -> dict[str, Any]:
@@ -747,14 +774,16 @@ def _process_source(conn: psycopg.Connection, writer: Writer, entry: SourceEntry
             stats.errors += 1
             return
         unchanged = (existing["parser_version"] == parser_version and stat.st_size == offset and existing["status"] == "indexed"
-                     and existing["mtime_ns"] == stat.st_mtime_ns and existing["tier"] == entry.tier)
+                     and existing["mtime_ns"] == stat.st_mtime_ns and existing["tier"] == entry.tier
+                     and existing.get("available_hot") == (entry.hot is not None)
+                     and existing.get("available_cold") == (entry.cold is not None))
         if unchanged:
             return
         if offset and stat.st_size >= offset and prefix_verified(existing, path):
             if stat.st_size == offset:
                 conn.execute(
                     "UPDATE ah.source_file SET tier=%s, available_hot=%s, available_cold=%s, size_bytes=%s, "
-                    "mtime_ns=%s, status='indexed' WHERE id=%s", (*tier_cols, source_id))
+                    "mtime_ns=%s, nul_tail_bytes=0, status='indexed' WHERE id=%s", (*tier_cols, source_id))
                 conn.commit()
                 stats.files_tier_only += 1
                 return
@@ -782,6 +811,7 @@ def _parse_batches(conn: psycopg.Connection, writer: Writer, path: Path, ctx: Fi
                    commit: bool = True) -> None:
     """Parse `path` from `offset` and write each batch; `commit=False` keeps the caller's transaction."""
     parser = parser_cls(ctx, dict(state))
+    consumed = offset
     stats.files_parsed += 1
     for batch in read_batches(path, offset, line_base):
         rows: list[Row] = []
@@ -813,7 +843,7 @@ def _parse_batches(conn: psycopg.Connection, writer: Writer, path: Path, ctx: Fi
             conn.execute(
                 "UPDATE ah.source_file SET tier=%s, available_hot=%s, available_cold=%s, size_bytes=%s, "
                 "mtime_ns=%s, indexed_offset=%s, line_count=%s, checkpoint_start=%s, checkpoint_sha256=%s, "
-                "head_sha256=%s, parser_version=%s, parser_state=%s, status=%s, indexed_at=now() WHERE id=%s",
+                "head_sha256=%s, parser_version=%s, parser_state=%s, status=%s, nul_tail_bytes=0, indexed_at=now() WHERE id=%s",
                 (*tier_cols, end, last.line_number, start, tail, head, parser_version,
                  Jsonb(new_state), "indexed" if end >= stat.st_size else "partial", source_id))
         if commit:
@@ -821,6 +851,26 @@ def _parse_batches(conn: psycopg.Connection, writer: Writer, path: Path, ctx: Fi
         stats.lines += len(batch)
         stats.bytes += end - batch[0][1].byte_offset
         stats.rows += len(rows)
+        consumed = end
+    # No complete line still constitutes a source observation. Keep archive availability fresh,
+    # but never advance parser state, offsets or indexed_at without indexing a complete record.
+    nul_bytes = nul_tail_bytes(path, consumed, stat)
+    with conn.transaction():
+        conn.execute(
+            "UPDATE ah.source_file SET tier=%s, available_hot=%s, available_cold=%s, size_bytes=%s, "
+            "mtime_ns=%s, nul_tail_bytes=%s, status=%s WHERE id=%s AND "
+            "(tier,available_hot,available_cold,size_bytes,mtime_ns,nul_tail_bytes,status) "
+            "IS DISTINCT FROM (%s,%s,%s,%s,%s,%s,%s)",
+            (*tier_cols, nul_bytes, "indexed" if consumed >= stat.st_size else "partial", source_id,
+             *tier_cols, nul_bytes, "indexed" if consumed >= stat.st_size else "partial"))
+        if nul_bytes:
+            conn.execute(
+                "INSERT INTO ah.parse_issue (source_id,byte_offset,kind,detail) VALUES (%s,%s,'nul_tail',%s) "
+                "ON CONFLICT (source_id,byte_offset,kind) DO UPDATE SET detail=EXCLUDED.detail,created_at=now() "
+                "WHERE ah.parse_issue.detail IS DISTINCT FROM EXCLUDED.detail",
+                (source_id, consumed, f"bytes={nul_bytes}"))
+    if commit:
+        conn.commit()
     if offset == 0 and stat.st_size == 0:
         conn.execute("UPDATE ah.source_file SET status='indexed', parser_version=%s, indexed_at=now() WHERE id=%s",
                      (parser_version, source_id))
@@ -1328,6 +1378,7 @@ def post_passes(conn: psycopg.Connection, refresh_id: int | None = None) -> dict
             refresh_id = new_refresh(conn, "refresh")
         conn.execute("CREATE TEMP TABLE IF NOT EXISTS dirty_now (session_id bigint PRIMARY KEY) ON COMMIT DELETE ROWS")
         conn.execute("INSERT INTO dirty_now SELECT session_id FROM ah.dirty_session ON CONFLICT DO NOTHING")
+        structure.prepare_errors(conn)
         # Artifact copies can arrive after the child JSONL. Their run/response evidence can
         # resolve an existing child without a further transcript append, so enqueue those
         # children and parents before the ordinary dirty-session early return.
@@ -1629,10 +1680,10 @@ def refresh(conn: psycopg.Connection, hot: Path | None = HOT_ROOT, cold: Path | 
         # was hundreds of megabytes read on every pass for the few files that actually grew.
         existing = {r[1]: dict(zip(("id", "rel_path", "indexed_offset", "line_count", "checkpoint_start",
                                      "checkpoint_sha256", "head_sha256", "parser_version",
-                                     "status", "mtime_ns", "tier"), r))
+                                     "status", "mtime_ns", "tier", "available_hot", "available_cold"), r))
                     for r in conn.execute(
                         "SELECT id, rel_path, indexed_offset, line_count, checkpoint_start, checkpoint_sha256, "
-                        "head_sha256, parser_version, status, mtime_ns, tier FROM ah.source_file")}
+                        "head_sha256, parser_version, status, mtime_ns, tier, available_hot, available_cold FROM ah.source_file")}
         conn.commit()
         writer = Writer(conn)
         # Main files first so parents exist before children; stable order otherwise.

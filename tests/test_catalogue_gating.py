@@ -18,7 +18,7 @@ HEAVY = {
     "embed_pending": "FROM ah.chunk c WHERE NOT EXISTS",
     "embed_failures": "count(*) FROM ah.embed_failure",
     "embed_vectors": "count(*) FROM ah.embedding",
-    "loop_health": "WITH latest AS MATERIALIZED",
+    "loop_health": "SELECT w.repo, w.harness",
 }
 TABLES = sorted({table for tables in GATED_SECTIONS.values() for table in tables})
 
@@ -115,6 +115,8 @@ class Connection:
             return Result([(table, *self.db.counters[table]) for table in params[0]])
         if "FROM ah.refresh_log" in query:
             return Result([(50.0,)])
+        if "sum(GREATEST(size_bytes-indexed_offset,0))" in query:
+            return Result([(self.db.value, 0)])
         if "GROUP BY status" in query:
             return Result([("indexed", 3 + self.db.value)])
         if "GROUP BY kind" in query:
@@ -188,14 +190,14 @@ def test_truncate_moves_the_token_without_any_tuple_counter(database):
     assert database.heavy(mark) == ["embed_pending", "embed_vectors"]
 
 
-def test_shared_tables_recompute_every_section_that_reads_them(database):
+def test_shared_tables_recompute_sections_unless_completed_scope_is_unchanged(database):
     collector, clock = build()
     render(collector)
     database.touch("session")
     mark = len(database.log)
     clock.advance(61)
     render(collector)
-    assert database.heavy(mark) == ["links", "loop_health"]
+    assert database.heavy(mark) == ["links"]
     database.touch("source_file")
     mark = len(database.log)
     clock.advance(61)
@@ -276,3 +278,22 @@ def test_query_failure_publishes_nothing_and_drops_the_cache_entry(database):
     clock.advance(1)
     render(collector)
     assert database.heavy(mark) == ["parse_issues"]
+
+
+def test_completed_dependency_failure_and_relation_rewrite_never_reuse_stale_success(database):
+    collector, clock = build()
+    first = render(collector)
+    database.touch("message")
+    database.fail_on = {"SELECT jsonb_build_object("}
+    clock.advance(61)
+    failed = render(collector)
+    assert loop_health.PREFIX + "completed_timestamp_seconds" not in failed
+    assert collector.section_health["catalogue_loop_health"][1] is True
+    assert "loop_health" not in collector.cache
+    database.fail_on = set()
+    assert render(collector) == first
+    database.truncate("message")
+    clock.advance(61)
+    mark = len(database.log)
+    render(collector)
+    assert "loop_health" in database.heavy(mark)
