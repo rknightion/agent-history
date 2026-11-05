@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.10.0](https://github.com/rknightion/agent-history/compare/v0.9.6...v0.10.0) (2026-11-05)
+
+
+### Features
+
+* diagnose source tails and reduce repeated catalogue work ([3cbcb73](https://github.com/rknightion/agent-history/commit/3cbcb73f716a81014a8182b6ad6d89a66caab8c6))
+* **parser:** store pi cost provenance beside the catalogue estimate ([40e31f2](https://github.com/rknightion/agent-history/commit/40e31f2db7cbc805b4d732ae14d3042035504085))
+
 ## [0.9.6](https://github.com/rknightion/agent-history/compare/v0.9.5...v0.9.6) (2026-11-03)
 
 
