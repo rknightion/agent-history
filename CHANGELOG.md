@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.1](https://github.com/rknightion/agent-history/compare/v0.10.0...v0.10.1) (2026-11-06)
+
+
+### Bug Fixes
+
+* reconcile configured archive availability during indexing ([4abad12](https://github.com/rknightion/agent-history/commit/4abad12e357880cc67bd974ee1f0f5dbeac12e15))
+
 ## [0.10.0](https://github.com/rknightion/agent-history/compare/v0.9.6...v0.10.0) (2026-11-05)
 
 
