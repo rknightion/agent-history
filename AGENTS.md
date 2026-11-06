@@ -137,7 +137,9 @@ are cleared through their foreign keys during rebuild.
 
 Incomplete tails retain original source bytes and indexed offsets. Only a stable all-NUL tail of
 at most 1 MiB is classified separately; raw lag still includes it. Source availability refreshes even
-without complete records. Keep actionable-lag alert fallback for collectors predating these metrics.
+without complete records. Configured hot-source indexing reconciles cold metadata hourly in batches,
+with targeted new/partial probes; it never admits cold-only files. Unknown roots retain prior
+observations. Keep actionable-lag alert fallback for collectors predating these metrics.
 
 Error classification uses a transactional per-row pending queue. Relevant call, operation and I/O
 mutations publish work; Codex cell-owner changes also invalidate dependent waits. A generation check

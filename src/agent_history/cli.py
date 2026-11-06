@@ -545,6 +545,7 @@ def _dispatch(args, parser, argv, reader_commands):
                     args.limit_files,
                     None,
                     sources=_sources(config, args.source),
+                    cold_sources=config.cold_sources,
                     usage_fill=litellm_usage.filler(config.litellm),
                 )
                 _usage_unknown = stats.usage_fill_failed

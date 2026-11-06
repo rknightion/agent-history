@@ -218,6 +218,19 @@ Source tier and archive-availability metadata refresh even when no complete new 
 without advancing parser state or the last indexed-content timestamp. Zero actionable lag does not
 assert that damaged source content has been recovered.
 
+Configured incremental indexing observes `cold_sources` only for files admitted by its hot
+inventory. It never admits cold-only files or reads cold transcript content. An hourly metadata
+census (also on mapping changes) refreshes existing archive availability in one transaction;
+new and partial sources receive targeted observations each pass. Unchanged indexed sources use
+cached availability between censuses. Missing or unreadable namespace roots are unknown and retain
+prior observations, with a bounded run diagnostic; verified missing children and symlinks are not
+available. These are last observations, not a guarantee that an archive mount is currently healthy.
+Directory traversal uses bounded, no-follow directory handles. If the namespace root disappears or
+changes identity during observation, that namespace's results are discarded as unknown. Removing a
+configured cold mapping retires its census cache, including when the final mapping is removed;
+filtering hot sources does not retire other configured mappings. Parser offsets, state and
+indexed-content timestamps do not advance for availability updates.
+
 - `message.prompt_origin` on prompts: `typed`, `pasted`, `slash_command`, `skill`, `local_command`,
   `launch_message` (a loop root's launch prompt) or `agent_message`.
 - `ah.tool_io`: one row per call (`kind = 'call'`) and per Codex executed operation (`kind = 'op'`),

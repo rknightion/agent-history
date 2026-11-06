@@ -1650,7 +1650,7 @@ def refresh(conn: psycopg.Connection, hot: Path | None = HOT_ROOT, cold: Path | 
             textfile: Path | None = TEXTFILE, log=print, kind: str = "refresh",
             sources: dict[str, Path] | None = None,
             source_entries: dict[str, SourceEntry] | None = None,
-            usage_fill=None) -> RunStats:
+            usage_fill=None, cold_sources: dict[str, Path] | None = None) -> RunStats:
     """Index new transcript bytes from `sources` (namespace -> agent home) or the hot/cold archive.
 
     `usage_fill(conn)`, when given, fills unknown usage from an external source under the index
@@ -1685,6 +1685,9 @@ def refresh(conn: psycopg.Connection, hot: Path | None = HOT_ROOT, cold: Path | 
                         "SELECT id, rel_path, indexed_offset, line_count, checkpoint_start, checkpoint_sha256, "
                         "head_sha256, parser_version, status, mtime_ns, tier, available_hot, available_cold FROM ah.source_file")}
         conn.commit()
+        if sources is not None and cold_sources is not None:
+            from .source_availability import reconcile
+            reconcile(conn, entries, existing, sources, cold_sources, log)
         writer = Writer(conn)
         # Main files first so parents exist before children; stable order otherwise.
         order = sorted(entries.values(), key=lambda e: (e.role != "main", e.rel_path))
