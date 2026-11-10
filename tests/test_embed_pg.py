@@ -110,6 +110,93 @@ def test_embed_is_incremental_and_rebuild_costs_nothing(db):
 
 
 
+class RejectingProvider(FakeProvider):
+    """Answers 400 for any input containing a rejected word, like a provider refusing one input."""
+
+    def __init__(self, rejected: str):
+        super().__init__()
+        self.rejected = rejected
+
+    def embed(self, texts, kind="document"):
+        if any(self.rejected in text for text in texts):
+            raise embed.ProviderError(400, "rejected")
+        return super().embed(texts, kind)
+
+
+def _failures(conn):
+    rows = conn.execute("SELECT input_sha256, attempts FROM ah.embed_failure WHERE model = %s", (MODEL,))
+    return dict(rows.fetchall())
+
+
+def test_a_later_success_clears_the_failure_row(db, tmp_path):
+    conn, _ids = db
+    run(conn, RejectingProvider("Traefik"))
+    failed = _failures(conn)
+    assert len(failed) == 1 and max(failed.values()) < embed.MAX_ATTEMPTS   # still retrying
+    run(conn, FakeProvider())
+    assert _failures(conn) == {}
+    assert conn.execute("SELECT count(*) FROM ah.embedding WHERE model = %s AND input_sha256 = %s",
+                        (MODEL, next(iter(failed)))).fetchone()[0] == 1
+    path = tmp_path / "agent-history-embed.prom"
+    embed.write_metrics(conn, embed.EmbedStats(), True, path)
+    assert "agent_history_embed_failed_inputs 0" in path.read_text().splitlines()
+
+
+def test_run_prunes_stale_failure_rows_and_keeps_live_ones(db, tmp_path):
+    conn, _ids = db
+    run(conn, FakeProvider())   # every input now has a vector and a chunk
+    embedded = conn.execute("SELECT input_sha256 FROM ah.chunk WHERE model = %s AND input_sha256 <> '' "
+                            "LIMIT 1", (MODEL,)).fetchone()[0]
+    # Rows left behind by a manual retry (attempts reset to 0) during an outage, as on a live catalogue:
+    # one input since embedded, one no chunk references any more, and a recent unreferenced retry.
+    conn.execute("INSERT INTO ah.embed_failure (model, input_sha256, attempts, last_error, last_at) VALUES "
+                 "(%(m)s, %(e)s, 0, '400', now() - interval '6 days'), "
+                 "(%(m)s, 'orphan', 0, '400', now() - interval '5 days'), "
+                 "(%(m)s, 'young', 1, '400', now() - interval '2 hours')",
+                 {"m": MODEL, "e": embedded})
+    # A permanently failed input stays failing while its chunk still references it, however old.
+    conn.execute("INSERT INTO ah.embed_failure (model, input_sha256, attempts, last_error, last_at) "
+                 "VALUES (%s, 'dead', %s, '400', now() - interval '30 days')", (MODEL, embed.MAX_ATTEMPTS))
+    conn.execute("UPDATE ah.chunk SET input_sha256 = 'dead' WHERE id = "
+                 "(SELECT min(id) FROM ah.chunk WHERE model = %s AND input_sha256 <> %s)", (MODEL, embedded))
+    _meta(conn, "chunks_reset_at", "now() - interval '10 days'")
+    conn.commit()
+    lines = []
+    stats = embed.run(conn, FakeProvider(), cap_tokens=0, daily_cap=0, log=lines.append)
+    assert set(_failures(conn)) == {"young", "dead"}
+    assert "embed: cleared failure rows embedded=1 orphaned=1" in lines
+    path = tmp_path / "agent-history-embed.prom"
+    embed.write_metrics(conn, stats, True, path)
+    assert "agent_history_embed_failed_inputs 2" in path.read_text().splitlines()
+
+
+@pytest.mark.parametrize("guard", ["recent_chunk_reset", "rebuild_in_progress", "no_reset_marker"])
+def test_orphan_prune_waits_for_chunks_to_refill_but_vector_prune_never_waits(db, guard):
+    conn, _ids = db
+    run(conn, FakeProvider())
+    embedded = conn.execute("SELECT input_sha256 FROM ah.chunk WHERE model = %s AND input_sha256 <> '' "
+                            "LIMIT 1", (MODEL,)).fetchone()[0]
+    conn.execute("INSERT INTO ah.embed_failure (model, input_sha256, attempts, last_error, last_at) VALUES "
+                 "(%(m)s, %(e)s, 0, '400', now() - interval '6 days'), "
+                 "(%(m)s, 'awaiting-rechunk', 2, '400', now() - interval '5 days')", {"m": MODEL, "e": embedded})
+    # A rebuild or re-chunk has emptied ah.chunk: every failure row now looks unreferenced.
+    conn.execute("DELETE FROM ah.chunk")
+    if guard == "recent_chunk_reset":
+        _meta(conn, "chunks_reset_at", "now() - interval '1 day'")
+    elif guard == "rebuild_in_progress":
+        _meta(conn, "chunks_reset_at", "now() - interval '10 days'")
+        _meta(conn, "rebuild_in_progress", "now() - interval '4 hours'")   # old enough for embed to run
+    else:
+        conn.execute("DELETE FROM ah.meta WHERE key = 'chunks_reset_at'")
+    conn.commit()
+    lines = []
+    embed.run(conn, RejectingProvider("never-matches"), cap_tokens=0, daily_cap=0, log=lines.append)
+    # Under every guard the input that already has a vector is still cleared (that delete is
+    # ungated), while the unreferenced row keeps its retry count until chunks refill.
+    assert _failures(conn) == {"awaiting-rechunk": 2}
+    assert f"embed: orphaned failure rows kept ({guard})" in lines
+
+
 def test_empty_candidate_lookup_does_not_visit_embedded_history(db):
     conn, ids = db
     provider = FakeProvider()

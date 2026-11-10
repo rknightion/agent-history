@@ -430,6 +430,7 @@ class CatalogueCollector:
                     result.append(gauge("agent_history_embed_pending_messages", "Chunks awaiting embeddings.", pending))
             with self.section(conn, result, "embed_failures") as gate:
                 if not gate.reused:
+                    # Same count as embed.FAILED_INPUTS_SQL: the embedder clears embedded and orphaned rows.
                     failures = conn.execute("SELECT count(*) FROM ah.embed_failure").fetchone()[0]
                     result.append(
                         gauge("agent_history_embed_failed_inputs", "Inputs with embedding failures.", failures)

@@ -8527,7 +8527,7 @@
               "transformations": []
             }
           },
-          "description": "ah.embed_failure rows (last_error is the API message, not content).",
+          "description": "ah.embed_failure: inputs currently failing (last_error is the API status, not content). attempts counts retries; 3 or more means failed for good.",
           "id": 301,
           "links": [],
           "title": "Embedding failures",
@@ -8613,7 +8613,7 @@
               "transformations": []
             }
           },
-          "description": "Inputs that failed 3+ times (ah.embed_failure).",
+          "description": "Inputs whose latest embedding attempt failed and that have no vector yet (ah.embed_failure), retrying or failed for good. A row clears once its input embeds; orphans are pruned after chunks refill.",
           "id": 291,
           "links": [],
           "title": "Failed inputs",

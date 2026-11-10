@@ -4058,7 +4058,7 @@ stat(
 stat(
     "em_failed",
     "Failed inputs",
-    "Inputs that failed 3+ times (ah.embed_failure).",
+    "Inputs whose latest embedding attempt failed and that have no vector yet (ah.embed_failure), retrying or failed for good. A row clears once its input embeds; orphans are pruned after chunks refill.",
     [prom(f"{EMB}_failed_inputs{{{AH}}}", instant=True)],
     steps_=steps("green", (1, "yellow"), (100, "red")),
 )
@@ -4155,7 +4155,7 @@ table(
 table(
     "em_fail_t",
     "Embedding failures",
-    "ah.embed_failure rows (last_error is the API message, not content).",
+    "ah.embed_failure: inputs currently failing (last_error is the API status, not content). attempts counts retries; 3 or more means failed for good.",
     [
         sql(
             "SELECT last_at, model, attempts, left(last_error, 200) AS last_error, message_id, summary_id FROM ah.embed_failure ORDER BY last_at DESC LIMIT 50"

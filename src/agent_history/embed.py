@@ -518,6 +518,39 @@ def _dead(conn: psycopg.Connection, model: str, hashes: list[str]) -> set[str]:
     return {r[0] for r in rows}
 
 
+# A failure row means "this input's latest attempt failed and it has no vector yet". It is cleared when
+# the input is embedded, and pruned once no chunk references it and no retry has touched it for
+# FAILURE_ORPHAN_DAYS: a pending input is retried every run (refreshing last_at) and a permanently
+# failed one is referenced by the chunk written for it, so neither is pruned while it still matters.
+# Pruning a row the embedder later needs again only restarts its attempt count. A rebuild or an
+# INPUT_VERSION re-chunk empties ah.chunk and refills it gradually, so the orphan prune takes the
+# vector GC's reset guards (gc_skip_reason, without the backlog test); the vector prune never needs them.
+FAILURE_ORPHAN_DAYS = 1
+FAILURE_EMBEDDED_SQL = """
+DELETE FROM ah.embed_failure f
+WHERE EXISTS (SELECT 1 FROM ah.embedding e WHERE e.model = f.model AND e.input_sha256 = f.input_sha256)
+"""
+FAILURE_ORPHAN_SQL = """
+DELETE FROM ah.embed_failure f
+WHERE f.last_at < now() - make_interval(days => %s)
+  AND NOT EXISTS (SELECT 1 FROM ah.chunk c WHERE c.model = f.model AND c.input_sha256 = f.input_sha256)
+"""
+FAILED_INPUTS_SQL = "SELECT count(*) FROM ah.embed_failure"
+
+
+def prune_failures(conn: psycopg.Connection) -> tuple[int, int, str | None]:
+    """Delete failure rows whose input now has a vector, then orphaned ones unless a chunk reset or
+    rebuild makes "no chunk references it" meaningless. Returns both counts and the orphan skip reason."""
+    with conn.transaction():
+        embedded = conn.execute(FAILURE_EMBEDDED_SQL).rowcount
+        now, reset, rebuilding = conn.execute(
+            "SELECT now(), (SELECT value FROM ah.meta WHERE key = 'chunks_reset_at'), "
+            "EXISTS (SELECT 1 FROM ah.meta WHERE key = 'rebuild_in_progress')").fetchone()
+        skipped = gc_skip_reason(now, reset, rebuilding, False)
+        orphaned = 0 if skipped else conn.execute(FAILURE_ORPHAN_SQL, (FAILURE_ORPHAN_DAYS,)).rowcount
+    return embedded, orphaned, skipped
+
+
 def _write_chunks(conn: psycopg.Connection, model: str, item: Item) -> int:
     """Replace this item's chunks, guarded against a concurrent rebuild re-using the id."""
     with conn.transaction():
@@ -600,6 +633,11 @@ def run(conn: psycopg.Connection, provider: Provider, cap_tokens: int = 3_000_00
         conn.commit()
         _ensure_message_queue(conn, provider.model)
         conn.commit()
+        embedded, orphaned, orphan_skip = prune_failures(conn)
+        if embedded or orphaned:
+            log(f"embed: cleared failure rows embedded={embedded} orphaned={orphaned}")
+        if orphan_skip:
+            log(f"embed: orphaned failure rows kept ({orphan_skip})")
         day_key = "embed_tokens_" + datetime.now(timezone.utc).strftime("%Y-%m-%d")
         row = conn.execute("SELECT value FROM ah.meta WHERE key = %s", (day_key,)).fetchone()
         used_today = int(row[0]) if row else 0
@@ -645,6 +683,8 @@ def run(conn: psycopg.Connection, provider: Provider, cap_tokens: int = 3_000_00
                             "attempts = ah.embed_failure.attempts + 1, last_error = EXCLUDED.last_error, "
                             "last_at = now()",
                             [(provider.model, by_input[inp], status) for inp, status in failed.items()])
+                    conn.execute("DELETE FROM ah.embed_failure WHERE model = %s AND input_sha256 = ANY(%s)",
+                                 (provider.model, [by_input[inp] for inp in good]))
                 stats.api_inputs += len(good)
                 stats.failed_inputs += len(failed)
                 failed_now |= {by_input[inp] for inp in failed}
@@ -735,8 +775,7 @@ def write_metrics(conn: psycopg.Connection, stats: EmbedStats, success: bool, pa
         if model:
             pending = conn.execute(PENDING_COUNT_SQL,
                                    {"classes": list(EMBED_CLASSES), "model": model[0]}).fetchone()[0]
-            failed = conn.execute("SELECT count(*) FROM ah.embed_failure WHERE model = %s AND attempts >= %s",
-                                  (model[0], MAX_ATTEMPTS)).fetchone()[0]
+            failed = conn.execute(FAILED_INPUTS_SQL).fetchone()[0]
             vectors = conn.execute("SELECT count(*) FROM ah.embedding WHERE model = %s", (model[0],)).fetchone()[0]
             lines += [f"agent_history_embed_pending_messages {pending}",
                       f"agent_history_embed_failed_inputs {failed}",
