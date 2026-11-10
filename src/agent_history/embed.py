@@ -523,8 +523,10 @@ def _dead(conn: psycopg.Connection, model: str, hashes: list[str]) -> set[str]:
 # FAILURE_ORPHAN_DAYS: a pending input is retried every run (refreshing last_at) and a permanently
 # failed one is referenced by the chunk written for it, so neither is pruned while it still matters.
 # Pruning a row the embedder later needs again only restarts its attempt count. A rebuild or an
-# INPUT_VERSION re-chunk empties ah.chunk and refills it gradually, so the orphan prune takes the
-# vector GC's reset guards (gc_skip_reason, without the backlog test); the vector prune never needs them.
+# INPUT_VERSION re-chunk empties ah.chunk and refills it gradually, and a permanently failed input is
+# unreferenced (and no longer retried, so its last_at ages) until its item is re-chunked. The orphan
+# prune therefore takes the vector GC's reset guards (gc_skip_reason) and runs after the pass, only when
+# the pass drained the backlog, so a refill slower than the quiet period cannot reset a capped input.
 FAILURE_ORPHAN_DAYS = 1
 FAILURE_EMBEDDED_SQL = """
 DELETE FROM ah.embed_failure f
@@ -538,15 +540,16 @@ WHERE f.last_at < now() - make_interval(days => %s)
 FAILED_INPUTS_SQL = "SELECT count(*) FROM ah.embed_failure"
 
 
-def prune_failures(conn: psycopg.Connection) -> tuple[int, int, str | None]:
-    """Delete failure rows whose input now has a vector, then orphaned ones unless a chunk reset or
-    rebuild makes "no chunk references it" meaningless. Returns both counts and the orphan skip reason."""
+def prune_failures(conn: psycopg.Connection, backlog_pending: bool) -> tuple[int, int, str | None]:
+    """Delete failure rows whose input now has a vector, then orphaned ones unless a chunk reset,
+    rebuild or undrained backlog makes "no chunk references it" meaningless. Returns both counts and
+    the orphan skip reason."""
     with conn.transaction():
         embedded = conn.execute(FAILURE_EMBEDDED_SQL).rowcount
         now, reset, rebuilding = conn.execute(
             "SELECT now(), (SELECT value FROM ah.meta WHERE key = 'chunks_reset_at'), "
             "EXISTS (SELECT 1 FROM ah.meta WHERE key = 'rebuild_in_progress')").fetchone()
-        skipped = gc_skip_reason(now, reset, rebuilding, False)
+        skipped = gc_skip_reason(now, reset, rebuilding, backlog_pending)
         orphaned = 0 if skipped else conn.execute(FAILURE_ORPHAN_SQL, (FAILURE_ORPHAN_DAYS,)).rowcount
     return embedded, orphaned, skipped
 
@@ -633,15 +636,11 @@ def run(conn: psycopg.Connection, provider: Provider, cap_tokens: int = 3_000_00
         conn.commit()
         _ensure_message_queue(conn, provider.model)
         conn.commit()
-        embedded, orphaned, orphan_skip = prune_failures(conn)
-        if embedded or orphaned:
-            log(f"embed: cleared failure rows embedded={embedded} orphaned={orphaned}")
-        if orphan_skip:
-            log(f"embed: orphaned failure rows kept ({orphan_skip})")
         day_key = "embed_tokens_" + datetime.now(timezone.utc).strftime("%Y-%m-%d")
         row = conn.execute("SELECT value FROM ah.meta WHERE key = %s", (day_key,)).fetchone()
         used_today = int(row[0]) if row else 0
         conn.commit()
+        drained = False
         while True:
             if stop_requested():
                 break  # every earlier batch is committed; the rest waits for the next worker
@@ -652,6 +651,7 @@ def run(conn: psycopg.Connection, provider: Provider, cap_tokens: int = 3_000_00
                 break
             items = _items(conn, provider.model, batch_items)
             if not items:
+                drained = True
                 break
             hashes = sorted({h for it in items for (_s, _e, _i, h) in it.pieces})
             have = _cached(conn, provider.model, hashes) | _dead(conn, provider.model, hashes)
@@ -706,6 +706,11 @@ def run(conn: psycopg.Connection, provider: Provider, cap_tokens: int = 3_000_00
                 f"failed={stats.failed_inputs} tokens~{stats.tokens}")
             if progressed == 0:
                 break
+        embedded, orphaned, orphan_skip = prune_failures(conn, not drained)
+        if embedded or orphaned:
+            log(f"embed: cleared failure rows embedded={embedded} orphaned={orphaned}")
+        if orphan_skip:
+            log(f"embed: orphaned failure rows kept ({orphan_skip})")
         if gc_interval_hours and not stop_requested():
             last = conn.execute("SELECT now(), (SELECT value FROM ah.meta WHERE key = 'embed_gc_at')").fetchone()
             conn.rollback()

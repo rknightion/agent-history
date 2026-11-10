@@ -197,6 +197,52 @@ def test_orphan_prune_waits_for_chunks_to_refill_but_vector_prune_never_waits(db
     assert f"embed: orphaned failure rows kept ({guard})" in lines
 
 
+def test_a_capped_input_keeps_its_attempts_while_its_item_awaits_a_slow_rechunk(db):
+    conn, _ids = db
+    for _ in range(embed.MAX_ATTEMPTS):
+        run(conn, RejectingProvider("Traefik"))
+    dead = _failures(conn)
+    assert len(dead) == 1 and set(dead.values()) == {embed.MAX_ATTEMPTS}   # capped, chunk written for it
+    (h,) = dead
+    # A re-chunk emptied ah.chunk more than the quiet period ago and the refill has not reached this
+    # item yet (it is rate limited by the token caps): nothing references the capped input.
+    conn.execute("DELETE FROM ah.chunk")
+    _meta(conn, "chunks_reset_at", "now() - interval '10 days'")
+    conn.execute("UPDATE ah.embed_failure SET last_at = now() - interval '30 days'")
+    conn.commit()
+    provider = RejectingProvider("Traefik")
+    embed.run(conn, provider, cap_tokens=0, daily_cap=0, log=lambda *_: None)
+    assert _failures(conn) == {h: embed.MAX_ATTEMPTS}   # not retried from zero
+    assert conn.execute("SELECT count(*) FROM ah.chunk WHERE model = %s AND input_sha256 = %s",
+                        (MODEL, h)).fetchone()[0] == 1
+
+
+def test_orphan_prune_waits_for_a_drained_backlog(db):
+    conn, _ids = db
+    run(conn, FakeProvider())
+    conn.execute("INSERT INTO ah.embed_failure (model, input_sha256, attempts, last_error, last_at) "
+                 "VALUES (%s, 'orphan', %s, '400', now() - interval '30 days')", (MODEL, embed.MAX_ATTEMPTS))
+    _meta(conn, "chunks_reset_at", "now() - interval '10 days'")
+    conn.commit()
+    assert embed.prune_failures(conn, backlog_pending=True) == (0, 0, "backlog_pending")
+    assert _failures(conn) == {"orphan": embed.MAX_ATTEMPTS}
+    assert embed.prune_failures(conn, backlog_pending=False) == (0, 1, None)
+    assert _failures(conn) == {}
+
+
+def test_a_pass_stopped_by_the_token_cap_does_not_prune_orphans(db):
+    conn, _ids = db
+    conn.execute("INSERT INTO ah.embed_failure (model, input_sha256, attempts, last_error, last_at) "
+                 "VALUES (%s, 'orphan', %s, '400', now() - interval '30 days')", (MODEL, embed.MAX_ATTEMPTS))
+    _meta(conn, "chunks_reset_at", "now() - interval '10 days'")
+    _meta(conn, "embed_input_version", f"'{embed.INPUT_VERSION}'")   # no re-chunk, so no fresh reset
+    conn.commit()
+    lines = []
+    embed.run(conn, FakeProvider(), cap_tokens=1, daily_cap=0, batch_items=1, log=lines.append)
+    assert _failures(conn) == {"orphan": embed.MAX_ATTEMPTS}
+    assert "embed: orphaned failure rows kept (backlog_pending)" in lines
+
+
 def test_empty_candidate_lookup_does_not_visit_embedded_history(db):
     conn, ids = db
     provider = FakeProvider()
