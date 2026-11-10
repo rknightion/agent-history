@@ -1,7 +1,7 @@
 """Collect charter/closeout identity metadata, never document bodies or receipt state.
 
-A qualified closeout also yields two integers, the distinct task IDs under its `## Landed` and
-`## Parked` headings. A charter yields the ordered task IDs that open the rows under its
+A qualified closeout also yields two integers, the distinct task IDs or `#N` issue numbers under
+its `## Landed` and `## Parked` headings. A charter yields the ordered task IDs that open the rows under its
 `## First wave` heading. The body is read in memory while it is hashed and then discarded; only
 the integers and the IDs leave this module.
 """
@@ -42,9 +42,11 @@ MAX_COUNT_BYTES = 1024 * 1024
 TASK_ID = re.compile(r"(?<![A-Za-z0-9_.-])[A-Z][A-Z0-9]*-[0-9]+(?:\.[0-9]+)*(?![A-Za-z0-9_-]|\.[0-9])")
 HEADING2 = re.compile(r" {0,3}##(?!#)(?:[ \t]+(.*?))?[ \t]*")
 FENCE = re.compile(r" {0,3}(```|~~~)")
-# A counted entry is a list item or table row that opens with its task ID, optionally in bold or
-# code; IDs elsewhere in an entry or in prose are references, not entries.
-ENTRY = re.compile(r"\s*(?:[-*+]|[0-9]+[.)]|\|)\s*(?:\*\*|__|`)?(" + TASK_ID.pattern + ")")
+# A tracker issue number: `#` and one to seven digits. A longer run of digits is skipped, not cut.
+ISSUE_ID = re.compile(r"(?<![A-Za-z0-9_.&#-])#[0-9]{1,7}(?![A-Za-z0-9_-]|\.[0-9])")
+# A counted entry is a list item or table row that opens with its task ID or issue number,
+# optionally in bold or code; IDs elsewhere in an entry or in prose are references, not entries.
+ENTRY = re.compile(r"\s*(?:[-*+]|[0-9]+[.)]|\|)\s*(?:\*\*|__|`)?(" + TASK_ID.pattern + "|" + ISSUE_ID.pattern + ")")
 # A first-wave ID must also have this exact bounded shape; a longer token is skipped, not cut.
 STRICT_TASK_ID = re.compile(r"[A-Z][A-Z0-9]{0,15}-[0-9]{1,6}(?:\.[0-9]{1,4}){0,3}")
 MAX_CHARTER_TASK_IDS = 200
@@ -77,9 +79,10 @@ def _sections(body: str, kinds: tuple[str, ...]) -> dict[str, list[str] | None]:
 
 
 def closeout_counts(body: str) -> tuple[int | None, int | None]:
-    """Distinct task IDs opening an entry under the `## Landed` and `## Parked` level-2 headings.
+    """Distinct task IDs or `#N` issue numbers opening an entry under the `## Landed` and `## Parked`
+    level-2 headings.
 
-    An entry is a list item or table row whose first token is the task ID. A section runs from its heading to the next level-2 heading. Headings match on text starting
+    An entry is a list item or table row whose first token is the task ID or issue number. A section runs from its heading to the next level-2 heading. Headings match on text starting
     with Landed or Parked in any case, so trailing words are allowed. A missing section is None;
     a present section without IDs is 0. Repeated sections of one kind are counted together.
     Headings inside fenced code blocks are not headings.
@@ -94,7 +97,7 @@ def charter_task_ids(body: str) -> list[str]:
     A row is a list item or table row whose first token is the ID, optionally in bold or code;
     a first table cell such as `ID (short note)` yields the ID only. IDs later in a row, in prose
     or under any other heading are references and are not collected. Only IDs of the strict
-    bounded shape count, and at most MAX_CHARTER_TASK_IDS are kept. No section yields [].
+    bounded shape count (a `#N` issue number is not one), and at most MAX_CHARTER_TASK_IDS are kept. No section yields [].
     """
     ids: list[str] = []
     for task in _sections(body, ("first wave",))["first wave"] or []:

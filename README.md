@@ -324,8 +324,9 @@ remote default branch before reading git objects; it never edits the checkout or
 Independently of that classification, it collects `codex/charter-*-loop<N>.md` and
 `codex/closeout-*-loop<N>.md` into the metadata-only `ah.loop_run_metadata` table: whole-file
 hash, qualified closeout line 1, mtime and explicit checkout origin, never document bodies. A
-qualified closeout also records two integers, the distinct task IDs opening a list item or table row
-under its `## Landed` and `## Parked` headings (migration 041); titles and those IDs are not stored.
+qualified closeout also records two integers, the distinct task IDs or `#N` issue numbers opening a
+list item or table row under its `## Landed` and `## Parked` headings (migration 041); titles and
+those IDs are not stored.
 A charter records the ordered task IDs opening the rows under its `## First wave` heading
 (migration 044) and nothing else from its body.
 Migration 038 adds this table and the narrow metadata grants for an existing `ah_ingest` role;
@@ -382,13 +383,26 @@ read `AGENT_HISTORY_EMBED_ENV`; OpenAI/Cohere gateway routes require `EMBED_BASE
 `agent-history loop <id>` prints one run's summary and lanes. The argument may instead be the
 run's absolute closeout path; when several launches share that closeout (a relaunch), they are
 shown together and the output says so. `agent-history loop <id or closeout path> --usage` prints
-a short Markdown block for a v3 root to paste into its closeout Notes: an `as of` UTC timestamp,
-wall time, LLM calls, the list-price cost total and a cost and calls table by role (root, then
-each lane role from `ah.lane.role`, `unattributed` for linked sessions without a lane) and model.
-Scope follows `ah.v_loop_summary` (root calls inside each launch window, linked sessions whole)
-and prices follow `ah.v_session_cost`. Unpriced calls and heuristic-linked sessions are stated
-when non-zero. It prints no prompt text or lane names. An unknown id or path exits non-zero with
-a one-line reason. The catalogue lags the transcripts by an indexer pass, hence the timestamp.
+a Markdown block for a root to paste into its closeout Notes: an `as of` UTC timestamp,
+wall time, LLM calls, the list-price cost total, then the numbers a v4 closeout carries (harness
+and version, landing mode, landed and parked tasks, root calls and root calls per landed task,
+peak root context, compactions and how many the owner typed, root question-tool calls and the
+hours they blocked, lane Bash timeouts), and tables of cost and calls by role (root, then each
+lane role from `ah.lane.role`, `unattributed` for linked sessions without a lane) and model,
+spend share by role, lane complete rate by role and denials by class. Scope follows
+`ah.v_loop_summary` (root calls inside each launch window, linked sessions whole) and prices
+follow `ah.v_session_cost`. A role with an unpriced call is marked `unpriced` or `(partial)` and
+its share is of priced cost only. A number the catalogue does not record prints `unknown` or
+`not recorded`, never 0: timeouts and denials are recorded for Claude sessions only, question
+tools for Claude and Codex, and owner-typed compactions only where the compaction has a trigger.
+Plugin and agent-docs versions are not recorded in the catalogue. When the closeout's run
+directory (`codex/loop<N>/` beside `codex/closeout-<date>-loop<N>.md`) is on the machine running
+the command and holds `landings.jsonl`, the block adds landings per hour, each landing's outcome
+and slot time, and takes the landed count from the ledger's issues when every landed landing names
+at least one issue (otherwise the closeout's count stands). A landing is its pull request within
+the run, as the landing tool keys it; the ledger has no repository key, so two repositories' pull
+requests with one number are not told apart. The file is read locally and never stored. Unpriced calls and heuristic-linked sessions are stated when non-zero. It prints
+no prompt text or lane names. An unknown id or path exits non-zero with a one-line reason. The catalogue lags the transcripts by an indexer pass, hence the timestamp.
 
 Private command add-ons can import `agent_history.reader.main(argv, register, dispatch)`.
 `register(subparsers)` adds parsers; `dispatch(args)` returns an integer status when handled or

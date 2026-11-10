@@ -31,11 +31,11 @@ def clean(conn):  # noqa: F811
     conn.commit()
 
 
-def session(db, uid, *, loop_id=None, method=None):
+def session(db, uid, *, loop_id=None, method=None, agent="claude"):
     return db.execute(
         "INSERT INTO ah.session (agent,session_uid,is_stub,loop_run_id,loop_link_method,first_event_at,last_event_at) "
-        "VALUES ('claude',%s,false,%s,%s,%s,%s) RETURNING id",
-        (uid, loop_id, method, AT, AT + timedelta(hours=3)),
+        "VALUES (%s,%s,false,%s,%s,%s,%s) RETURNING id",
+        (agent, uid, loop_id, method, AT, AT + timedelta(hours=3)),
     ).fetchone()[0]
 
 
@@ -96,8 +96,8 @@ def test_usage_block_for_a_relaunched_closeout(clean, monkeypatch, capsys):
         "- Unpriced calls: 1 (not in the cost total)",
         "- Heuristic-linked sessions: 1 (attributed by timing, not by an explicit link)",
     ]
-    assert lines[8:] == [
-        "",
+    at = lines.index("| Role | Model | Calls | Cost |")
+    assert lines[at - 1] == "" and lines[at : at + 6] == [
         "| Role | Model | Calls | Cost |",
         "| --- | --- | ---: | ---: |",
         f"| root | {PRICED} | 2 | $6.00 |",
@@ -121,3 +121,187 @@ def test_usage_block_for_a_relaunched_closeout(clean, monkeypatch, capsys):
     with pytest.raises(SystemExit) as raised:
         reader.main(["loop", "/synthetic/project/codex/closeout-other-loop1.md", "--usage"])
     assert str(raised.value.code).startswith("agent-history: no loop run has closeout path ")
+
+
+def test_usage_block_numbers_from_catalogue_rows(clean, monkeypatch, capsys):
+    db = clean
+    db.execute(
+        "INSERT INTO ah.model_pricing (model,effective_from,input_per_mtok,output_per_mtok) VALUES (%s,'2026-01-01',1,2)",
+        (PRICED,),
+    )
+    root = session(db, "synthetic-v4-root")
+    db.execute("UPDATE ah.session SET cli_version_last='2.1.4' WHERE id=%s", (root,))
+    run = launch(db, "usage:v4", root, AT, AT + timedelta(hours=2))
+    db.execute("UPDATE ah.loops SET tasks_landed=3, parks_total=1 WHERE launch_uid='usage:v4'")
+    # Root context: the larger call is 1,500 tokens; a call before the launch is not in the window.
+    call(db, root, "root-early", AT - timedelta(minutes=5))
+    call(db, root, "root-a", AT + timedelta(minutes=5))
+    call(db, root, "root-b", AT + timedelta(minutes=6))
+    db.execute("UPDATE ah.llm_call SET input_uncached=1200, cache_read=300 WHERE response_id='root-b'")
+    db.execute("UPDATE ah.llm_call SET input_uncached=800 WHERE response_id='root-a'")
+    db.execute("UPDATE ah.llm_call SET input_uncached=9000000 WHERE response_id='root-early'")
+    for n, (offset, trigger) in enumerate(((10, "manual"), (20, "auto"), (30, "auto"), (40, None), (-5, "manual"))):
+        db.execute(
+            "INSERT INTO ah.compaction (agent,event_uid,session_id,ts,trigger,source_id,byte_offset) "
+            "VALUES ('claude',%s,%s,%s,%s,0,%s)",
+            (f"synthetic-compaction-{n}", root, AT + timedelta(minutes=offset), trigger, n),
+        )
+    worker = session(db, "synthetic-v4-worker", loop_id=run, method="lineage")
+    reviewer = session(db, "synthetic-v4-reviewer", loop_id=run, method="lineage")
+    other = session(db, "synthetic-v4-other", loop_id=run, method="lineage")
+    for sid, name, role, status in (
+        (worker, "lane-a", "worker", "complete"),
+        (reviewer, "lane-b", "reviewer", "complete"),
+        (other, "lane-c", "worker", "failed"),
+    ):
+        db.execute(
+            "INSERT INTO ah.lane (loop_run_id,session_id,lane_name,role,link_method,return_status) "
+            "VALUES (%s,%s,%s,%s,'lineage',%s)",
+            (run, sid, name, role, status),
+        )
+    # Rows the Claude parser can produce: a timeout is a timed-out result, a denial carries its kind
+    # and the outcome `denied`, and a question with no result yet has no end and `no_result`.
+    # (session, tool, outcome, timed_out, denial, duration_ms, minutes after the launch)
+    tools = [
+        (root, "AskUserQuestion", "ok", None, None, 1_800_000, 15),
+        (root, "AskUserQuestion", "ok", None, None, 3_600_000, 16),
+        (root, "AskUserQuestion", "ok", None, None, 60_000, -30),
+        (root, "AskUserQuestion", "no_result", None, None, None, 35),
+        (root, "Bash", "timeout", True, None, 1000, 17),
+        (worker, "Bash", "timeout", True, None, 1000, 18),
+        (worker, "Bash", "timeout", True, None, 1000, 19),
+        (worker, "Bash", "ok", False, None, 1000, 20),
+        (other, "Bash", "timeout", True, None, 1000, 21),
+        (other, "Read", "timeout", True, None, 1000, 22),
+        (root, "Edit", "denied", None, "user-rejected", 10, 23),
+        (worker, "Bash", "denied", None, "user-rejected", 10, 24),
+        (worker, "Bash", "denied", None, "automode-blocked", 10, 25),
+    ]
+    for n, (sid, name, outcome, timed_out, denial, ms, offset) in enumerate(tools):
+        db.execute(
+            "INSERT INTO ah.tool_call (agent,call_uid,session_id,tool_name,started_at,ended_at,duration_ms,outcome,"
+            "timed_out,denial_kind,source_id,byte_offset) VALUES ('claude',%s,%s,%s,%s,%s,%s,%s,%s,%s,0,%s)",
+            (
+                f"synthetic-tool-{n}",
+                sid,
+                name,
+                AT + timedelta(minutes=offset),
+                None if outcome == "no_result" else AT + timedelta(minutes=offset, seconds=1),
+                ms,
+                outcome,
+                timed_out,
+                denial,
+                n,
+            ),
+        )
+    db.commit()
+    monkeypatch.setenv("AGENT_HISTORY_READER_DSN", READER)
+    assert reader.main(["loop", CLOSEOUT, "--usage"]) == 0
+    out = capsys.readouterr().out
+    lines = out.splitlines()
+    assert "- Harness: claude 2.1.4" in lines
+    assert "- Landed: 3 tasks (from the closeout)" in lines and "- Parked: 1 task (from the closeout)" in lines
+    assert "- Root calls: 2" in lines
+    assert "- Root calls per landed task: 0.7" in lines
+    assert "- Peak root context: 1,500 tokens" in lines
+    # Two automatic and one typed compaction inside the window, one with no trigger; the early one is out.
+    assert "- Compactions: 4 (typed by the owner: unknown, 1 with no trigger recorded)" in lines
+    assert "- Root question-tool calls: 3 (blocked 1.50 hours, 1 still open at closeout)" in lines
+    # Lane shell timeouts only: not the root's, not a non-shell tool's. Claude records them.
+    assert "- Lane Bash timeouts: 3" in lines
+    at = lines.index("| Lane role | Lanes | Complete | Complete rate |")
+    assert lines[at + 2 : at + 4] == ["| reviewer | 1 | 1 | 100% |", "| worker | 2 | 1 | 50% |"]
+    at = lines.index("| Denial class | Denials |")
+    assert lines[at + 2 : at + 4] == ["| user-rejected | 2 |", "| automode-blocked | 1 |"]
+    assert not any(line.startswith("- Denials by class") for line in lines)
+    assert "| Role | Cost | Share of cost |" in lines
+    assert "secret" not in out
+
+
+def tool(db, agent, sid, name, n, *, minutes=10, ended=True, duration=None, outcome="ok"):
+    db.execute(
+        "INSERT INTO ah.tool_call (agent,call_uid,session_id,tool_name,started_at,ended_at,duration_ms,outcome,"
+        "source_id,byte_offset) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,0,%s)",
+        (
+            agent,
+            f"synthetic-{agent}-{n}",
+            sid,
+            name,
+            AT + timedelta(minutes=minutes),
+            AT + timedelta(minutes=minutes, seconds=2) if ended else None,
+            duration,
+            outcome if ended else "no_result",
+            n,
+        ),
+    )
+
+
+def usage_lines(monkeypatch, capsys):
+    monkeypatch.setenv("AGENT_HISTORY_READER_DSN", READER)
+    assert reader.main(["loop", CLOSEOUT, "--usage"]) == 0
+    return capsys.readouterr().out.splitlines()
+
+
+def test_codex_question_tools_count_and_unrecorded_numbers_are_unknown(clean, monkeypatch, capsys):
+    db = clean
+    root = session(db, "synthetic-codex-root", agent="codex")
+    db.execute("UPDATE ah.session SET cli_version_last='0.9.1' WHERE id=%s", (root,))
+    run = launch(db, "usage:codex", root, AT, AT + timedelta(hours=2))
+    lane = session(db, "synthetic-codex-lane", loop_id=run, method="lineage", agent="codex")
+    db.execute(
+        "INSERT INTO ah.lane (loop_run_id,session_id,lane_name,role,link_method) VALUES (%s,%s,'lane-a','worker','lineage')",
+        (run, lane),
+    )
+    tool(db, "codex", root, "request_user_input", 1, duration=600_000)
+    tool(db, "codex", root, "request_user_input_async", 2, minutes=20, ended=False)
+    tool(db, "codex", root, "exec_command", 3)
+    tool(db, "codex", lane, "exec_command", 4, outcome="error")
+    db.commit()
+    lines = usage_lines(monkeypatch, capsys)
+    assert "- Harness: codex 0.9.1" in lines
+    assert "- Root question-tool calls: 2 (blocked 0.17 hours, 1 still open at closeout)" in lines
+    assert "- Lane Bash timeouts: unknown (not recorded for codex lanes)" in lines
+    assert "- Denials by class: not recorded for codex" in lines
+    assert "| Denial class | Denials |" not in lines
+
+
+def test_a_pi_root_has_no_question_tool_recorded(clean, monkeypatch, capsys):
+    db = clean
+    root = session(db, "synthetic-pi-root", agent="pi")
+    launch(db, "usage:pi", root, AT, AT + timedelta(hours=2))
+    tool(db, "pi", root, "bash", 1)
+    db.commit()
+    lines = usage_lines(monkeypatch, capsys)
+    assert "- Root question-tool calls: unknown (no question tool recorded for pi)" in lines
+    assert "- Lane Bash timeouts: 0" in lines  # no lane sessions: nothing to be unrecorded
+
+
+def test_a_relaunch_across_harnesses_names_both_and_counts_each(clean, monkeypatch, capsys):
+    db = clean
+    first = session(db, "synthetic-mixed-claude", agent="claude")
+    second = session(db, "synthetic-mixed-codex", agent="codex")
+    db.execute("UPDATE ah.session SET cli_version_last='2.1.4' WHERE id=%s", (first,))
+    db.execute("UPDATE ah.session SET cli_version_last='0.9.1' WHERE id=%s", (second,))
+    launch(db, "usage:mixed-a", first, AT, AT + timedelta(hours=1))
+    launch(db, "usage:mixed-b", second, AT + timedelta(hours=1), AT + timedelta(hours=2))
+    tool(db, "claude", first, "AskUserQuestion", 1, duration=1000)
+    tool(db, "codex", second, "request_user_input", 2, minutes=70, duration=1000)
+    db.commit()
+    lines = usage_lines(monkeypatch, capsys)
+    assert "- Harness: claude 2.1.4, codex 0.9.1" in lines
+    assert "- Root question-tool calls: 2 (blocked 0.00 hours)" in lines
+
+
+def test_a_relaunch_session_on_another_harness_is_read_as_a_root(clean, monkeypatch, capsys):
+    db = clean
+    root = session(db, "synthetic-resume-claude", agent="claude")
+    db.execute("UPDATE ah.session SET cli_version_last='2.1.4' WHERE id=%s", (root,))
+    run = launch(db, "usage:resume", root, AT, AT + timedelta(hours=2))
+    resumed = session(db, "synthetic-resume-pi", loop_id=run, method="relaunch", agent="pi")
+    db.execute("UPDATE ah.session SET cli_version_last='1.5.0' WHERE id=%s", (resumed,))
+    tool(db, "claude", root, "AskUserQuestion", 1, duration=1000)
+    db.commit()
+    lines = usage_lines(monkeypatch, capsys)
+    assert "- Harness: claude 2.1.4, pi 1.5.0" in lines
+    assert "- Root question-tool calls: 1 (blocked 0.00 hours, not recorded for pi)" in lines
+    assert "- Denials by class: recorded for claude sessions only, not for pi" in lines
