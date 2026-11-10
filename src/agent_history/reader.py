@@ -716,8 +716,10 @@ def ledger_landings(events: list[dict]) -> list[dict]:
     the landing tool keys it, or its head in direct mode where there is no pull request. Its state
     is its last event and its head the latest one any event carried (a refusal can carry an old
     head and an error none). It landed when a `merged` or `verified` event exists, and its issues
-    are the ones those events name. The ledger has no repository key, so pull requests of two
-    repositories with one number are not told apart."""
+    are the ones those events name. It is a fix-forward landing when its last `ready` event with
+    outcome `go` carries a `fix_forward` reason: the tool writes the flag there (and on a refusal)
+    and leaves it null on `merged` and `verified`. The ledger has no repository key, so pull
+    requests of two repositories with one number are not told apart."""
     landings: dict[tuple[str, str], dict] = {}
     for event in events:
         head = str(event["head"]) if event["head"] else ""
@@ -732,12 +734,13 @@ def ledger_landings(events: list[dict]) -> list[dict]:
         )
         row["outcome"] = event["outcome"] if event["outcome"] is not None else event["event"]
         row["head"] = head or row["head"]
+        if event["event"] == "ready" and event["outcome"] == "go":
+            row["fix_forward"] = event["fix_forward"] is not None
         slot = _seconds(event["slot_seconds"])
         if slot is not None:
             row["slot_seconds"] = slot
         if event["event"] in ("merged", "verified"):
             row["landed"] = True
-            row["fix_forward"] = row["fix_forward"] or bool(event["fix_forward"])
             for issue in event["issues"] if isinstance(event["issues"], list) else []:
                 if (name := _issue(issue)) is not None and name not in row["issues"]:
                     row["issues"].append(name)

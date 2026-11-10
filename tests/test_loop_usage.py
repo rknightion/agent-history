@@ -1,5 +1,6 @@
 """`agent-history loop <id|closeout path> --usage`: target resolution and the Markdown block's shape."""
 
+import json
 import shutil
 from pathlib import Path
 
@@ -272,6 +273,41 @@ def test_the_new_numbers_sit_between_the_old_bullets_and_the_model_table():
     assert lines.index("| Role | Cost | Share of priced cost |") > lines.index("| root | model-a | 1,200 | $40.50 |")
 
 
+EVENT_KEYS = ("v", "ts", "event", "outcome", "pr", "head", "issues", "merge_sha", "main", "deploy", "fix_forward")
+
+
+def tool_shape(event):
+    """What the landing tool never writes. `fix_forward` is set only on a `ready` (outcome `go`) or a
+    `refused` event and is null on `merged` and `verified`; a `merged` event has no outcome."""
+    if not isinstance(event, dict):
+        return []
+    problems = []
+    if event.get("event") in ("merged", "verified") and event.get("fix_forward") is not None:
+        problems.append("fix_forward on " + event["event"])
+    if event.get("event") == "merged" and event.get("outcome") is not None:
+        problems.append("outcome on merged")
+    if event.get("fix_forward") is not None and event.get("event") not in ("ready", "refused"):
+        problems.append("fix_forward on " + str(event.get("event")))
+    return problems
+
+
+def ev(event, pr=None, head=None, issues=(), **fields):
+    """An event as the tool writes it: the whole schema, with only that event's fields set."""
+    row = dict.fromkeys(EVENT_KEYS)
+    row |= {"v": 1, "ts": "2026-11-02T09:00:00Z", "event": event, "pr": pr, "head": head, "issues": list(issues)}
+    row |= {"slot_seconds": None, **fields}
+    assert not tool_shape(row), tool_shape(row)
+    return row
+
+
+def ledger_text(*events):
+    return "".join(json.dumps(event) + "\n" for event in events)
+
+
+def lines_of(text):
+    return [json.loads(line) for line in text.splitlines() if line.strip().startswith("{")]
+
+
 def ledger_beside_closeout(tmp_path, name="landings.jsonl", text=None):
     closeout = tmp_path / "codex" / "closeout-2026-11-02-loop7.md"
     run = closeout.parent / "loop7"
@@ -279,8 +315,42 @@ def ledger_beside_closeout(tmp_path, name="landings.jsonl", text=None):
     if text is None:
         shutil.copy(SAMPLE_LEDGER, run / name)
     else:
+        # Every ledger a test writes is held to the tool's shape.
+        assert not [p for event in lines_of(text) for p in tool_shape(event)]
         (run / name).write_text(text)
     return str(closeout)
+
+
+def reader_event(event):
+    return {key: event.get(key) for key in reader.LEDGER_KEPT}
+
+
+def with_events(*events, summary=V4):
+    ledger = {"too_large": False, "unreadable": 0, "events": [reader_event(e) for e in events]}
+    return detail_block(summary, ledger=ledger)
+
+
+@pytest.mark.parametrize("path", sorted(SAMPLE_LEDGER.parent.glob("*.jsonl")), ids=lambda p: p.name)
+def test_fixture_ledgers_have_the_shape_the_landing_tool_writes(path):
+    events = lines_of(path.read_text())
+    assert events and not [p for event in events for p in tool_shape(event)]
+    assert any(e["event"] == "ready" and e["fix_forward"] for e in events)
+    assert all(e["outcome"] is None for e in events if e["event"] == "merged")
+
+
+def test_the_shape_check_rejects_what_the_tool_does_not_write():
+    assert tool_shape({"event": "merged", "fix_forward": "reason", "outcome": "merged"}) == [
+        "fix_forward on merged",
+        "outcome on merged",
+        "fix_forward on merged",
+    ]
+    assert tool_shape({"event": "verified", "fix_forward": "reason"})[0] == "fix_forward on verified"
+    assert tool_shape({"event": "ready", "outcome": "go", "fix_forward": "reason"}) == []
+    assert tool_shape({"event": "refused", "outcome": "held", "fix_forward": "reason"}) == []
+    with pytest.raises(AssertionError):
+        ev("merged", 1, "a", outcome="merged")
+    with pytest.raises(AssertionError):
+        ev("verified", 1, "a", outcome="landed", fix_forward="reason")
 
 
 def test_a_ledger_beside_the_closeout_adds_landings_and_their_rows(tmp_path):
@@ -300,38 +370,28 @@ def test_a_ledger_beside_the_closeout_adds_landings_and_their_rows(tmp_path):
     ]
 
 
-def test_ledger_issues_replace_the_closeout_count():
-    events = [
-        {"event": "merged", "outcome": "merged", "pr": 1, "head": "a", "issues": ["X-1", "X-2"]},
-        {"event": "refused", "outcome": "held", "pr": 2, "head": "b", "issues": ["X-3"]},
+def merged_landing(pr, head, issues, **fields):
+    return [
+        ev("ready", pr, head, issues, outcome="go", **fields),
+        ev("merged", pr, head, issues, merge_sha="m" * 40),
     ]
-    ledger = {"too_large": False, "unreadable": 0, "events": [reader_event(e) for e in events]}
-    lines = detail_block({**V4, "landed": "9"}, ledger=ledger)
+
+
+def test_ledger_issues_replace_the_closeout_count():
+    events = [*merged_landing(1, "a", ["X-1", "X-2"]), ev("refused", 2, "b", ["X-3"], outcome="held")]
+    lines = with_events(*events, summary={**V4, "landed": "9"})
     assert "- Landed: 2 tasks (from the ledger)" in lines
     assert "- Root calls per landed task: 600.0" in lines
     # A ledger with no landing falls back to the closeout's count.
-    ledger["events"] = ledger["events"][1:]
-    assert "- Landed: 9 tasks (from the closeout)" in detail_block({**V4, "landed": "9"}, ledger=ledger)
-
-
-def reader_event(event):
-    return {key: None for key in reader.LEDGER_KEPT} | event
+    assert "- Landed: 9 tasks (from the closeout)" in with_events(events[-1], summary={**V4, "landed": "9"})
 
 
 def test_a_direct_mode_landing_is_keyed_by_its_head():
     events = [
-        reader_event({"event": "ready", "outcome": "go", "head": "0123456789abcdef0123"}),
-        reader_event(
-            {
-                "event": "verified",
-                "outcome": "landed",
-                "head": "0123456789abcdef0123",
-                "issues": ["X-1"],
-                "slot_seconds": 45,
-            }
-        ),
+        ev("ready", None, "0123456789abcdef0123", outcome="go"),
+        ev("verified", None, "0123456789abcdef0123", ["X-1"], outcome="landed", main="green", slot_seconds=45),
     ]
-    lines = detail_block(V4, ledger={"too_large": False, "unreadable": 0, "events": events})
+    lines = with_events(*events)
     assert "- Landing mode: direct (from the ledger)" in lines
     assert lines[-1] == "| direct 0123456789ab | landed | 45s |"
     assert "- Landed: 1 task (from the ledger)" in lines
@@ -339,15 +399,15 @@ def test_a_direct_mode_landing_is_keyed_by_its_head():
 
 def test_ledger_lines_that_are_not_events_are_counted_and_cells_are_escaped(tmp_path):
     text = (
-        '{"event":"merged","outcome":"a|b\\nc","pr":5,"head":"h","issues":[1]}\n'
-        "not json\n[1,2]\n\n"
-        '{"event":"closeout-check","outcome":"ok","pr":null,"head":null}\n'
+        ledger_text(ev("verified", 5, "h", [1], outcome="a|b\nc", slot_seconds=75))
+        + "not json\n[1,2]\n\n"
+        + ledger_text(ev("closeout-check", outcome="ok", missing=[]))
     )
     ledger = reader.read_ledger(ledger_beside_closeout(tmp_path, text=text))
     assert ledger["unreadable"] == 2 and len(ledger["events"]) == 1
     lines = detail_block(V4, ledger=ledger)
     assert "- Landing ledger lines that were not events: 2" in lines
-    assert "| PR 5 (h) | a\\|b c | - |" in lines
+    assert "| PR 5 (h) | a\\|b c | 1m 15s |" in lines
 
 
 def test_read_ledger_only_reads_the_named_file_beside_a_closeout(tmp_path):
@@ -384,6 +444,7 @@ def test_loop_usage_reads_the_ledger_beside_the_closeout_it_resolves(monkeypatch
     out = capsys.readouterr().out.splitlines()
     assert "- Landings per hour: 0.50 (2 landings in 4h 0m)" in out
     assert "- Landed: 3 tasks (from the ledger)" in out
+    assert "- Fix-forward landings: 1" in out
     assert "| PR 12 (2222222) | main-red | 19m 00s |" in out
     # The ledger is read on this machine only: without the file the block has no landing rows.
     summary = {**V4, "report_path": str(tmp_path / "elsewhere" / "closeout-2026-11-02-loop7.md")}
@@ -407,43 +468,35 @@ def test_queries_carry_every_number_the_block_prints():
         assert needle in summary
 
 
-def with_events(*events, summary=V4):
-    ledger = {"too_large": False, "unreadable": 0, "events": [reader_event(e) for e in events]}
-    return detail_block(summary, ledger=ledger)
-
-
 def test_landed_issues_come_from_the_merged_or_verified_event_only():
     lines = with_events(
-        {"event": "refused", "outcome": "held", "pr": 1, "head": "a", "issues": ["X-8"]},
-        {"event": "ready", "outcome": "go", "pr": 1, "head": "a", "issues": ["X-1", "X-9"]},
-        {"event": "merged", "outcome": "merged", "pr": 1, "head": "a", "issues": ["X-1"]},
+        ev("refused", 1, "a", ["X-8"], outcome="held"),
+        ev("ready", 1, "a", ["X-1", "X-9"], outcome="go"),
+        ev("merged", 1, "a", ["X-1"], merge_sha="m"),
     )
     assert "- Landed: 1 task (from the ledger)" in lines
 
 
 def test_an_issue_number_and_its_hash_form_are_one_issue():
     lines = with_events(
-        {"event": "merged", "outcome": "merged", "pr": 1, "head": "a", "issues": [5, "#5", " #5 ", "6"]},
-        {"event": "merged", "outcome": "merged", "pr": 2, "head": "b", "issues": ["#6", None, True, ""]},
+        ev("merged", 1, "a", [5, "#5", " #5 ", "6"]),
+        ev("merged", 2, "b", ["#6", None, True, ""]),
     )
     assert "- Landed: 2 tasks (from the ledger)" in lines
 
 
 def test_a_merged_landing_that_names_no_issue_does_not_zero_the_count():
-    lines = with_events({"event": "merged", "outcome": "merged", "pr": 1, "head": "a", "issues": []})
+    lines = with_events(ev("merged", 1, "a", []))
     assert "- Landed: 3 tasks (from the closeout)" in lines
     assert "- Landings per hour: 0.25 (1 landing in 4h 0m)" in lines
     # One landing that names its issues does not hide another that does not.
-    lines = with_events(
-        {"event": "merged", "outcome": "merged", "pr": 1, "head": "a", "issues": ["X-1"]},
-        {"event": "merged", "outcome": "merged", "pr": 2, "head": "b", "issues": []},
-    )
+    lines = with_events(ev("merged", 1, "a", ["X-1"]), ev("merged", 2, "b", []))
     assert "- Landed: 3 tasks (from the closeout)" in lines
     assert "- Landings per hour: 0.50 (2 landings in 4h 0m)" in lines
 
 
 def test_one_landing_is_singular():
-    lines = with_events({"event": "merged", "outcome": "merged", "pr": 1, "head": "a", "issues": ["X-1"]})
+    lines = with_events(ev("merged", 1, "a", ["X-1"]))
     assert "- Landings per hour: 0.25 (1 landing in 4h 0m)" in lines
 
 
@@ -451,46 +504,58 @@ def test_one_landing_is_one_row_whatever_head_its_events_carry():
     """The landing tool keys a landing by its pull request. A failed verify writes an error event
     with no head; a refusal carries the head it was asked about. Neither makes another landing."""
     lines = with_events(
-        {"event": "ready", "outcome": "go", "pr": 12, "head": "aaaaaaaaaa", "issues": ["X-1"]},
-        {"event": "merged", "outcome": "merged", "pr": 12, "head": "aaaaaaaaaa", "issues": ["X-1"]},
-        {"event": "error", "outcome": None, "pr": 12, "head": None},
+        *merged_landing(12, "aaaaaaaaaa", ["X-1"]),
+        ev("error", 12, None, outcome="error"),
     )
     rows = [line for line in lines if line.startswith("| PR ")]
     assert rows == ["| PR 12 (aaaaaaa) | error | - |"]
     assert "- Landings per hour: 0.25 (1 landing in 4h 0m)" in lines
 
 
-def test_fix_forward_counts_once_per_landed_landing_and_shows_the_latest_head():
-    lines = with_events(
-        {"event": "refused", "outcome": "stale-head", "pr": 12, "head": "oldoldold", "fix_forward": "main is red"},
-        {"event": "ready", "outcome": "go", "pr": 12, "head": "newnewnew", "fix_forward": "main is red"},
-        {"event": "merged", "outcome": "merged", "pr": 12, "head": "newnewnew", "issues": ["X-1"], "fix_forward": "r"},
-        {
-            "event": "verified",
-            "outcome": "landed",
-            "pr": 12,
-            "head": "newnewnew",
-            "fix_forward": "r",
-            "slot_seconds": 9,
-        },
-        # A fix-forward refusal that never merged is not a fix-forward landing.
-        {"event": "refused", "outcome": "held", "pr": 13, "head": "ccccccccc", "fix_forward": "main is red"},
-    )
-    assert "- Fix-forward landings: 1" in lines
-    assert [line for line in lines if line.startswith("| PR ")] == [
-        "| PR 12 (newnewn) | landed | 9s |",
-        "| PR 13 (ccccccc) | held | - |",
+def fix_forward_attempt(flag):
+    """One pull request: a stale-head refusal, then ready, merged and verified on a new head."""
+    return [
+        ev("refused", 12, "oldoldold", ["X-1"], outcome="stale-head", fix_forward=flag),
+        ev("ready", 12, "newnewnew", ["X-1"], outcome="go", fix_forward=flag),
+        ev("merged", 12, "newnewnew", ["X-1"], merge_sha="m"),
+        ev("verified", 12, "newnewnew", ["X-1"], outcome="landed", main="green", slot_seconds=9),
     ]
-    assert not any(
-        line.startswith("- Fix-forward")
-        for line in with_events(
-            {"event": "refused", "outcome": "held", "pr": 13, "head": "c", "fix_forward": "main is red"}
-        )
+
+
+def test_a_fix_forward_landing_is_counted_once_from_its_ready_event():
+    lines = with_events(*fix_forward_attempt("main is red"))
+    assert "- Fix-forward landings: 1" in lines
+    assert [line for line in lines if line.startswith("| PR ")] == ["| PR 12 (newnewn) | landed | 9s |"]
+    assert "- Landings per hour: 0.25 (1 landing in 4h 0m)" in lines
+
+
+def test_the_same_landing_without_the_flag_prints_no_fix_forward_line():
+    lines = with_events(*fix_forward_attempt(None))
+    assert not any(line.startswith("- Fix-forward") for line in lines)
+    assert [line for line in lines if line.startswith("| PR ")] == ["| PR 12 (newnewn) | landed | 9s |"]
+
+
+def test_an_abandoned_fix_forward_attempt_is_not_counted():
+    lines = with_events(
+        ev("ready", 13, "ccccccccc", ["X-2"], outcome="go", fix_forward="main is red"),
+        ev("abandoned", 13, "ccccccccc", ["X-2"], outcome="abandoned", slot_seconds=2400),
+        ev("refused", 14, "ddddddddd", ["X-3"], outcome="held", fix_forward="main is red"),
     )
+    assert not any(line.startswith("- Fix-forward") for line in lines)
+
+
+def test_only_the_last_go_decides_whether_a_landing_is_fix_forward():
+    lines = with_events(
+        ev("ready", 12, "a", ["X-1"], outcome="go", fix_forward="main is red"),
+        ev("abandoned", 12, "a", ["X-1"], outcome="abandoned", slot_seconds=1),
+        ev("ready", 12, "b", ["X-1"], outcome="go"),
+        ev("merged", 12, "b", ["X-1"], merge_sha="m"),
+    )
+    assert not any(line.startswith("- Fix-forward") for line in lines)
 
 
 def test_a_last_event_without_an_outcome_shows_the_event_name():
-    lines = with_events({"event": "merged", "outcome": None, "pr": 3, "head": "dddddddd", "issues": ["X-1"]})
+    lines = with_events(ev("merged", 3, "dddddddd", ["X-1"]))
     assert "| PR 3 (ddddddd) | merged | - |" in lines
 
 
