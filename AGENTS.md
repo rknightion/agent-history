@@ -119,6 +119,18 @@ retroactively. No SQL migration or baseline-ledger change is needed.
 `session-owner` records are recognised and counted without indexing account or organisation
 identifiers. Parser version stays unchanged; existing parse issues remain historical evidence.
 
+## Additive transcript fields
+
+Migration 052 batches the additive transcript fields: workflow journal phases, Claude requested
+model and tool input stream time, Codex parent turn and initiating agent path, and the Claude
+subagent `*.meta.json` sidecar table (CONTRACT.md, "Additive transcript fields (migration 052)").
+Claude permission outcomes in `tool_call.meta` and the Codex turn trigger and model provider need no
+schema change. Parser versions stay unchanged; existing rows are not repaired. Sidecars have their
+own file role and parser version, are replaced on rewrite and never set `session.agent_type`. The
+workflow journal's `launched` line is recognised and counted, never a parse issue. An unparsed field
+audit decides each new field on catalogue value; account or organisation identifiers, noise and
+content duplicates stay unparsed.
+
 ## Incremental derived queues
 
 Message embedding work is tracked per model. Registration seeds existing coverage once under

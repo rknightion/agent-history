@@ -54,6 +54,7 @@ REPLAYED = (
     "049_pi_cost_source.sql",
     "050_source_nul_tail.sql",
     "051_error_classification_queue.sql",
+    "052_transcript_fields.sql",
 )
 
 

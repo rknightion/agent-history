@@ -10,6 +10,17 @@ from datetime import datetime, timezone
 from pathlib import PurePosixPath
 from typing import Any
 
+
+def clean_text(value: str) -> str:
+    """Text PostgreSQL can store: NUL characters dropped, unencodable surrogates replaced."""
+    if "\x00" in value:
+        value = value.replace("\x00", "")
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        value = value.encode("utf-8", "replace").decode("utf-8")
+    return value
+
 MARKDOWN_PATH = re.compile(r"\[[^\]]*\]\((?:file://)?(<?/[^)>]+>?)(?:\s+['\"][^'\"]*['\"])?\)")
 GIT_COMMIT_LINE = re.compile(r"^\[([^\]\s]+)(?: \(root-commit\))? ([0-9a-f]{7,40})\]", re.M)
 GIT_PUSH_RANGE = re.compile(r"^\s*([0-9a-f]{7,})\.\.([0-9a-f]{7,})\s+(\S+)\s+->\s+(\S+)", re.M)

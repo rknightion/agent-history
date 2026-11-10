@@ -1,2 +1,3 @@
-{"type": "started", "key": "v2:k1", "agentId": "a0000000000000004"}
-{"type": "result", "key": "v2:k1", "agentId": "a0000000000000004", "result": {"text": "synthetic result"}}
+{"type":"launched"}
+{"type": "started", "key": "v2:k1", "agentId": "a0000000000000004", "label": "review:widget", "phase": "Review"}
+{"type": "result", "key": "v2:k1", "agentId": "a0000000000000004", "result": {"text": "synthetic result"}, "toolsUsed": ["Read", "Bash"], "remoteControlDeviceReport": false}

@@ -23,8 +23,8 @@ import psycopg
 from psycopg.types.json import Jsonb
 
 from . import model, telemetry
-from .common import parse_ts
-from .model import (KEEP, MAX, MIN, NOTHING, OR, UPDATE, AttachmentRow, FileContext, LinePos, MessageRow,
+from .common import clean_text, parse_ts
+from .model import (KEEP, MAX, MERGE, MIN, NOTHING, OR, UPDATE, AttachmentRow, FileContext, LinePos, MessageRow,
                     ParseIssueRow, RecordTypeRow, Row, SessionKey, SessionRow, ToolIoRow)
 
 HOT_ROOT: Path | None = None    # archive layout: <root>/<namespace>/... (optional)
@@ -55,6 +55,9 @@ def file_role(agent: str, parts: tuple[str, ...]) -> str | None:
     if agent == "pi" and len(parts) == 2 and parts[0] == "progress" and parts[1].endswith(".json"):
         from .parse_pi import PROGRESS_SESSION
         return "pi_progress" if PROGRESS_SESSION.fullmatch(parts[1][:-5]) else None
+    if (agent == "claude" and len(parts) >= 4 and parts[0] == "projects" and "subagents" in parts
+            and parts[-1].startswith("agent-") and parts[-1].endswith(".meta.json") and "_history" not in parts):
+        return "claude_subagent_meta"
     if not parts or not parts[-1].endswith(".jsonl") or "_history" in parts:
         return None
     if agent == "codex":
@@ -83,7 +86,7 @@ def file_role(agent: str, parts: tuple[str, ...]) -> str | None:
 
 
 def logical_uid(agent: str, role: str, parts: tuple[str, ...]) -> str | None:
-    stem = parts[-1].removesuffix(".jsonl")
+    stem = parts[-1].removesuffix(".meta.json" if role == "claude_subagent_meta" else ".jsonl")
     if agent == "pi":
         if role == "pi_progress":
             return parts[-1].removesuffix(".json")
@@ -242,6 +245,10 @@ def inventory_map(sources: dict[str, Path], *, strict: bool = False) -> dict[str
     return result
 
 
+# Whole-file sidecar roles: optional bounded observations with no transcript rows of their own.
+SIDECAR_ROLES = ("pi_progress", "claude_subagent_meta")
+
+
 def check_rebuild_sources(conn: psycopg.Connection, sources: dict[str, Path],
                           cold_sources: dict[str, Path] | None = None
                           ) -> tuple[dict[str, SourceEntry], dict[str, dict[str, int | bool]]]:
@@ -253,7 +260,9 @@ def check_rebuild_sources(conn: psycopg.Connection, sources: dict[str, Path],
     report: dict[str, dict[str, int | bool]] = {}
     catalogued: dict[str, set[str]] = {n: set() for n in cold_sources}
     if cold_sources:
-        for namespace, rel in conn.execute("SELECT namespace, rel_path FROM ah.source_file"):
+        # Sidecars are optional observations, not transcripts: a lost one never refuses a rebuild.
+        for namespace, rel in conn.execute("SELECT namespace, rel_path FROM ah.source_file "
+                                           "WHERE file_role <> ALL(%s)", (list(SIDECAR_ROLES),)):
             if namespace in catalogued:
                 catalogued[namespace].add(rel)
     for namespace in sorted(sources):
@@ -344,16 +353,6 @@ def prefix_verified(row: dict[str, Any], path: Path) -> bool:
 # --- value adaptation --------------------------------------------------------------------------
 
 
-def clean_text(value: str) -> str:
-    if "\x00" in value:
-        value = value.replace("\x00", "")
-    try:
-        value.encode("utf-8")
-    except UnicodeEncodeError:
-        value = value.encode("utf-8", "replace").decode("utf-8")
-    return value
-
-
 def adapt(value: Any) -> Any:
     if isinstance(value, Jsonb):
         return value
@@ -378,6 +377,8 @@ def policy_sql(table: str, column: str, policy: str) -> str:
         return f"{column} = LEAST({old}, {new})"
     if policy == OR:
         return f"{column} = CASE WHEN {old} IS NULL AND {new} IS NULL THEN NULL ELSE (COALESCE({old}, false) OR COALESCE({new}, false)) END"
+    if policy == MERGE:
+        return f"{column} = CASE WHEN {old} IS NULL THEN {new} WHEN {new} IS NULL THEN {old} ELSE {old} || {new} END"
     raise ValueError(policy)
 
 
@@ -721,6 +722,9 @@ def _process_source(conn: psycopg.Connection, writer: Writer, entry: SourceEntry
     if entry.role == "pi_progress":
         _process_progress_source(conn, writer, entry, stats)
         return
+    if entry.role == "claude_subagent_meta":
+        _process_subagent_meta_source(conn, writer, entry, existing, stats)
+        return
     path = entry.path
     try:
         stat = path.stat()
@@ -926,6 +930,78 @@ def _process_progress_source(conn: psycopg.Connection, writer: Writer, entry: So
             conn.execute("UPDATE ah.session SET namespace=COALESCE(namespace,%s), profile=COALESCE(profile,%s), "
                          "machine=COALESCE(machine,%s) WHERE id=%s", (entry.namespace, entry.profile, entry.machine, sid))
             conn.execute("INSERT INTO ah.dirty_session (session_id) VALUES (%s) ON CONFLICT DO NOTHING", (sid,))
+    conn.commit()
+    stats.files_parsed += 1
+    stats.lines += 1
+    stats.bytes += len(raw)
+    stats.rows += 1
+
+
+SUBAGENT_META_PARSER_VERSION = "1"
+SUBAGENT_META_MAX_BYTES = 65536
+SUBAGENT_META_COLUMNS = ("agent_type", "model", "picked_effort_model", "effort", "spawn_depth", "request_shape",
+                         "request_non_interactive", "workflow_phase", "tool_use_id", "parent_agent_id", "finished",
+                         "stopped_by_user", "launched_with_defaults", "is_fork", "unknown_keys")
+
+
+def _process_subagent_meta_source(conn: psycopg.Connection, writer: Writer, entry: SourceEntry,
+                                  existing: dict[str, Any] | None, stats: RunStats) -> None:
+    """A Claude subagent sidecar is a whole-file snapshot the harness rewrites in place: an
+    unchanged file is skipped on its stat alone, and a changed one replaces its session's row.
+    spawnDepth is also copied to the session; no other session column is touched."""
+    import stat as stat_module
+    from .parse_claude import subagent_meta
+    try:
+        current = entry.path.stat()
+    except OSError:
+        return
+    if (existing and existing["status"] == "indexed" and existing["parser_version"] == SUBAGENT_META_PARSER_VERSION
+            and existing["mtime_ns"] == current.st_mtime_ns and existing["indexed_offset"] == current.st_size
+            and (existing["tier"], existing["available_hot"], existing["available_cold"])
+            == (entry.tier, entry.hot is not None, entry.cold is not None)):
+        return  # a tier move or a lost copy re-reads the file, refreshing its source_file row
+    try:
+        fd = os.open(entry.path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, "rb") as handle:
+            before = os.fstat(handle.fileno())
+            if not stat_module.S_ISREG(before.st_mode) or before.st_size > SUBAGENT_META_MAX_BYTES:
+                return
+            raw = handle.read(SUBAGENT_META_MAX_BYTES + 1)
+            after = os.fstat(handle.fileno())
+        if len(raw) > SUBAGENT_META_MAX_BYTES or (before.st_ino, before.st_size, before.st_mtime_ns) != (
+                after.st_ino, after.st_size, after.st_mtime_ns):
+            return  # mid-rewrite: the next pass reads the settled file
+        row = subagent_meta(json.loads(raw))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return
+    session_uid, _, agent_id = (entry.logical_uid or "").partition("/")
+    if row is None or not session_uid or not agent_id:
+        return
+    with conn.transaction():
+        source_id = conn.execute(
+            "INSERT INTO ah.source_file (rel_path, namespace, agent, profile, machine, file_role, logical_uid, "
+            "tier, available_hot, available_cold, size_bytes, mtime_ns, parser_version, indexed_offset, "
+            "line_count, head_sha256, status, indexed_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,1,%s,'indexed',now()) "
+            "ON CONFLICT (rel_path) DO UPDATE SET size_bytes=EXCLUDED.size_bytes, mtime_ns=EXCLUDED.mtime_ns, "
+            "head_sha256=EXCLUDED.head_sha256, indexed_offset=EXCLUDED.indexed_offset, indexed_at=now(), "
+            "parser_version=EXCLUDED.parser_version, tier=EXCLUDED.tier, available_hot=EXCLUDED.available_hot, "
+            "available_cold=EXCLUDED.available_cold, status='indexed' RETURNING id",
+            (entry.rel_path, entry.namespace, entry.agent, entry.profile, entry.machine, entry.role,
+             entry.logical_uid, entry.tier, entry.hot is not None, entry.cold is not None, len(raw), after.st_mtime_ns,
+             SUBAGENT_META_PARSER_VERSION, len(raw), hashlib.sha256(raw).hexdigest())).fetchone()[0]
+        sid = writer.session_id(SessionKey("claude", session_uid, agent_id))
+        values = [row[c] for c in SUBAGENT_META_COLUMNS]
+        conn.execute(
+            f"INSERT INTO ah.subagent_meta (session_id, source_id, namespace, {', '.join(SUBAGENT_META_COLUMNS)}) "
+            f"VALUES (%s, %s, %s, {', '.join(['%s'] * len(SUBAGENT_META_COLUMNS))}) "
+            "ON CONFLICT (session_id) DO UPDATE SET source_id = EXCLUDED.source_id, namespace = EXCLUDED.namespace, "
+            + ", ".join(f"{c} = EXCLUDED.{c}" for c in SUBAGENT_META_COLUMNS) + ", observed_at = now()",
+            (sid, source_id, entry.namespace, *values))
+        # A sidecar can precede its transcript: identify the stub without fabricating activity.
+        conn.execute("UPDATE ah.session SET namespace=COALESCE(namespace,%s), profile=COALESCE(profile,%s), "
+                     "machine=COALESCE(machine,%s), spawn_depth=COALESCE(%s, spawn_depth) WHERE id=%s",
+                     (entry.namespace, entry.profile, entry.machine, row["spawn_depth"], sid))
+        conn.execute("INSERT INTO ah.dirty_session (session_id) VALUES (%s) ON CONFLICT DO NOTHING", (sid,))
     conn.commit()
     stats.files_parsed += 1
     stats.lines += 1
@@ -1836,7 +1912,7 @@ def now_utc() -> datetime:
 # request), but remain derived data and are explicitly truncated on a full rebuild.
 DATA_TABLES = ("request_progress", "request_recovery", "request_incident", "loops", "lane", "loop_run", "session_rollup", "dirty_session", "parse_issue", "record_type_seen", "cost_state",
                "pi_run_response", "rate_limit_sample", "session_event", "artifact", "git_event", "compaction", "hook_event",
-               "subagent_spawn", "tool_op", "tool_call", "llm_call", "message", "turn", "tool_io", "attachment",
+               "subagent_spawn", "subagent_meta", "tool_op", "tool_call", "llm_call", "message", "turn", "tool_io", "attachment",
                "file_touch", "session_continuation", "session_embedding", "session", "repo", "source_file")
 # Never truncated: change_log, refresh_log (consumer cursors), collector tables, ah.embedding (paid cache).
 POST_LOAD_INDEXES = ("message_search_idx", "tool_io_search_idx")
@@ -1945,8 +2021,8 @@ def rebuild(conn: psycopg.Connection, hot: Path | None = HOT_ROOT, cold: Path | 
             return stats  # Failed source loads must not advertise a complete generation.
         # A path may disappear after inventory. process_source can skip a failed stat,
         # so verify that each retained transcript/artifact produced its source row.
-        # Progress sidecars are optional bounded observations and may validly be skipped.
-        expected = {rel for rel, entry in source_entries.items() if entry.role != "pi_progress"}
+        # Progress and subagent-meta sidecars are optional bounded observations and may validly be skipped.
+        expected = {rel for rel, entry in source_entries.items() if entry.role not in SIDECAR_ROLES}
         loaded = {row[0] for row in conn.execute("SELECT rel_path FROM ah.source_file")}
         conn.commit()
         missing = expected - loaded
@@ -2057,7 +2133,8 @@ def reclassify_prompts(conn: psycopg.Connection, hot: Path | None = HOT_ROOT, co
                     stat = entry.path.stat()
                 except OSError:
                     stat = None
-            if (entry is None or stat is None or entry.role == "pi_progress" or entry.agent not in RECLASSIFY_AGENTS
+            if (entry is None or stat is None or entry.role in SIDECAR_ROLES
+                    or entry.agent not in RECLASSIFY_AGENTS
                     or row["status"] != "indexed" or stat.st_size < (row["indexed_offset"] or 0)
                     # A parser upgrade needs a rebuild (see _process_source); never mix versions here.
                     or row["parser_version"] != parser_for(entry.agent, entry.role)[1]

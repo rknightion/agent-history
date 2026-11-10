@@ -58,6 +58,8 @@ CASES = [
             "ttft_ms": ("integer", 20, 0),
             "attempts": ("integer", 2, 0),
             "processing_ms": ("integer", 80, 0),
+            "requested_model": ("text", "synthetic-model[1m]", "synthetic-model"),
+            "tool_input_stream_ms": ("integer", 340, 0),
         },
     ),
     (
@@ -83,6 +85,8 @@ CASES = [
             "turn_index": ("integer", 5, 0),
             "pending_bg_agents": ("integer", 2, 0),
             "pending_workflows": ("integer", 1, 0),
+            "parent_turn_key": ("text", "synthetic-parent-turn", "synthetic-parent-turn-v2"),
+            "initiating_agent_path": ("text", "/root", "/root/worker"),
         },
     ),
     (
@@ -100,6 +104,7 @@ CASES = [
             "spawn_budget": ("integer", 4, 0),
             "active_async_capacity": ("integer", 2, 0),
             "lifecycle_status": ("text", "synthetic-running", "synthetic-finished"),
+            "workflow_phase": ("text", "synthetic-phase", "synthetic-phase-v2"),
         },
     ),
     (
@@ -217,7 +222,8 @@ def test_nullable_telemetry_roundtrip_and_merge(conn, writer, row, spec):
     elif isinstance(update, CostStateRow):
         update = replace(update, total_cost_usd=99, ts=TS + timedelta(seconds=1))
     writer.write([update], 0, CTX)
-    expected = tuple(first if name == "thinking_ms" else latest for name, (_, first, latest) in spec.items())
+    maximum = {"thinking_ms", "tool_input_stream_ms"}
+    expected = tuple(first if name in maximum else latest for name, (_, first, latest) in spec.items())
     assert stored() == [expected]
     writer.write([row], 0, CTX)
     assert stored() == [expected]  # NULL never erases known data.
@@ -236,3 +242,27 @@ def test_nullable_telemetry_roundtrip_and_merge(conn, writer, row, spec):
         ]
     elif isinstance(row, ToolCallRow):
         assert conn.execute(f"SELECT exit_code FROM ah.tool_call WHERE {where}", key_values).fetchall() == [(7,)]
+
+
+@pytest.mark.parametrize("order", ["call_first", "result_first"])
+def test_tool_call_meta_halves_merge_in_writer_and_memstore(conn, writer, order):
+    call = ToolCallRow("claude", f"synthetic-meta-{order}", KEY, "Bash", 0, meta={"cmd_verb": "git"})
+    result = ToolCallRow(
+        "claude",
+        call.call_uid,
+        KEY,
+        "Bash",
+        0,
+        outcome="ok",
+        meta={"permission_decision": "accept", "permission_reason": "rule"},
+    )
+    store = MemStore()
+    halves = [call, result] if order == "call_first" else [result, call]
+    for half in [*halves, replace(call, meta=None)]:  # a later half without meta erases nothing
+        writer.write([half], 0, CTX)
+        store.upsert(half, CTX.rel_path)
+    expected = {"cmd_verb": "git", "permission_decision": "accept", "permission_reason": "rule"}
+    assert conn.execute("SELECT meta FROM ah.tool_call WHERE call_uid = %s", (call.call_uid,)).fetchall() == [
+        (expected,)
+    ]
+    assert store.rows("tool_call")[0]["meta"] == expected

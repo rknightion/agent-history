@@ -59,8 +59,11 @@ def snapshot(store: MemStore) -> dict:
 
 # The pi-only cost provenance columns are never set by the Codex parser (asserted below).
 PI_ONLY = {"cost_from_provider", "cost_estimate_usd"}
-TELEMETRY = {"llm_call": {"duration_ms", "latency_basis", "service_tier", *PI_ONLY},
-             "message": {"phase"}, "turn": {"reasoning_summary", "trace_id", "root_turn_key"},
+# Later additive fields (Claude-only on llm_call, unset by this fixture on turn) are outside the frozen surface.
+LATER = {"llm_call": {"requested_model", "tool_input_stream_ms"}, "turn": {"parent_turn_key", "initiating_agent_path"}}
+TELEMETRY = {"llm_call": {"duration_ms", "latency_basis", "service_tier", *PI_ONLY, *LATER["llm_call"]},
+             "message": {"phase"},
+             "turn": {"reasoning_summary", "trace_id", "root_turn_key", *LATER["turn"]},
              "tool_op": {"mcp_plugin_id", "mcp_read_only"}}
 
 
@@ -241,6 +244,21 @@ def test_nullable_call_timing_rejects_unattributable_endpoints(tmp_path, case):
             record.pop("ordinal", None)
     row = one(load_records(tmp_path, records), "llm_call", response_id=target)
     assert (row["duration_ms"], row["latency_basis"]) == (None, None)
+
+
+@pytest.mark.parametrize("value", ["user", "exec", None, 123, ""])
+def test_turn_trigger_and_model_provider_are_recorded(tmp_path, value):
+    records = telemetry_records()
+    records[1]["payload"]["thread_settings"]["model_provider_id"] = value
+    records[2]["payload"]["turn_attribution"] = {"turn_trigger": value, "parent_turn_id": value,
+                                                 "initiating_agent_path": value}
+    store = load_records(tmp_path, records)
+    known = value if isinstance(value, str) and value else None
+    turn = one(store, "turn", turn_key="telemetry-turn")
+    assert (turn["origin_hint"], turn["parent_turn_key"], turn["initiating_agent_path"]) == (known, known, known)
+    settings = by(store, "session_event", kind="thread_settings")
+    assert settings[0]["detail"].get("model_provider") == known
+    assert "model_provider" not in settings[1]["detail"]
 
 
 @pytest.mark.parametrize("value", [None, 123, {}, ""])

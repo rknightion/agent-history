@@ -10,8 +10,8 @@ import json
 from pathlib import Path
 from typing import Any, Iterable
 
-from .model import (KEEP, MAX, MIN, NOTHING, OR, UPDATE, FileContext, LinePos, ParseIssueRow,
-                    Row)
+from .model import (KEEP, MAX, MERGE, MIN, NOTHING, OR, UPDATE, FileContext, LinePos,
+                    ParseIssueRow, Row)
 
 
 def _merge(policy: str, old: Any, new: Any) -> Any:
@@ -31,6 +31,10 @@ def _merge(policy: str, old: Any, new: Any) -> Any:
         if old is None and new is None:
             return None
         return bool(old) or bool(new)
+    if policy == MERGE:
+        if old is None or new is None:
+            return new if old is None else old
+        return {**old, **new}
     raise ValueError(policy)
 
 

@@ -25,8 +25,9 @@ Weak lines (isMeta, interrupt markers) are held in state and only emitted when t
 depend on batch boundaries.
 
 Workflow journals emit no session or messages: each `started`/`result` record becomes a
-SubagentSpawnRow keyed `wf:<wf_id>:<agentId>` in the parent session (launch/completion facts only;
-the `result` payload is never read).
+SubagentSpawnRow keyed `wf:<wf_id>:<agentId>` in the parent session (launch/completion facts, the
+step's `label` as description and its `phase`; the `result` payload is never read). The opening
+`{"type": "launched"}` line is counted only: the parent's Workflow call already records the launch.
 
 Parser v4 (content contract lifted; every v3 row is still emitted unchanged, new rows only add):
 
@@ -116,7 +117,7 @@ from datetime import datetime, timedelta
 from pathlib import PurePosixPath
 from typing import Any, Iterable
 
-from .common import (BOUNDED_STATE_SECONDS, as_bool, as_int, as_str, artifact_kind, cmd_verb, ssh_target,
+from .common import (BOUNDED_STATE_SECONDS, as_bool, clean_text, as_int, as_str, artifact_kind, cmd_verb, ssh_target,
                      git_ops_from_command, git_event_extras, git_from_output, json_size, key_set, linked_paths, mcp_split, parse_ts,
                      prompt_origin, sha256_text, split_legacy_peer_injections, split_prompt_injections, text_blocks)
 from .model import (ArtifactRow, AttachmentRow, CompactionRow, ContinuationRow, CostStateRow,
@@ -1333,6 +1334,7 @@ class ClaudeParser:
         else:
             out_bytes = 0
         background = True if tur_d.get("backgroundTaskId") or tur_d.get("isAsync") else None
+        meta = _permission_meta(rec) if n == 1 else None
         if early and ts is not None:
             self.s["early_results"][cid] = [ts.isoformat(), duration is not None]
         out.append(ToolCallRow(
@@ -1342,7 +1344,7 @@ class ClaudeParser:
             persisted_output_bytes=as_int(tur_d.get("persistedOutputSize")), outcome=outcome,
             is_error=bool(is_error) if is_error is not None else (True if outcome != "ok" else None),
             exit_code=exit_code, denial_kind=denial, interrupted=interrupted or None,
-            timed_out=timed_out, background=background))
+            timed_out=timed_out, background=background, meta=meta))
         if denial and ts is not None:
             self._event(out, f"{cid}:denial", ts, "denial", pos, denial, {"tool": name[:120]})
         if ts is None:
@@ -1494,6 +1496,8 @@ class ClaudeParser:
                          latency_basis="claude_parent_to_last_line" if duration is not None else None,
                          thinking_ms=_telemetry_int(rec.get("thinkingDurationMs")),
                          advisor_model=as_str(rec.get("advisorModel")),
+                         requested_model=as_str(rec.get("requestedModel")),
+                         tool_input_stream_ms=_telemetry_int(rec.get("toolInputStreamMs")),
                          input_transform_types=_transform_types(msg.get("input_transformations")))
         diagnostics = msg.get("diagnostics") if isinstance(msg.get("diagnostics"), dict) else {}
         miss = diagnostics.get("cache_miss_reason")
@@ -1686,6 +1690,10 @@ class ClaudeParser:
     def _journal(self, rec, pos, out):
         agent_id = as_str(rec.get("agentId"))
         rtype = rec.get("type")
+        if rtype == "launched" and self.wf_id:
+            # The run's opening line carries no agent, time or field: the parent's Workflow call
+            # already holds the launch (spawn workflow_id = runId), so it is only counted.
+            return
         if not agent_id or not self.wf_id:
             out.append(ParseIssueRow(byte_offset=pos.byte_offset, kind="missing_field",
                                      line_number=pos.line_number, detail="journal agentId"))
@@ -1696,6 +1704,10 @@ class ClaudeParser:
                                workflow_id=self.wf_id, requested_type="workflow_agent")
         if rtype == "started":
             row.launch_status = "started"
+            label = as_str(rec.get("label"))
+            row.description = label[:200] if label else None
+            phase = as_str(rec.get("phase"))
+            row.workflow_phase = phase[:200] if phase else None
         elif rtype == "result":
             row.completion_status = "completed"
         else:
@@ -1703,6 +1715,66 @@ class ClaudeParser:
                                      line_number=pos.line_number, detail=f"journal:{str(rtype)[:40]}"))
             return
         out.append(row)
+
+
+PERMISSION_FIELDS = {"decision": "permission_decision", "source": "permission_source",
+                     "reasonType": "permission_reason", "reasonCode": "permission_code",
+                     "ruleSource": "permission_rule_source", "grantScope": "permission_scope",
+                     "classifierCategory": "permission_category", "circuitBreaker": "permission_breaker"}
+
+
+def _permission_meta(rec: dict[str, Any]) -> dict[str, Any] | None:
+    """The harness's recorded permission outcome for a tool result line: short enumerated codes
+    (accept/reject, config/hook/user, classifier/rule/mode, rule source, classifier category),
+    never the classifier request or context. Sandboxed is the recorded boolean."""
+    out: dict[str, Any] = {}
+    decision = rec.get("permissionDecision")
+    if isinstance(decision, dict):
+        for field, key in PERMISSION_FIELDS.items():
+            value = as_str(decision.get(field))
+            if value:
+                out[key] = value[:120]
+    if isinstance(rec.get("sandboxed"), bool):
+        out["sandboxed"] = rec["sandboxed"]
+    return out or None
+
+
+# Claude subagent `agent-<id>.meta.json` sidecars (load role claude_subagent_meta): sidecar key ->
+# (ah.subagent_meta column, kind). Every other key is named in unknown_keys, except these known keys
+# that are deliberately not stored: description duplicates the spawn label, isBuiltIn is implied by
+# agentType, and the worktree keys carry paths and branch names rather than scalars of the agent.
+SUBAGENT_META_FIELDS = {
+    "agentType": ("agent_type", str), "model": ("model", str), "pickedEffortModel": ("picked_effort_model", str),
+    "effort": ("effort", str), "spawnDepth": ("spawn_depth", int), "requestShape": ("request_shape", str),
+    "requestNonInteractive": ("request_non_interactive", bool), "workflowPhase": ("workflow_phase", str),
+    "toolUseId": ("tool_use_id", str), "parentAgentId": ("parent_agent_id", str), "finished": ("finished", bool),
+    "stoppedByUser": ("stopped_by_user", bool), "launchedWithDefaults": ("launched_with_defaults", bool),
+    "isFork": ("is_fork", bool),
+}
+SUBAGENT_META_IGNORED = {"description", "isBuiltIn", "worktreePath", "worktreeBranch", "spawnedWithWorktree",
+                         "worktreeCleanlyRemoved", "inheritedWorktreePath"}
+SUBAGENT_META_UNKNOWN_MAX = 64
+
+
+def subagent_meta(data: Any) -> dict[str, Any] | None:
+    """Columns of one sidecar snapshot, or None when it is not a JSON object. A value of the wrong
+    type is NULL; strings are capped at 200 characters; unknown key names are kept sorted, capped."""
+    if not isinstance(data, dict):
+        return None
+    row: dict[str, Any] = {}
+    for key, (column, kind) in SUBAGENT_META_FIELDS.items():
+        value = data.get(key)
+        if kind is str:
+            text = clean_text(as_str(value) or "")[:200]   # a JSON "\u0000" decodes to a NUL
+            row[column] = text or None
+        elif kind is int:
+            row[column] = _telemetry_int(value)
+        else:
+            row[column] = value if type(value) is bool else None
+    unknown = sorted({clean_text(k)[:80] for k in data if k not in SUBAGENT_META_FIELDS
+                      and k not in SUBAGENT_META_IGNORED} - {""})
+    row["unknown_keys"] = unknown[:SUBAGENT_META_UNKNOWN_MAX]
+    return row
 
 
 def _b64_size(data: str) -> int:

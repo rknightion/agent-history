@@ -139,3 +139,33 @@ def test_rebuild_rechecks_catalogue_after_writer_lock(clean, tmp_path, monkeypat
 def test_cold_source_requires_corresponding_hot_namespace():
     with pytest.raises(ConfigError, match="cold_sources"):
         parse_config({"sources": {}, "cold_sources": {"claude-local": "/archive/claude-local"}})
+
+
+@pytest.mark.parametrize(
+    "namespace,sidecar",
+    [
+        (
+            "claude-local",
+            "projects/-home-tester-repo/11111111-1111-4111-8111-111111111111/subagents/"
+            "agent-a0000000000000099.meta.json",
+        ),
+        ("pi-local", "progress/synthetic-progress.json"),
+    ],
+)
+def test_lost_sidecar_never_refuses_a_rebuild(clean, tmp_path, namespace, sidecar):  # noqa: F811
+    sources, cold_sources, _rel = layout(tmp_path)
+    load.rebuild(clean, sources=cold_sources, textfile=None, log=lambda *_: None)
+    role = "claude_subagent_meta" if namespace.startswith("claude") else "pi_progress"
+    # A sidecar indexed earlier, now in neither tree: archives need not keep optional sidecars.
+    clean.execute(
+        "INSERT INTO ah.source_file (rel_path, namespace, agent, profile, file_role, tier, size_bytes, mtime_ns, "
+        "parser_version, status) VALUES (%s, %s, %s, 'local', %s, 'hot', 2, 1, '1', 'indexed')",
+        (f"{namespace}/{sidecar}", namespace, namespace.split("-")[0], role),
+    )
+    clean.commit()
+    probe_sources = {**sources, namespace: sources.get(namespace, tmp_path / "pi-hot")}
+    probe_cold = {**cold_sources, namespace: cold_sources.get(namespace, tmp_path / "pi-cold")}
+    for path in (probe_sources[namespace], probe_cold[namespace]):
+        path.mkdir(parents=True, exist_ok=True)
+    _entries, report = load.check_rebuild_sources(clean, probe_sources, probe_cold)
+    assert report[namespace]["missing"] == 0 and not report[namespace]["refused"]

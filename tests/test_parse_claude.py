@@ -939,12 +939,126 @@ def test_workflow_journal_and_agent():
     spawn = one(store, "subagent_spawn", spawn_uid="wf:wf_abc:a0000000000000004")
     assert spawn["session"] == MAIN_KEY and spawn["child_agent_id"] == "a0000000000000004"
     assert spawn["launch_status"] == "started" and spawn["completion_status"] == "completed"
+    assert spawn["description"] == "review:widget" and spawn["workflow_phase"] == "Review"
+    # The opening {"type":"launched"} line is recognised and counted, never a missing agentId.
+    assert not store.issues
+    assert len(store.rows("subagent_spawn")) == 1
+    assert {r["record_type"] for r in store.rows("record_type_seen")} >= {"launched", "started", "result"}
     sessions = store.rows("session")
     assert len(sessions) == 1                         # the journal emits no session
     assert sessions[0]["spawn_kind"] == "workflow" and sessions[0]["workflow_id"] == "wf_abc"
     assert one(store, "message", event_uid="w-001")["message_class"] == "subagent_brief"
     assert one(store, "message", event_uid="toolu_so1:report")["message_class"] == "subagent_report"
     assert not by(store, "message", message_class="human_prompt")
+
+
+def test_journal_line_without_agent_id_is_still_an_issue(tmp_path):
+    journal = tmp_path / "projects" / "-home-tester-repo" / SID / "subagents" / "workflows" / "wf_x" / "journal.jsonl"
+    journal.parent.mkdir(parents=True)
+    journal.write_text('{"type":"started","key":"k","label":"x"}\n')
+    store = MemStore()
+    run_file(ClaudeParser, FileContext(str(journal), f"claude-test/projects/-home-tester-repo/{SID}/subagents/"
+                                       "workflows/wf_x/journal.jsonl", "claude-test", "claude", "test", None,
+                                       "workflow_journal"), store)
+    assert [(i.kind, i.detail) for i in store.issues] == [("missing_field", "journal agentId")]
+
+
+def _permission_session(tmp_path, result_lines):
+    call = {"type": "assistant", "sessionId": SID, "uuid": "perm-a", "timestamp": "2026-10-01T10:00:00Z",
+            "message": {"id": "msg_perm", "role": "assistant", "model": "claude-opus-5-5",
+                        "content": [{"type": "tool_use", "id": "toolu_perm", "name": "Bash",
+                                     "input": {"command": "git status"}}]}}
+    result = {"type": "user", "sessionId": SID, "uuid": "perm-u", "timestamp": "2026-10-01T10:00:01Z",
+              "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_perm",
+                                                       "content": "clean", "is_error": False}]},
+              "permissionDecision": {"decision": "reject", "source": "config", "reasonType": "classifier",
+                                     "reasonCode": "classifier:auto-mode", "classifierCategory": "git_destructive",
+                                     "circuitBreaker": "dangerousRemoval", "unexpected": {"nested": 1}},
+              "sandboxed": False,
+              "serverClassifierContext": {"context": "synthetic classifier context", "request": "r"}}
+    lines = {"call": call, "result": result}
+    path = tmp_path / "perm.jsonl"
+    path.write_text("".join(json.dumps(lines[name]) + "\n" for name in result_lines))
+    store = MemStore()
+    run_file(ClaudeParser, FileContext(str(path), "claude-test/projects/perm.jsonl", "claude-test", "claude",
+                                       "test", None, "main"), store, batch_lines=1)
+    return one(store, "tool_call", call_uid="toolu_perm")
+
+
+@pytest.mark.parametrize("order", [("call", "result"), ("result", "call")])
+def test_permission_decision_joins_the_call_meta(tmp_path, order):
+    call = _permission_session(tmp_path, order)
+    assert call["tool_name"] == "Bash" and call["outcome"] == "ok"
+    # Both halves add keys to meta whichever line comes first; classifier text is never stored.
+    assert call["meta"] == {"cmd_verb": "git", "permission_decision": "reject",
+                            "permission_source": "config", "permission_reason": "classifier",
+                            "permission_code": "classifier:auto-mode", "permission_category": "git_destructive",
+                            "permission_breaker": "dangerousRemoval", "sandboxed": False}
+    assert "synthetic classifier context" not in json.dumps(call["meta"])
+
+
+@pytest.mark.parametrize("batch", [1, 5000])
+def test_requested_model_and_tool_input_stream_time(tmp_path, batch):
+    def line(uid, call, stream_ms):
+        return {"type": "assistant", "sessionId": SID, "uuid": uid, "timestamp": "2026-10-01T10:00:00Z",
+                "requestedModel": "claude-opus-5-5[1m]", "toolInputStreamMs": stream_ms,
+                "message": {"id": "msg_stream", "role": "assistant", "model": "claude-opus-5-5",
+                            "content": [{"type": "tool_use", "id": call, "name": "Read",
+                                         "input": {"file_path": "/home/tester/repo/a.py"}}]}}
+    path = tmp_path / "stream.jsonl"
+    # One response, one line per tool_use block: the longest stream is kept, in either order.
+    records = [line("s-1", "toolu_s1", 340), line("s-2", "toolu_s2", 120), line("s-3", "toolu_s3", 1.5)]
+    path.write_text("".join(json.dumps(r) + "\n" for r in records))
+    store = MemStore()
+    run_file(ClaudeParser, FileContext(str(path), "claude-test/projects/stream.jsonl", "claude-test", "claude",
+                                       "test", None, "main"), store, batch_lines=batch)
+    call = one(store, "llm_call", response_id="msg_stream")
+    assert (call["model"], call["requested_model"], call["tool_input_stream_ms"]) == (
+        "claude-opus-5-5", "claude-opus-5-5[1m]", 340)
+    assert call["context_window"] is None   # never inferred from the [1m] suffix
+
+
+def test_subagent_meta_sidecar_columns_and_unknown_keys():
+    from agent_history.parse_claude import subagent_meta
+
+    row = subagent_meta({"agentType": "workflow-subagent", "isBuiltIn": True, "description": "review:widget",
+                         "workflowPhase": "Review", "spawnDepth": 1, "requestShape": "foreground",
+                         "requestNonInteractive": False, "model": "sonnet", "pickedEffortModel": "claude-opus-5-5",
+                         "toolUseId": "toolu_side", "finished": True, "worktreePath": "/home/tester/wt",
+                         "brandNewKey": {"nested": "value"}, "anotherNewKey": 1})
+    assert row == {"agent_type": "workflow-subagent", "model": "sonnet", "picked_effort_model": "claude-opus-5-5",
+                   "effort": None, "spawn_depth": 1, "request_shape": "foreground", "request_non_interactive": False,
+                   "workflow_phase": "Review", "tool_use_id": "toolu_side", "parent_agent_id": None,
+                   "finished": True, "stopped_by_user": None, "launched_with_defaults": None, "is_fork": None,
+                   "unknown_keys": ["anotherNewKey", "brandNewKey"]}
+    # Wrong types are unknown values, never coerced; a non-object snapshot is no row.
+    bad = subagent_meta({"spawnDepth": "1", "requestNonInteractive": 0, "model": 5, "finished": "yes"})
+    assert (bad["spawn_depth"], bad["request_non_interactive"], bad["model"], bad["finished"]) == (None,) * 4
+    assert subagent_meta([1, 2]) is None
+
+
+def test_subagent_meta_sidecar_drops_nul_from_strings_and_key_names():
+    from agent_history.parse_claude import subagent_meta
+
+    # Parsed from JSON text, as the loader does: an escaped \u0000 decodes to a NUL PostgreSQL rejects.
+    raw = '{"description": "label\\u0000x", "model": "son\\u0000net", "new\\u0000Key": 1, "\\u0000": 2}'
+    row = subagent_meta(json.loads(raw))
+    assert row["model"] == "sonnet"
+    assert row["unknown_keys"] == ["newKey"]
+    assert not any("\x00" in v for v in row.values() if isinstance(v, str))
+
+
+def test_subagent_meta_sidecar_role_and_identity():
+    from agent_history.load import file_role, logical_uid
+
+    plain = ("projects", "-home-tester-repo", SID, "subagents", "agent-a01.meta.json")
+    workflow = ("projects", "-home-tester-repo", SID, "subagents", "workflows", "wf_abc", "agent-a02.meta.json")
+    for parts, agent_id in ((plain, "a01"), (workflow, "a02")):
+        assert file_role("claude", parts) == "claude_subagent_meta"
+        assert logical_uid("claude", "claude_subagent_meta", parts) == f"{SID}/{agent_id}"
+    assert file_role("claude", ("projects", "-home-tester-repo", "agent-a01.meta.json")) is None
+    assert file_role("claude", ("projects", "-home-tester-repo", SID, "subagents", "other.meta.json")) is None
+    assert file_role("codex", ("sessions", SID, "subagents", "agent-a01.meta.json")) is None
 
 
 def test_state_is_json_and_content_free():

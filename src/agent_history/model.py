@@ -32,6 +32,7 @@ UPDATE = "update"    # COALESCE(excluded, existing): latest non-null observation
 MAX = "max"          # GREATEST(existing, excluded)
 MIN = "min"          # LEAST(existing, excluded)
 OR = "or"            # existing OR excluded (booleans that only ever become true)
+MERGE = "merge"      # existing || excluded: JSON objects whose halves carry disjoint keys
 NOTHING = "nothing"  # ON CONFLICT DO NOTHING for the whole row
 
 
@@ -50,7 +51,7 @@ class FileContext:
     agent: str
     profile: str
     machine: str | None
-    file_role: str        # main | subagent | workflow_agent | workflow_journal | pi_artifact
+    file_role: str        # main | subagent | workflow_agent | workflow_journal | pi_artifact | pi_progress | claude_subagent_meta
 
 
 @dataclass(frozen=True)
@@ -147,6 +148,8 @@ class TurnRow(Row):
     trace_id: str | None = None
     root_turn_key: str | None = None
     origin_hint: str | None = None
+    parent_turn_key: str | None = None        # Codex turn_attribution.parent_turn_id (parent thread's turn)
+    initiating_agent_path: str | None = None  # Codex turn_attribution.initiating_agent_path
     prompt_index: int | None = None
     turn_index: int | None = None
     pending_bg_agents: int | None = None
@@ -210,6 +213,7 @@ class LlmCallRow(Row):
         "input_uncached": MAX, "cache_read": MAX, "cache_write_5m": MAX, "cache_write_1h": MAX,
         "output": MAX, "reasoning": MAX, "web_search_requests": MAX, "web_fetch_requests": MAX,
         "line_count": MAX, "byte_offset": KEEP, "is_api_error": OR, "thinking_ms": MAX,
+        "tool_input_stream_ms": MAX,
     }
     agent: str
     response_id: str
@@ -255,6 +259,8 @@ class LlmCallRow(Row):
     ttft_ms: int | None = None
     attempts: int | None = None
     processing_ms: int | None = None
+    requested_model: str | None = None        # Claude `requestedModel`, verbatim
+    tool_input_stream_ms: int | None = None   # longest recorded tool input stream of the response
 
     def unknown_if_zero(self) -> "LlmCallRow":
         """An all-zero usage record that carries no stop reason is unknown, not a measured zero.
@@ -402,6 +408,7 @@ class ToolCallRow(Row):
     POLICY: ClassVar[dict[str, str]] = {
         "session": KEEP, "turn_key": KEEP, "response_id": KEEP, "started_at": MIN,
         "ended_at": MAX, "byte_offset": KEEP, "interrupted": OR, "timed_out": OR,
+        "meta": MERGE,   # the call half and the Claude result half (permission decision) add keys
     }
     agent: str
     call_uid: str
@@ -495,6 +502,7 @@ class SubagentSpawnRow(Row):
     reported_tool_uses: int | None = None
     reported_duration_ms: int | None = None
     workflow_id: str | None = None
+    workflow_phase: str | None = None    # Claude workflow journal `phase` of the agent's step
     timeout_ms: int | None = None
     deadline_at: datetime | None = None
     run_fanout_budget: int | None = None

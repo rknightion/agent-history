@@ -35,6 +35,18 @@ printed one in a command's output, the secret is in the catalogue.
   reason is retained in catalogue metadata across failed runs and omitted from the snapshot after
   success. Labels never contain response bodies, status text, URLs or input text. Existing embed
   metric names, labels and help text are unchanged.
+- `ah.embed_failure` holds inputs whose latest embedding attempt failed and that have no vector
+  yet. Its lifecycle, at the start of every embed run and in every successful batch:
+  - A row whose input now has a vector is deleted unconditionally, even while vector GC would
+    skip: a vector proves the input no longer fails, whatever state `ah.chunk` is in. A successful
+    batch deletes its own rows at once.
+  - A row that no chunk references and that no retry has touched for a day is an orphan and is
+    deleted, but only when vector GC's reset guards allow it (`gc_skip_reason` without its backlog
+    test): never while a rebuild is in progress or while `chunks_reset_at` is missing, unparseable
+    or under 7 days old, because an emptied `ah.chunk` makes every row look orphaned. The skip is
+    logged with its reason.
+  - A permanently failed input stays while its chunk references it.
+  Both `agent_history_embed_failed_inputs` publications count every remaining row.
 - Metric families are published only over OTLP, by the periodic indexer's metric collection
   (service `agent-history-index`). The package serves no metrics endpoint and writes no Prometheus
   textfile for a scraper; the worker run snapshots under `/var/lib/alloy/textfile-agent-history` are
@@ -296,6 +308,52 @@ transcripts are required. No live catalogue rebuild is implied by migration appl
 | `ah.subagent_spawn` | `timeout_ms bigint`, `deadline_at timestamptz` | Explicit valid integer spawn timeout in milliseconds. A deadline is a recorded timezone-aware ISO timestamp or explicit epoch-millisecond value converted to UTC, never computed from completion or a relative timeout. Invalid or non-finite values remain NULL. |
 | `ah.subagent_spawn` | `run_fanout_budget int`, `spawn_budget int`, `active_async_capacity int`, `lifecycle_status text` | Explicit retained spawn/run budget, capacity and lifecycle metadata. Budget/capacity objects contribute only a valid finite integer `.limit`; legacy scalar integers are retained directly. Unlimited/invalid values remain NULL; `.used`, `.remaining`, observed child counts and liveness are not limits. Existing launch/completion status policies are unchanged. |
 | `ah.tool_op` | `mcp_plugin_id text`, `mcp_read_only bool` | Explicit executed MCP-operation plugin identifier and read-only annotation (including Codex operation metadata), not classification from tool name or arguments. |
+
+### Additive transcript fields (migration 052)
+
+Migration `052_transcript_fields.sql` adds the following, all nullable with no backfill:
+
+| Table | Columns | Source and meaning |
+|---|---|---|
+| `ah.subagent_spawn` | `workflow_phase text` | The `phase` a Claude workflow journal records on an agent's `started` line. Its `label` goes in the existing `description`. |
+| `ah.llm_call` | `requested_model text` | Claude `requestedModel`, verbatim, including a `[1m]` suffix. `context_window` is never inferred from it. |
+| `ah.llm_call` | `tool_input_stream_ms int` | Claude `toolInputStreamMs`. It is recorded per tool_use line, so a response with several tool calls keeps the longest (MAX policy): the longest single tool input stream of the response, not a total. |
+| `ah.turn` | `parent_turn_key text` | Codex `task_started.turn_attribution.parent_turn_id`: the parent thread's turn id, verbatim, which is that parent session's `turn_key` (join through `session.parent_session_id`). Not `root_turn_key`. |
+| `ah.turn` | `initiating_agent_path text` | Codex `turn_attribution.initiating_agent_path`, the agent path (`/root`, ...) that initiated the turn. |
+| `ah.subagent_meta` | one row per Claude subagent session | The latest Claude subagent `agent-<id>.meta.json` sidecar, below. |
+
+The journal's opening `{"type":"launched"}` line carries no agent, time or other field; it is
+counted in `record_type_seen` without a parse issue, because the parent's `Workflow` call already
+records the launch (its spawn row's `workflow_id` is the run id).
+
+Claude subagent sidecars (`projects/**/subagents/[workflows/<run>/]agent-<id>.meta.json`) are
+indexed under file role `claude_subagent_meta` with their own parser version. A sidecar is a
+whole-file snapshot that Claude Code rewrites in place: an unchanged file is skipped on its size and
+mtime, and a changed one replaces its session's `ah.subagent_meta` row (keyed by `session_id`), so
+a key the harness drops becomes NULL. Columns: `agent_type`, `model`, `picked_effort_model`,
+`effort`, `spawn_depth`, `request_shape`, `request_non_interactive`, `workflow_phase`,
+`tool_use_id`, `parent_agent_id`, `finished`, `stopped_by_user`, `launched_with_defaults`, `is_fork`,
+and `unknown_keys` (the sorted names of unrecognised keys, never values). `description`, `isBuiltIn`
+and the worktree path and branch keys are recognised and not stored. `spawnDepth` is also copied to
+`ah.session.spawn_depth`; `agentType` never changes `ah.session.agent_type`, which keeps its
+spawn-derived value. A sidecar can precede its transcript and then identifies a session stub only.
+Files over 64 KiB, mid-rewrite or not a JSON object are skipped without rows or issues. Sidecars are
+optional observations: rebuild completeness and prompt reclassification do not require them.
+
+`ah.tool_call.meta` on Claude calls gains the tool result line's recorded permission outcome:
+`permission_decision`, `permission_source`, `permission_reason`, `permission_code`,
+`permission_rule_source`, `permission_scope`, `permission_category` and `permission_breaker` (short
+enumerated codes from `permissionDecision`), and `sandboxed`. Classifier requests and context are
+never stored. The call and result halves merge their `meta` keys, so neither half's keys are lost
+whichever line is read first.
+
+Codex `task_started.turn_attribution.turn_trigger` supplies `ah.turn.origin_hint`, and
+`thread_settings.model_provider_id` is kept as `model_provider` in the `thread_settings` session
+event detail. Account and user identifiers in the same records stay unindexed.
+
+These fields are additive: the Claude and Codex parser versions are unchanged, and rows indexed
+before them keep NULL or lack the keys until their transcripts are re-read by a rebuild. Existing
+sidecars are picked up as new sources on the next pass.
 
 For retained native pi single-agent launches, existing `ah.subagent_spawn.spawned_at` is the matched call-entry **dispatch** timestamp. It is not an OS process-start timestamp or tool-result completion time. A successful native single-mode result with matching `asyncId`/`runId` may establish an asynchronous launch when `async` was omitted; management calls, failures and ambiguous result shapes do not establish a spawn.
 

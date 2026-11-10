@@ -936,7 +936,12 @@ class CodexParser:
         origin = None
         if self.s["sub"] and self.s["own_turns"] == 1:
             origin, turn["o"] = "subagent_brief", True
+        attribution = p.get("turn_attribution") if isinstance(p.get("turn_attribution"), dict) else {}
+        trigger = as_str(attribution.get("turn_trigger"))
         return [TurnRow(key, turn_id, pos.byte_offset, origin=origin, effort=turn["ef"],
+                        origin_hint=trigger[:40] if trigger else None,
+                        parent_turn_key=as_str(attribution.get("parent_turn_id")),
+                        initiating_agent_path=as_str(attribution.get("initiating_agent_path")),
                         started_at=parse_ts(p.get("started_at")) or ts, status="open", context_window=cw,
                         collaboration_mode=as_str(p.get("collaboration_mode_kind")),
                         trace_id=as_str(p.get("trace_id")), root_turn_key=as_str(p.get("root_turn_id")))]
@@ -1825,7 +1830,8 @@ class CodexParser:
                       "approval_policy": as_str(ts_.get("approval_policy")),
                       "permission_profile": as_str(profile.get("type")) if isinstance(profile, dict) else None,
                       "collaboration_mode": as_str(collab.get("mode")) if isinstance(collab, dict) else None,
-                      "service_tier": as_str(ts_.get("service_tier"))}
+                      "service_tier": as_str(ts_.get("service_tier")),
+                      "model_provider": as_str(ts_.get("model_provider_id"))}
             return [SessionEventRow(AGENT, uid, key, ts, "thread_settings", pos.byte_offset, self.s.get("cur"),
                                     detail["model"], {k: v for k, v in detail.items() if v is not None})]
         if ptype == "thread_rolled_back":
