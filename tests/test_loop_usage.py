@@ -57,6 +57,8 @@ ROOT = {
     "compactions_untyped": "0",
     "ask_calls": "2",
     "ask_blocked_s": "5400",
+    "ask_open": "0",
+    "ask_untimed": "0",
 }
 LANES = [
     {"role": "reviewer", "lanes": "3", "complete": "3"},
@@ -66,7 +68,13 @@ TOOLS = [
     {"kind": "denial", "label": "user-rejected", "n": "5"},
     {"kind": "denial", "label": "automode-blocked", "n": "2"},
     {"kind": "timeout", "label": "", "n": "4"},
+    {"kind": "agent", "label": "root:claude", "n": "1"},
+    {"kind": "agent", "label": "lane:claude", "n": "11"},
 ]
+
+
+def agents(*labels):
+    return [{"kind": "agent", "label": label, "n": "1"} for label in labels]
 
 
 def fake_query(summary=SUMMARY, rows=ROWS, root=ROOT, lanes=LANES, tools=TOOLS, seen=None):
@@ -125,7 +133,14 @@ def test_unknown_loop_exits_non_zero_with_one_line(monkeypatch, target, message)
     assert raised.value.code == message and "\n" not in message
 
 
-V4 = {**SUMMARY, "wall_s": "14400", "landed": "3", "parked": "1", "harness": "claude", "harness_version": "2.1.4"}
+V4 = {
+    **SUMMARY,
+    "wall_s": "14400",
+    "landed": "3",
+    "parked": "1",
+    "harness": "claude 2.1.4",
+    "root_agents": "claude",
+}
 
 
 def test_stamp_names_the_harness_and_what_the_catalogue_does_not_record():
@@ -133,8 +148,12 @@ def test_stamp_names_the_harness_and_what_the_catalogue_does_not_record():
     assert "- Harness: claude 2.1.4" in lines
     assert "- Plugin and agent-docs versions: not recorded in the catalogue" in lines
     assert "- Landing mode: unknown" in lines
-    unknown = {**V4, "harness": "", "harness_version": ""}
-    assert "- Harness: unknown" in detail_block(unknown)
+    assert "- Harness: unknown" in detail_block({**V4, "harness": ""})
+
+
+def test_a_relaunch_across_harnesses_names_both():
+    both = {**V4, "harness": "claude 2.1.4, codex 0.9.1", "root_agents": "claude,codex"}
+    assert "- Harness: claude 2.1.4, codex 0.9.1" in detail_block(both)
 
 
 def test_landed_and_parked_come_from_the_closeout_when_there_is_no_ledger():
@@ -160,12 +179,13 @@ def test_peak_root_context():
 
 
 def test_compactions_and_how_many_the_owner_typed():
-    assert "- Compactions: 3 (1 typed by the owner)" in detail_block(V4)
+    assert "- Compactions: 3 (typed by the owner: 1)" in detail_block(V4)
     root = {**ROOT, "compactions": "0", "compactions_typed": "0"}
-    assert "- Compactions: 0 (0 typed by the owner)" in detail_block(V4, root=root)
-    # Codex and pi record no trigger: those are not counted as typed or as automatic.
+    assert "- Compactions: 0 (typed by the owner: 0)" in detail_block(V4, root=root)
+    # Codex and pi record no trigger: the typed count is then unknown, not the manual rows alone.
     root = {**ROOT, "compactions": "4", "compactions_typed": "1", "compactions_untyped": "2"}
-    assert "- Compactions: 4 (1 typed by the owner, 2 with no trigger recorded)" in detail_block(V4, root=root)
+    line = "- Compactions: 4 (typed by the owner: unknown, 2 with no trigger recorded)"
+    assert line in detail_block(V4, root=root)
 
 
 def test_root_question_tool_calls_and_blocked_hours():
@@ -174,9 +194,42 @@ def test_root_question_tool_calls_and_blocked_hours():
     assert "- Root question-tool calls: 0 (blocked 0.00 hours)" in detail_block(V4, root=root)
 
 
+def test_question_tools_on_codex_count_and_pi_records_none():
+    codex = {**V4, "root_agents": "codex"}
+    assert "- Root question-tool calls: 2 (blocked 1.50 hours)" in detail_block(codex)
+    pi = {**V4, "root_agents": "pi"}
+    assert "- Root question-tool calls: unknown (no question tool recorded for pi)" in detail_block(pi)
+    assert "- Root question-tool calls: unknown (no question tool recorded)" in detail_block({**V4, "root_agents": ""})
+    both = {**V4, "root_agents": "claude,pi"}
+    assert "- Root question-tool calls: 2 (blocked 1.50 hours, not recorded for pi)" in detail_block(both)
+
+
+def test_an_open_question_is_open_not_zero_hours():
+    root = {**ROOT, "ask_calls": "1", "ask_blocked_s": "0", "ask_open": "1"}
+    line = "- Root question-tool calls: 1 (blocked 0.00 hours, 1 still open at closeout)"
+    assert line in detail_block(V4, root=root)
+    root = {**ROOT, "ask_calls": "2", "ask_untimed": "1"}
+    line = "- Root question-tool calls: 2 (blocked 1.50 hours, 1 with no duration recorded)"
+    assert line in detail_block(V4, root=root)
+
+
 def test_lane_bash_timeouts_count_only_timeout_rows():
     assert "- Lane Bash timeouts: 4" in detail_block(V4)
     assert "- Lane Bash timeouts: 0" in detail_block(V4, tools=TOOLS[:2])
+
+
+def test_timeouts_and_denials_are_not_recorded_for_codex_and_pi_sessions():
+    """Only the Claude parser records a timeout or a denial: another harness is unknown, not 0."""
+    codex = [r for r in TOOLS if r["kind"] != "agent"] + agents("root:codex", "lane:codex", "lane:pi")
+    lines = detail_block(V4, tools=codex)
+    assert "- Lane Bash timeouts: unknown (not recorded for codex, pi lanes)" in lines
+    assert "- Denials by class: not recorded (not recorded for codex, pi)" in lines
+    mixed = [r for r in TOOLS if r["kind"] != "agent"] + agents("root:claude", "lane:claude", "lane:pi")
+    lines = detail_block(V4, tools=mixed)
+    assert "- Lane Bash timeouts: 4 (not recorded for pi lanes)" in lines
+    assert "- Denials by class: claude sessions only (not recorded for pi)" in lines
+    lines = detail_block(V4)
+    assert not any(line.startswith("- Denials by class") for line in lines)
 
 
 def test_lane_complete_rate_by_role():
@@ -189,11 +242,19 @@ def test_lane_complete_rate_by_role():
 
 def test_spend_share_by_role():
     lines = detail_block(V4)
-    at = lines.index("| Role | Cost | Share of cost |")
+    # The worker role has 30 unpriced calls in ROWS: its figure is a floor and the shares are of
+    # priced cost only, so they are not offered as complete.
+    at = lines.index("| Role | Cost | Share of priced cost |")
     assert lines[at - 1] == "" and lines[at + 1] == "| --- | ---: | ---: |"
-    assert lines[at + 2 : at + 4] == ["| root | $40.50 | 97.0% |", "| worker | $1.26 | 3.0% |"]
+    assert lines[at + 2 : at + 4] == ["| root | $40.50 | 97.0% |", "| worker | $1.26 (partial) | 3.0% (partial) |"]
     free = [{**ROWS[0], "cost": "", "unpriced": "1200"}]
-    assert "| root | $0.00 | n/a |" in detail_block(V4, rows=free)
+    lines = detail_block(V4, rows=free)
+    assert "| root | unpriced | unpriced |" in lines
+    assert not any(line.startswith("| root |") and ("$0.00" in line or "0.0%" in line) for line in lines)
+    # Fully priced roles keep plain figures under the plain heading.
+    lines = detail_block(V4, rows=[ROWS[0], {**ROWS[2], "unpriced": "0"}])
+    assert "| Role | Cost | Share of cost |" in lines
+    assert "| worker | $1.26 | 3.0% |" in lines
 
 
 def test_denials_by_class():
@@ -208,7 +269,7 @@ def test_the_new_numbers_sit_between_the_old_bullets_and_the_model_table():
     lines = detail_block(V4)
     assert lines[2:5] == ["- Wall time: 4h 0m", "- LLM calls: 1,234", "- List-price cost: $41.76"]
     assert lines.index("- Harness: claude 2.1.4") == 6 and lines.index("| Role | Model | Calls | Cost |") > 15
-    assert lines.index("| Role | Cost | Share of cost |") > lines.index("| root | model-a | 1,200 | $40.50 |")
+    assert lines.index("| Role | Cost | Share of priced cost |") > lines.index("| root | model-a | 1,200 | $40.50 |")
 
 
 def ledger_beside_closeout(tmp_path, name="landings.jsonl", text=None):
@@ -233,9 +294,9 @@ def test_a_ledger_beside_the_closeout_adds_landings_and_their_rows(tmp_path):
     at = lines.index("| Landing | Outcome | Slot time |")
     assert lines[at - 1] == "" and lines[at + 1] == "| --- | --- | ---: |"
     assert lines[at + 2 :] == [
-        "| PR 11 | landed | 14m 35s |",
-        "| PR 12 | main-red | 19m 00s |",
-        "| PR 13 | abandoned | 40m 00s |",
+        "| PR 11 (1111111) | landed | 14m 35s |",
+        "| PR 12 (2222222) | main-red | 19m 00s |",
+        "| PR 13 (3333333) | abandoned | 40m 00s |",
     ]
 
 
@@ -259,8 +320,16 @@ def reader_event(event):
 
 def test_a_direct_mode_landing_is_keyed_by_its_head():
     events = [
-        reader_event({"event": "ready", "outcome": "go", "head": "0123456789abcdef0123", "issues": ["X-1"]}),
-        reader_event({"event": "verified", "outcome": "landed", "head": "0123456789abcdef0123", "slot_seconds": 45}),
+        reader_event({"event": "ready", "outcome": "go", "head": "0123456789abcdef0123"}),
+        reader_event(
+            {
+                "event": "verified",
+                "outcome": "landed",
+                "head": "0123456789abcdef0123",
+                "issues": ["X-1"],
+                "slot_seconds": 45,
+            }
+        ),
     ]
     lines = detail_block(V4, ledger={"too_large": False, "unreadable": 0, "events": events})
     assert "- Landing mode: direct (from the ledger)" in lines
@@ -278,7 +347,7 @@ def test_ledger_lines_that_are_not_events_are_counted_and_cells_are_escaped(tmp_
     assert ledger["unreadable"] == 2 and len(ledger["events"]) == 1
     lines = detail_block(V4, ledger=ledger)
     assert "- Landing ledger lines that were not events: 2" in lines
-    assert "| PR 5 | a\\|b c | - |" in lines
+    assert "| PR 5 (h) | a\\|b c | - |" in lines
 
 
 def test_read_ledger_only_reads_the_named_file_beside_a_closeout(tmp_path):
@@ -315,7 +384,7 @@ def test_loop_usage_reads_the_ledger_beside_the_closeout_it_resolves(monkeypatch
     out = capsys.readouterr().out.splitlines()
     assert "- Landings per hour: 0.50 (2 landings in 4h 0m)" in out
     assert "- Landed: 3 tasks (from the ledger)" in out
-    assert "| PR 12 | main-red | 19m 00s |" in out
+    assert "| PR 12 (2222222) | main-red | 19m 00s |" in out
     # The ledger is read on this machine only: without the file the block has no landing rows.
     summary = {**V4, "report_path": str(tmp_path / "elsewhere" / "closeout-2026-11-02-loop7.md")}
     monkeypatch.setattr(reader, "query", fake_query(summary=summary))
@@ -336,3 +405,67 @@ def test_queries_carry_every_number_the_block_prints():
     summary = reader.USAGE_SUMMARY_SQL.format(ids=ids)
     for needle in ("tasks_landed", "parks_total", "report_path", "cli_version_last"):
         assert needle in summary
+
+
+def with_events(*events, summary=V4):
+    ledger = {"too_large": False, "unreadable": 0, "events": [reader_event(e) for e in events]}
+    return detail_block(summary, ledger=ledger)
+
+
+def test_landed_issues_come_from_the_merged_or_verified_event_only():
+    lines = with_events(
+        {"event": "refused", "outcome": "held", "pr": 1, "head": "a", "issues": ["X-8"]},
+        {"event": "ready", "outcome": "go", "pr": 1, "head": "a", "issues": ["X-1", "X-9"]},
+        {"event": "merged", "outcome": "merged", "pr": 1, "head": "a", "issues": ["X-1"]},
+    )
+    assert "- Landed: 1 task (from the ledger)" in lines
+
+
+def test_an_issue_number_and_its_hash_form_are_one_issue():
+    lines = with_events(
+        {"event": "merged", "outcome": "merged", "pr": 1, "head": "a", "issues": [5, "#5", " #5 ", "6"]},
+        {"event": "merged", "outcome": "merged", "pr": 2, "head": "b", "issues": ["#6", None, True, ""]},
+    )
+    assert "- Landed: 2 tasks (from the ledger)" in lines
+
+
+def test_a_merged_landing_that_names_no_issue_does_not_zero_the_count():
+    lines = with_events({"event": "merged", "outcome": "merged", "pr": 1, "head": "a", "issues": []})
+    assert "- Landed: 3 tasks (from the closeout)" in lines
+    assert "- Landings per hour: 0.25 (1 landing in 4h 0m)" in lines
+    # One landing that names its issues does not hide another that does not.
+    lines = with_events(
+        {"event": "merged", "outcome": "merged", "pr": 1, "head": "a", "issues": ["X-1"]},
+        {"event": "merged", "outcome": "merged", "pr": 2, "head": "b", "issues": []},
+    )
+    assert "- Landed: 3 tasks (from the closeout)" in lines
+    assert "- Landings per hour: 0.50 (2 landings in 4h 0m)" in lines
+
+
+def test_one_landing_is_singular():
+    lines = with_events({"event": "merged", "outcome": "merged", "pr": 1, "head": "a", "issues": ["X-1"]})
+    assert "- Landings per hour: 0.25 (1 landing in 4h 0m)" in lines
+
+
+def test_the_same_pull_request_number_on_two_heads_is_two_landings():
+    """The ledger has no repository key: pull request and head together are the most it can tell apart."""
+    lines = with_events(
+        {"event": "merged", "outcome": "merged", "pr": 7, "head": "aaaaaaaaaa", "issues": ["X-1"]},
+        {"event": "verified", "outcome": "landed", "pr": 7, "head": "aaaaaaaaaa", "slot_seconds": 60},
+        {"event": "merged", "outcome": "merged", "pr": 7, "head": "bbbbbbbbbb", "issues": ["X-2"]},
+        {"event": "abandoned", "outcome": "abandoned", "pr": 7, "head": "bbbbbbbbbb", "slot_seconds": 5},
+    )
+    assert "| PR 7 (aaaaaaa) | landed | 1m 00s |" in lines
+    assert "| PR 7 (bbbbbbb) | abandoned | 5s |" in lines
+    assert "- Landed: 2 tasks (from the ledger)" in lines
+
+
+def test_a_slot_time_that_is_not_a_finite_number_is_not_shown(tmp_path):
+    text = "".join(
+        '{"event":"verified","outcome":"landed","pr":%d,"head":"h%d","issues":[%d],"slot_seconds":%s}\n' % (n, n, n, v)
+        for n, v in enumerate(["NaN", "Infinity", "-Infinity", '"90"', "true", "null", "1e999", "90"], 1)
+    )
+    ledger = reader.read_ledger(ledger_beside_closeout(tmp_path, text=text))
+    lines = detail_block(V4, ledger=ledger)
+    slots = [line.strip("|").split("|")[-1].strip() for line in lines if line.startswith("| PR ")]
+    assert slots == ["-"] * 7 + ["1m 30s"]

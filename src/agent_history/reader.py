@@ -10,6 +10,7 @@ import argparse
 import csv
 import io
 import json
+import math
 import os
 import re
 import shlex
@@ -504,8 +505,6 @@ def resolve_loop(value: str) -> list[int]:
     return [int(row["id"]) for row in rows]
 
 
-# Scope as ah.v_loop_summary: root calls inside each launch window, linked sessions whole.
-# Prices as ah.v_session_cost: one ah.priced_usd per model and day. Relaunch sessions are root.
 USAGE_SUMMARY_SQL = """
 SELECT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS as_of,
        EXTRACT(EPOCH FROM (max(CASE WHEN live.status = 'finished' AND l.end_ts IS NOT NULL
@@ -515,16 +514,17 @@ SELECT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS as_of,
        max(live.tasks_landed) AS landed,
        max(live.parks_total) AS parked,
        max(l.report_path) AS report_path,
-       min(rs.agent) AS harness,
-       max(rs.cli_version_last) AS harness_version
+       string_agg(DISTINCT rs.agent, ',' ORDER BY rs.agent) AS root_agents,
+       string_agg(DISTINCT rs.agent || COALESCE(' ' || rs.cli_version_last, ''), ', '
+                  ORDER BY rs.agent || COALESCE(' ' || rs.cli_version_last, '')) AS harness
 FROM ah.loop_run l LEFT JOIN ah.loops live USING (launch_uid)
 LEFT JOIN ah.session rs ON rs.id = l.root_session_id
 WHERE l.id = ANY({ids});
 """
 
-# The runs of one closeout and every session that belongs to them. A run's own root session is
-# read inside its launch window; a relaunch session counts as root; every other linked session
-# takes its lane role. Shared by every usage query below.
+# The runs of one closeout and every session that belongs to them, scoped as ah.v_loop_summary:
+# a run's own root session is read inside its launch window, a relaunch session counts as root and
+# every other linked session is read whole under its lane role. Shared by every usage query below.
 USAGE_SCOPE = """
 runs AS (
     -- An unfinished run's end_ts is only its last observed root event: leave the window open.
@@ -541,7 +541,6 @@ runs AS (
 )
 """
 
-# Scope as ah.v_loop_summary: root calls inside each launch window, linked sessions whole.
 # Prices as ah.v_session_cost: one ah.priced_usd per model and day. Relaunch sessions are root.
 USAGE_ROWS_SQL = (
     "WITH "
@@ -567,7 +566,8 @@ ORDER BY role <> 'root', role, sum(cost) DESC NULLS LAST, model;
 
 # The root's own numbers: the largest context any root call carried, its compactions (a Claude
 # compaction records whether the owner typed it; Codex and pi record no trigger) and the owner
-# question tool with the time the root spent waiting on it.
+# question tools (Claude's, and Codex's two) with the time the root spent waiting on them. A
+# question with no result yet is open: it has no wait to add.
 USAGE_ROOT_SQL = (
     "WITH "
     + USAGE_SCOPE
@@ -583,19 +583,21 @@ USAGE_ROOT_SQL = (
     WHERE NOT m.windowed OR (k.ts >= m.launch_ts AND k.ts < COALESCE(m.end_ts, 'infinity'))
     GROUP BY k.id, k.trigger
 ), asked AS (
-    SELECT t.id, t.duration_ms
+    SELECT t.id, t.duration_ms, t.ended_at
     FROM roots m JOIN ah.tool_call t ON t.session_id = m.session_id
-    WHERE t.tool_name = 'AskUserQuestion'
+    WHERE t.tool_name IN ('AskUserQuestion', 'request_user_input', 'request_user_input_async')
       AND (NOT m.windowed OR (COALESCE(t.started_at, t.ended_at) >= m.launch_ts
                               AND COALESCE(t.started_at, t.ended_at) < COALESCE(m.end_ts, 'infinity')))
-    GROUP BY t.id, t.duration_ms
+    GROUP BY t.id, t.duration_ms, t.ended_at
 )
 SELECT (SELECT peak_context FROM peak) AS peak_context,
        (SELECT count(*) FROM compacted) AS compactions,
        (SELECT count(*) FROM compacted WHERE trigger = 'manual') AS compactions_typed,
        (SELECT count(*) FROM compacted WHERE trigger IS NULL) AS compactions_untyped,
        (SELECT count(*) FROM asked) AS ask_calls,
-       (SELECT COALESCE(sum(duration_ms), 0) / 1000 FROM asked)::bigint AS ask_blocked_s;
+       (SELECT COALESCE(sum(duration_ms), 0) / 1000 FROM asked)::bigint AS ask_blocked_s,
+       (SELECT count(*) FROM asked WHERE ended_at IS NULL) AS ask_open,
+       (SELECT count(*) FROM asked WHERE ended_at IS NOT NULL AND duration_ms IS NULL) AS ask_untimed;
 """
 )
 
@@ -608,7 +610,9 @@ GROUP BY 1 ORDER BY 1;
 """
 
 # Tool failures that matter to the run: shell calls that timed out in a lane, and every denial by
-# its class. A shell tool is Claude's Bash, pi's bash or Codex's command tools.
+# its class. A shell tool is Claude's Bash, pi's bash or Codex's command tools. Only the Claude
+# parser records a timeout or a denial, so the sessions' harnesses come back too, as 'agent' rows
+# labelled root:<agent> or lane:<agent>, for the block to say where a count is not recorded.
 USAGE_TOOLS_SQL = (
     "WITH "
     + USAGE_SCOPE
@@ -625,6 +629,11 @@ WHERE role <> 'root' AND tool_name IN ('Bash', 'bash', 'exec_command', 'shell', 
 UNION ALL
 SELECT 'denial', COALESCE(denial_kind, 'denied'), count(*) FROM tools
 WHERE denial_kind IS NOT NULL OR outcome = 'denied'
+GROUP BY 2
+UNION ALL
+SELECT 'agent', m.role_kind || ':' || s.agent, count(DISTINCT m.session_id)
+FROM (SELECT session_id, CASE WHEN role = 'root' THEN 'root' ELSE 'lane' END AS role_kind FROM members) m
+JOIN ah.session s ON s.id = m.session_id
 GROUP BY 2
 ORDER BY 1, 3 DESC, 2;
 """
@@ -682,29 +691,50 @@ def read_ledger(report_path: str) -> dict | None:
     return {"too_large": False, "events": events, "unreadable": unreadable}
 
 
+def _issue(value: object) -> str | None:
+    """An issue as the block counts it: `5` and `#5` are one."""
+    if value is None or isinstance(value, (bool, dict, list)):
+        return None
+    text = str(value).strip().removeprefix("#").strip()
+    return text or None
+
+
+def _seconds(value: object) -> int | None:
+    """A slot time, or None for anything that is not a finite number."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return int(value)
+
+
 def ledger_landings(events: list[dict]) -> list[dict]:
-    """One row per landing, in first-seen order: a landing is its pull request, or its head in
-    direct mode, and its state is its last event. It landed when a `merged` or `verified` event
-    exists; its issues are every issue its events name."""
-    landings: dict[tuple[str, str], dict] = {}
+    """One row per landing, in first-seen order. A landing is a pull request and the head it was
+    landed from (the ledger has no repository key, so the pair is the most it can tell apart), or
+    the head alone in direct mode; its state is its last event. It landed when a `merged` or
+    `verified` event exists, and its issues are the ones those events name."""
+    landings: dict[tuple[str, ...], dict] = {}
     for event in events:
+        head = str(event["head"]) if event["head"] else ""
         if event["pr"] is not None:
-            key = ("pr", str(event["pr"]))
-        elif event["head"]:
-            key = ("head", str(event["head"]))
+            key = ("pr", str(event["pr"]), head)
+        elif head:
+            key = ("head", head)
         else:
             continue
         row = landings.setdefault(
             key, {"key": key, "landed": False, "issues": [], "fix_forward": False, "slot_seconds": None}
         )
         row["outcome"] = event["outcome"]
-        row["landed"] = row["landed"] or event["event"] in ("merged", "verified")
         row["fix_forward"] = row["fix_forward"] or bool(event["fix_forward"])
-        if isinstance(event["slot_seconds"], (int, float)) and not isinstance(event["slot_seconds"], bool):
-            row["slot_seconds"] = int(event["slot_seconds"])
-        for issue in event["issues"] if isinstance(event["issues"], list) else []:
-            if str(issue) not in row["issues"]:
-                row["issues"].append(str(issue))
+        slot = _seconds(event["slot_seconds"])
+        if slot is not None:
+            row["slot_seconds"] = slot
+        if event["event"] in ("merged", "verified"):
+            row["landed"] = True
+            for issue in event["issues"] if isinstance(event["issues"], list) else []:
+                if (name := _issue(issue)) is not None and name not in row["issues"]:
+                    row["issues"].append(name)
     return list(landings.values())
 
 
@@ -728,6 +758,15 @@ def _count(row: dict[str, str], key: str) -> int | None:
     return int(value) if value not in (None, "") else None
 
 
+# The parsers that record a tool timeout or a denial, and those that record an owner question tool.
+RECORDS_TIMEOUTS = {"claude"}
+RECORDS_QUESTIONS = {"claude", "codex"}
+
+
+def _agents(labels: list[str]) -> set[str]:
+    return {label.partition(":")[2] if ":" in label else label for label in labels if label}
+
+
 def usage_detail_lines(
     summary: dict[str, str], rows: list[dict[str, str]], runs: int, detail: dict
 ) -> tuple[list[str], list[str]]:
@@ -739,22 +778,46 @@ def usage_detail_lines(
     landings = ledger_landings(ledger["events"]) if ledger else []
     landed_rows = [x for x in landings if x["landed"]]
     closeout_landed, parked = _count(summary, "landed"), _count(summary, "parked")
-    if landed_rows:
+    # The ledger's issues stand in for the closeout's count only when every landing names some.
+    if landed_rows and all(x["issues"] for x in landed_rows):
         landed, landed_from = len({i for x in landed_rows for i in x["issues"]}), "the ledger"
     else:
         landed, landed_from = closeout_landed, "the closeout"
     harness = summary.get("harness") or "unknown"
-    version = summary.get("harness_version")
     if not landings:
         mode = "unknown"
     else:
         mode = "pull request" if any(x["key"][0] == "pr" for x in landings) else "direct"
     root_calls = sum(int(r["calls"]) for r in rows if r["role"] == "root")
     peak = _count(root, "peak_context")
-    typed, untyped = _count(root, "compactions_typed") or 0, _count(root, "compactions_untyped") or 0
+    untyped = _count(root, "compactions_untyped") or 0
+    typed = "unknown" if untyped else f"{_count(root, 'compactions_typed') or 0:,}"
+    marks = [r["label"] for r in detail["tools"] if r["kind"] == "agent"]
+    lane_agents = _agents([m for m in marks if m.startswith("lane:")])
+    session_agents = _agents(marks)
     timeouts = sum(int(r["n"]) for r in detail["tools"] if r["kind"] == "timeout")
+    blind = sorted(lane_agents - RECORDS_TIMEOUTS)
+    if blind and not lane_agents & RECORDS_TIMEOUTS:
+        timeout_text = f"unknown (not recorded for {', '.join(blind)} lanes)"
+    elif blind:
+        timeout_text = f"{timeouts:,} (not recorded for {', '.join(blind)} lanes)"
+    else:
+        timeout_text = f"{timeouts:,}"
+    root_agents = _agents(summary.get("root_agents", "").split(","))
+    no_question = sorted(root_agents - RECORDS_QUESTIONS)
+    if not root_agents or not root_agents & RECORDS_QUESTIONS:
+        ask_text = f"unknown (no question tool recorded{' for ' + ', '.join(no_question) if no_question else ''})"
+    else:
+        notes = [f"blocked {(_count(root, 'ask_blocked_s') or 0) / 3600:.2f} hours"]
+        if _count(root, "ask_open"):
+            notes.append(f"{_count(root, 'ask_open'):,} still open at closeout")
+        if _count(root, "ask_untimed"):
+            notes.append(f"{_count(root, 'ask_untimed'):,} with no duration recorded")
+        if no_question:
+            notes.append(f"not recorded for {', '.join(no_question)}")
+        ask_text = f"{_count(root, 'ask_calls') or 0:,} ({', '.join(notes)})"
     bullets = [
-        f"- Harness: {harness}" + (f" {version}" if version else ""),
+        f"- Harness: {harness}",
         f"- Landing mode: {mode}" + (" (from the ledger)" if landings else ""),
         "- Plugin and agent-docs versions: not recorded in the catalogue",
         f"- Landed: {'unknown' if landed is None else f'{_tasks(landed)} (from {landed_from})'}",
@@ -763,34 +826,57 @@ def usage_detail_lines(
         "- Root calls per landed task: "
         + (f"{root_calls / landed:,.1f}" if landed else "unknown (no landed tasks counted)"),
         f"- Peak root context: {'unknown' if peak is None else f'{peak:,} tokens'}",
-        f"- Compactions: {_count(root, 'compactions') or 0:,} ({typed:,} typed by the owner"
+        f"- Compactions: {_count(root, 'compactions') or 0:,} (typed by the owner: {typed}"
         + (f", {untyped:,} with no trigger recorded" if untyped else "")
         + ")",
-        f"- Root question-tool calls: {_count(root, 'ask_calls') or 0:,} "
-        f"(blocked {(_count(root, 'ask_blocked_s') or 0) / 3600:.2f} hours)",
-        f"- Lane Bash timeouts: {timeouts:,}",
+        f"- Root question-tool calls: {ask_text}",
+        f"- Lane Bash timeouts: {timeout_text}",
     ]
+    missing_denials = sorted(session_agents - RECORDS_TIMEOUTS)
+    if missing_denials:
+        bullets.append(
+            "- Denials by class: "
+            + ("not recorded" if not session_agents & RECORDS_TIMEOUTS else "claude sessions only")
+            + f" (not recorded for {', '.join(missing_denials)})"
+        )
     if ledger and ledger["too_large"]:
         bullets.append("- Landing ledger: too large to read")
     elif ledger:
         span = int(summary.get("wall_s") or 0)
         per_hour = f"{len(landed_rows) * 3600 / span:,.2f}" if span else "unknown"
-        bullets.append(f"- Landings per hour: {per_hour} ({len(landed_rows):,} landings in {_duration(span)})")
+        count = len(landed_rows)
+        bullets.append(
+            f"- Landings per hour: {per_hour} ({count:,} landing{'' if count == 1 else 's'} in {_duration(span)})"
+        )
         fixes = sum(1 for x in landings if x["fix_forward"])
         if fixes:
             bullets.append(f"- Fix-forward landings: {fixes:,}")
         if ledger["unreadable"]:
             bullets.append(f"- Landing ledger lines that were not events: {ledger['unreadable']:,}")
     cost: dict[str, Decimal] = {}
+    calls: dict[str, int] = {}
+    unpriced: dict[str, int] = {}
     for r in rows:
         cost[r["role"]] = cost.get(r["role"], Decimal(0)) + (Decimal(r["cost"]) if r["cost"] else Decimal(0))
+        calls[r["role"]] = calls.get(r["role"], 0) + int(r["calls"])
+        unpriced[r["role"]] = unpriced.get(r["role"], 0) + int(r["unpriced"])
     total = sum(cost.values(), Decimal(0))
     tables: list[list[str]] = []
     if rows:
-        spend = ["| Role | Cost | Share of cost |", "| --- | ---: | ---: |"]
+        # A role with an unpriced call is flagged: its figure is a floor, and every share is of
+        # the priced cost only.
+        flagged = any(unpriced.values())
+        spend = ["| Role | Cost | Share of priced cost |" if flagged else "| Role | Cost | Share of cost |"]
+        spend.append("| --- | ---: | ---: |")
         for role, value in sorted(cost.items(), key=lambda item: (item[0] != "root", -item[1], item[0])):
             share = f"{value / total:.1%}" if total else "n/a"
-            spend.append(f"| {_cell(role)} | ${value:,.2f} | {share} |")
+            if unpriced[role] == calls[role]:
+                figures = ["unpriced", "unpriced"]
+            elif unpriced[role]:
+                figures = [f"${value:,.2f} (partial)", f"{share} (partial)"]
+            else:
+                figures = [f"${value:,.2f}", share]
+            spend.append(f"| {_cell(role)} | {figures[0]} | {figures[1]} |")
         tables.append(spend)
     if detail["lanes"]:
         lanes = ["| Lane role | Lanes | Complete | Complete rate |", "| --- | ---: | ---: | ---: |"]
@@ -806,8 +892,10 @@ def usage_detail_lines(
     if landings:
         table = ["| Landing | Outcome | Slot time |", "| --- | --- | ---: |"]
         for x in landings:
-            kind, ident = x["key"]
-            label = f"PR {ident}" if kind == "pr" else f"direct {ident[:12]}"
+            if x["key"][0] == "pr":
+                label = f"PR {x['key'][1]}" + (f" ({x['key'][2][:7]})" if x["key"][2] else "")
+            else:
+                label = f"direct {x['key'][1][:12]}"
             table.append(f"| {_cell(label)} | {_cell(x.get('outcome'))} | {_slot(x['slot_seconds'])} |")
         tables.append(table)
     return bullets, [line for table in tables for line in ["", *table]]
