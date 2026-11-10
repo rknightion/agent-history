@@ -36,15 +36,18 @@ printed one in a command's output, the secret is in the catalogue.
   success. Labels never contain response bodies, status text, URLs or input text. Existing embed
   metric names, labels and help text are unchanged.
 - `ah.embed_failure` holds inputs whose latest embedding attempt failed and that have no vector
-  yet. Its lifecycle, at the start of every embed run and in every successful batch:
+  yet. Its lifecycle, in every successful batch and once at the end of every embed run:
   - A row whose input now has a vector is deleted unconditionally, even while vector GC would
     skip: a vector proves the input no longer fails, whatever state `ah.chunk` is in. A successful
     batch deletes its own rows at once.
   - A row that no chunk references and that no retry has touched for a day is an orphan and is
-    deleted, but only when vector GC's reset guards allow it (`gc_skip_reason` without its backlog
+    deleted, but only when vector GC's guards allow it (`gc_skip_reason`, including its backlog
     test): never while a rebuild is in progress or while `chunks_reset_at` is missing, unparseable
-    or under 7 days old, because an emptied `ah.chunk` makes every row look orphaned. The skip is
-    logged with its reason.
+    or under 7 days old, because an emptied `ah.chunk` makes every row look orphaned. The prune
+    runs after the embed pass and skips with `backlog_pending` unless the pass drained the backlog
+    (a pass stopped by a token cap, a stop request or a no-progress break did not), so a capped
+    input still awaiting its re-chunk keeps its attempt count however slow the refill. The skip
+    is logged with its reason.
   - A permanently failed input stays while its chunk references it.
   Both `agent_history_embed_failed_inputs` publications count every remaining row.
 - Metric families are published only over OTLP, by the periodic indexer's metric collection
