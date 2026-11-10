@@ -15,6 +15,7 @@ import re
 import shlex
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import threading
@@ -510,13 +511,22 @@ SELECT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS as_of,
        EXTRACT(EPOCH FROM (max(CASE WHEN live.status = 'finished' AND l.end_ts IS NOT NULL
                                     THEN l.end_ts ELSE now() END) - min(l.launch_ts)))::bigint AS wall_s,
        (SELECT count(*) FROM ah.session s WHERE s.loop_run_id = ANY({ids})
-          AND s.loop_link_method = 'heuristic') AS heuristic_sessions
+          AND s.loop_link_method = 'heuristic') AS heuristic_sessions,
+       max(live.tasks_landed) AS landed,
+       max(live.parks_total) AS parked,
+       max(l.report_path) AS report_path,
+       min(rs.agent) AS harness,
+       max(rs.cli_version_last) AS harness_version
 FROM ah.loop_run l LEFT JOIN ah.loops live USING (launch_uid)
+LEFT JOIN ah.session rs ON rs.id = l.root_session_id
 WHERE l.id = ANY({ids});
 """
 
-USAGE_ROWS_SQL = """
-WITH runs AS (
+# The runs of one closeout and every session that belongs to them. A run's own root session is
+# read inside its launch window; a relaunch session counts as root; every other linked session
+# takes its lane role. Shared by every usage query below.
+USAGE_SCOPE = """
+runs AS (
     -- An unfinished run's end_ts is only its last observed root event: leave the window open.
     SELECT l.id, l.root_session_id, l.launch_ts, CASE WHEN live.status = 'finished' THEN l.end_ts END AS end_ts
     FROM ah.loop_run l LEFT JOIN ah.loops live USING (launch_uid) WHERE l.id = ANY({ids})
@@ -528,7 +538,15 @@ WITH runs AS (
                       ELSE COALESCE(NULLIF(ln.role, ''), 'unattributed') END, false, r.launch_ts, r.end_ts
     FROM runs r JOIN ah.session s ON s.loop_run_id = r.id AND s.id <> r.root_session_id
     LEFT JOIN ah.lane ln ON ln.loop_run_id = r.id AND ln.session_id = s.id
-), calls AS (
+)
+"""
+
+# Scope as ah.v_loop_summary: root calls inside each launch window, linked sessions whole.
+# Prices as ah.v_session_cost: one ah.priced_usd per model and day. Relaunch sessions are root.
+USAGE_ROWS_SQL = (
+    "WITH "
+    + USAGE_SCOPE
+    + """, calls AS (
     SELECT DISTINCT ON (c.id) c.id, m.role, c.model, c.ts, c.input_uncached, c.cache_read,
            c.cache_write_5m, c.cache_write_1h, c.output
     FROM members m JOIN ah.llm_call c ON c.session_id = m.session_id
@@ -545,6 +563,72 @@ SELECT role, COALESCE(model, '(unknown)') AS model, sum(calls) AS calls, sum(cos
 FROM priced GROUP BY 1, 2
 ORDER BY role <> 'root', role, sum(cost) DESC NULLS LAST, model;
 """
+)
+
+# The root's own numbers: the largest context any root call carried, its compactions (a Claude
+# compaction records whether the owner typed it; Codex and pi record no trigger) and the owner
+# question tool with the time the root spent waiting on it.
+USAGE_ROOT_SQL = (
+    "WITH "
+    + USAGE_SCOPE
+    + """, roots AS (
+    SELECT * FROM members WHERE role = 'root'
+), peak AS (
+    SELECT max(c.context_tokens) AS peak_context
+    FROM roots m JOIN ah.llm_call c ON c.session_id = m.session_id
+    WHERE NOT m.windowed OR (c.ts >= m.launch_ts AND c.ts < COALESCE(m.end_ts, 'infinity'))
+), compacted AS (
+    SELECT k.id, k.trigger
+    FROM roots m JOIN ah.compaction k ON k.session_id = m.session_id
+    WHERE NOT m.windowed OR (k.ts >= m.launch_ts AND k.ts < COALESCE(m.end_ts, 'infinity'))
+    GROUP BY k.id, k.trigger
+), asked AS (
+    SELECT t.id, t.duration_ms
+    FROM roots m JOIN ah.tool_call t ON t.session_id = m.session_id
+    WHERE t.tool_name = 'AskUserQuestion'
+      AND (NOT m.windowed OR (COALESCE(t.started_at, t.ended_at) >= m.launch_ts
+                              AND COALESCE(t.started_at, t.ended_at) < COALESCE(m.end_ts, 'infinity')))
+    GROUP BY t.id, t.duration_ms
+)
+SELECT (SELECT peak_context FROM peak) AS peak_context,
+       (SELECT count(*) FROM compacted) AS compactions,
+       (SELECT count(*) FROM compacted WHERE trigger = 'manual') AS compactions_typed,
+       (SELECT count(*) FROM compacted WHERE trigger IS NULL) AS compactions_untyped,
+       (SELECT count(*) FROM asked) AS ask_calls,
+       (SELECT COALESCE(sum(duration_ms), 0) / 1000 FROM asked)::bigint AS ask_blocked_s;
+"""
+)
+
+# Lanes by role, and how many of them handed back a complete return.
+USAGE_LANES_SQL = """
+SELECT COALESCE(NULLIF(ln.role, ''), 'unattributed') AS role, count(*) AS lanes,
+       count(*) FILTER (WHERE ln.return_status = 'complete') AS complete
+FROM ah.lane ln WHERE ln.loop_run_id = ANY({ids})
+GROUP BY 1 ORDER BY 1;
+"""
+
+# Tool failures that matter to the run: shell calls that timed out in a lane, and every denial by
+# its class. A shell tool is Claude's Bash, pi's bash or Codex's command tools.
+USAGE_TOOLS_SQL = (
+    "WITH "
+    + USAGE_SCOPE
+    + """, tools AS (
+    SELECT DISTINCT ON (t.id) t.id, m.role, t.tool_name, t.timed_out, t.outcome, t.denial_kind
+    FROM members m JOIN ah.tool_call t ON t.session_id = m.session_id
+    WHERE NOT m.windowed OR (COALESCE(t.started_at, t.ended_at) >= m.launch_ts
+                             AND COALESCE(t.started_at, t.ended_at) < COALESCE(m.end_ts, 'infinity'))
+    ORDER BY t.id, m.role
+)
+SELECT 'timeout' AS kind, '' AS label, count(*) AS n FROM tools
+WHERE role <> 'root' AND tool_name IN ('Bash', 'bash', 'exec_command', 'shell', 'local_shell')
+  AND (COALESCE(timed_out, false) OR outcome = 'timeout')
+UNION ALL
+SELECT 'denial', COALESCE(denial_kind, 'denied'), count(*) FROM tools
+WHERE denial_kind IS NOT NULL OR outcome = 'denied'
+GROUP BY 2
+ORDER BY 1, 3 DESC, 2;
+"""
+)
 
 
 def _duration(seconds: int) -> str:
@@ -554,8 +638,184 @@ def _duration(seconds: int) -> str:
     return f"{days}d {text}" if days else text
 
 
-def usage_markdown(summary: dict[str, str], rows: list[dict[str, str]], runs: int) -> str:
-    """The closeout Notes block: totals and a role/model table, no prompt text or lane names."""
+CLOSEOUT_NAME = re.compile(r"closeout-[\w.-]*-loop([0-9]+)\.md")
+MAX_LEDGER_BYTES = 4 * 1024 * 1024
+LEDGER_KEPT = ("event", "outcome", "pr", "head", "issues", "fix_forward", "slot_seconds")
+
+
+def read_ledger(report_path: str) -> dict | None:
+    """The landing ledger beside a closeout on this machine, or None when there is none.
+
+    A closeout `<dir>/closeout-<date>-loop<N>.md` keeps its run files in `<dir>/loop<N>/`, and the
+    ledger is `landings.jsonl` there. Only a regular file is read, at most MAX_LEDGER_BYTES of it.
+    Returns the landing events (the keys the block uses) and the count of lines that were not
+    events; `too_large` replaces both when the file is over the bound.
+    """
+    name = CLOSEOUT_NAME.fullmatch(os.path.basename(report_path or ""))
+    if name is None:
+        return None
+    path = Path(report_path).parent / f"loop{name[1]}" / "landings.jsonl"
+    try:
+        info = path.lstat()
+    except OSError:
+        return None
+    if not stat.S_ISREG(info.st_mode):
+        return None
+    if info.st_size > MAX_LEDGER_BYTES:
+        return {"too_large": True, "events": [], "unreadable": 0}
+    events, unreadable = [], 0
+    try:
+        text = path.read_bytes().decode("utf-8", errors="replace")
+    except OSError:
+        return None
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except ValueError:
+            event = None
+        if not isinstance(event, dict) or not isinstance(event.get("event"), str):
+            unreadable += 1
+        elif event["event"] != "closeout-check":
+            events.append({key: event.get(key) for key in LEDGER_KEPT})
+    return {"too_large": False, "events": events, "unreadable": unreadable}
+
+
+def ledger_landings(events: list[dict]) -> list[dict]:
+    """One row per landing, in first-seen order: a landing is its pull request, or its head in
+    direct mode, and its state is its last event. It landed when a `merged` or `verified` event
+    exists; its issues are every issue its events name."""
+    landings: dict[tuple[str, str], dict] = {}
+    for event in events:
+        if event["pr"] is not None:
+            key = ("pr", str(event["pr"]))
+        elif event["head"]:
+            key = ("head", str(event["head"]))
+        else:
+            continue
+        row = landings.setdefault(
+            key, {"key": key, "landed": False, "issues": [], "fix_forward": False, "slot_seconds": None}
+        )
+        row["outcome"] = event["outcome"]
+        row["landed"] = row["landed"] or event["event"] in ("merged", "verified")
+        row["fix_forward"] = row["fix_forward"] or bool(event["fix_forward"])
+        if isinstance(event["slot_seconds"], (int, float)) and not isinstance(event["slot_seconds"], bool):
+            row["slot_seconds"] = int(event["slot_seconds"])
+        for issue in event["issues"] if isinstance(event["issues"], list) else []:
+            if str(issue) not in row["issues"]:
+                row["issues"].append(str(issue))
+    return list(landings.values())
+
+
+def _cell(value: object, width: int = 40) -> str:
+    return re.sub(r"\s+", " ", str(value)).strip()[:width].replace("|", "\\|") or "-"
+
+
+def _slot(seconds: int | None) -> str:
+    if seconds is None:
+        return "-"
+    minutes, rest = divmod(max(0, seconds), 60)
+    return f"{minutes}m {rest:02d}s" if minutes else f"{rest}s"
+
+
+def _tasks(n: int) -> str:
+    return f"{n:,} task" + ("" if n == 1 else "s")
+
+
+def _count(row: dict[str, str], key: str) -> int | None:
+    value = row.get(key)
+    return int(value) if value not in (None, "") else None
+
+
+def usage_detail_lines(
+    summary: dict[str, str], rows: list[dict[str, str]], runs: int, detail: dict
+) -> tuple[list[str], list[str]]:
+    """(bullets, tables) for the v4 numbers. A number the catalogue could not supply prints as
+    unknown, never as zero."""
+    from decimal import Decimal
+
+    root, ledger = detail["root"], detail.get("ledger")
+    landings = ledger_landings(ledger["events"]) if ledger else []
+    landed_rows = [x for x in landings if x["landed"]]
+    closeout_landed, parked = _count(summary, "landed"), _count(summary, "parked")
+    if landed_rows:
+        landed, landed_from = len({i for x in landed_rows for i in x["issues"]}), "the ledger"
+    else:
+        landed, landed_from = closeout_landed, "the closeout"
+    harness = summary.get("harness") or "unknown"
+    version = summary.get("harness_version")
+    if not landings:
+        mode = "unknown"
+    else:
+        mode = "pull request" if any(x["key"][0] == "pr" for x in landings) else "direct"
+    root_calls = sum(int(r["calls"]) for r in rows if r["role"] == "root")
+    peak = _count(root, "peak_context")
+    typed, untyped = _count(root, "compactions_typed") or 0, _count(root, "compactions_untyped") or 0
+    timeouts = sum(int(r["n"]) for r in detail["tools"] if r["kind"] == "timeout")
+    bullets = [
+        f"- Harness: {harness}" + (f" {version}" if version else ""),
+        f"- Landing mode: {mode}" + (" (from the ledger)" if landings else ""),
+        "- Plugin and agent-docs versions: not recorded in the catalogue",
+        f"- Landed: {'unknown' if landed is None else f'{_tasks(landed)} (from {landed_from})'}",
+        f"- Parked: {'unknown' if parked is None else f'{_tasks(parked)} (from the closeout)'}",
+        f"- Root calls: {root_calls:,}",
+        "- Root calls per landed task: "
+        + (f"{root_calls / landed:,.1f}" if landed else "unknown (no landed tasks counted)"),
+        f"- Peak root context: {'unknown' if peak is None else f'{peak:,} tokens'}",
+        f"- Compactions: {_count(root, 'compactions') or 0:,} ({typed:,} typed by the owner"
+        + (f", {untyped:,} with no trigger recorded" if untyped else "")
+        + ")",
+        f"- Root question-tool calls: {_count(root, 'ask_calls') or 0:,} "
+        f"(blocked {(_count(root, 'ask_blocked_s') or 0) / 3600:.2f} hours)",
+        f"- Lane Bash timeouts: {timeouts:,}",
+    ]
+    if ledger and ledger["too_large"]:
+        bullets.append("- Landing ledger: too large to read")
+    elif ledger:
+        span = int(summary.get("wall_s") or 0)
+        per_hour = f"{len(landed_rows) * 3600 / span:,.2f}" if span else "unknown"
+        bullets.append(f"- Landings per hour: {per_hour} ({len(landed_rows):,} landings in {_duration(span)})")
+        fixes = sum(1 for x in landings if x["fix_forward"])
+        if fixes:
+            bullets.append(f"- Fix-forward landings: {fixes:,}")
+        if ledger["unreadable"]:
+            bullets.append(f"- Landing ledger lines that were not events: {ledger['unreadable']:,}")
+    cost: dict[str, Decimal] = {}
+    for r in rows:
+        cost[r["role"]] = cost.get(r["role"], Decimal(0)) + (Decimal(r["cost"]) if r["cost"] else Decimal(0))
+    total = sum(cost.values(), Decimal(0))
+    tables: list[list[str]] = []
+    if rows:
+        spend = ["| Role | Cost | Share of cost |", "| --- | ---: | ---: |"]
+        for role, value in sorted(cost.items(), key=lambda item: (item[0] != "root", -item[1], item[0])):
+            share = f"{value / total:.1%}" if total else "n/a"
+            spend.append(f"| {_cell(role)} | ${value:,.2f} | {share} |")
+        tables.append(spend)
+    if detail["lanes"]:
+        lanes = ["| Lane role | Lanes | Complete | Complete rate |", "| --- | ---: | ---: | ---: |"]
+        for r in detail["lanes"]:
+            n, done = int(r["lanes"]), int(r["complete"])
+            lanes.append(f"| {_cell(r['role'])} | {n:,} | {done:,} | {done / n:.0%} |")
+        tables.append(lanes)
+    denials = [r for r in detail["tools"] if r["kind"] == "denial"]
+    if denials:
+        table = ["| Denial class | Denials |", "| --- | ---: |"]
+        table += [f"| {_cell(r['label'])} | {int(r['n']):,} |" for r in denials]
+        tables.append(table)
+    if landings:
+        table = ["| Landing | Outcome | Slot time |", "| --- | --- | ---: |"]
+        for x in landings:
+            kind, ident = x["key"]
+            label = f"PR {ident}" if kind == "pr" else f"direct {ident[:12]}"
+            table.append(f"| {_cell(label)} | {_cell(x.get('outcome'))} | {_slot(x['slot_seconds'])} |")
+        tables.append(table)
+    return bullets, [line for table in tables for line in ["", *table]]
+
+
+def usage_markdown(summary: dict[str, str], rows: list[dict[str, str]], runs: int, detail: dict | None = None) -> str:
+    """The closeout Notes block: totals, the v4 numbers when `detail` is given, and a role/model
+    table, with no prompt text or lane names."""
     from decimal import Decimal
 
     calls = sum(int(r["calls"]) for r in rows)
@@ -575,19 +835,31 @@ def usage_markdown(summary: dict[str, str], rows: list[dict[str, str]], runs: in
     heuristic = int(summary.get("heuristic_sessions") or 0)
     if heuristic:
         lines.append(f"- Heuristic-linked sessions: {heuristic:,} (attributed by timing, not by an explicit link)")
+    more: list[str] = []
+    if detail is not None:
+        bullets, more = usage_detail_lines(summary, rows, runs, detail)
+        lines += bullets
     if rows:
         lines += ["", "| Role | Model | Calls | Cost |", "| --- | --- | ---: | ---: |"]
         for r in rows:
             priced = f"${Decimal(r['cost']):,.2f}" if r["cost"] else "unpriced"
             role, model = (r[k].replace("|", "\\|") for k in ("role", "model"))
             lines.append(f"| {role} | {model} | {int(r['calls']):,} | {priced} |")
-    return "\n".join(lines) + "\n"
+    return "\n".join(lines + more) + "\n"
 
 
 def loop_usage(ids: list[int]) -> str:
     array = loop_id_array(ids)
     (summary,) = query(USAGE_SUMMARY_SQL.format(ids=array), {})
-    return usage_markdown(summary, query(USAGE_ROWS_SQL.format(ids=array), {}), len(ids))
+    rows = query(USAGE_ROWS_SQL.format(ids=array), {})
+    (root,) = query(USAGE_ROOT_SQL.format(ids=array), {})
+    detail = {
+        "root": root,
+        "lanes": query(USAGE_LANES_SQL.format(ids=array), {}),
+        "tools": query(USAGE_TOOLS_SQL.format(ids=array), {}),
+        "ledger": read_ledger(summary.get("report_path") or ""),
+    }
+    return usage_markdown(summary, rows, len(ids), detail)
 
 
 def live_loops(repo: str | None, fmt: str) -> int:

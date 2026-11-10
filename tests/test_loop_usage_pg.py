@@ -96,8 +96,8 @@ def test_usage_block_for_a_relaunched_closeout(clean, monkeypatch, capsys):
         "- Unpriced calls: 1 (not in the cost total)",
         "- Heuristic-linked sessions: 1 (attributed by timing, not by an explicit link)",
     ]
-    assert lines[8:] == [
-        "",
+    at = lines.index("| Role | Model | Calls | Cost |")
+    assert lines[at - 1] == "" and lines[at : at + 6] == [
         "| Role | Model | Calls | Cost |",
         "| --- | --- | ---: | ---: |",
         f"| root | {PRICED} | 2 | $6.00 |",
@@ -121,3 +121,84 @@ def test_usage_block_for_a_relaunched_closeout(clean, monkeypatch, capsys):
     with pytest.raises(SystemExit) as raised:
         reader.main(["loop", "/synthetic/project/codex/closeout-other-loop1.md", "--usage"])
     assert str(raised.value.code).startswith("agent-history: no loop run has closeout path ")
+
+
+def test_usage_block_numbers_from_catalogue_rows(clean, monkeypatch, capsys):
+    db = clean
+    db.execute(
+        "INSERT INTO ah.model_pricing (model,effective_from,input_per_mtok,output_per_mtok) VALUES (%s,'2026-01-01',1,2)",
+        (PRICED,),
+    )
+    root = session(db, "synthetic-v4-root")
+    db.execute("UPDATE ah.session SET cli_version_last='2.1.4' WHERE id=%s", (root,))
+    run = launch(db, "usage:v4", root, AT, AT + timedelta(hours=2))
+    db.execute("UPDATE ah.loops SET tasks_landed=3, parks_total=1 WHERE launch_uid='usage:v4'")
+    # Root context: the larger call is 1,500 tokens; a call before the launch is not in the window.
+    call(db, root, "root-early", AT - timedelta(minutes=5))
+    call(db, root, "root-a", AT + timedelta(minutes=5))
+    call(db, root, "root-b", AT + timedelta(minutes=6))
+    db.execute("UPDATE ah.llm_call SET input_uncached=1200, cache_read=300 WHERE response_id='root-b'")
+    db.execute("UPDATE ah.llm_call SET input_uncached=800 WHERE response_id='root-a'")
+    db.execute("UPDATE ah.llm_call SET input_uncached=9000000 WHERE response_id='root-early'")
+    for n, (offset, trigger) in enumerate(((10, "manual"), (20, "auto"), (30, "auto"), (40, None), (-5, "manual"))):
+        db.execute(
+            "INSERT INTO ah.compaction (agent,event_uid,session_id,ts,trigger,source_id,byte_offset) "
+            "VALUES ('claude',%s,%s,%s,%s,0,%s)",
+            (f"synthetic-compaction-{n}", root, AT + timedelta(minutes=offset), trigger, n),
+        )
+    worker = session(db, "synthetic-v4-worker", loop_id=run, method="lineage")
+    reviewer = session(db, "synthetic-v4-reviewer", loop_id=run, method="lineage")
+    other = session(db, "synthetic-v4-other", loop_id=run, method="lineage")
+    for sid, name, role, status in (
+        (worker, "lane-a", "worker", "complete"),
+        (reviewer, "lane-b", "reviewer", "complete"),
+        (other, "lane-c", "worker", "failed"),
+    ):
+        db.execute(
+            "INSERT INTO ah.lane (loop_run_id,session_id,lane_name,role,link_method,return_status) "
+            "VALUES (%s,%s,%s,%s,'lineage',%s)",
+            (run, sid, name, role, status),
+        )
+    # (session, tool, outcome, timed_out, denial, duration_ms, minutes after the launch)
+    tools = [
+        (root, "AskUserQuestion", "ok", None, None, 1_800_000, 15),
+        (root, "AskUserQuestion", "ok", None, None, 3_600_000, 16),
+        (root, "AskUserQuestion", "ok", None, None, 60_000, -30),
+        (root, "Bash", "timeout", True, None, 1000, 17),
+        (worker, "Bash", "timeout", True, None, 1000, 18),
+        (worker, "Bash", "timeout", True, None, 1000, 19),
+        (worker, "Bash", "ok", False, None, 1000, 20),
+        (other, "bash", "timeout", True, None, 1000, 21),
+        (other, "Read", "timeout", True, None, 1000, 22),
+        (root, "Edit", "denied", None, "user-rejected", 10, 23),
+        (worker, "Bash", "denied", None, "user-rejected", 10, 24),
+        (worker, "Bash", "denied", None, "automode-blocked", 10, 25),
+        (worker, "Write", "denied", None, None, 10, 26),
+    ]
+    for n, (sid, name, outcome, timed_out, denial, ms, offset) in enumerate(tools):
+        db.execute(
+            "INSERT INTO ah.tool_call (agent,call_uid,session_id,tool_name,started_at,duration_ms,outcome,"
+            "timed_out,denial_kind,source_id,byte_offset) VALUES ('claude',%s,%s,%s,%s,%s,%s,%s,%s,0,%s)",
+            (f"synthetic-tool-{n}", sid, name, AT + timedelta(minutes=offset), ms, outcome, timed_out, denial, n),
+        )
+    db.commit()
+    monkeypatch.setenv("AGENT_HISTORY_READER_DSN", READER)
+    assert reader.main(["loop", CLOSEOUT, "--usage"]) == 0
+    out = capsys.readouterr().out
+    lines = out.splitlines()
+    assert "- Harness: claude 2.1.4" in lines
+    assert "- Landed: 3 tasks (from the closeout)" in lines and "- Parked: 1 task (from the closeout)" in lines
+    assert "- Root calls: 2" in lines
+    assert "- Root calls per landed task: 0.7" in lines
+    assert "- Peak root context: 1,500 tokens" in lines
+    # Two automatic and one typed compaction inside the window, one with no trigger; the early one is out.
+    assert "- Compactions: 4 (1 typed by the owner, 1 with no trigger recorded)" in lines
+    assert "- Root question-tool calls: 2 (blocked 1.50 hours)" in lines
+    # Lane shell timeouts only: not the root's, not a non-shell tool's.
+    assert "- Lane Bash timeouts: 3" in lines
+    at = lines.index("| Lane role | Lanes | Complete | Complete rate |")
+    assert lines[at + 2 : at + 4] == ["| reviewer | 1 | 1 | 100% |", "| worker | 2 | 1 | 50% |"]
+    at = lines.index("| Denial class | Denials |")
+    assert lines[at + 2 : at + 5] == ["| user-rejected | 2 |", "| automode-blocked | 1 |", "| denied | 1 |"]
+    assert "| Role | Cost | Share of cost |" in lines
+    assert "secret" not in out

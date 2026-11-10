@@ -215,6 +215,45 @@ def test_closeout_counts(body, expected):
     assert cm.closeout_counts(body) == expected
 
 
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        # Issue-number rows in a list and in a table count, in bold and code too; the second
+        # column of a row is a reference and a repeat is one entry.
+        (
+            "## Landed\n- #101 (first)\n- **#102** bold\n* `#103` code\n1. #104 numbered\n- #101 again\n"
+            "| #105 (table) | see #106 |\n## Parked\n- #201: needs the owner\n| #202 | owner |\n",
+            (5, 2),
+        ),
+        # Task IDs and issue numbers are counted together, as distinct entries.
+        ("## Landed\n- ABC-0001\n- #1\n- #1 repeated\n## Parked\n- ABC-0002\n- #2\n", (2, 2)),
+        # Prose, headings, links, longer digit runs and embedded hashes are not entries.
+        (
+            "## Landed\n#301 starts a line\n# 302\nNothing but #303 in prose.\n- see #304\n- [#305](u)\n"
+            "- #12345678 too long\n- #306x\n- ##307\n- a#308\n- #309.5\n- #\n- #-1\n",
+            (0, None),
+        ),
+        # A fenced block holds code, and a heading in another section ends the section.
+        ("## Landed\n```\n- #401\n```\n- #402\n## Notes\n- #403\n", (1, None)),
+    ],
+)
+def test_closeout_counts_issue_number_rows(body, expected):
+    assert cm.closeout_counts(body) == expected
+
+
+def test_charter_first_wave_ignores_issue_number_rows():
+    assert cm.charter_task_ids("## First wave\n- #11 (row)\n- APP-0001\n| #12 | x |\n") == ["APP-0001"]
+
+
+def test_collected_issue_number_counts_leave_only_as_integers(repo):
+    body = "## Landed\n- #101 (confidential title)\n- #102\n## Parked\n- #103\n"
+    write(repo, "closeout-project-loop12.md", f"{HEADER}\n{body}".encode())
+    row = next(cm.metadata(repo, "test-machine"))
+    assert (row["landed_count"], row["parked_count"]) == (2, 1)
+    assert row["task_ids"] is None
+    assert not any("confidential" in str(value) or "#10" in str(value) for value in row.values())
+
+
 def test_collected_closeout_counts_only_leave_as_integers(repo):
     body = "## Landed\n- ABC-0001 (confidential title)\n- ABC-0002\n## Parked\n- ABC-0003\n"
     write(repo, "closeout-project-loop12.md", f"{HEADER}\n{body}".encode())
