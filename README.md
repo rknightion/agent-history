@@ -398,8 +398,10 @@ tools for Claude and Codex, and owner-typed compactions only where the compactio
 Plugin and agent-docs versions are not recorded in the catalogue. When the closeout's run
 directory (`codex/loop<N>/` beside `codex/closeout-<date>-loop<N>.md`) is on the machine running
 the command and holds `landings.jsonl`, the block adds landings per hour, each landing's outcome
-and slot time, and takes the landed count from the ledger's issues; the file is read locally and
-never stored. Unpriced calls and heuristic-linked sessions are stated when non-zero. It prints
+and slot time, and takes the landed count from the ledger's issues when every landed landing names
+at least one issue (otherwise the closeout's count stands). A landing is its pull request within
+the run, as the landing tool keys it; the ledger has no repository key, so two repositories' pull
+requests with one number are not told apart. The file is read locally and never stored. Unpriced calls and heuristic-linked sessions are stated when non-zero. It prints
 no prompt text or lane names. An unknown id or path exits non-zero with a one-line reason. The catalogue lags the transcripts by an indexer pass, hence the timestamp.
 
 Private command add-ons can import `agent_history.reader.main(argv, register, dispatch)`.

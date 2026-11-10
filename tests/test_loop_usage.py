@@ -223,11 +223,11 @@ def test_timeouts_and_denials_are_not_recorded_for_codex_and_pi_sessions():
     codex = [r for r in TOOLS if r["kind"] != "agent"] + agents("root:codex", "lane:codex", "lane:pi")
     lines = detail_block(V4, tools=codex)
     assert "- Lane Bash timeouts: unknown (not recorded for codex, pi lanes)" in lines
-    assert "- Denials by class: not recorded (not recorded for codex, pi)" in lines
+    assert "- Denials by class: not recorded for codex, pi" in lines
     mixed = [r for r in TOOLS if r["kind"] != "agent"] + agents("root:claude", "lane:claude", "lane:pi")
     lines = detail_block(V4, tools=mixed)
     assert "- Lane Bash timeouts: 4 (not recorded for pi lanes)" in lines
-    assert "- Denials by class: claude sessions only (not recorded for pi)" in lines
+    assert "- Denials by class: recorded for claude sessions only, not for pi" in lines
     lines = detail_block(V4)
     assert not any(line.startswith("- Denials by class") for line in lines)
 
@@ -447,17 +447,51 @@ def test_one_landing_is_singular():
     assert "- Landings per hour: 0.25 (1 landing in 4h 0m)" in lines
 
 
-def test_the_same_pull_request_number_on_two_heads_is_two_landings():
-    """The ledger has no repository key: pull request and head together are the most it can tell apart."""
+def test_one_landing_is_one_row_whatever_head_its_events_carry():
+    """The landing tool keys a landing by its pull request. A failed verify writes an error event
+    with no head; a refusal carries the head it was asked about. Neither makes another landing."""
     lines = with_events(
-        {"event": "merged", "outcome": "merged", "pr": 7, "head": "aaaaaaaaaa", "issues": ["X-1"]},
-        {"event": "verified", "outcome": "landed", "pr": 7, "head": "aaaaaaaaaa", "slot_seconds": 60},
-        {"event": "merged", "outcome": "merged", "pr": 7, "head": "bbbbbbbbbb", "issues": ["X-2"]},
-        {"event": "abandoned", "outcome": "abandoned", "pr": 7, "head": "bbbbbbbbbb", "slot_seconds": 5},
+        {"event": "ready", "outcome": "go", "pr": 12, "head": "aaaaaaaaaa", "issues": ["X-1"]},
+        {"event": "merged", "outcome": "merged", "pr": 12, "head": "aaaaaaaaaa", "issues": ["X-1"]},
+        {"event": "error", "outcome": None, "pr": 12, "head": None},
     )
-    assert "| PR 7 (aaaaaaa) | landed | 1m 00s |" in lines
-    assert "| PR 7 (bbbbbbb) | abandoned | 5s |" in lines
-    assert "- Landed: 2 tasks (from the ledger)" in lines
+    rows = [line for line in lines if line.startswith("| PR ")]
+    assert rows == ["| PR 12 (aaaaaaa) | error | - |"]
+    assert "- Landings per hour: 0.25 (1 landing in 4h 0m)" in lines
+
+
+def test_fix_forward_counts_once_per_landed_landing_and_shows_the_latest_head():
+    lines = with_events(
+        {"event": "refused", "outcome": "stale-head", "pr": 12, "head": "oldoldold", "fix_forward": "main is red"},
+        {"event": "ready", "outcome": "go", "pr": 12, "head": "newnewnew", "fix_forward": "main is red"},
+        {"event": "merged", "outcome": "merged", "pr": 12, "head": "newnewnew", "issues": ["X-1"], "fix_forward": "r"},
+        {
+            "event": "verified",
+            "outcome": "landed",
+            "pr": 12,
+            "head": "newnewnew",
+            "fix_forward": "r",
+            "slot_seconds": 9,
+        },
+        # A fix-forward refusal that never merged is not a fix-forward landing.
+        {"event": "refused", "outcome": "held", "pr": 13, "head": "ccccccccc", "fix_forward": "main is red"},
+    )
+    assert "- Fix-forward landings: 1" in lines
+    assert [line for line in lines if line.startswith("| PR ")] == [
+        "| PR 12 (newnewn) | landed | 9s |",
+        "| PR 13 (ccccccc) | held | - |",
+    ]
+    assert not any(
+        line.startswith("- Fix-forward")
+        for line in with_events(
+            {"event": "refused", "outcome": "held", "pr": 13, "head": "c", "fix_forward": "main is red"}
+        )
+    )
+
+
+def test_a_last_event_without_an_outcome_shows_the_event_name():
+    lines = with_events({"event": "merged", "outcome": None, "pr": 3, "head": "dddddddd", "issues": ["X-1"]})
+    assert "| PR 3 (ddddddd) | merged | - |" in lines
 
 
 def test_a_slot_time_that_is_not_a_finite_number_is_not_shown(tmp_path):

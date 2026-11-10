@@ -514,11 +514,14 @@ SELECT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS as_of,
        max(live.tasks_landed) AS landed,
        max(live.parks_total) AS parked,
        max(l.report_path) AS report_path,
-       string_agg(DISTINCT rs.agent, ',' ORDER BY rs.agent) AS root_agents,
-       string_agg(DISTINCT rs.agent || COALESCE(' ' || rs.cli_version_last, ''), ', '
-                  ORDER BY rs.agent || COALESCE(' ' || rs.cli_version_last, '')) AS harness
+       (SELECT string_agg(DISTINCT x.agent, ',' ORDER BY x.agent) FROM ah.session x
+        WHERE x.id IN (SELECT root_session_id FROM ah.loop_run WHERE id = ANY({ids}))
+           OR (x.loop_run_id = ANY({ids}) AND x.loop_link_method = 'relaunch')) AS root_agents,
+       (SELECT string_agg(DISTINCT x.agent || COALESCE(' ' || x.cli_version_last, ''), ', '
+                          ORDER BY x.agent || COALESCE(' ' || x.cli_version_last, '')) FROM ah.session x
+        WHERE x.id IN (SELECT root_session_id FROM ah.loop_run WHERE id = ANY({ids}))
+           OR (x.loop_run_id = ANY({ids}) AND x.loop_link_method = 'relaunch')) AS harness
 FROM ah.loop_run l LEFT JOIN ah.loops live USING (launch_uid)
-LEFT JOIN ah.session rs ON rs.id = l.root_session_id
 WHERE l.id = ANY({ids});
 """
 
@@ -709,29 +712,32 @@ def _seconds(value: object) -> int | None:
 
 
 def ledger_landings(events: list[dict]) -> list[dict]:
-    """One row per landing, in first-seen order. A landing is a pull request and the head it was
-    landed from (the ledger has no repository key, so the pair is the most it can tell apart), or
-    the head alone in direct mode; its state is its last event. It landed when a `merged` or
-    `verified` event exists, and its issues are the ones those events name."""
-    landings: dict[tuple[str, ...], dict] = {}
+    """One row per landing, in first-seen order. A landing is its pull request within the run, as
+    the landing tool keys it, or its head in direct mode where there is no pull request. Its state
+    is its last event and its head the latest one any event carried (a refusal can carry an old
+    head and an error none). It landed when a `merged` or `verified` event exists, and its issues
+    are the ones those events name. The ledger has no repository key, so pull requests of two
+    repositories with one number are not told apart."""
+    landings: dict[tuple[str, str], dict] = {}
     for event in events:
         head = str(event["head"]) if event["head"] else ""
         if event["pr"] is not None:
-            key = ("pr", str(event["pr"]), head)
+            key = ("pr", str(event["pr"]))
         elif head:
             key = ("head", head)
         else:
             continue
         row = landings.setdefault(
-            key, {"key": key, "landed": False, "issues": [], "fix_forward": False, "slot_seconds": None}
+            key, {"key": key, "head": "", "landed": False, "issues": [], "fix_forward": False, "slot_seconds": None}
         )
-        row["outcome"] = event["outcome"]
-        row["fix_forward"] = row["fix_forward"] or bool(event["fix_forward"])
+        row["outcome"] = event["outcome"] if event["outcome"] is not None else event["event"]
+        row["head"] = head or row["head"]
         slot = _seconds(event["slot_seconds"])
         if slot is not None:
             row["slot_seconds"] = slot
         if event["event"] in ("merged", "verified"):
             row["landed"] = True
+            row["fix_forward"] = row["fix_forward"] or bool(event["fix_forward"])
             for issue in event["issues"] if isinstance(event["issues"], list) else []:
                 if (name := _issue(issue)) is not None and name not in row["issues"]:
                     row["issues"].append(name)
@@ -833,12 +839,10 @@ def usage_detail_lines(
         f"- Lane Bash timeouts: {timeout_text}",
     ]
     missing_denials = sorted(session_agents - RECORDS_TIMEOUTS)
-    if missing_denials:
-        bullets.append(
-            "- Denials by class: "
-            + ("not recorded" if not session_agents & RECORDS_TIMEOUTS else "claude sessions only")
-            + f" (not recorded for {', '.join(missing_denials)})"
-        )
+    if missing_denials and not session_agents & RECORDS_TIMEOUTS:
+        bullets.append(f"- Denials by class: not recorded for {', '.join(missing_denials)}")
+    elif missing_denials:
+        bullets.append(f"- Denials by class: recorded for claude sessions only, not for {', '.join(missing_denials)}")
     if ledger and ledger["too_large"]:
         bullets.append("- Landing ledger: too large to read")
     elif ledger:
@@ -848,7 +852,7 @@ def usage_detail_lines(
         bullets.append(
             f"- Landings per hour: {per_hour} ({count:,} landing{'' if count == 1 else 's'} in {_duration(span)})"
         )
-        fixes = sum(1 for x in landings if x["fix_forward"])
+        fixes = sum(1 for x in landed_rows if x["fix_forward"])
         if fixes:
             bullets.append(f"- Fix-forward landings: {fixes:,}")
         if ledger["unreadable"]:
@@ -893,7 +897,7 @@ def usage_detail_lines(
         table = ["| Landing | Outcome | Slot time |", "| --- | --- | ---: |"]
         for x in landings:
             if x["key"][0] == "pr":
-                label = f"PR {x['key'][1]}" + (f" ({x['key'][2][:7]})" if x["key"][2] else "")
+                label = f"PR {x['key'][1]}" + (f" ({x['head'][:7]})" if x["head"] else "")
             else:
                 label = f"direct {x['key'][1][:12]}"
             table.append(f"| {_cell(label)} | {_cell(x.get('outcome'))} | {_slot(x['slot_seconds'])} |")

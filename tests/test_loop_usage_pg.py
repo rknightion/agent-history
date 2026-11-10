@@ -261,7 +261,7 @@ def test_codex_question_tools_count_and_unrecorded_numbers_are_unknown(clean, mo
     assert "- Harness: codex 0.9.1" in lines
     assert "- Root question-tool calls: 2 (blocked 0.17 hours, 1 still open at closeout)" in lines
     assert "- Lane Bash timeouts: unknown (not recorded for codex lanes)" in lines
-    assert "- Denials by class: not recorded (not recorded for codex)" in lines
+    assert "- Denials by class: not recorded for codex" in lines
     assert "| Denial class | Denials |" not in lines
 
 
@@ -290,3 +290,18 @@ def test_a_relaunch_across_harnesses_names_both_and_counts_each(clean, monkeypat
     lines = usage_lines(monkeypatch, capsys)
     assert "- Harness: claude 2.1.4, codex 0.9.1" in lines
     assert "- Root question-tool calls: 2 (blocked 0.00 hours)" in lines
+
+
+def test_a_relaunch_session_on_another_harness_is_read_as_a_root(clean, monkeypatch, capsys):
+    db = clean
+    root = session(db, "synthetic-resume-claude", agent="claude")
+    db.execute("UPDATE ah.session SET cli_version_last='2.1.4' WHERE id=%s", (root,))
+    run = launch(db, "usage:resume", root, AT, AT + timedelta(hours=2))
+    resumed = session(db, "synthetic-resume-pi", loop_id=run, method="relaunch", agent="pi")
+    db.execute("UPDATE ah.session SET cli_version_last='1.5.0' WHERE id=%s", (resumed,))
+    tool(db, "claude", root, "AskUserQuestion", 1, duration=1000)
+    db.commit()
+    lines = usage_lines(monkeypatch, capsys)
+    assert "- Harness: claude 2.1.4, pi 1.5.0" in lines
+    assert "- Root question-tool calls: 1 (blocked 0.00 hours, not recorded for pi)" in lines
+    assert "- Denials by class: recorded for claude sessions only, not for pi" in lines
