@@ -41,7 +41,6 @@ STORED = {
     "agent_sessions_cold_nfs_mounted": "agent_sessions_cold_nfs_mounted_ratio",
     "agent_sessions_filesystem_bytes": "agent_sessions_filesystem_bytes",
     "agent_sessions_hot_retention_eligible_files": "agent_sessions_hot_retention_eligible_files",
-    "agent_efficiency_root_no_lane_seconds": "agent_efficiency_root_no_lane_seconds",
 }
 # The archive service and timer states come from the deployment's node exporter systemd collector
 # (job agent-sessions), not from the indexer, so they are not OTLP families.
@@ -88,7 +87,6 @@ ACTIONABLE_LAG = stored("agent_history_actionable_lag_bytes")
 PARSE_ISSUES = stored("agent_history_parse_issues_total")
 ARCHIVE_RECEIPT = stored("agent_sessions_archive_receipt_timestamp_seconds")
 COLD_NFS = stored("agent_sessions_cold_nfs_mounted")
-NO_LANE = stored("agent_efficiency_root_no_lane_seconds")
 HOT_RETENTION_ELIGIBLE = stored("agent_sessions_hot_retention_eligible_files")
 TIMER_ACTIVE = f'node_systemd_unit_state{{{SYSTEMD_JOB},name="{ARCHIVE_TIMER}",state="active"}}'
 SERVICE_FAILED = f'node_systemd_unit_state{{{SYSTEMD_JOB},name="{ARCHIVE_SERVICE}",state="failed"}}'
@@ -154,7 +152,6 @@ HOT_FILESYSTEM_PRESSURE = f"{filesystem_used_percent('hot')} > 85"
 COLD_FILESYSTEM_PRESSURE = f"{filesystem_used_percent('cold')} > 90"
 HOT_RETENTION_BACKLOG = f"max({HOT_RETENTION_ELIGIBLE}) > 0"
 COLLECTION_RUNTIME_HIGH = f"max({COLLECTION_DURATION}) > 60"
-LOOP_ROOT_STALLED = f"max by (namespace) ({NO_LANE}) > 1200"
 
 ABSENT_NOTE = (
     " Absent series do not fire (noDataState OK): this rule cannot tell a healthy embedder from"
@@ -371,18 +368,6 @@ RULES = [
         ),
         "expr": HOT_RETENTION_BACKLOG,
         "for": "36h",
-        "severity": "warning",
-    },
-    {
-        "name": "agent-history-loop-root-stalled",
-        "title": "agent-history loop root stalled",
-        "summary": "{{ $labels.namespace }} has had no lane in flight for {{ $values.A.Value | humanizeDuration }}",
-        "description": (
-            "A live loop root in this namespace has had no lane in flight for over 20 minutes. A"
-            " deliberate pause or a drain can trigger it as easily as a stuck loop."
-        ),
-        "expr": LOOP_ROOT_STALLED,
-        "for": "5m",
         "severity": "warning",
     },
 ]
@@ -643,15 +628,6 @@ def indexer_fixtures() -> dict:
         "45m",
         one(1, '{section="loop_checkout_observation"}'),
     )
-    # Protocol is deliberately not a metric label here. The transcript collector
-    # emits the same bounded gauge for v3 and legacy roots and suppresses quiet
-    # roots before aggregation. Missing evidence must never imply a stall.
-    no_lane = NO_LANE.replace("{", '{namespace="pi-local",loop="example/loop7",', 1)
-    case("v3 root stalled", [(no_lane, "1300x40")], LOOP_ROOT_STALLED, "30m", one(1300, '{namespace="pi-local"}'))
-    for state in ("active lanes", "waiting", "paused"):
-        case(f"v3 root {state}", [(no_lane, "0x40")], LOOP_ROOT_STALLED, "30m", [])
-    case("v3 wait expired", [(no_lane, "0x10 1300x30")], LOOP_ROOT_STALLED, "30m", one(1300, '{namespace="pi-local"}'))
-    case("v3 root evidence missing", [], LOOP_ROOT_STALLED, "30m", [])
     case("archive timer active", [(TIMER_ACTIVE, "1x20")], ARCHIVE_TIMER_INACTIVE, "10m", [])
     case("archive timer inactive", [(TIMER_ACTIVE, "0x20")], ARCHIVE_TIMER_INACTIVE, "10m", one(1))
     case(
@@ -679,6 +655,10 @@ def main() -> None:
         else:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(content, encoding="utf-8")
+    # grafana-sync publishes every JSON file here, so a rule removed from RULES must not linger.
+    stale = sorted({path.name for path in OUT.glob("*.json")} - {path.name for path, _ in artifacts})
+    if stale:
+        raise SystemExit(f"stale generated rule (delete it and the live rule): {', '.join(stale)}")
 
 
 if __name__ == "__main__":

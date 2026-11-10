@@ -210,3 +210,20 @@ def test_agent_changes_annotation_reads_the_grafana_tag(dashboard):
     assert (query["kind"], query["group"], query["datasource"]) == ("DataQuery", "grafana", {"name": "-- Grafana --"})
     assert query["spec"]["tags"] == ["agent-change"] and query["spec"]["type"] == "tags"
     assert not query["spec"]["matchAny"]
+
+
+def test_dashboards_describe_current_alerts_and_failure_semantics():
+    import json
+
+    texts = {path.name: path.read_text(encoding="utf-8") for path in (ROOT / "dashboards").glob("*.json")}
+    rules = {path.stem for path in (ROOT / "alerts" / "grafana-managed").glob("*.json")}
+    # No panel may present itself as the companion of an alert that no longer exists.
+    assert "agent-history-loop-root-stalled" not in rules
+    assert not [name for name, text in texts.items() if "AgentLoopRootStalled" in text or "loop root stalled" in text]
+    panels = json.loads(texts["agent-history.json"])
+    found = [
+        element["spec"]["description"]
+        for element in panels["spec"]["elements"].values()
+        if element.get("spec", {}).get("id") is not None and "failed_inputs" in json.dumps(element)
+    ]
+    assert found and all("3+" not in text and "no vector yet" in text for text in found)

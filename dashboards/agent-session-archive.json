@@ -5234,7 +5234,7 @@
               "transformations": []
             }
           },
-          "description": "Alert companion: the longest a live spawning root has currently gone with zero children in flight; AgentLoopRootStalled fires above 1200s.",
+          "description": "The longest a live spawning root has currently gone with zero children in flight. No alert reads it: loops routinely wait on the owner. Thresholds mark 15 and 20 minutes.",
           "id": 166,
           "links": [],
           "title": "Longest no-lane stretch now",
@@ -5323,7 +5323,7 @@
               "transformations": []
             }
           },
-          "description": "Alert companion: per-namespace max no-lane stretch over time, with a threshold line at the 1200s AgentLoopRootStalled trigger so the climb toward the alert is visible.",
+          "description": "Per-namespace max no-lane stretch over time, with threshold lines at 15 and 20 minutes. Informational only: no alert reads it, because loops routinely wait on the owner.",
           "id": 167,
           "links": [],
           "title": "No-lane stretch by namespace",

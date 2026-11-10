@@ -1524,7 +1524,7 @@ def build() -> dict[str, Any]:
                 166,
                 "Longest no-lane stretch now",
                 f"max(agent_efficiency_root_no_lane_seconds{{{EFF},{ns},{agent_v}}})",
-                "Alert companion: the longest a live spawning root has currently gone with zero children in flight; AgentLoopRootStalled fires above 1200s.",
+                "The longest a live spawning root has currently gone with zero children in flight. No alert reads it: loops routinely wait on the owner. Thresholds mark 15 and 20 minutes.",
                 "s",
                 900,
                 1200,
@@ -1539,7 +1539,7 @@ def build() -> dict[str, Any]:
                         "{{namespace}}",
                     )
                 ],
-                "Alert companion: per-namespace max no-lane stretch over time, with a threshold line at the 1200s AgentLoopRootStalled trigger so the climb toward the alert is visible.",
+                "Per-namespace max no-lane stretch over time, with threshold lines at 15 and 20 minutes. Informational only: no alert reads it, because loops routinely wait on the owner.",
                 "s",
                 warning=900,
                 critical=1200,
