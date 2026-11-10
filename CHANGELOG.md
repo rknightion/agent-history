@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.11.0](https://github.com/rknightion/agent-history/compare/v0.10.1...v0.11.0) (2026-11-10)
+
+
+### Features
+
+* **parse:** record unparsed Claude and Codex transcript fields ([9ccecf1](https://github.com/rknightion/agent-history/commit/9ccecf144089062e56315eadf1c8bd7021579f21))
+
+
+### Bug Fixes
+
+* **alerts:** drop the loop root stalled alert ([025f4b9](https://github.com/rknightion/agent-history/commit/025f4b93202374e472c6cc17748fbcaa8ae5dcb2))
+* **embed:** clear failure rows once their input embeds ([37aa734](https://github.com/rknightion/agent-history/commit/37aa7340a3ad1451e3680e50beefe8b55cd7d6da))
+
 ## [0.10.1](https://github.com/rknightion/agent-history/compare/v0.10.0...v0.10.1) (2026-11-06)
 
 
