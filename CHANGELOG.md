@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.12.0](https://github.com/rknightion/agent-history/compare/v0.11.0...v0.12.0) (2026-11-10)
+
+
+### Features
+
+* **loop:** usage block reports root calls, context, roles and landings ([#88](https://github.com/rknightion/agent-history/issues/88)) ([92ccc45](https://github.com/rknightion/agent-history/commit/92ccc4597349b69da744b34337dfc36b26c6822b))
+
+
+### Bug Fixes
+
+* **embed:** the orphan failure prune waits for a drained backlog ([#90](https://github.com/rknightion/agent-history/issues/90)) ([4c6bb40](https://github.com/rknightion/agent-history/commit/4c6bb40f7872b522cdc136d37d42747afcbf099e))
+
 ## [0.11.0](https://github.com/rknightion/agent-history/compare/v0.10.1...v0.11.0) (2026-11-10)
 
 
