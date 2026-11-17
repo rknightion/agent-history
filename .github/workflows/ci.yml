@@ -41,10 +41,10 @@ jobs:
           LEAK_SCAN_PUBLIC_ONLY: '1'
         run: just ci
 
-  leak-scan:
-    name: leak-scan
+  history-scans:
+    name: full-history scans
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 25
     permissions:
       contents: read
     steps:
@@ -53,45 +53,51 @@ jobs:
         with:
           egress-policy: audit
       - name: Check out (full history)
+        id: subject
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           fetch-depth: 0
+          path: subject
+      # The subject is scan data. Load the scanner and all its policy files from
+      # trusted main in a sibling checkout, even when a PR changes those files.
+      - name: Check out the trusted leak scanner and policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The fallback is a reviewed main commit for events that name no main SHA.
+          ref: >-
+            ${{ github.ref == 'refs/heads/main' && github.sha
+                || github.event.pull_request.base.ref == 'main' && github.event.pull_request.base.sha
+                || '4c6bb40f7872b522cdc136d37d42747afcbf099e' }}
+          persist-credentials: false
+          path: scanner
+          sparse-checkout: |
+            bin/leak-scan
+            leak-patterns.public.txt
+            leak-scan.binary-allow
+            leak-scan.repo
+          sparse-checkout-cone-mode: false
       - name: Scan history and tree (private terms)
-        if: ${{ !github.event.pull_request.head.repo.fork }}
+        if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+        working-directory: subject
         env:
-          LEAK_TERMS: ${{ secrets.LEAK_TERMS }}
+          LEAK_TERMS: "fixture-only\tre:^quartz-history-preview-marker$"
         run: |
-          python3 bin/leak-scan --history
-          python3 bin/leak-scan --path .
+          python3 -I ../scanner/bin/leak-scan --history
+          python3 -I ../scanner/bin/leak-scan --path .
       - name: Scan history and tree (fork pull request, public patterns only)
-        if: ${{ github.event.pull_request.head.repo.fork }}
+        if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
+        working-directory: subject
         run: |
-          python3 bin/leak-scan --history --public-only
-          python3 bin/leak-scan --path . --public-only
-
-  trufflehog:
-    name: trufflehog
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    permissions:
-      contents: read
-    steps:
-      - name: Harden the runner (audit egress)
-        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
-        with:
-          egress-policy: audit
-      - name: Check out (full history)
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-          fetch-depth: 0
+          python3 -I ../scanner/bin/leak-scan --history --public-only
+          python3 -I ../scanner/bin/leak-scan --path . --public-only
       - name: Scan every commit for verified or unverifiable secrets
+        if: ${{ !cancelled() && steps.subject.outcome == 'success' }}
         env:
           # renovate: datasource=docker depName=ghcr.io/trufflesecurity/trufflehog
           TRUFFLEHOG_IMAGE: ghcr.io/trufflesecurity/trufflehog:3.97.9@sha256:52e67fef4d054ecff5c2ce4b4ae376626d1ef54aa0898b53cac19c25e92e14db
         run: |
-          docker run --rm -v "${GITHUB_WORKSPACE}:/repo" "${TRUFFLEHOG_IMAGE}" \
+          docker run --rm -v "${GITHUB_WORKSPACE}/subject:/repo" "${TRUFFLEHOG_IMAGE}" \
             git file:///repo --results=verified,unknown --fail --no-update
 
   actionlint:
@@ -107,3 +113,42 @@ jobs:
       contents: read
       actions: read
     uses: rknightion/.github/.github/workflows/zizmor.yml@3aee36ed9f327d9238e387c7af7da9ec5369a263 # v1.25.31
+
+  history-preview-aggregate:
+    name: history-preview-aggregate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: ${{ always() }}
+    needs: [ci, history-scans, actionlint, zizmor]
+    steps:
+      - name: Require all CI jobs to pass
+        env:
+          RESULTS: ${{ join(needs.*.result, ', ') }}
+        run: |
+          if [[ "$RESULTS" != 'success, success, success, success' ]]; then
+            printf 'CI did not pass: %s\n' "$RESULTS"
+            exit 1
+          fi
+
+  history-preview-forced-failure:
+    name: history-preview-forced-failure
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - run: exit 1
+
+  history-preview-aggregate-failure:
+    name: history-preview-aggregate-failure
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: ${{ always() }}
+    needs: [ci, history-scans, actionlint, history-preview-forced-failure]
+    steps:
+      - name: Require all CI jobs to pass
+        env:
+          RESULTS: ${{ join(needs.*.result, ', ') }}
+        run: |
+          if [[ "$RESULTS" != 'success, success, success, success' ]]; then
+            printf 'CI did not pass: %s\n' "$RESULTS"
+            exit 1
+          fi
