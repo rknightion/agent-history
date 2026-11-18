@@ -1,0 +1,19 @@
+# Deterministic alert and dashboard renderings. Review their Python sources.
+/alerts/grafana-managed/agent-history-archive-job-failed.json linguist-generated=true
+/alerts/grafana-managed/agent-history-archive-stale.json linguist-generated=true
+/alerts/grafana-managed/agent-history-archive-timer-inactive.json linguist-generated=true
+/alerts/grafana-managed/agent-history-cold-filesystem-pressure.json linguist-generated=true
+/alerts/grafana-managed/agent-history-cold-nfs-unavailable.json linguist-generated=true
+/alerts/grafana-managed/agent-history-collection-runtime-high.json linguist-generated=true
+/alerts/grafana-managed/agent-history-collector-section-failing.json linguist-generated=true
+/alerts/grafana-managed/agent-history-embed-run-failed.json linguist-generated=true
+/alerts/grafana-managed/agent-history-embed-stale-pending.json linguist-generated=true
+/alerts/grafana-managed/agent-history-hot-filesystem-pressure.json linguist-generated=true
+/alerts/grafana-managed/agent-history-hot-retention-backlog.json linguist-generated=true
+/alerts/grafana-managed/agent-history-index-lag-stuck.json linguist-generated=true
+/alerts/grafana-managed/agent-history-index-run-failed.json linguist-generated=true
+/alerts/grafana-managed/agent-history-index-stale.json linguist-generated=true
+/alerts/grafana-managed/agent-history-metrics-stale.json linguist-generated=true
+/alerts/grafana-managed/agent-history-parse-issues-new.json linguist-generated=true
+/dashboards/agent-history.json linguist-generated=true
+/dashboards/agent-session-archive.json linguist-generated=true
