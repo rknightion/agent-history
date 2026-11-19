@@ -7,6 +7,18 @@ CONTRACT.md before changing a parser, the loader, the schema or anything that re
 
 `just check` is the gate before every commit. `just ci` adds the database tests and needs Docker.
 
+## Cursor Cloud specific instructions
+
+The pinned [environment](.cursor/environment.json) syncs locked development dependencies
+and compiles bytecode with the image's Python. Run `just fmt-check lint </dev/null` for
+a fast check.
+
+For the source gate, use a disposable checkout with full Git history. Run
+`just cloud-bootstrap </dev/null`, then `just hooks </dev/null && LEAK_SCAN_PUBLIC_ONLY=1 just check </dev/null`.
+This uses the same public-pattern mode as CI's dependency-installing job. The separate hosted
+leak scan checks the full history with its configured terms. Run `just ci` in a Docker-enabled
+environment to exercise the disposable database and promtool fixtures.
+
 ## Task tracking
 
 This repository has no task board and does not use GitHub Issues for planned work: the maintainer

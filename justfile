@@ -14,6 +14,11 @@ default:
 setup: hooks
     uv sync --locked --group dev
 
+# Prepare the locked development environment for Cursor Cloud
+[group('dev')]
+cloud-bootstrap:
+    uv sync --locked --group dev --no-python-downloads --compile-bytecode
+
 # Format the package's own Python files and the justfile
 [group('dev')]
 fmt:
