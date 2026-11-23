@@ -36,6 +36,26 @@ def test_usage_markdown_shape():
     ]
 
 
+def test_synthetic_records_are_counted_apart_not_as_a_model_row():
+    # The reader query returns Claude Code's client-written '<synthetic>' records as a row with no
+    # calls; the block reports them once and keeps them out of calls, unpriced calls and the table.
+    rows = [
+        {**ROWS[0], "synthetic": "0"},
+        {"role": "root", "model": "<synthetic>", "calls": "0", "cost": "", "unpriced": "0", "synthetic": "7"},
+        {**ROWS[2], "synthetic": "0"},
+    ]
+    lines = reader.usage_markdown(SUMMARY, rows, 1).splitlines()
+    assert "- LLM calls: 1,204" in lines
+    assert "- Synthetic records: 7 (written by the client, not model calls)" in lines
+    assert not any("<synthetic>" in line for line in lines)
+    assert not any(line.startswith("- Unpriced") for line in lines)
+    detail = detail_block(V4, rows=rows)
+    assert "- Root calls: 1,200" in detail
+    assert "| root | $40.50 | 97.0% |" in detail
+    # Without synthetic records nothing changes.
+    assert not any(line.startswith("- Synthetic") for line in reader.usage_markdown(SUMMARY, ROWS, 1).splitlines())
+
+
 def test_usage_markdown_states_shared_closeouts_and_heuristic_links():
     summary = {**SUMMARY, "wall_s": "59", "heuristic_sessions": "2"}
     rows = [{**ROWS[0], "role": "a|b"}]

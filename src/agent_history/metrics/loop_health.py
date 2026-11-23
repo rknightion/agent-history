@@ -17,11 +17,11 @@ DEPENDENCY_QUERY = (
     SELECT DISTINCT c.id, c.version, c.session_id, c.response_id
     FROM windows w JOIN roots r ON r.id = w.id
     CROSS JOIN LATERAL (
-        SELECT c.id, c.xmin::text AS version, c.session_id, c.response_id, c.ts, c.stop_reason
+        SELECT c.id, c.xmin::text AS version, c.session_id, c.response_id, c.ts, c.stop_reason, c.model
         FROM ah.llm_call c WHERE c.session_id = r.session_id
         OFFSET 0
     ) c
-    WHERE c.ts >= w.launch_ts AND c.ts < w.window_end
+    WHERE c.ts >= w.launch_ts AND c.ts < w.window_end AND c.model IS DISTINCT FROM '<synthetic>'
       AND (c.stop_reason IS NULL OR (c.stop_reason NOT LIKE 'usage:%'
            AND c.stop_reason NOT IN ('compaction', 'branch_summary')))
 ), selected_messages AS (
@@ -67,7 +67,7 @@ PREFIX = "agent_history_loop_health_"
 METRICS = {
     "completed_timestamp_seconds": "End of the latest completed loop, not collection time.",
     "root_model_time_share": "Root assistant model time / wall time, capped at one; omitted unless timing is complete.",
-    "root_model_calls": "Root assistant calls in the completed-loop window, excluding compaction and usage records.",
+    "root_model_calls": "Root assistant calls in the completed-loop window, excluding compaction, usage and synthetic records.",
     "root_model_timed_calls": "Root assistant calls with valid finished persisted pi timing in the window.",
     "root_messages": "Root assistant text messages in the completed-loop window, excluding reasoning and briefs.",
     "owner_questions_per_1k_root_messages": "Approximate owner-question text matches per 1000 root assistant text messages.",

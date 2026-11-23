@@ -167,7 +167,9 @@ LANGUAGE sql STABLE AS $$
                    + COALESCE(l.cache_write_1h, 0) AS input_tokens,
                l.cache_read, l.output, s.agent
         FROM ah.llm_call l JOIN sess s ON s.id = l.session_id
-        WHERE (l.stop_reason IS NULL OR (l.stop_reason NOT LIKE 'usage:%' AND l.stop_reason NOT IN ('compaction', 'branch_summary')))
+        -- Claude Code's '<synthetic>' assistant records are written by the client, not a model call.
+        WHERE l.model IS DISTINCT FROM '<synthetic>'
+          AND (l.stop_reason IS NULL OR (l.stop_reason NOT LIKE 'usage:%' AND l.stop_reason NOT IN ('compaction', 'branch_summary')))
           AND num_nonnulls(l.input_uncached, l.cache_read, l.cache_write_5m, l.cache_write_1h, l.output, l.reasoning) > 0
     ),
     -- Per-source physical order, not the timestamp supplied by a record. Each session normally

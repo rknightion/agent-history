@@ -56,6 +56,7 @@ REPLAYED = (
     "051_error_classification_queue.sql",
     "052_transcript_fields.sql",
     "053_loop_protocol.sql",
+    "054_requeue_synthetic_rollups.sql",
 )
 
 

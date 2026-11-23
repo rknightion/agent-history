@@ -885,20 +885,28 @@ def _refresh_progress(conn: psycopg.Connection, also: Sequence[str] = ()) -> Non
                 SELECT c.* FROM members s JOIN ah.llm_call c ON c.session_id = s.id
                 WHERE NOT s.is_root OR (c.ts >= s.launch_ts AND c.ts < COALESCE(s.end_ts, 'infinity'))
             ), usage AS (
-                SELECT NULLIF(count(*), 0) AS llm_calls,
-                       CASE WHEN count(input_uncached) = count(*) THEN sum(input_uncached) END AS input_uncached,
-                       CASE WHEN count(cache_read) = count(*) THEN sum(cache_read) END AS cache_read,
-                       CASE WHEN count(cache_write_5m) = count(*) AND count(cache_write_1h) = count(*)
-                            THEN sum(cache_write_5m + cache_write_1h) END AS cache_write,
-                       CASE WHEN count(output) = count(*) THEN sum(output) END AS output,
+                -- Claude Code's client-written '<synthetic>' records are not model calls: they are left
+                -- out of the call count and the token totals (r), but an API error they record counts.
+                SELECT NULLIF(count(*) FILTER (WHERE r), 0) AS llm_calls,
+                       CASE WHEN count(input_uncached) FILTER (WHERE r) = count(*) FILTER (WHERE r)
+                            THEN sum(input_uncached) FILTER (WHERE r) END AS input_uncached,
+                       CASE WHEN count(cache_read) FILTER (WHERE r) = count(*) FILTER (WHERE r)
+                            THEN sum(cache_read) FILTER (WHERE r) END AS cache_read,
+                       CASE WHEN count(cache_write_5m) FILTER (WHERE r) = count(*) FILTER (WHERE r)
+                                 AND count(cache_write_1h) FILTER (WHERE r) = count(*) FILTER (WHERE r)
+                            THEN sum(cache_write_5m + cache_write_1h) FILTER (WHERE r) END AS cache_write,
+                       CASE WHEN count(output) FILTER (WHERE r) = count(*) FILTER (WHERE r)
+                            THEN sum(output) FILTER (WHERE r) END AS output,
                        CASE WHEN count(*) > 0 THEN count(*) FILTER (WHERE is_api_error) END AS api_errors
-                FROM calls
+                FROM (SELECT c.*, c.model IS DISTINCT FROM '<synthetic>' AS r FROM calls c) calls
             ), priced AS (
                 SELECT CASE WHEN input_uncached IS NOT NULL AND cache_read IS NOT NULL
                                  AND cache_write_5m IS NOT NULL AND cache_write_1h IS NOT NULL
                                  AND output IS NOT NULL
                             THEN ah.priced_usd(model, ts::date, input_uncached, cache_read,
                                                cache_write_5m, cache_write_1h, output) END AS cost FROM calls
+                -- A '<synthetic>' record is no model call and has no price: it never makes the cost unknown.
+                WHERE model IS DISTINCT FROM '<synthetic>'
             ), costs AS (
                 SELECT CASE WHEN count(cost) = count(*) THEN sum(cost) END AS cost FROM priced
             ), tools AS (

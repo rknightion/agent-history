@@ -114,20 +114,27 @@ END $$;
 -- predicate is pushed into the aggregate, so a lookup reads only that session's calls.
 -- snapshot_calls (Claude only, NULL for Codex): calls with no stop_reason carry just the streamed
 -- usage snapshot (anthropics/claude-code#84223), so output is a lower bound when it is above zero.
+-- A row whose model is Claude Code's '<synthetic>' marker is written by the client, not returned by
+-- a model: it is counted in synthetic_calls and in no other call count (llm_calls + synthetic_calls
+-- is every llm_call row of the session).
 CREATE OR REPLACE VIEW ah.v_session_cost AS
 SELECT x.session_id, sum(x.calls) AS llm_calls,
-       sum(x.calls) FILTER (WHERE x.cost IS NULL) AS unpriced_calls,
+       sum(x.calls) FILTER (WHERE x.cost IS NULL AND x.calls > 0) AS unpriced_calls,
        sum(x.input_uncached) AS input_uncached, sum(x.cache_read) AS cache_read,
        sum(x.cache_write_5m) AS cache_write_5m, sum(x.cache_write_1h) AS cache_write_1h,
        sum(x.output) AS output, sum(x.cost) AS priced_cost_usd,
-       CASE WHEN bool_or(x.claude) THEN sum(x.snapshot) END AS snapshot_calls
+       CASE WHEN bool_or(x.claude) THEN sum(x.snapshot) END AS snapshot_calls,
+       sum(x.synthetic) AS synthetic_calls
 FROM (SELECT g.*, ah.priced_usd(g.model, g.day, g.input_uncached, g.cache_read, g.cache_write_5m,
                                 g.cache_write_1h, g.output) AS cost
-      FROM (SELECT c.session_id, c.model, c.ts::date AS day, count(*) AS calls,
+      FROM (SELECT c.session_id, c.model, c.ts::date AS day,
+                   count(*) FILTER (WHERE c.model IS DISTINCT FROM '<synthetic>') AS calls,
+                   count(*) FILTER (WHERE c.model = '<synthetic>') AS synthetic,
                    sum(c.input_uncached) AS input_uncached, sum(c.cache_read) AS cache_read,
                    sum(c.cache_write_5m) AS cache_write_5m, sum(c.cache_write_1h) AS cache_write_1h,
                    sum(c.output) AS output,
-                   count(*) FILTER (WHERE c.stop_reason IS NULL AND NOT c.is_api_error) AS snapshot,
+                   count(*) FILTER (WHERE c.stop_reason IS NULL AND NOT c.is_api_error
+                                      AND c.model IS DISTINCT FROM '<synthetic>') AS snapshot,
                    bool_or(c.agent = 'claude') AS claude
             FROM ah.llm_call c GROUP BY 1, 2, 3) g) x
 GROUP BY x.session_id;
@@ -145,7 +152,7 @@ SELECT s.id AS session_id, s.agent, s.namespace, s.profile, s.machine, s.session
        s.is_subagent, s.spawn_kind, s.agent_type, s.root_session_id, s.parent_session_id,
        COALESCE(s.custom_title, s.title) AS title, s.cwd, s.git_branch, s.entrypoint,
        s.cli_version_last, s.first_event_at, s.last_event_at, s.loop_run_id, s.loop_link_method,
-       r.turns_human, r.turns_other, r.messages, r.llm_calls, r.input_uncached, r.cache_read,
+       r.turns_human, r.turns_other, r.messages, r.llm_calls, r.synthetic_calls, r.input_uncached, r.cache_read,
        r.cache_write, r.output, r.reasoning, r.peak_context_tokens, r.tool_calls, r.tool_errors,
        r.tool_denials, r.tool_interrupts, r.subagents, r.compactions, r.commits, r.pushes,
        r.api_errors, r.interrupts, r.models, r.duration_s, r.claude_cost_usd
@@ -157,7 +164,7 @@ CREATE OR REPLACE VIEW ah.v_session_tree AS
 SELECT root.id AS root_session_id, root.agent, root.namespace, root.session_uid,
        COALESCE(root.custom_title, root.title) AS title, root.cwd, root.first_event_at,
        max(s.last_event_at) AS last_event_at, count(*) AS sessions,
-       sum(r.turns_human) AS turns_human, sum(r.llm_calls) AS llm_calls,
+       sum(r.turns_human) AS turns_human, sum(r.llm_calls) AS llm_calls, sum(r.synthetic_calls) AS synthetic_calls,
        sum(r.input_uncached) AS input_uncached, sum(r.cache_read) AS cache_read,
        sum(r.cache_write) AS cache_write, sum(r.output) AS output, sum(r.reasoning) AS reasoning,
        sum(r.tool_calls) AS tool_calls, sum(r.tool_errors) AS tool_errors,
@@ -175,16 +182,26 @@ GROUP BY root.id;
 -- Lineage and heuristic sessions count whole (they were tagged by start time
 -- inside the loop window); the root session only contributes activity inside [launch_ts, end_ts],
 -- because one root session can host several loops.
+-- protocol is the run's declared protocol, separate from mode (the dialect of its terminal document).
+-- closeout_ts is the earliest collected modification time of the run's closeout document at or after
+-- launch (kinds closeout and run_closeout); it does not change end_ts. active_s is the time inside
+-- [launch_ts, end_ts] covered by the run's sessions' model calls and tool calls, where calls less than
+-- 15 minutes apart join one active span; it is never more than wall_s. The task counters are
+-- ah.loops' own, NULL when unknown. llm_calls never counts '<synthetic>' rows; synthetic_calls does.
 CREATE OR REPLACE VIEW ah.v_loop_summary AS
 SELECT l.id AS loop_run_id, COALESCE(live.status, l.status) AS status, l.repo_slug, l.campaign_slug, l.loop_number, l.mode,
-       l.report_path, l.launch_ts, l.end_ts, l.end_evidence, l.budget_s,
+       l.protocol, l.report_path, l.launch_ts, l.end_ts, l.end_evidence, l.budget_s,
        EXTRACT(EPOCH FROM (l.end_ts - l.launch_ts))::bigint AS wall_s,
+       co.closeout_ts, EXTRACT(EPOCH FROM (co.closeout_ts - l.launch_ts))::bigint AS closeout_wall_s,
+       act.active_s,
+       live.tasks_admitted, live.tasks_landed, live.tasks_done, live.parks_total,
        root.agent AS root_agent, root.namespace, root.session_uid AS root_session_uid,
        (SELECT count(*) FROM ah.lane x WHERE x.loop_run_id = l.id) AS lanes,
        1 + COALESCE(m.sessions, 0) AS sessions,
        COALESCE(m.heuristic_sessions, 0) AS heuristic_sessions,
        COALESCE(rw.turns_human, 0) + COALESCE(m.turns_human, 0) AS turns_human,
        COALESCE(rw.llm_calls, 0) + COALESCE(m.llm_calls, 0) AS llm_calls,
+       COALESCE(rw.synthetic_calls, 0) + COALESCE(m.synthetic_calls, 0) AS synthetic_calls,
        COALESCE(rw.input_uncached, 0) + COALESCE(m.input_uncached, 0) AS input_uncached,
        COALESCE(rw.cache_read, 0) + COALESCE(m.cache_read, 0) AS cache_read,
        COALESCE(rw.cache_write, 0) + COALESCE(m.cache_write, 0) AS cache_write,
@@ -210,7 +227,7 @@ LEFT JOIN ah.loops live ON live.launch_uid = l.launch_uid
 LEFT JOIN ah.session root ON root.id = l.root_session_id
 LEFT JOIN LATERAL (
     SELECT count(*) AS sessions, count(*) FILTER (WHERE s.loop_link_method = 'heuristic') AS heuristic_sessions,
-           sum(r.turns_human) AS turns_human, sum(r.llm_calls) AS llm_calls,
+           sum(r.turns_human) AS turns_human, sum(r.llm_calls) AS llm_calls, sum(r.synthetic_calls) AS synthetic_calls,
            sum(r.input_uncached) AS input_uncached, sum(r.cache_read) AS cache_read,
            sum(r.cache_write) AS cache_write, sum(r.output) AS output, sum(r.reasoning) AS reasoning,
            sum(r.output) FILTER (WHERE s.agent = 'claude') AS claude_output,
@@ -231,7 +248,7 @@ LEFT JOIN LATERAL (
               AND mm.prompt_origin IS DISTINCT FROM 'agent_message'
               AND left(mm.text, 15) <> '<agent-message '
               AND mm.ts >= l.launch_ts AND mm.ts < COALESCE(l.end_ts, 'infinity')) AS turns_human,
-           c.llm_calls, c.input_uncached, c.cache_read, c.cache_write, c.output, c.reasoning, c.api_errors,
+           c.llm_calls, c.synthetic_calls, c.input_uncached, c.cache_read, c.cache_write, c.output, c.reasoning, c.api_errors,
            c.peak_context_tokens, tc.tool_calls, tc.tool_errors, tc.tool_denials, tc.tool_interrupts,
            (SELECT count(*) FROM ah.subagent_spawn x WHERE x.parent_session_id = l.root_session_id
               AND x.spawned_at >= l.launch_ts AND x.spawned_at < COALESCE(l.end_ts, 'infinity')) AS subagents,
@@ -246,7 +263,9 @@ LEFT JOIN LATERAL (
                          sum(cache_write_5m) AS w5, sum(cache_write_1h) AS w1, sum(output) AS o
                   FROM ah.llm_call WHERE session_id = l.root_session_id
                     AND ts >= l.launch_ts AND ts < COALESCE(l.end_ts, 'infinity') GROUP BY 1, 2) z) AS priced_cost_usd
-    FROM (SELECT count(*) AS llm_calls, sum(input_uncached) AS input_uncached, sum(cache_read) AS cache_read,
+    FROM (SELECT count(*) FILTER (WHERE model IS DISTINCT FROM '<synthetic>') AS llm_calls,
+                 count(*) FILTER (WHERE model = '<synthetic>') AS synthetic_calls,
+                 sum(input_uncached) AS input_uncached, sum(cache_read) AS cache_read,
                  sum(COALESCE(cache_write_5m,0) + COALESCE(cache_write_1h,0)) AS cache_write, sum(output) AS output,
                  sum(reasoning) AS reasoning, count(*) FILTER (WHERE is_api_error) AS api_errors,
                  max(context_tokens) AS peak_context_tokens
@@ -256,7 +275,29 @@ LEFT JOIN LATERAL (
                  count(*) FILTER (WHERE outcome = 'denied') AS tool_denials,
                  count(*) FILTER (WHERE outcome = 'interrupted') AS tool_interrupts
           FROM ah.tool_call WHERE session_id = l.root_session_id
-            AND started_at >= l.launch_ts AND started_at < COALESCE(l.end_ts, 'infinity')) tc) rw ON true;
+            AND started_at >= l.launch_ts AND started_at < COALESCE(l.end_ts, 'infinity')) tc) rw ON true
+LEFT JOIN LATERAL (
+    SELECT min(md.file_mtime) AS closeout_ts FROM ah.loop_run_metadata md
+    WHERE md.kind IN ('closeout', 'run_closeout') AND md.path = l.report_path AND md.file_mtime >= l.launch_ts) co ON true
+LEFT JOIN LATERAL (
+    -- Model calls are points and tool calls spans, clipped to the run's window. Ordered by start, a
+    -- span opens a new active span when it starts more than 15 minutes after every earlier one ended.
+    WITH ss AS (SELECT l.root_session_id AS id UNION SELECT y.id FROM ah.session y WHERE y.loop_run_id = l.id),
+    x AS (SELECT c.ts AS s, c.ts AS e FROM ss JOIN ah.llm_call c ON c.session_id = ss.id
+          WHERE c.model IS DISTINCT FROM '<synthetic>'
+          UNION ALL
+          SELECT COALESCE(t.started_at, t.ended_at), COALESCE(t.ended_at, t.started_at)
+          FROM ss JOIN ah.tool_call t ON t.session_id = ss.id
+          WHERE COALESCE(t.started_at, t.ended_at) IS NOT NULL),
+    v AS (SELECT GREATEST(x.s, l.launch_ts) AS s, LEAST(x.e, COALESCE(l.end_ts, 'infinity')) AS e FROM x
+          WHERE l.launch_ts IS NOT NULL AND x.e >= l.launch_ts AND x.s <= COALESCE(l.end_ts, 'infinity')),
+    o AS (SELECT v.s, v.e, max(v.e) OVER (ORDER BY v.s, v.e ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS prev_e
+          FROM v),
+    g AS (SELECT o.s, o.e, count(*) FILTER (WHERE o.prev_e IS NULL OR o.s > o.prev_e + interval '15 minutes')
+                             OVER (ORDER BY o.s, o.e ROWS UNBOUNDED PRECEDING) AS grp
+          FROM o)
+    SELECT sum(EXTRACT(EPOCH FROM (sp.e - sp.s)))::bigint AS active_s
+    FROM (SELECT min(g.s) AS s, max(g.e) AS e FROM g GROUP BY g.grp) sp) act ON true;
 
 CREATE OR REPLACE FUNCTION ah.loop_compare(loop_ids bigint[])
 RETURNS SETOF ah.v_loop_summary LANGUAGE sql STABLE AS $$
@@ -273,14 +314,14 @@ $$;
 CREATE OR REPLACE FUNCTION ah.loop_lanes(loop_id bigint)
 RETURNS TABLE (session_id bigint, lane_name text, role text, link_method text, agent text,
                model text, first_event_at timestamptz, last_event_at timestamptz, wall_s bigint,
-               llm_calls integer, input_uncached bigint, cache_read bigint, output bigint,
+               llm_calls integer, synthetic_calls integer, input_uncached bigint, cache_read bigint, output bigint,
                tool_calls integer, tool_errors integer, tool_denials integer, compactions integer,
                commits integer, return_status text, spawn_completion text, priced_cost_usd numeric)
 LANGUAGE sql STABLE AS $$
     SELECT s.id, ln.lane_name, ln.role, ln.link_method, s.agent,
            (r.models)[1], s.first_event_at, s.last_event_at,
            EXTRACT(EPOCH FROM (s.last_event_at - s.first_event_at))::bigint,
-           r.llm_calls, r.input_uncached, r.cache_read, r.output, r.tool_calls, r.tool_errors,
+           r.llm_calls, r.synthetic_calls, r.input_uncached, r.cache_read, r.output, r.tool_calls, r.tool_errors,
            r.tool_denials, r.compactions, r.commits, ln.return_status, sp.completion_status, sc.priced_cost_usd
     FROM ah.lane ln
     JOIN ah.session s ON s.id = ln.session_id
@@ -401,7 +442,7 @@ CROSS JOIN LATERAL (SELECT count(*) AS wait_agent_calls FROM ah.tool_call w
                     WHERE w.session_id = f.session_id AND w.tool_name = 'wait_agent'
                       AND w.started_at >= f.hour AND w.started_at < f.hour + interval '1 hour') w
 CROSS JOIN LATERAL (SELECT count(*) AS root_llm_calls FROM ah.llm_call l
-                    WHERE l.session_id = f.session_id
+                    WHERE l.session_id = f.session_id AND l.model IS DISTINCT FROM '<synthetic>'
                       AND l.ts >= f.hour AND l.ts < f.hour + interval '1 hour') l;
 
 -- The same per root session over its whole life, with its worst hour.
@@ -421,18 +462,22 @@ JOIN ah.session s ON s.id = f.session_id AND NOT s.is_subagent
 LEFT JOIN ah.session_rollup r ON r.session_id = s.id
 CROSS JOIN LATERAL (SELECT count(*) AS wait_agent_calls FROM ah.tool_call w
                     WHERE w.session_id = f.session_id AND w.tool_name = 'wait_agent') w
-CROSS JOIN LATERAL (SELECT count(*) AS root_llm_calls FROM ah.llm_call l WHERE l.session_id = f.session_id) l;
+CROSS JOIN LATERAL (SELECT count(*) AS root_llm_calls FROM ah.llm_call l
+                    WHERE l.session_id = f.session_id AND l.model IS DISTINCT FROM '<synthetic>') l;
 
 -- Daily token usage per namespace/agent/model, priced at model_pricing (NULL = model not priced).
 -- Tokens are summed per day first and priced once per group (5m and 1h cache writes priced apart).
+-- The '<synthetic>' model's group keeps its row with llm_calls 0 and its rows in synthetic_calls.
 CREATE OR REPLACE VIEW ah.v_daily_usage AS
-SELECT d.day, d.namespace, d.agent, d.model, d.llm_calls, d.input_uncached, d.cache_read,
+SELECT d.day, d.namespace, d.agent, d.model, d.llm_calls, d.synthetic_calls, d.input_uncached, d.cache_read,
        COALESCE(d.cache_write_5m, 0) + COALESCE(d.cache_write_1h, 0) AS cache_write,
        d.output, d.reasoning,
        ah.priced_usd(d.model, d.day::date, d.input_uncached, d.cache_read, d.cache_write_5m,
                      d.cache_write_1h, d.output) AS priced_cost_usd,
        d.cache_write_5m, d.cache_write_1h
-FROM (SELECT date_trunc('day', c.ts) AS day, s.namespace, c.agent, c.model, count(*) AS llm_calls,
+FROM (SELECT date_trunc('day', c.ts) AS day, s.namespace, c.agent, c.model,
+             count(*) FILTER (WHERE c.model IS DISTINCT FROM '<synthetic>') AS llm_calls,
+             count(*) FILTER (WHERE c.model = '<synthetic>') AS synthetic_calls,
              sum(c.input_uncached) AS input_uncached, sum(c.cache_read) AS cache_read,
              sum(c.cache_write_5m) AS cache_write_5m, sum(c.cache_write_1h) AS cache_write_1h,
              sum(c.output) AS output, sum(c.reasoning) AS reasoning
@@ -497,6 +542,7 @@ LEFT JOIN ah.turn t ON t.session_id = m.session_id AND t.turn_key = m.turn_key
 LEFT JOIN LATERAL (
     SELECT c.response_id, c.ts FROM ah.llm_call c
     WHERE c.session_id = m.session_id AND c.ts > m.ts AND c.is_api_error IS NOT TRUE
+      AND c.model IS DISTINCT FROM '<synthetic>'
       AND (c.stop_reason IS NULL OR (c.stop_reason NOT LIKE 'usage:%'
                                      AND c.stop_reason NOT IN ('compaction', 'branch_summary')))
     ORDER BY c.ts, c.id LIMIT 1) nc ON true
@@ -922,6 +968,12 @@ GROUP BY r.task_key, b.title, b.status, b.repo_slug, b.context;
 -- starts with it and that is in the session's remote repo, or (no remote) committed within 15 min
 -- of the event; the repo match wins, then the closest time. ci_conclusion is over the latest run
 -- per workflow: pending | failure | success | mixed | NULL (no runs).
+-- A squash merge puts a new sha on the default branch, so a commit the sha does not resolve falls
+-- back to its pull request: the same session's nearest pull request event at or after the commit
+-- (else the latest before it), then the earliest default-branch commit of that pull request's
+-- repository at or after the commit whose subject ends with "(#<number>)", GitHub's squash subject.
+-- resolved_by is 'sha', 'pr_number' or NULL; pr_number is the pull request a 'pr_number' row used.
+-- Every commit squashed into one pull request resolves to the same merge commit.
 CREATE OR REPLACE VIEW ah.v_agent_commit_quality AS
 SELECT g.id AS git_event_id, g.ts, g.op, g.sha_short, g.branch, s.agent, s.namespace, s.session_uid, s.agent_id,
        s.is_subagent, s.loop_run_id,
@@ -929,6 +981,8 @@ SELECT g.id AS git_event_id, g.ts, g.op, g.sha_short, g.branch, s.agent, s.names
        gc.sha, gc.committed_at, gc.subject, gc.on_default, gc.files_changed,
        COALESCE(gc.insertions, 0) + COALESCE(gc.deletions, 0) AS lines_changed,
        gc.sha IS NOT NULL AS resolved,
+       CASE WHEN bysha.sha IS NOT NULL THEN 'sha' WHEN bypr.sha IS NOT NULL THEN 'pr_number' END AS resolved_by,
+       CASE WHEN bysha.sha IS NULL AND bypr.sha IS NOT NULL THEN pr.pr_number END AS pr_number,
        ci.runs AS ci_runs, ci.failed AS ci_failed_workflows, ci.conclusion AS ci_conclusion,
        COALESCE(rv.reverted, false) AS reverted, rv.reverted_by
 FROM ah.git_event g
@@ -941,7 +995,30 @@ LEFT JOIN LATERAL (
            OR abs(EXTRACT(EPOCH FROM (c.committed_at - g.ts))) <= 900)
     ORDER BY (lower(c.repo_slug) = ah.remote_slug(s.git_remote_url)) DESC NULLS LAST,
              abs(EXTRACT(EPOCH FROM (c.committed_at - g.ts)))
-    LIMIT 1) gc ON true
+    LIMIT 1) bysha ON true
+LEFT JOIN LATERAL (
+    SELECT p.pr_number,
+           COALESCE(ah.remote_slug(substring(p.pr_url FROM '^(https?://[^/]+/[^/]+/[^/]+)/pull/[0-9]+')),
+                    CASE WHEN p.pr_repo ~ '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$' THEN 'github.com/' || lower(p.pr_repo) END,
+                    ah.remote_slug(s.git_remote_url)) AS repo_slug
+    FROM ah.git_event p
+    WHERE bysha.sha IS NULL AND p.session_id = g.session_id AND p.op = 'pr' AND p.pr_number IS NOT NULL
+    ORDER BY (p.ts >= g.ts) DESC, abs(EXTRACT(EPOCH FROM (p.ts - g.ts))), p.id
+    LIMIT 1) pr ON true
+LEFT JOIN LATERAL (
+    SELECT c.* FROM ah.git_commit c
+    WHERE pr.pr_number IS NOT NULL AND lower(c.repo_slug) = lower(pr.repo_slug) AND c.committed_at >= g.ts AND c.on_default
+      AND c.subject ~ ('\(#' || pr.pr_number || '\)[[:space:]]*$')
+    ORDER BY c.committed_at, c.sha
+    LIMIT 1) bypr ON true
+-- At most one of bysha and bypr has a row (pr looks only when bysha found none).
+CROSS JOIN LATERAL (
+    SELECT COALESCE(bysha.repo_slug, bypr.repo_slug) AS repo_slug, COALESCE(bysha.sha, bypr.sha) AS sha,
+           COALESCE(bysha.committed_at, bypr.committed_at) AS committed_at,
+           COALESCE(bysha.subject, bypr.subject) AS subject, COALESCE(bysha.on_default, bypr.on_default) AS on_default,
+           COALESCE(bysha.files_changed, bypr.files_changed) AS files_changed,
+           COALESCE(bysha.insertions, bypr.insertions) AS insertions,
+           COALESCE(bysha.deletions, bypr.deletions) AS deletions) gc
 LEFT JOIN LATERAL (
     SELECT count(*) AS runs,
            count(*) FILTER (WHERE r.conclusion IN ('failure', 'timed_out', 'startup_failure', 'action_required')) AS failed,
@@ -959,18 +1036,26 @@ LEFT JOIN LATERAL (
     HAVING count(*) > 0) rv ON true
 WHERE g.op IN ('commit', 'cherry_pick');
 
+-- resolved = resolved_by_sha + resolved_by_pr. A squash merge commit's lines count once per week and
+-- repository however many agent commits resolved to it (pr_merge_commits of them).
 CREATE OR REPLACE VIEW ah.v_agent_commit_quality_weekly AS
 SELECT date_trunc('week', q.ts) AS week, q.repo_slug, count(*) AS agent_commits,
        count(*) FILTER (WHERE q.resolved) AS resolved,
+       count(*) FILTER (WHERE q.resolved_by = 'sha') AS resolved_by_sha,
+       count(*) FILTER (WHERE q.resolved_by = 'pr_number') AS resolved_by_pr,
+       count(DISTINCT q.sha) FILTER (WHERE q.resolved_by = 'pr_number') AS pr_merge_commits,
        count(*) FILTER (WHERE q.ci_conclusion IS NOT NULL) AS with_ci,
        count(*) FILTER (WHERE q.ci_conclusion = 'success') AS ci_success,
        count(*) FILTER (WHERE q.ci_conclusion = 'failure') AS ci_failure,
        count(*) FILTER (WHERE q.reverted) AS reverted,
-       sum(q.lines_changed) FILTER (WHERE q.resolved) AS lines_changed,
+       sum(q.lines_changed) FILTER (WHERE q.resolved_by = 'sha' OR (q.resolved_by = 'pr_number' AND q.merge_ref = 1))
+           AS lines_changed,
        round(count(*) FILTER (WHERE q.ci_conclusion = 'failure')::numeric
              / NULLIF(count(*) FILTER (WHERE q.ci_conclusion IS NOT NULL), 0), 3) AS ci_failure_rate,
        round(count(*) FILTER (WHERE q.reverted)::numeric / NULLIF(count(*) FILTER (WHERE q.resolved), 0), 3) AS revert_rate
-FROM ah.v_agent_commit_quality q
+FROM (SELECT q.*, row_number() OVER (PARTITION BY date_trunc('week', q.ts), q.repo_slug, q.sha, q.resolved_by
+                                     ORDER BY q.ts, q.git_event_id) AS merge_ref
+      FROM ah.v_agent_commit_quality q) q
 GROUP BY 1, 2;
 
 -- Rate-limit forecast per (namespace, plan_type, window_minutes, limit_id) over the last 8 days of
@@ -1391,7 +1476,8 @@ LANGUAGE sql STABLE AS $$
            lp.excerpt, s.last_event_at, EXTRACT(EPOCH FROM (now() - s.last_event_at))::bigint
     FROM ah.session s
     LEFT JOIN LATERAL (SELECT c.model, c.context_tokens, c.context_window FROM ah.llm_call c
-                       WHERE c.session_id = s.id ORDER BY c.ts DESC LIMIT 1) lc ON true
+                       WHERE c.session_id = s.id AND c.model IS DISTINCT FROM '<synthetic>'
+                       ORDER BY c.ts DESC LIMIT 1) lc ON true
     LEFT JOIN LATERAL (SELECT left(m.text, 120) AS excerpt FROM ah.message m
                        WHERE m.session_id = s.id AND m.message_class IN ('human_prompt', 'queued_prompt')
                        ORDER BY m.ts DESC LIMIT 1) lp ON true

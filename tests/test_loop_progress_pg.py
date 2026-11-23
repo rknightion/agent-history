@@ -71,6 +71,70 @@ def test_running_finished_and_unknown_returns(clean, tmp_path):
     assert row[-1] == "claude"
 
 
+def test_synthetic_records_are_not_model_calls(clean, tmp_path):
+    root, child = populated(clean, tmp_path)
+    for uid, sid in (("synthetic-root-marker", root), ("synthetic-child-marker", child)):
+        add_usage(clean, sid, uid, model="<synthetic>")
+    clean.execute("UPDATE ah.llm_call SET is_api_error=true WHERE response_id='synthetic-root-marker'")
+    clean.execute("INSERT INTO ah.dirty_session (session_id) VALUES (%s), (%s)", (root, child))
+    clean.commit()
+    load.post_passes(clean)
+    row = progress(clean)
+    rows = clean.execute("SELECT count(*) FROM ah.llm_call").fetchone()[0]
+    synthetic = clean.execute("SELECT count(*) FROM ah.llm_call WHERE model='<synthetic>'").fetchone()[0]
+    # llm_calls + the synthetic records is every call row; api_errors keeps the synthetic API error.
+    assert row[3] == 2 and row[3] + synthetic == rows == 4
+    assert row[10] == 1
+
+
+def test_synthetic_records_without_usage_leave_token_totals_known(clean, tmp_path):
+    root, child = populated(clean, tmp_path)
+    clean.execute(
+        "INSERT INTO ah.llm_call (agent,response_id,session_id,ts,model,source_id,byte_offset,is_api_error) "
+        "VALUES ('claude','synthetic-no-usage',%s,now(),'<synthetic>',0,0,true)",
+        (root,),
+    )
+    clean.execute("INSERT INTO ah.dirty_session (session_id) VALUES (%s)", (root,))
+    clean.commit()
+    load.post_passes(clean)
+    row = progress(clean)
+    # The two real calls' totals, as without the record; its API error still counts.
+    assert row[3:8] == (2, 22, 24, 54, 30) and row[10] == 1
+    # A real call with no usage still makes the totals unknown.
+    clean.execute(
+        "INSERT INTO ah.llm_call (agent,response_id,session_id,ts,model,source_id,byte_offset) "
+        "VALUES ('claude','synthetic-real-no-usage',%s,now(),'synthetic-unpriced',0,0)",
+        (child,),
+    )
+    clean.execute("INSERT INTO ah.dirty_session (session_id) VALUES (%s)", (child,))
+    clean.commit()
+    load.post_passes(clean)
+    assert progress(clean)[3:8] == (3, None, None, None, None)
+
+
+def test_synthetic_records_do_not_make_the_cost_unknown(clean, tmp_path):
+    root, child = populated(clean, tmp_path)
+    clean.execute(
+        "INSERT INTO ah.model_pricing (model,effective_from,input_per_mtok,cached_input_per_mtok,"
+        "cache_write_per_mtok,cache_write_1h_per_mtok,output_per_mtok) "
+        "VALUES ('synthetic-priced','2000-01-01',1,1,1,1,1) ON CONFLICT DO NOTHING"
+    )
+    clean.execute("UPDATE ah.llm_call SET model='synthetic-priced'")
+    for uid, sid in (("synthetic-root-marker", root), ("synthetic-child-marker", child)):
+        add_usage(clean, sid, uid, model="<synthetic>")
+    clean.execute("INSERT INTO ah.dirty_session (session_id) VALUES (%s), (%s)", (root, child))
+    clean.commit()
+    load.post_passes(clean)
+    # The two priced calls alone: the unpriced '<synthetic>' records leave the total known.
+    assert progress(clean)[8] == Decimal("0.000130")
+    # A real call with no price still makes the total unknown.
+    add_usage(clean, child, "synthetic-unpriced-call")
+    clean.execute("INSERT INTO ah.dirty_session (session_id) VALUES (%s)", (child,))
+    clean.commit()
+    load.post_passes(clean)
+    assert progress(clean)[8] is None
+
+
 def test_partial_usage_and_partial_pricing_are_unknown(clean, tmp_path):
     root, _ = populated(clean, tmp_path)
     clean.execute(
