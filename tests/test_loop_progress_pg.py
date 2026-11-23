@@ -71,6 +71,22 @@ def test_running_finished_and_unknown_returns(clean, tmp_path):
     assert row[-1] == "claude"
 
 
+def test_synthetic_records_are_not_model_calls(clean, tmp_path):
+    root, child = populated(clean, tmp_path)
+    for uid, sid in (("synthetic-root-marker", root), ("synthetic-child-marker", child)):
+        add_usage(clean, sid, uid, model="<synthetic>")
+    clean.execute("UPDATE ah.llm_call SET is_api_error=true WHERE response_id='synthetic-root-marker'")
+    clean.execute("INSERT INTO ah.dirty_session (session_id) VALUES (%s), (%s)", (root, child))
+    clean.commit()
+    load.post_passes(clean)
+    row = progress(clean)
+    rows = clean.execute("SELECT count(*) FROM ah.llm_call").fetchone()[0]
+    synthetic = clean.execute("SELECT count(*) FROM ah.llm_call WHERE model='<synthetic>'").fetchone()[0]
+    # llm_calls + the synthetic records is every call row; api_errors keeps the synthetic API error.
+    assert row[3] == 2 and row[3] + synthetic == rows == 4
+    assert row[10] == 1
+
+
 def test_partial_usage_and_partial_pricing_are_unknown(clean, tmp_path):
     root, _ = populated(clean, tmp_path)
     clean.execute(

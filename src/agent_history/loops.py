@@ -885,7 +885,8 @@ def _refresh_progress(conn: psycopg.Connection, also: Sequence[str] = ()) -> Non
                 SELECT c.* FROM members s JOIN ah.llm_call c ON c.session_id = s.id
                 WHERE NOT s.is_root OR (c.ts >= s.launch_ts AND c.ts < COALESCE(s.end_ts, 'infinity'))
             ), usage AS (
-                SELECT NULLIF(count(*), 0) AS llm_calls,
+                -- Claude Code's client-written '<synthetic>' records are not model calls.
+                SELECT NULLIF(count(*) FILTER (WHERE model IS DISTINCT FROM '<synthetic>'), 0) AS llm_calls,
                        CASE WHEN count(input_uncached) = count(*) THEN sum(input_uncached) END AS input_uncached,
                        CASE WHEN count(cache_read) = count(*) THEN sum(cache_read) END AS cache_read,
                        CASE WHEN count(cache_write_5m) = count(*) AND count(cache_write_1h) = count(*)
