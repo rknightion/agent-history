@@ -10,7 +10,7 @@ CONTRACT.md before changing a parser, the loader, the schema or anything that re
 ## Cursor Cloud specific instructions
 
 The pinned [environment](.cursor/environment.json) syncs locked development dependencies
-and compiles bytecode with the image's Python. Run `just fmt-check lint </dev/null` for
+and compiles bytecode with the Python that `.python-version` pins. Run `just fmt-check lint </dev/null` for
 a fast check.
 
 For the source gate, use a disposable checkout with full Git history. Run

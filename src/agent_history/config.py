@@ -92,7 +92,7 @@ def _secret(value: str | None, file: str | None, env: str | None, key: str) -> s
     if file:
         try:
             return Path(file).expanduser().read_text().strip().splitlines()[0].strip()
-        except (OSError, IndexError):
+        except OSError, IndexError:
             raise ConfigError(f"{key}: cannot read the file it names", key=key) from None
     return value
 

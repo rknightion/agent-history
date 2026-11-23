@@ -167,7 +167,7 @@ def _live_timestamp(value: Any) -> str | None:
         return None
     try:
         return value.astimezone(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
-    except (ValueError, OverflowError):
+    except ValueError, OverflowError:
         return None
 
 
@@ -188,7 +188,7 @@ def _json(raw: Any) -> Any:
     if isinstance(raw, str):
         try:
             return json.loads(raw, parse_constant=reject_constant)
-        except (ValueError, RecursionError):
+        except ValueError, RecursionError:
             return None
     return raw
 

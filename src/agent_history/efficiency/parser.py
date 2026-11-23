@@ -2460,7 +2460,7 @@ def efficiency_parse_file(
                 break
             try:
                 parser.line(raw)
-            except (ValueError, TypeError, AttributeError, KeyError, IndexError, OverflowError):
+            except ValueError, TypeError, AttributeError, KeyError, IndexError, OverflowError:
                 skipped += 1
             file_state["offset"] += len(raw)
             lines += 1
@@ -2846,6 +2846,6 @@ def efficiency_emit_stalls(
 def read_state(path: Path) -> dict[str, Any]:
     try:
         result = json.loads(path.read_text())
-    except (OSError, ValueError):
+    except OSError, ValueError:
         return {}
     return result if isinstance(result, dict) else {}

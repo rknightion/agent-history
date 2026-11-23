@@ -184,7 +184,7 @@ def walk_jsonl(root: Path | None, *, exclude_admin: bool = False) -> dict[str, t
                 continue
             if not NAMESPACE.fullmatch(entry.name) or not entry.is_dir():
                 continue
-        except (FileNotFoundError, PermissionError):
+        except FileNotFoundError, PermissionError:
             continue
         for rel, stat in scan_jsonl(entry.path, entry.name + "/", prune):
             files[rel] = (stat.st_size, stat.st_mtime_ns)
@@ -396,7 +396,7 @@ class ArchiveCollector:
                 receipt_files = int(payload.get("jsonl_files", 0))
                 receipt_bytes = int(payload.get("jsonl_bytes", 0))
                 receipt_mtime = latest.stat().st_mtime
-            except (ValueError, AttributeError, TypeError, OSError):
+            except ValueError, AttributeError, TypeError, OSError:
                 pass  # A malformed or concurrently removed receipt is not a collection failure.
             else:
                 result.extend(

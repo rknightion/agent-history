@@ -159,7 +159,7 @@ def structured_content(tool: str, raw: str | None, target: str, cwd: str | None)
     touched = False
     try:
         args = json.loads(raw, object_pairs_hook=_unique)
-    except (ValueError, RecursionError):
+    except ValueError, RecursionError:
         args = None
     if tool == "write" and isinstance(args, dict):
         if _path(args.get("file_path", args.get("path")), cwd) == target:
