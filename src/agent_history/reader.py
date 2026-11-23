@@ -132,7 +132,7 @@ def _service_connection_settings(dsn: str) -> dict[str, str]:
                 env=env,
                 pass_fds=(outgoing.fileno(),),
             )
-        except (OSError, ValueError):
+        except OSError, ValueError:
             sys.exit("agent-history: cannot resolve reader service connection")
         finally:
             outgoing.close()
@@ -148,7 +148,7 @@ def _service_connection_settings(dsn: str) -> dict[str, str]:
             or not all(isinstance(key, str) and isinstance(value, str) for key, value in effective.items())
         ):
             raise ValueError
-    except (ValueError, UnicodeError, RecursionError):
+    except ValueError, UnicodeError, RecursionError:
         sys.exit("agent-history: cannot resolve reader service connection")
     return effective
 

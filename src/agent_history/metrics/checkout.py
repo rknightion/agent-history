@@ -46,7 +46,7 @@ def local_config(config):
     try:
         with config.path.open("rb") as handle:
             data = tomllib.load(handle)
-    except (OSError, ValueError):
+    except OSError, ValueError:
         return replace(config, sources=sources)
     homes = data.get("collector", {}).get("homes", {})
     for home, namespace in homes.items():
@@ -188,7 +188,7 @@ def observe(
                         record = json.loads(raw)
                         if isinstance(record, dict):
                             _record(entry, relative.split("-", 1)[0], record)
-                    except (ValueError, TypeError, AttributeError):
+                    except ValueError, TypeError, AttributeError:
                         entry["invalid"] = True
             entry["mtime"] = mtime
         except OSError:
@@ -235,7 +235,7 @@ def observe(
             slug = repo_slug(origin.stdout.strip()) if origin.returncode == 0 else None
             if repo_admitted(slug, config.identities.git_owners, config.identities.git_repos):
                 count += 1
-        except (OSError, ValueError, subprocess.TimeoutExpired):
+        except OSError, ValueError, subprocess.TimeoutExpired:
             complete = False
     return {
         "at": time.time(),
@@ -328,5 +328,5 @@ def summary_fields(config):
         if type(count) is not int or count < 0 or type(summary["complete"]) is not bool:
             raise ValueError("invalid observation")
         return _fields(summary)
-    except (OSError, ValueError, KeyError, TypeError):
+    except OSError, ValueError, KeyError, TypeError:
         return {"loop_checkout_observation": "unavailable", "warnings": []}

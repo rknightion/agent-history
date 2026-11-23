@@ -98,7 +98,7 @@ def _origin(repo: Path) -> str | None:
             timeout=30,
             errors="replace",
         )
-    except (OSError, subprocess.TimeoutExpired):
+    except OSError, subprocess.TimeoutExpired:
         return None
     parsed = parse_remote(result.stdout.strip()) if result.returncode == 0 else None
     return f"{parsed[1]}/{parsed[2]}" if parsed else None

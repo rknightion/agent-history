@@ -601,7 +601,7 @@ def github_forks() -> set[str] | None:
                 text=True,
                 timeout=60,
             )
-        except (OSError, subprocess.TimeoutExpired):
+        except OSError, subprocess.TimeoutExpired:
             return None
         if out.returncode != 0:
             return None
@@ -627,7 +627,7 @@ def github_forks() -> set[str] | None:
                 return None
             if fork:
                 forks.add(slug)
-        except (OSError, subprocess.TimeoutExpired, ValueError, KeyError, TypeError):
+        except OSError, subprocess.TimeoutExpired, ValueError, KeyError, TypeError:
             return None
     return forks
 
@@ -989,7 +989,7 @@ def _skills_in(root: Path) -> list[str]:
 def _json(path: Path) -> Any:
     try:
         return json.loads(path.read_text())
-    except (OSError, ValueError):
+    except OSError, ValueError:
         return None
 
 
@@ -1053,7 +1053,7 @@ def codex_features(home: Path) -> list[dict[str, Any]]:
         rows.append({"kind": "skill", "name": normalise_skill(name), "source": "system", "enabled": True})
     try:
         config = tomllib.loads((home / "config.toml").read_text())
-    except (OSError, tomllib.TOMLDecodeError):
+    except OSError, tomllib.TOMLDecodeError:
         config = {}
     for key, value in sorted((config.get("plugins") or {}).items()):
         enabled = bool((value or {}).get("enabled", True))
@@ -1383,7 +1383,7 @@ class Collector:
             self.check_time()
             try:
                 info, reason = classify_repo(repo, forks)
-            except (RuntimeError, subprocess.TimeoutExpired, OSError):
+            except RuntimeError, subprocess.TimeoutExpired, OSError:
                 info, reason = None, "git_error"
             if reason:
                 if reason != "not_git":
@@ -1694,7 +1694,7 @@ def machine_name() -> tuple[str, str]:
         local = subprocess.run(
             ["/usr/sbin/scutil", "--get", "LocalHostName"], capture_output=True, text=True, timeout=10
         ).stdout.strip()
-    except (OSError, subprocess.TimeoutExpired):
+    except OSError, subprocess.TimeoutExpired:
         local = ""
     host = socket.gethostname()
     return (local or host.split(".")[0]).lower(), f"{local} {host}"

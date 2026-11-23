@@ -268,7 +268,7 @@ def sync(conn: psycopg.Connection, db_path: Path = APP_DB) -> dict[str, Any]:
     for row in rows:
         try:
             _ts(row[COLUMNS.index("analysed_at")])
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             result["journal_skipped_reason"] = (
                 "selected source record has invalid required analysed_at; catalogue unchanged"
             )

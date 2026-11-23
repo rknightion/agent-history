@@ -183,7 +183,7 @@ def _attempt(conn, config: LiteLLM, days: int, max_rows: int | None) -> tuple[di
         return None, "config"
     try:
         source = connect_source(dsn)
-    except (psycopg.Error, OSError):
+    except psycopg.Error, OSError:
         return None, "connect"
     try:
         return fill(conn, source, config.namespaces, days, config.batch, max_rows), None

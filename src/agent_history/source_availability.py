@@ -86,7 +86,7 @@ def reconcile(conn, entries, existing, sources, cold_sources, log=print):
         cached = json.loads(row[0]) if row else {}
         if not isinstance(cached, dict):
             cached = {}
-    except (ValueError, TypeError):
+    except ValueError, TypeError:
         cached = {}
     # cold_sources is the complete configured map, whereas sources may be --source-filtered.
     # Remove retired mappings even when the last one is removed, but retain filtered namespaces.
@@ -106,7 +106,7 @@ def reconcile(conn, entries, existing, sources, cold_sources, log=print):
             try:
                 age = now - float(previous.get("checked_at", 0))
                 census = previous.get("mapping") != fingerprint or not 0 <= age < CENSUS_INTERVAL
-            except (ValueError, TypeError, AttributeError):
+            except ValueError, TypeError, AttributeError:
                 census = True
             observer = Observer()
             try:

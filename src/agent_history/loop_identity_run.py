@@ -100,7 +100,7 @@ def _named_paths(tool: str, raw: str | None) -> list[Any]:
     tool = tool.rsplit(".", 1)[-1].lower()
     try:
         args = json.loads(raw, object_pairs_hook=_unique)
-    except (ValueError, RecursionError):
+    except ValueError, RecursionError:
         args = None
     if tool == "write" and isinstance(args, dict):
         return [args.get("file_path", args.get("path"))]
