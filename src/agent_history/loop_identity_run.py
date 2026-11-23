@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Iterable, Mapping
 
-from .loop_identity_v3 import ORIGIN, SHA256, TOOLS_SQL, _path, _remote, structured_content
+from .loop_identity_v3 import ORIGIN, PATCH_FILE, SHA256, TOOLS_SQL, _path, _remote, _unique, structured_content
 
 MODE = "run"
 PROTOCOL = "v5"
@@ -39,8 +39,6 @@ RUN_CLOSEOUT_HEADER = re.compile(r"# Closeout: (" + _REPO + r") (" + _NAME + r")
 # One declared protocol token on a line of its own: `protocol: v5`, `protocol: v4.1`.
 PROTOCOL_LINE = re.compile(r"protocol: (v[1-9][0-9]{0,2}(?:\.[0-9]{1,3})?)[ \t]*")
 DOCUMENT = re.compile(r"(/.+)/codex/(" + _NAME + r")/(AUTHORITY|CLOSEOUT)\.md")
-# Only a hint for which paths a structured input may name; the structured parse decides.
-CANDIDATE = re.compile(r"[^\s\"'`*:<>|\\]*codex/" + _NAME + r"/AUTHORITY\.md")
 
 
 def run_name(name: str) -> str | None:
@@ -90,6 +88,38 @@ def _content_qualifies(kind: str, run: str, content: Any) -> bool:
     return qualified(kind, run, first) and declared_protocol(content) == PROTOCOL
 
 
+def _named_paths(tool: str, raw: str | None) -> list[Any]:
+    """The paths one structured input names, decoded: never a pattern over the raw text.
+
+    A Write's path argument, a FileChange's keys, or an apply_patch's file and move headers (the
+    patch given whole or as the JSON `input`/`patch` argument). Which of them it creates whole is
+    for `structured_content` to decide.
+    """
+    if not raw:
+        return []
+    tool = tool.rsplit(".", 1)[-1].lower()
+    try:
+        args = json.loads(raw, object_pairs_hook=_unique)
+    except (ValueError, RecursionError):
+        args = None
+    if tool == "write" and isinstance(args, dict):
+        return [args.get("file_path", args.get("path"))]
+    if tool == "filechange" and isinstance(args, dict):
+        return list(args)
+    if tool == "apply_patch":
+        patch = args.get("input", args.get("patch")) if isinstance(args, dict) else raw
+        if not isinstance(patch, str):
+            return []
+        paths = []
+        for line in re.split(r"\r?\n", patch):
+            if match := PATCH_FILE.fullmatch(line):
+                paths.append(match[2])
+            elif line.startswith("*** Move to: "):
+                paths.append(line[13:])
+        return paths
+    return []
+
+
 def authority_targets(tool: str, raw: str | None, cwd: str | None) -> list[str]:
     """Exact AUTHORITY.md paths one structured input creates whole with a qualified v5 body.
 
@@ -98,8 +128,10 @@ def authority_targets(tool: str, raw: str | None, cwd: str | None) -> list[str]:
     several is ambiguous and starts no run, so each run has its own write.
     """
     found = []
-    for candidate in dict.fromkeys(CANDIDATE.findall(raw or "")):
+    for candidate in dict.fromkeys(_named_paths(tool, raw)):
         target = _path(candidate, cwd)
+        if target is None or os.path.join(cwd or "", candidate) != target:
+            continue  # only a path written in normal form names a run folder
         place = document(target)
         if not place or place[2] != "authority":
             continue

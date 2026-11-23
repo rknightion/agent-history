@@ -1889,31 +1889,32 @@ def lane_returns(
     return [entry for *_, entry in found]
 
 
-LANE_RETURNS_MARKER = "loops_lane_returns_final_message_v1"
+# A new return form needs a new bounded pass over every lane, not a reset of the old cursor.
+LANE_RETURNS_MARKER = "loops_lane_returns_status_line_v2"
 LANE_RETURNS_BATCH = 256
 
 
 def _refresh_lane_returns(conn: psycopg.Connection) -> list[str]:
     """Re-read the returns of lanes indexed before the final-message and status-line sources, once.
 
-    A bounded batch of lanes without a return status per pass, in id order behind a transactional
-    cursor; new lanes are read when their sessions change. Returns the runs whose lanes gained a
-    return, so their progress counts are refreshed in the same pass.
+    A bounded batch of lanes per pass, in id order behind a transactional cursor. Every lane is
+    re-read, a lane that already has a return status included: a later plain return can supersede an
+    earlier fenced one. New lanes are read when their sessions change. Returns the runs whose lanes'
+    return status changed, so their progress counts are refreshed in the same pass.
     """
     saved = conn.execute("SELECT value FROM ah.meta WHERE key = %s", (LANE_RETURNS_MARKER,)).fetchone()
     if saved and saved[0] == "complete":
         return []
     cursor = int(saved[0]) if saved else 0
     lanes = conn.execute(
-        "SELECT l.id, l.loop_run_id, l.session_id, l.link_method, r.launch_uid FROM ah.lane l "
-        "JOIN ah.loop_run r ON r.id = l.loop_run_id WHERE l.id > %s AND l.return_status IS NULL "
-        "ORDER BY l.id LIMIT %s",
+        "SELECT l.id, l.loop_run_id, l.session_id, l.link_method, r.launch_uid, l.return_status FROM ah.lane l "
+        "JOIN ah.loop_run r ON r.id = l.loop_run_id WHERE l.id > %s ORDER BY l.id LIMIT %s",
         (cursor, LANE_RETURNS_BATCH),
     ).fetchall()
     changed = []
-    for lane_id, loop_id, session_id, method, uid in lanes:
+    for lane_id, loop_id, session_id, method, uid, status in lanes:
         _lane(conn, loop_id, session_id, method)
-        if conn.execute("SELECT return_status IS NOT NULL FROM ah.lane WHERE id = %s", (lane_id,)).fetchone()[0]:
+        if conn.execute("SELECT return_status FROM ah.lane WHERE id = %s", (lane_id,)).fetchone()[0] != status:
             changed.append(uid)
     following = str(lanes[-1][0]) if len(lanes) == LANE_RETURNS_BATCH else "complete"
     conn.execute(

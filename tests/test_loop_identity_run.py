@@ -84,6 +84,41 @@ def test_one_input_creating_two_authorities_starts_no_run():
     assert authority_targets("apply_patch", patch + "*** End Patch", CWD) == []
 
 
+SPACED = "/tmp/synthetic project/codex/" + RUN + "/AUTHORITY.md"
+ESCAPED = '/tmp/synthétique "quoted"/codex/' + RUN + "/AUTHORITY.md"
+
+
+@pytest.mark.parametrize("target", [SPACED, ESCAPED])
+@pytest.mark.parametrize(
+    "shape",
+    [
+        lambda path: ("Write", json.dumps({"file_path": path, "content": AUTHORITY_BODY})),
+        # JSON may escape the solidus and every non-ASCII character.
+        lambda path: ("Write", json.dumps({"file_path": path, "content": AUTHORITY_BODY}).replace("/", "\\/")),
+        lambda path: ("FileChange", json.dumps({path: {"type": "add", "content": AUTHORITY_BODY}})),
+        lambda path: (
+            "apply_patch",
+            f"*** Begin Patch\n*** Add File: {path}\n"
+            + "".join("+" + line + "\n" for line in AUTHORITY_BODY.splitlines())
+            + "*** End Patch",
+        ),
+        lambda path: (
+            "apply_patch",
+            json.dumps(
+                {
+                    "input": f"*** Begin Patch\n*** Add File: {path}\n"
+                    + "".join("+" + line + "\n" for line in AUTHORITY_BODY.splitlines())
+                    + "*** End Patch"
+                }
+            ),
+        ),
+    ],
+)
+def test_authority_paths_come_from_the_decoded_arguments(target, shape):
+    tool, raw = shape(target)
+    assert authority_targets(tool, raw, CWD) == [target]
+
+
 def test_relative_paths_need_an_absolute_cwd():
     raw = json.dumps({"path": f"codex/{RUN}/AUTHORITY.md", "content": AUTHORITY_BODY})
     assert authority_targets("write", raw, None) == []

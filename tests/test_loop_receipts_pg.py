@@ -802,6 +802,9 @@ def ingest_role(clean):
         password = psycopg.conninfo.conninfo_to_dict(ADMIN_DSN).get("password")
         if password:
             admin.execute(sql.SQL("ALTER ROLE ah_ingest PASSWORD {}").format(sql.Literal(password)))
+    # ah.v_loop_summary reads ah.loop_run_metadata, and two analytics functions return its row type.
+    # They all live in analytics.sql, which apply_schema below re-applies whole.
+    clean.execute("DROP VIEW ah.v_loop_summary CASCADE")
     clean.execute("DROP TABLE ah.loop_receipt, ah.loop_run_metadata")
     # Recreate the entire 038 footprint on this disposable catalogue. Its other
     # indexes belong to retained derived tables, not the collector table above.

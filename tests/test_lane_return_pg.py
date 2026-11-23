@@ -131,3 +131,34 @@ def test_existing_lanes_gain_their_returns_once(clean, tmp_path):
     marker = clean.execute("SELECT value FROM ah.meta WHERE key=%s", (loops.LANE_RETURNS_MARKER,)).fetchone()
     assert marker == ("complete",)
     assert clean.execute("SELECT lanes_returned FROM ah.loops").fetchone() == (1,)
+
+
+def test_existing_returned_lanes_are_re_read_once(clean, tmp_path):
+    loop_id, root_id = launched(clean, tmp_path)
+    codex = lane(clean, root_id, "c1", AT + timedelta(minutes=5), agent="codex")
+    block = 'Done.\n```lane-return\n{"v": 3, "lane": "C1", "status": "partial"}\n```'
+    say(clean, codex, "c1-early", block, AT + timedelta(minutes=7), agent="codex", cls="subagent_report")
+    say(
+        clean,
+        codex,
+        "c1-late",
+        "Status: complete\nResumed and merged.",
+        AT + timedelta(minutes=9),
+        agent="codex",
+        cls="subagent_report",
+    )
+    # Recorded before the plain return form existed: only the earlier fenced return was read.
+    clean.execute("UPDATE ah.session SET loop_run_id=%s, loop_link_method='lineage' WHERE id=%s", (loop_id, codex))
+    clean.execute(
+        "INSERT INTO ah.lane (loop_run_id, session_id, link_method, return_status) VALUES (%s, %s, 'lineage', 'partial')",
+        (loop_id, codex),
+    )
+    clean.execute("DELETE FROM ah.meta WHERE key=%s", (loops.LANE_RETURNS_MARKER,))
+    clean.commit()
+    loops.refresh_live(clean)
+    clean.commit()
+    assert clean.execute(
+        "SELECT return_status, jsonb_array_length(returns) FROM ah.lane WHERE session_id=%s", (codex,)
+    ).fetchone() == ("complete", 2)
+    marker = clean.execute("SELECT value FROM ah.meta WHERE key=%s", (loops.LANE_RETURNS_MARKER,)).fetchone()
+    assert marker == ("complete",)
