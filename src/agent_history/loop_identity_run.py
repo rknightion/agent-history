@@ -94,7 +94,8 @@ def authority_targets(tool: str, raw: str | None, cwd: str | None) -> list[str]:
     """Exact AUTHORITY.md paths one structured input creates whole with a qualified v5 body.
 
     Only a complete `Write`/`write`, `apply_patch` Add File or executed FileChange add counts:
-    an edit cannot show byte zero, and shell text is never interpreted.
+    an edit cannot show byte zero, and shell text is never interpreted. One input that creates
+    several is ambiguous and starts no run, so each run has its own write.
     """
     found = []
     for candidate in dict.fromkeys(CANDIDATE.findall(raw or "")):
@@ -105,7 +106,7 @@ def authority_targets(tool: str, raw: str | None, cwd: str | None) -> list[str]:
         _, content = structured_content(tool, raw, target, cwd)
         if _content_qualifies("authority", place[1], content):
             found.append(target)
-    return found
+    return found if len(found) == 1 else []
 
 
 def closeout_path(authority: str) -> str:
@@ -238,10 +239,10 @@ SELECTION_SQL = """
     )
     SELECT l.launch_uid,l.root_session_id,l.id,l.launch_ts,l.goal_path,l.report_path,s.git_remote_url,
            least((SELECT min(n.launch_ts) FROM ah.loop_run n
-                  WHERE n.report_path=l.report_path AND n.launch_ts>l.launch_ts),
+                  WHERE n.report_path=l.report_path AND n.launch_ts>l.launch_ts AND n.mode='run'),
                  (SELECT min(n.launch_ts) FROM ah.loop_run n
-                  WHERE n.root_session_id=l.root_session_id AND n.launch_ts>l.launch_ts)) AS following,
-           EXISTS(SELECT 1 FROM ah.loop_run n WHERE n.report_path=l.report_path
+                  WHERE n.root_session_id=l.root_session_id AND n.launch_ts>l.launch_ts AND n.mode='run')) AS following,
+           EXISTS(SELECT 1 FROM ah.loop_run n WHERE n.report_path=l.report_path AND n.mode='run'
                   AND n.launch_ts=l.launch_ts AND n.launch_uid<>l.launch_uid) AS tied
     FROM selected p JOIN ah.loop_run l USING(launch_uid) JOIN ah.session s ON s.id=l.root_session_id
     WHERE l.mode='run' AND l.launch_ts IS NOT NULL ORDER BY l.launch_uid
@@ -366,7 +367,7 @@ def refresh_counts(conn) -> None:
         WITH target AS (
             SELECT l.launch_uid, r.report_path, r.launch_ts,
                    (SELECT min(n.launch_ts) FROM ah.loop_run n
-                    WHERE n.launch_ts > r.launch_ts
+                    WHERE n.launch_ts > r.launch_ts AND n.mode = 'run'
                       AND (n.report_path = r.report_path OR n.root_session_id = r.root_session_id)) AS following
             FROM ah.loops l JOIN ah.loop_run r USING (launch_uid)
             WHERE r.mode = %s AND r.end_evidence = 'closeout' AND r.end_ts IS NOT NULL

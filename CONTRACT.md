@@ -543,15 +543,17 @@ NULL, the protocol token, and for a qualified `run_closeout` the `landed_count` 
 A run of this dialect is recognised from the root's own transcript, never from a collected file.
 Its root is the top-level session whose complete successful structured write (`Write`/`write`,
 `apply_patch` Add File or executed FileChange add) creates an exact `AUTHORITY.md` path of a run
-folder with the qualified first line and `protocol: v5`. Edits, shell text, a subagent's write and
-any other path start nothing. One `ah.loop_run` row per folder and root, keyed by the root and the
+folder with the qualified first line and `protocol: v5`. Edits, shell text, a subagent's write (also
+while its parent is not yet indexed), one write that creates several `AUTHORITY.md` files and any
+other path start nothing. One `ah.loop_run` row per folder and root, keyed by the root and the
 first such write's tool I/O uid, has `mode = 'run'`, `protocol = 'v5'`, `naming = 'run'`,
 `goal_path` the `AUTHORITY.md` path, `report_path` the sibling `CLOSEOUT.md` path, `launch_ts` the
 write's time and no loop number or launch hash. Its lanes are the root's sessions that start in
 the half-open window up to the root's next run. `ah.loops.loop` holds the run name and
 `goal_sha256` is NULL; `ah.loops.repo` is the collected origin of the run's documents, else the
 captured remote of the root, else the checkout fallback below. No v3 or historical rule reads
-these rows, and no rule of this dialect reads rows of another dialect.
+these rows, and no rule of this dialect reads rows of another dialect: on a shared root, a run of
+one dialect never bounds a window, tie or lifecycle line of the other.
 
 The run ends with `end_evidence = 'closeout'` when its `CLOSEOUT.md` qualifies in the half-open
 window bounded by the next run on the same root or exact path: every in-window collected

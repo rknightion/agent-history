@@ -724,7 +724,7 @@ def _refresh_identity(
             FROM ah.loop_run l JOIN ah.session s ON s.id = l.root_session_id
             LEFT JOIN ah.message m ON m.session_id = s.id
                 AND l.launch_uid = s.agent || '/' || s.session_uid || '/' || s.agent_id || ':' || m.event_uid
-            WHERE l.launch_ts IS NOT NULL
+            WHERE l.launch_ts IS NOT NULL AND l.mode IS DISTINCT FROM 'run'
         )
         SELECT l.launch_uid, l.root_session_id, l.number, l.goal_path, l.report_path,
                l.launch_ts, l.text, l.following, l.window_known, l.tied_start
@@ -1016,7 +1016,7 @@ def _refresh_trailer_lands(conn: psycopg.Connection, state_qualified: list[str])
             SELECT l.launch_uid, r.id, r.root_session_id, l.repo, l.launch_ts,
                    least(l.end_ts, (
                        SELECT min(n.launch_ts) FROM ah.loop_run n
-                       WHERE n.launch_ts > l.launch_ts
+                       WHERE n.launch_ts > l.launch_ts AND n.mode IS DISTINCT FROM 'run'
                          AND (n.root_session_id = r.root_session_id OR
                               (r.report_path IS NOT NULL AND n.report_path = r.report_path))
                    )) AS cutoff
@@ -1024,7 +1024,7 @@ def _refresh_trailer_lands(conn: psycopg.Connection, state_qualified: list[str])
             WHERE r.mode = 'v3' AND NOT (l.launch_uid = ANY(%s))
               AND NOT EXISTS (
                   SELECT 1 FROM ah.loop_run n WHERE n.id <> r.id AND n.launch_ts = l.launch_ts
-                    AND (n.root_session_id = r.root_session_id OR
+                    AND n.mode IS DISTINCT FROM 'run' AND (n.root_session_id = r.root_session_id OR
                          (r.report_path IS NOT NULL AND n.report_path = r.report_path))
               )
         ), repos AS (
@@ -1557,7 +1557,7 @@ def _refresh_closeout_counts(conn: psycopg.Connection) -> None:
         WITH target AS (
             SELECT l.launch_uid, r.report_path, r.launch_ts,
                    (SELECT min(n.launch_ts) FROM ah.loop_run n
-                    WHERE n.launch_ts > r.launch_ts
+                    WHERE n.launch_ts > r.launch_ts AND n.mode IS DISTINCT FROM 'run'
                       AND (n.report_path = r.report_path OR n.root_session_id = r.root_session_id)) AS following
             FROM ah.loops l JOIN ah.loop_run r USING (launch_uid)
             WHERE r.mode = 'v3' AND r.end_evidence = 'closeout' AND r.end_ts IS NOT NULL
@@ -1668,6 +1668,14 @@ def _tag_runs(conn: psycopg.Connection, root_id: int, root_key: str, root_last: 
     AUTHORITY.md starts it, and its lanes are the root's sessions that start inside the window up to
     the root's next such run. Only this top-level session counts as the root; launch text is not read.
     """
+    top = conn.execute(
+        "SELECT NOT COALESCE(is_subagent, false) AND (root_session_id IS NULL OR root_session_id = id) "
+        "FROM ah.session WHERE id = %s",
+        (root_id,),
+    ).fetchone()
+    if not top or not top[0]:
+        # A child indexed before its parent has no root yet; it is never a run's root.
+        return 0
     starts: dict[str, tuple[str, Any]] = {}
     for io_uid, tool, raw, cwd, ts, output in conn.execute(RUN_WRITES_SQL, (root_id,)):
         if tool.rsplit(".", 1)[-1].lower() == "apply_patch" and re.match(

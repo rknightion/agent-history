@@ -346,10 +346,11 @@ WINDOWS_SQL = """
     SELECT l.launch_uid,l.root_session_id,l.loop_number,l.launch_ts,l.goal_path,l.report_path,l.mode,
            s.cwd,s.git_remote_url,m.text,
            least((SELECT min(n.launch_ts) FROM ah.loop_run n
-                  WHERE n.report_path=l.report_path AND n.launch_ts>l.launch_ts),
+                  WHERE n.report_path=l.report_path AND n.launch_ts>l.launch_ts AND n.mode IS DISTINCT FROM 'run'),
                  (SELECT min(n.launch_ts) FROM ah.loop_run n
-                  WHERE n.root_session_id=l.root_session_id AND n.launch_ts>l.launch_ts)) AS following,
-           EXISTS(SELECT 1 FROM ah.loop_run n WHERE n.report_path=l.report_path
+                  WHERE n.root_session_id=l.root_session_id AND n.launch_ts>l.launch_ts
+                    AND n.mode IS DISTINCT FROM 'run')) AS following,
+           EXISTS(SELECT 1 FROM ah.loop_run n WHERE n.report_path=l.report_path AND n.mode IS DISTINCT FROM 'run'
                   AND n.launch_ts=l.launch_ts AND n.launch_uid<>l.launch_uid) AS tied,
            l.id
     FROM ah.loop_run l JOIN ah.session s ON s.id=l.root_session_id

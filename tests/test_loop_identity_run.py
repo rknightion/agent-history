@@ -71,6 +71,19 @@ def test_anything_else_is_not_a_run_start(tool, raw):
     assert authority_targets(tool, raw, CWD) == []
 
 
+def test_one_input_creating_two_authorities_starts_no_run():
+    other = AUTHORITY.replace(RUN, "run-20261123-2")
+    two = {
+        AUTHORITY: {"type": "add", "content": AUTHORITY_BODY},
+        other: {"type": "add", "content": AUTHORITY_BODY.replace(RUN, "run-20261123-2")},
+    }
+    assert authority_targets("FileChange", json.dumps(two), CWD) == []
+    patch = "*** Begin Patch\n"
+    for path, change in two.items():
+        patch += f"*** Add File: {path}\n" + "".join("+" + line + "\n" for line in change["content"].splitlines())
+    assert authority_targets("apply_patch", patch + "*** End Patch", CWD) == []
+
+
 def test_relative_paths_need_an_absolute_cwd():
     raw = json.dumps({"path": f"codex/{RUN}/AUTHORITY.md", "content": AUTHORITY_BODY})
     assert authority_targets("write", raw, None) == []

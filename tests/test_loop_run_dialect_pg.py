@@ -275,3 +275,108 @@ def test_old_dialect_run_is_identified_as_before_and_takes_its_declared_protocol
     observe("closeout", V3_CLOSEOUT, "b" * 64, V3_HEADER, "v5", machine="machine-b")
     refresh(clean)
     assert identity() == [(expected[0], None, *expected[1:])]
+
+
+def claude_authority(source, session, *, agent_id=None):
+    """A Claude session whose Write creates the run's AUTHORITY.md; a subagent when agent_id is set."""
+    base = {"sessionId": session, "cwd": CWD, "isSidechain": agent_id is not None}
+    if agent_id:
+        base["agentId"] = agent_id
+    at = T0 + timedelta(seconds=10)
+    records = [
+        {
+            **base,
+            "type": "user",
+            "uuid": "u1",
+            "timestamp": T0.isoformat(),
+            "message": {"role": "user", "content": "Run the ready queue."},
+        },
+        {
+            **base,
+            "type": "assistant",
+            "uuid": "a1",
+            "parentUuid": "u1",
+            "timestamp": at.isoformat(),
+            "message": {
+                "id": "msg_a1",
+                "type": "message",
+                "role": "assistant",
+                "model": "synthetic-model",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_authority",
+                        "name": "Write",
+                        "input": {"file_path": AUTHORITY, "content": AUTHORITY_BODY},
+                    }
+                ],
+                "stop_reason": "tool_use",
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            },
+        },
+        {
+            **base,
+            "type": "user",
+            "uuid": "u2",
+            "parentUuid": "a1",
+            "timestamp": (at + timedelta(seconds=1)).isoformat(),
+            "message": {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_authority",
+                        "content": "File created successfully.",
+                        "is_error": False,
+                    }
+                ],
+            },
+        },
+    ]
+    folder = source / "projects" / "synthetic"
+    write(
+        folder / session / "subagents" / f"agent-{agent_id}.jsonl" if agent_id else folder / f"{session}.jsonl", records
+    )
+
+
+@pytest.mark.parametrize("subagent", [False, True])
+def test_only_a_top_level_session_starts_a_run(clean, tmp_path, subagent):
+    # The subagent's parent transcript is never indexed, so its root is unknown when it is tagged.
+    session = "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
+    claude_authority(tmp_path, session, agent_id="a0123456789abcdef" if subagent else None)
+    assert load.refresh(clean, sources={"claude-test": tmp_path}, textfile=None, log=lambda *_: None).errors == 0
+    clean.commit()
+    if subagent:
+        # The finding's precondition: the writer is a subagent whose root is not yet known.
+        assert clean.execute("SELECT root_session_id IS NULL FROM ah.session WHERE is_subagent").fetchall() == [(True,)]
+    expected = [] if subagent else [("run", "v5", AUTHORITY)]
+    assert clean.execute("SELECT mode, protocol, goal_path FROM ah.loop_run").fetchall() == expected
+
+
+@pytest.mark.parametrize("first", ["v3", "run"])
+def test_dialects_do_not_bound_each_others_windows(clean, tmp_path, first):
+    from test_loop_launch_v3 import PROMPT
+
+    v3_launch = [stamp(message("launch", "user", PROMPT), T0 + timedelta(minutes=10 if first == "run" else 0))]
+    authority = tool_write("authority", T0 + timedelta(minutes=10 if first == "v3" else 0), AUTHORITY, AUTHORITY_BODY)
+    records = [stamp(header(ROOT), T0)] + (v3_launch + authority if first == "v3" else authority + v3_launch)
+    records.append(
+        stamp(assistant("idle", [{"type": "text", "text": "Waiting."}], stopReason="stop"), T0 + timedelta(hours=3))
+    )
+    write(tmp_path / "sessions" / "synthetic" / "mixed-root.jsonl", records)
+    refresh(clean, tmp_path)
+    assert sorted(r[0] for r in clean.execute("SELECT mode FROM ah.loop_run")) == ["run", "v3"]
+    # Each terminal document lands after the other dialect's later start on the same root.
+    when = T0 + timedelta(minutes=20)
+    if first == "v3":
+        clean.execute(
+            "INSERT INTO ah.loop_run_metadata(machine,path,kind,sha256,line1,file_mtime,repo_origin) "
+            "VALUES ('machine-a',%s,'closeout',%s,%s,%s,'example/project')",
+            (V3_CLOSEOUT, "b" * 64, V3_HEADER, when),
+        )
+        clean.commit()
+    else:
+        collect(clean, when=when)
+    refresh(clean)
+    ended = clean.execute("SELECT mode, end_evidence FROM ah.loop_run WHERE mode=%s", (first,)).fetchone()
+    assert ended == (first, "closeout")
