@@ -79,10 +79,11 @@ jobs:
           RELEASE_TAG: ${{ inputs.release_tag }}
           IMAGE: ghcr.io/${{ github.repository }}
         run: |
-          # The reusable tags every default-branch build main-<7 char sha> (docker/metadata-action
+          # The reusable tags every default-branch build main-<short sha> (docker/metadata-action
           # type=sha) but offers no full-SHA tag and exposes no digest output.
-          # A release run is tagged by version (semver strips a leading v), an edge run main-<sha7>.
-          if [ -n "${RELEASE_TAG}" ]; then sources=("${RELEASE_TAG#v}" "${RELEASE_TAG}"); else sources=("main-${COMMIT:0:7}"); fi
+          # Its short sha is 12 characters now and was 7; try both so a pin bump cannot break this again.
+          # A release run is tagged by version (semver strips a leading v), an edge run main-<short sha>.
+          if [ -n "${RELEASE_TAG}" ]; then sources=("${RELEASE_TAG#v}" "${RELEASE_TAG}"); else sources=("main-${COMMIT:0:12}" "main-${COMMIT:0:7}"); fi
           digest=""
           for source in "${sources[@]}"; do
             digest="$(docker buildx imagetools inspect "${IMAGE}:${source}" --format '{{json .Manifest.Digest}}' 2>/dev/null | tr -d '"')" || digest=""
