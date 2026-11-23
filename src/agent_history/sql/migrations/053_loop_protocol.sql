@@ -24,5 +24,5 @@ ON CONFLICT DO NOTHING;
 INSERT INTO ah.dirty_session (session_id)
 SELECT DISTINCT COALESCE(s.root_session_id, s.id)
 FROM ah.file_touch f JOIN ah.session s ON s.id = f.session_id
-WHERE f.path ~ '/codex/run-[0-9]{8}-[1-9][0-9]{0,3}/AUTHORITY\.md$'
+WHERE f.path ~ '(^|/)codex/run-[0-9]{8}-[1-9][0-9]{0,3}/AUTHORITY\.md$'
 ON CONFLICT DO NOTHING;

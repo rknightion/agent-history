@@ -380,3 +380,23 @@ def test_dialects_do_not_bound_each_others_windows(clean, tmp_path, first):
     refresh(clean)
     ended = clean.execute("SELECT mode, end_evidence FROM ah.loop_run WHERE mode=%s", (first,)).fetchone()
     assert ended == (first, "closeout")
+
+
+def test_a_late_root_on_the_same_folder_reprojects_the_finished_run(clean, tmp_path):
+    run_root(tmp_path)
+    refresh(clean, tmp_path)
+    collect(clean, when=T0 + timedelta(hours=1))
+    refresh(clean)
+    assert counts(clean)[3:5] == ("finished", "closeout")
+    # Long after collection, so only the late root's arrival can select the finished run again.
+    clean.execute("UPDATE ah.loop_run_metadata SET seen_at = now() - interval '1 day'")
+    clean.commit()
+    late = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"
+    records = [stamp(header(late), T0 + timedelta(minutes=30))]
+    records += tool_write("late-authority", T0 + timedelta(minutes=30), AUTHORITY, AUTHORITY_BODY)
+    write(tmp_path / "sessions" / "synthetic" / "late-root.jsonl", records)
+    refresh(clean, tmp_path)
+    rows = clean.execute("SELECT launch_ts, end_evidence FROM ah.loop_run ORDER BY launch_ts").fetchall()
+    # The first run's window now ends where the late run starts, before the closeout was saved.
+    assert rows[0] == (T0 + timedelta(seconds=10), "next_launch")
+    assert rows[1] == (T0 + timedelta(minutes=30), "closeout")

@@ -228,10 +228,15 @@ MARKER = "loops_run_projection_v1"
 SELECTION_SQL = """
     WITH changed AS MATERIALIZED (
         SELECT s.id,s.root_session_id,s.loop_run_id FROM dirty_now d JOIN ah.session s ON s.id=d.session_id
+    ), dirty_owners AS MATERIALIZED (
+        SELECT l.launch_uid FROM changed c JOIN ah.loop_run l ON l.root_session_id=COALESCE(c.root_session_id,c.id)
+        UNION SELECT l.launch_uid FROM changed c JOIN ah.loop_run l ON l.id=c.loop_run_id
     ), selected AS (
         SELECT launch_uid FROM ah.loops WHERE status IN ('running','waiting','paused')
-        UNION SELECT l.launch_uid FROM changed c JOIN ah.loop_run l ON l.root_session_id=COALESCE(c.root_session_id,c.id)
-        UNION SELECT l.launch_uid FROM changed c JOIN ah.loop_run l ON l.id=c.loop_run_id
+        UNION SELECT launch_uid FROM dirty_owners
+        -- A late run on a folder bounds every other run of that folder, finished ones included.
+        UNION SELECT n.launch_uid FROM dirty_owners d JOIN ah.loop_run l USING(launch_uid)
+              JOIN ah.loop_run n ON n.report_path=l.report_path AND n.mode='run'
         UNION SELECT l.launch_uid FROM ah.loop_run_metadata r JOIN ah.loop_run l ON l.goal_path=r.path
               WHERE r.kind='authority' AND r.seen_at >= %s::timestamptz - interval '2 hours' AND r.seen_at <= %s
         UNION SELECT l.launch_uid FROM ah.loop_run_metadata r JOIN ah.loop_run l ON l.report_path=r.path

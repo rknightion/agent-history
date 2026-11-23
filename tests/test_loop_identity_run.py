@@ -223,3 +223,25 @@ def test_latest_write_must_be_unique_and_other_paths_are_untouched():
     assert check(writes=[first, second]).end is None
     assert closeout_write("Write", write(AUTHORITY, CLOSEOUT_BODY), CLOSEOUT, CWD, AT, AT) is None
     assert closeout_write("Write", write(CLOSEOUT, CLOSEOUT_BODY), AUTHORITY, CWD, AT, AT) is None
+
+
+@pytest.mark.parametrize(
+    ("path", "queued"),
+    [
+        (AUTHORITY, True),
+        (f"codex/{RUN}/AUTHORITY.md", True),  # a relative path, as the Codex parser keeps it
+        (f"xcodex/{RUN}/AUTHORITY.md", False),
+        (f"{CWD}/codex/{RUN}/PLAN.md", False),
+        (f"{CWD}/codex/archive/AUTHORITY.md", False),
+    ],
+)
+def test_migration_queues_roots_of_absolute_and_relative_authority_writes(path, queued):
+    """The 053 backfill's path pattern, read from the migration (the same POSIX regex in Python)."""
+    import re
+    from pathlib import Path
+
+    import agent_history
+
+    sql = (Path(agent_history.__file__).parent / "sql" / "migrations" / "053_loop_protocol.sql").read_text()
+    (pattern,) = re.findall(r"WHERE f\.path ~ '([^']+)'", sql)
+    assert bool(re.search(pattern, path)) is queued
