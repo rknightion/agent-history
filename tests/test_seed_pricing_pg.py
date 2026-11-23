@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import re
 import subprocess
 import sys
 import uuid
@@ -27,6 +28,17 @@ MODEL = "gpt-6-sol"
 # 1-hour cache write (none published), output. It is the contract, not a copy of the seed file.
 MODEL_61 = "gpt-6.1-sol"
 RATE_61 = (Decimal("2.00"), Decimal("0.10"), Decimal("2.50"), None, Decimal("10.00"))
+
+
+# The vendor list prices of the models added from the pricing pages on 2026-11-23, USD per million
+# tokens: input, cached input, cache write, 1-hour cache write, output. The OpenAI page publishes a
+# 12-hour write price, which no column models, so the 1-hour column stays NULL for those rows.
+NEW_RATES = {
+    "gpt-6.2-sol": (Decimal("2.00"), Decimal("0.10"), Decimal("2.50"), None, Decimal("10.00")),
+    "gpt-6.1-terra": (Decimal("1.00"), Decimal("0.05"), Decimal("1.25"), None, Decimal("5.00")),
+    "gpt-6.2-astra": (Decimal("8.00"), Decimal("0.40"), Decimal("10.00"), None, Decimal("40.00")),
+    "claude-fable-5-2": (Decimal("8.00"), Decimal("0.20"), Decimal("10.00"), Decimal("16.00"), Decimal("40.00")),
+}
 
 
 def insert_session(conn, model):
@@ -196,6 +208,24 @@ def test_explicit_seed_prices_gpt_6_1_sol_and_keeps_operator_row(catalogue_61):
         (MODEL_61,),
     ).fetchall() == [(Decimal("0.50"), "operator override")]
     assert cost(conn, session) == (1, None, Decimal("12.50"), Decimal("12.50"))
+
+
+@pytest.mark.parametrize("model", sorted(NEW_RATES))
+def test_explicit_seed_prices_each_added_model_with_a_dated_source(model):
+    with priced_session(model) as (conn, session):
+        assert cost(conn, session) == (1, 1, None, None)
+        conn.commit()
+        seed_pricing()
+        rows = conn.execute(
+            "SELECT input_per_mtok, cached_input_per_mtok, cache_write_per_mtok, cache_write_1h_per_mtok, "
+            "output_per_mtok, effective_from::text, source FROM ah.model_pricing WHERE model = %s",
+            (model,),
+        ).fetchall()
+        assert [row[:6] for row in rows] == [(*NEW_RATES[model], "2000-01-01")]
+        assert re.fullmatch(r"(openai|anthropic) pricing 2026-11-23", rows[0][6])
+        # 1M uncached input, 1M cached input and 1M output tokens.
+        total = NEW_RATES[model][0] + NEW_RATES[model][1] + NEW_RATES[model][4]
+        assert cost(conn, session) == (1, None, total, total)
 
 
 def test_unseeded_gpt_6_1_sol_session_is_unpriced_not_zero(catalogue_61):

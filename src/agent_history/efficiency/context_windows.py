@@ -33,4 +33,9 @@ PI_CONTEXT_WINDOWS: dict[str, int] = {
     "gpt-6-luna": 700000,
     # pi overlay models.json: providers.openai.modelOverrides.gpt-6-astra.contextWindow.
     "gpt-6-astra": 700000,
+    # pi overlay models.json: providers.openai.modelOverrides.gpt-6.2-sol.contextWindow.
+    "gpt-6.2-sol": 600000,
+    # No overlay override: pi's own catalogue value for the openai provider.
+    "gpt-6.1-terra": 272000,
+    "gpt-6.2-astra": 272000,
 }
