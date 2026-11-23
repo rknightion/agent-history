@@ -66,18 +66,19 @@ def test_claude_lane_returns_come_from_its_final_message(clean, tmp_path):
     stale = lane(clean, root_id, "a3", AT + timedelta(minutes=5))
     say(clean, stale, "s1", block, AT + timedelta(minutes=6))
     say(clean, stale, "s2", "Finished, see the branch. Status: complete", AT + timedelta(minutes=7))
-    # Codex and pi lanes keep their own final reports; a plain report states its status too.
-    pi = lane(clean, root_id, "a4", AT + timedelta(minutes=5), agent="pi")
+    # A Codex lane keeps its own final report; a plain report states its status too. (A synthetic pi
+    # child would be re-parented by the pi lineage pass, so Codex stands for both here.)
+    codex = lane(clean, root_id, "a4", AT + timedelta(minutes=5), agent="codex")
     say(
         clean,
-        pi,
+        codex,
         "r1",
         "Status: failed\nThe gate failed.",
         AT + timedelta(minutes=7),
-        agent="pi",
+        agent="codex",
         cls="subagent_report",
     )
-    say(clean, pi, "r2", block, AT + timedelta(minutes=8), agent="pi")
+    say(clean, codex, "r2", block, AT + timedelta(minutes=8), agent="codex")
     retag(clean, root_id)
     lanes = clean.execute(
         "SELECT session_id, return_status, returns->-1->>'source', jsonb_array_length(returns) FROM ah.lane "
@@ -88,7 +89,7 @@ def test_claude_lane_returns_come_from_its_final_message(clean, tmp_path):
         (plain, "blocked", "final_message", 1),
         (fenced, "complete", "final_message", 1),
         (stale, None, None, None),
-        (pi, "failed", "report", 1),
+        (codex, "failed", "report", 1),
     ]
     assert clean.execute("SELECT lane_return FROM ah.lane WHERE session_id=%s", (plain,)).fetchone() == (
         {"status": "blocked", "form": "status_line"},
