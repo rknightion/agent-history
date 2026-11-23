@@ -760,10 +760,16 @@ Migration `026_loop_planner_signals.sql` adds the collector tables `ah.backlog_d
 
 `ah.lane.returns` (migration `040_lane_returns.sql`) holds every `lane-return` block of the lane, oldest first, as a
 JSON array of `{at, source, event_uid, status, return}`. `source` is `report` for a block in the lane session's own
-`subagent_report` messages, or `hand_back` for a block in a Claude subagent hand-back (`[Subagent hand-back]`,
-`<agent-message from="<the lane's agent id>">`) relayed to the lane's parent as an `agent_message` or
-`queued_prompt`: a lane resumed after a one-shot hand-back returns again only that way. A relayed block equal to
-one already held is the same return. `ah.lane.return_status` and `lane_return` are the latest entry's.
+`subagent_report` messages, `final_message` for a block in a Claude lane session's last `assistant_text` message
+(where a Claude subagent writes its final message), or `hand_back` for a block in a Claude subagent hand-back
+(`[Subagent hand-back]`, `<agent-message from="<the lane's agent id>">`) relayed to the lane's parent as an
+`agent_message` or `queued_prompt`: a lane resumed after a one-shot hand-back returns again only that way. A block
+equal to one already held is the same return. `ah.lane.return_status` and `lane_return` are the latest entry's.
+A `report` or `final_message` without a fenced block is a return only when its first non-empty line is exactly
+`Status: <complete|partial|blocked|failed>` (trailing spaces allowed); it is stored as
+`{"status": <status>, "form": "status_line"}` and nothing else of the message is projected. No status is
+inferred from any other text. Lanes indexed before these two sources are re-read once, in bounded batches
+behind a transactional cursor, without a rebuild.
 A v2 or v3 block (`"v"` the JSON integer 2 or 3, with `lane` and `status` in
 `complete|partial|blocked|failed`) is stored whole and gives `return_status` only when both are valid;
 an object with any other `v` is stored whole with no `return_status`; the earlier free-form object (no

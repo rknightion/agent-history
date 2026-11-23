@@ -40,6 +40,8 @@ LANE_CLOSE = re.compile(r"\s*```")
 FENCE_LINE_END = re.compile(r"```[ \t]*\r?$", re.M)
 UNPARSED = object()
 LANE_STATUS_V2 = ("complete", "partial", "blocked", "failed")
+# The plain return a lane gives without a fenced block: its first non-empty line, exactly this.
+STATUS_LINE = re.compile(r"Status: (complete|partial|blocked|failed)[ \t]*")
 CAMPAIGN = re.compile(r"^(?:report|closeout)-(.*?)-(?:loop|wave)\d+\.md$")
 # wave-notify completion receipts by kind. `.notified` (no longer written): `sha256:<64 hex> request
 # <id>`, or the legacy `request <id>`. `.posted`, written once the receiver accepted the report:
@@ -433,7 +435,7 @@ def refresh_live(conn: psycopg.Connection) -> dict[str, int]:
 
     refresh_status(conn)
     _refresh_identity(conn, finished, v3_projected)
-    _refresh_progress(conn)
+    _refresh_progress(conn, _refresh_lane_returns(conn))
     _refresh_state_counts(conn)
     conn.execute("UPDATE ah.loops SET waiting_until=NULL WHERE status='finished' AND waiting_until IS NOT NULL")
     from .loop_live import refresh as refresh_phase
@@ -839,7 +841,7 @@ PROGRESS_SELECTION_SQL = """
 """
 
 
-def _refresh_progress(conn: psycopg.Connection) -> None:
+def _refresh_progress(conn: psycopg.Connection, also: Sequence[str] = ()) -> None:
     """Refresh active/dirty loops plus at most 128 historical rows per transaction.
 
     The cursor is transactional with the projection. Existing catalogues therefore backfill on
@@ -860,7 +862,7 @@ def _refresh_progress(conn: psycopg.Connection) -> None:
             )
         ]
     active = [r[0] for r in conn.execute(PROGRESS_SELECTION_SQL)]
-    for uid in dict.fromkeys(historical + active):
+    for uid in dict.fromkeys(historical + active + list(also)):
         conn.execute(
             """
             WITH target AS (
@@ -1714,6 +1716,19 @@ def parse_lane_returns(text: str) -> list[tuple[Any, str | None]]:
     return [_projected(value) for value in _lane_blocks(text)]
 
 
+def parse_status_line(text: str) -> tuple[dict[str, str], str] | None:
+    """The plain return: a message whose first non-empty line is exactly `Status: <status>`.
+
+    The status is one of complete|partial|blocked|failed. The stored return is only that stated
+    status, `{"status": ..., "form": "status_line"}`; nothing else of the message is projected.
+    """
+    for line in (text or "").splitlines():
+        if line.strip():
+            match = STATUS_LINE.fullmatch(line)
+            return ({"status": match[1], "form": "status_line"}, match[1]) if match else None
+    return None
+
+
 def parse_lane_return(text: str) -> tuple[Any, str | None]:
     """(lane_return, return_status) of the last ```lane-return block in a lane's final message.
 
@@ -1739,16 +1754,21 @@ def lane_returns(
 ) -> list[dict[str, Any]]:
     """Every lane-return of one lane session, oldest first.
 
-    Sources: the session's own final reports, then (Claude) subagent hand-backs addressed from its
-    agent id and relayed to a parent as an agent message or queued prompt, which is the only place a
-    lane resumed after a one-shot hand-back returns again. A relayed copy equal to a return already
-    held is the same return, not another.
+    Sources: the session's own final reports, then (Claude) the lane session's last assistant text,
+    which is where a Claude subagent writes its final message, then (Claude) subagent hand-backs
+    addressed from its agent id and relayed to a parent as an agent message or queued prompt, which
+    is the only place a lane resumed after a one-shot hand-back returns again. A copy equal to a
+    return already held is the same return, not another. A final report or final message without a
+    fenced block gives a return only when its first non-empty line states the status.
     """
     found: list[tuple[Any, int, int, dict[str, Any]]] = []
     seen: set[str] = set()
 
-    def add(source: str, ts: Any, uid: str, text: str, rank: int, keep_equal: bool) -> None:
-        for index, (value, status) in enumerate(parse_lane_returns(text)):
+    def add(source: str, ts: Any, uid: str, text: str, rank: int, keep_equal: bool, plain: bool = False) -> None:
+        values = parse_lane_returns(text)
+        if not values and plain and (stated := parse_status_line(text)):
+            values = [stated]
+        for index, (value, status) in enumerate(values):
             key = json.dumps(value, sort_keys=True)
             if not keep_equal and key in seen:
                 continue
@@ -1758,10 +1778,19 @@ def lane_returns(
 
     for uid, ts, text in conn.execute(
         "SELECT event_uid, ts, text FROM ah.message WHERE session_id = %s AND message_class = 'subagent_report' "
-        "AND position('```lane-return' in text) > 0 ORDER BY ts, byte_offset, id",
+        "AND (position('```lane-return' in text) > 0 OR ltrim(text, E' \\t\\r\\n') LIKE 'Status:%%') "
+        "ORDER BY ts, byte_offset, id",
         (session_id,),
     ):
-        add("report", ts, uid, text, 0, True)
+        add("report", ts, uid, text, 0, True, plain=True)
+    if agent == "claude":
+        final = conn.execute(
+            "SELECT event_uid, ts, text FROM ah.message WHERE session_id = %s AND message_class = 'assistant_text' "
+            "ORDER BY ts DESC, byte_offset DESC, id DESC LIMIT 1",
+            (session_id,),
+        ).fetchone()
+        if final:
+            add("final_message", final[1], final[0], final[2], 2, False, plain=True)
     if agent == "claude" and agent_id and parents:
         header = _hand_back_header(agent_id)
         for uid, ts, text in conn.execute(
@@ -1775,6 +1804,40 @@ def lane_returns(
                 add("hand_back", ts, uid, text[framed.end() :], 1, False)
     found.sort(key=lambda item: item[:3])
     return [entry for *_, entry in found]
+
+
+LANE_RETURNS_MARKER = "loops_lane_returns_final_message_v1"
+LANE_RETURNS_BATCH = 256
+
+
+def _refresh_lane_returns(conn: psycopg.Connection) -> list[str]:
+    """Re-read the returns of lanes indexed before the final-message and status-line sources, once.
+
+    A bounded batch of lanes without a return status per pass, in id order behind a transactional
+    cursor; new lanes are read when their sessions change. Returns the runs whose lanes gained a
+    return, so their progress counts are refreshed in the same pass.
+    """
+    saved = conn.execute("SELECT value FROM ah.meta WHERE key = %s", (LANE_RETURNS_MARKER,)).fetchone()
+    if saved and saved[0] == "complete":
+        return []
+    cursor = int(saved[0]) if saved else 0
+    lanes = conn.execute(
+        "SELECT l.id, l.loop_run_id, l.session_id, l.link_method, r.launch_uid FROM ah.lane l "
+        "JOIN ah.loop_run r ON r.id = l.loop_run_id WHERE l.id > %s AND l.return_status IS NULL "
+        "ORDER BY l.id LIMIT %s",
+        (cursor, LANE_RETURNS_BATCH),
+    ).fetchall()
+    changed = []
+    for lane_id, loop_id, session_id, method, uid in lanes:
+        _lane(conn, loop_id, session_id, method)
+        if conn.execute("SELECT return_status IS NOT NULL FROM ah.lane WHERE id = %s", (lane_id,)).fetchone()[0]:
+            changed.append(uid)
+    following = str(lanes[-1][0]) if len(lanes) == LANE_RETURNS_BATCH else "complete"
+    conn.execute(
+        "INSERT INTO ah.meta (key, value) VALUES (%s, %s) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+        (LANE_RETURNS_MARKER, following),
+    )
+    return list(dict.fromkeys(changed))
 
 
 def _return_lane(entries: Sequence[dict[str, Any]]) -> str | None:
