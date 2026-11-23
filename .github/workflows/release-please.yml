@@ -21,7 +21,7 @@ jobs:
       tag_name: ${{ steps.release.outputs.tag_name }}
     steps:
       - id: bao
-        uses: rknightion/.github/.github/actions/broker-token@774210034cb603b840df2d136fd3e8fe33469d27 # v1.31.5
+        uses: rknightion/.github/.github/actions/broker-token@b8a49e837c591099a98530180ab1050e89b29b23 # v1.31.8
         with:
           permission-set: release-please-agent-history
           role: release-please-agent-history
