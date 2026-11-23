@@ -58,7 +58,7 @@ def refresh(conn: psycopg.Connection) -> int:
             SELECT l.*, lead(launch_ts) OVER (
                 PARTITION BY root_session_id ORDER BY launch_ts, id
             ) AS following
-            FROM ah.loop_run l
+            FROM ah.loop_run l WHERE l.mode IS DISTINCT FROM 'run'
         )
         SELECT l.launch_uid, live.status, live.end_ts, live.waiting_until,
                l.launch_ts, l.end_ts, l.end_evidence,

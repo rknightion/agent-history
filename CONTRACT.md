@@ -510,6 +510,68 @@ lifecycle unless independent replacement or qualified state-close evidence still
 end. A v3 closeout does not require a legacy notification receipt. Projection reads retained
 catalogue evidence only, never the indexer's local document paths.
 
+### Run-folder dialect (protocol v5) and declared protocol (migration 053)
+
+Migration `053_loop_protocol.sql` adds nullable `ah.loop_run.protocol`, nullable
+`ah.loop_run_metadata.protocol`, the metadata kinds `authority` and `run_closeout`, and nullable
+`ah.session_rollup.synthetic_calls`. `loop_run.mode` keeps its meaning, the dialect of the run's
+terminal document; `protocol` is separate and never selects a dialect.
+
+A collected document's `protocol` is the token of a `protocol: <token>` line that is the first
+non-empty line after its first line, exactly: lower-case `protocol`, one space, `v`, one to three
+digits not starting with 0, and optionally `.` and one to three digits, then only trailing spaces
+or tabs. Any other line, position or token stores NULL. Only the token is stored. Rows collected
+before this migration stay NULL until collected again.
+
+For a run of the earlier dialects, `loop_run.protocol` is the one token declared by the
+exact-path charter (`goal_path`) and closeout (`report_path`) snapshots, re-projected on every
+refresh; no declaration, or two different tokens, is NULL. It never changes identity, completion,
+counts or `mode`.
+
+The run-folder dialect has no charter and no launch text. A run folder is
+`codex/run-<YYYYMMDD>-<n>/` directly below `codex/` of a repository, with a real calendar date and
+`n` counting from 1. Its documents are `AUTHORITY.md`, whose first line is
+`# Authority: <repo> run-<YYYYMMDD>-<n>`, and `CLOSEOUT.md`, whose first line is
+`# Closeout: <repo> run-<YYYYMMDD>-<n>`; in both the run name must equal the folder name and the
+declared protocol must be `v5`. The collector records them for configured checkouts as kinds
+`authority` and `run_closeout` under the same metadata-only rules as charters and closeouts:
+anchored no-follow descriptors for `codex/`, the run folder and the file, a qualified line 1 or
+NULL, the protocol token, and for a qualified `run_closeout` the `landed_count` and
+`parked_count` of its `## Landed` and `## Parked` headings, counted exactly as for a v3 closeout
+(a `- #<n> <title>` line is one entry). No other file of the folder is read.
+
+A run of this dialect is recognised from the root's own transcript, never from a collected file.
+Its root is the top-level session whose complete successful structured write (`Write`/`write`,
+`apply_patch` Add File or executed FileChange add) creates an exact `AUTHORITY.md` path of a run
+folder with the qualified first line and `protocol: v5`. Edits, shell text, a subagent's write (also
+while its parent is not yet indexed), one write that creates several `AUTHORITY.md` files and any
+other path start nothing. One `ah.loop_run` row per folder and root, keyed by the root and the
+first such write's tool I/O uid, has `mode = 'run'`, `protocol = 'v5'`, `naming = 'run'`,
+`goal_path` the `AUTHORITY.md` path, `report_path` the sibling `CLOSEOUT.md` path, `launch_ts` the
+write's time and no loop number or launch hash. Its lanes are the root's sessions that start in
+the half-open window up to the root's next run. `ah.loops.loop` holds the run name and
+`goal_sha256` is NULL; `ah.loops.repo` is the collected origin of the run's documents, else the
+captured remote of the root, else the checkout fallback below. No v3 or historical rule reads
+these rows, and no rule of this dialect reads rows of another dialect: on a shared root, a run of
+one dialect never bounds a window, tie or lifecycle line of the other.
+
+The run ends with `end_evidence = 'closeout'` when its `CLOSEOUT.md` qualifies in the half-open
+window bounded by the next run on the same root or exact path: every in-window collected
+`run_closeout` must have the run's qualified line 1 and `protocol = 'v5'` and share one hash, and
+the latest in-window captured mutation of the exact path must be unique, with complete qualified
+bytes that match a collected copy when one exists, or be an edit followed by a collected copy saved
+at or after it. The end is the earliest remaining evidence, which may be the transcript write
+alone. A later lane start does not move or block it. Malformed or conflicting collected origins,
+tied starts and any failed condition leave no closeout end; revoked, the end returns to the next
+run's start or the root's last event. For a run finished by its closeout, a qualified collected
+`run_closeout` with `protocol = 'v5'` supplies `tasks_landed`, `tasks_done` and `parks_total` exactly
+as v3 closeout counts do, on every refresh; counts come only from collected copies.
+
+The migration marks for one recomputation every session that holds a `<synthetic>` model call and
+every root that wrote a run folder's `AUTHORITY.md`, so existing roots are recognised without a
+rebuild. `session_rollup.synthetic_calls` counts a session's `llm_call` rows whose model is Claude
+Code's `<synthetic>` marker; it is NULL until the session is rolled up by a rollup that writes it.
+
 ### HISTORICAL v2 identity and retained compatibility
 
 The following report/goal rules describe historical v2 and legacy launches, not v3 closeouts.
@@ -760,10 +822,16 @@ Migration `026_loop_planner_signals.sql` adds the collector tables `ah.backlog_d
 
 `ah.lane.returns` (migration `040_lane_returns.sql`) holds every `lane-return` block of the lane, oldest first, as a
 JSON array of `{at, source, event_uid, status, return}`. `source` is `report` for a block in the lane session's own
-`subagent_report` messages, or `hand_back` for a block in a Claude subagent hand-back (`[Subagent hand-back]`,
-`<agent-message from="<the lane's agent id>">`) relayed to the lane's parent as an `agent_message` or
-`queued_prompt`: a lane resumed after a one-shot hand-back returns again only that way. A relayed block equal to
-one already held is the same return. `ah.lane.return_status` and `lane_return` are the latest entry's.
+`subagent_report` messages, `final_message` for a block in a Claude lane session's last `assistant_text` message
+(where a Claude subagent writes its final message), or `hand_back` for a block in a Claude subagent hand-back
+(`[Subagent hand-back]`, `<agent-message from="<the lane's agent id>">`) relayed to the lane's parent as an
+`agent_message` or `queued_prompt`: a lane resumed after a one-shot hand-back returns again only that way. A block
+equal to one already held is the same return. `ah.lane.return_status` and `lane_return` are the latest entry's.
+A `report` or `final_message` without a fenced block is a return only when its first non-empty line is exactly
+`Status: <complete|partial|blocked|failed>` (trailing spaces allowed); it is stored as
+`{"status": <status>, "form": "status_line"}` and nothing else of the message is projected. No status is
+inferred from any other text. Lanes indexed before these two sources are re-read once, in bounded batches
+behind a transactional cursor, without a rebuild.
 A v2 or v3 block (`"v"` the JSON integer 2 or 3, with `lane` and `status` in
 `complete|partial|blocked|failed`) is stored whole and gives `return_status` only when both are valid;
 an object with any other `v` is stored whole with no `return_status`; the earlier free-form object (no
@@ -1269,9 +1337,10 @@ never identity or inferred lifecycle root activity.
 Author emails are compared to configured identities but only `author_is_owner` is stored.
 Permission logs contribute timestamps, line hashes, tool names, command verbs, classifier reasons
 and sub-agent flags, never command arguments or target text. New run metadata contributes only
-hashes, qualified closeout line 1, mtime, origin, two closeout task counts and a charter's ordered
-first-wave task IDs (the IDs opening rows under its `## First wave` heading, and nothing else from
-the body) alongside its key, never charter/closeout bodies, titles, notes or any other task IDs.
+hashes, qualified closeout, authority and run closeout line 1, mtime, origin, two closeout task counts, one
+declared protocol token and a charter's ordered first-wave task IDs (the IDs opening rows under its
+`## First wave` heading, and nothing else from the body) alongside its key, never document bodies, titles,
+notes or any other task IDs.
 Legacy `loop_receipt` rows retain receipt text, qualified report line 1, hashes and origin for
 historical reads; new receipt collection is retired globally. These metadata fields may themselves
 be sensitive. Protect collector homes, configuration and the catalogue accordingly.

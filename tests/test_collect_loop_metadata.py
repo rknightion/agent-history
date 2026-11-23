@@ -47,6 +47,7 @@ def test_metadata_only_stream_hash_and_origin(repo):
         "landed_count",
         "parked_count",
         "task_ids",
+        "protocol",
     }
     assert {name for name, _ in cm.COLS} == expected
     assert cm.KEY == ["machine", "kind", "path"]
@@ -381,3 +382,140 @@ def test_collected_charter_keeps_only_first_wave_ids(repo):
     assert next(cm.metadata(repo, "test-machine"))["task_ids"] is None
     write(repo, "charter-project-loop12.md", CHARTER.encode() + b"x" * cm.MAX_COUNT_BYTES)
     assert next(cm.metadata(repo, "test-machine"))["task_ids"] is None
+
+
+# ---- protocol line and the run-folder dialect --------------------------------------------------
+
+RUN = "run-20261123-1"
+AUTHORITY_HEADER = f"# Authority: sample/project {RUN}"
+RUN_CLOSEOUT_HEADER = f"# Closeout: sample/project {RUN}"
+
+
+def run_file(repo, folder, name, data):
+    path = repo / "codex" / folder / name
+    path.parent.mkdir(exist_ok=True)
+    path.write_bytes(data)
+    return path
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        ("# Title\nprotocol: v5\nbody\n", "v5"),
+        ("# Title\n\n  \nprotocol: v4.1  \r\nbody\n", "v4.1"),
+        ("# Title\r\nprotocol: v5\r\n", "v5"),
+        # Anywhere but the first non-empty line after line 1 is not a declaration.
+        ("# Title\nIntro.\nprotocol: v5\n", None),
+        ("protocol: v5\n", None),
+        # The token and its spelling are strict.
+        ("# Title\nProtocol: v5\n", None),
+        ("# Title\nprotocol:v5\n", None),
+        ("# Title\nprotocol: V5\n", None),
+        ("# Title\nprotocol: v5 (draft)\n", None),
+        ("# Title\nprotocol: v05\n", None),
+        ("# Title\nprotocol: five\n", None),
+        ("# Title\nprotocol: v1234\n", None),
+        ("# Title\n- protocol: v5\n", None),
+        ("# Title\n", None),
+    ],
+)
+def test_declared_protocol_line_is_strict(body, expected):
+    from agent_history.loop_identity_run import declared_protocol
+
+    assert declared_protocol(body) == expected
+
+
+def test_charter_and_closeout_carry_their_declared_protocol(repo):
+    write(repo, "charter-project-loop12.md", b"# Charter\nprotocol: v4\n## First wave\n- ABC-0001\n")
+    write(repo, "closeout-project-loop12.md", (HEADER + "\n\n## Landed\n- ABC-0001\n").encode())
+    rows = {row["kind"]: row for row in cm.metadata(repo, "test-machine")}
+    assert (rows["charter"]["protocol"], rows["charter"]["task_ids"], rows["charter"]["line1"]) == (
+        "v4",
+        ["ABC-0001"],
+        None,
+    )
+    # A closeout without the line declares nothing; its counts are unchanged.
+    assert (rows["closeout"]["protocol"], rows["closeout"]["landed_count"]) == (None, 1)
+
+
+def test_run_folder_documents_are_collected_with_counts_and_protocol(repo):
+    authority = (AUTHORITY_HEADER + "\n\nprotocol: v5\n\nPrivate scope.\n").encode()
+    closeout = (
+        RUN_CLOSEOUT_HEADER
+        + "\nprotocol: v5\n\n## Landed\n- #12 First change\n- #13 Second change\n\n## Parked\n- #14 Waits\n\n"
+        "## Decisions needed\n- #15 is only a reference.\n\n## Spend by role\n| role | calls |\n"
+    ).encode()
+    run_file(repo, RUN, "AUTHORITY.md", authority)
+    run_file(repo, RUN, "CLOSEOUT.md", closeout)
+    run_file(repo, RUN, "PLAN.md", b"not collected")
+    errors = []
+    rows = sorted(cm.metadata(repo, "test-machine", errors), key=lambda row: row["kind"])
+    assert errors == []
+    assert [(r["kind"], r["path"], r["line1"], r["protocol"], r["landed_count"], r["parked_count"]) for r in rows] == [
+        ("authority", str(repo / "codex" / RUN / "AUTHORITY.md"), AUTHORITY_HEADER, "v5", None, None),
+        ("run_closeout", str(repo / "codex" / RUN / "CLOSEOUT.md"), RUN_CLOSEOUT_HEADER, "v5", 2, 1),
+    ]
+    assert [r["sha256"] for r in rows] == [hashlib.sha256(authority).hexdigest(), hashlib.sha256(closeout).hexdigest()]
+    assert all(r["repo_origin"] == "sample/project" and r["task_ids"] is None for r in rows)
+
+
+@pytest.mark.parametrize(
+    "suffix",
+    [
+        "sample/project run-20261123-2",  # another run's name
+        "sample/project run-20261123-1 extra",
+        "sample/project loop12",
+        "sample/project run-20261123-1 · Charter: " + "a" * 64,
+        None,  # each document carries the other document's header
+    ],
+)
+def test_run_folder_header_must_name_its_folder(repo, suffix):
+    authority = f"# Authority: {suffix}" if suffix else RUN_CLOSEOUT_HEADER
+    closeout = f"# Closeout: {suffix}" if suffix else AUTHORITY_HEADER
+    run_file(repo, RUN, "AUTHORITY.md", (authority + "\nprotocol: v5\n").encode())
+    run_file(repo, RUN, "CLOSEOUT.md", (closeout + "\nprotocol: v5\n## Landed\n- #1 x\n").encode())
+    rows = list(cm.metadata(repo, "test-machine"))
+    assert len(rows) == 2
+    assert all(r["line1"] is None and r["landed_count"] is None and r["protocol"] == "v5" for r in rows)
+
+
+@pytest.mark.parametrize(
+    "folder", ["run-20261332-1", "run-20261123-0", "run-2026112-1", "run-20261123-01", "run-20261123-1x", "runs"]
+)
+def test_only_dated_run_folders_are_read(repo, folder):
+    run_file(repo, folder, "AUTHORITY.md", (f"# Authority: sample/project {folder}\nprotocol: v5\n").encode())
+    errors = []
+    assert list(cm.metadata(repo, "test-machine", errors)) == []
+    assert errors == []
+
+
+def test_linked_run_folder_and_documents_are_refused(repo, tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "AUTHORITY.md").write_bytes((AUTHORITY_HEADER + "\nprotocol: v5\n").encode())
+    (repo / "codex" / RUN).symlink_to(outside, target_is_directory=True)
+    errors = []
+    assert list(cm.metadata(repo, "test-machine", errors)) == []
+    assert errors and all(e["step"] == "loop_run_metadata" for e in errors)
+    (repo / "codex" / RUN).unlink()
+    (repo / "codex" / RUN).mkdir()
+    (repo / "codex" / RUN / "AUTHORITY.md").symlink_to(outside / "AUTHORITY.md")
+    errors = []
+    assert list(cm.metadata(repo, "test-machine", errors)) == []
+    assert errors
+
+
+def test_run_folder_changed_during_read_is_rejected(repo, monkeypatch):
+    run_file(repo, RUN, "AUTHORITY.md", (AUTHORITY_HEADER + "\nprotocol: v5\n").encode())
+    original = cm.hashlib.sha256
+
+    def raced(*args, **kwargs):
+        folder = repo / "codex" / RUN
+        folder.rename(repo / "codex" / "old-run")
+        run_file(repo, RUN, "AUTHORITY.md", (AUTHORITY_HEADER + "\nprotocol: v5\n").encode())
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(cm.hashlib, "sha256", raced)
+    errors = []
+    assert list(cm.metadata(repo, "test-machine", errors)) == []
+    assert errors and errors[0]["step"] == "loop_run_metadata"

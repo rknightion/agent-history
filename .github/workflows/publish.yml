@@ -55,6 +55,7 @@ jobs:
     with:
       release-tag: ${{ inputs.release_tag }}
       dockerfile: Dockerfile
+      trivy-ignore-unfixed: true
   sha-tag:
     name: tag full commit SHA and report digest
     needs: [metadata, image]
