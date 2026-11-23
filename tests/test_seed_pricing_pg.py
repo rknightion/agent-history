@@ -222,7 +222,7 @@ def test_explicit_seed_prices_each_added_model_with_a_dated_source(model):
             (model,),
         ).fetchall()
         assert [row[:6] for row in rows] == [(*NEW_RATES[model], "2000-01-01")]
-        assert re.fullmatch(r"(openai|anthropic) pricing 2026-11-23", rows[0][6])
+        assert re.fullmatch(r"(openai|anthropic) pricing 2026-11-23 \(.+\)", rows[0][6])
         # 1M uncached input, 1M cached input and 1M output tokens.
         total = NEW_RATES[model][0] + NEW_RATES[model][1] + NEW_RATES[model][4]
         assert cost(conn, session) == (1, None, total, total)
