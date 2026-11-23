@@ -8,7 +8,10 @@ SET search_path = ah, public;
 
 INSERT INTO model_pricing (model, effective_from, input_per_mtok, cached_input_per_mtok, cache_write_per_mtok,
                            cache_write_1h_per_mtok, output_per_mtok, source) VALUES
+    ('gpt-6.2-astra',            '2000-01-01',  8.00, 0.40,  10.00, NULL, 40.00, 'openai pricing 2026-11-23 (developers.openai.com/api/docs/pricing, standard short context, 30-minute cache write)'),
     ('gpt-6-astra',              '2000-01-01', 10.00, 1.00,  12.50, NULL, 50.00, 'openai pricing 2026-09-25'),
+    ('gpt-6.2-sol',              '2000-01-01',  2.00, 0.10,   2.50, NULL, 10.00, 'openai pricing 2026-11-23 (developers.openai.com/api/docs/pricing, standard short context, 30-minute cache write)'),
+    ('gpt-6.1-terra',            '2000-01-01',  1.00, 0.05,   1.25, NULL,  5.00, 'openai pricing 2026-11-23 (developers.openai.com/api/docs/pricing, standard short context, 30-minute cache write)'),
     ('gpt-6.1-sol',              '2000-01-01',  2.00, 0.10,   2.50, NULL, 10.00, 'openai pricing 2026-09-29'),
     ('gpt-6-sol',                '2000-01-01',  2.00, 0.20,   2.50, NULL, 10.00, 'openai pricing 2026-09-25'),
     ('gpt-6-luna',               '2000-01-01',  0.10, 0.01,  0.125, NULL,  0.50, 'openai pricing 2026-09-25'),
@@ -24,6 +27,7 @@ INSERT INTO model_pricing (model, effective_from, input_per_mtok, cached_input_p
     ('claude-sonnet-5-5',        '2000-01-01',  2.00, 0.10,   2.50, 4.00, 10.00, 'anthropic pricing 2026-10-14 (cache read cut to 0.10 on 2026-10-07)'),
     ('claude-sonnet-5',          '2000-01-01',  2.00, 0.20,   2.50, 4.00, 10.00, 'anthropic pricing 2026-09-25'),
     ('claude-sonnet-4-6',        '2000-01-01',  3.00, 0.30,   3.75, 6.00, 15.00, 'anthropic pricing 2026-09-25'),
+    ('claude-fable-5-2',        '2000-01-01',  8.00, 0.20,  10.00, 16.00, 40.00, 'anthropic pricing 2026-11-23 (platform.claude.com/docs/en/about-claude/pricing)'),
     ('claude-fable-5-1',         '2000-01-01', 10.00, 0.25,  12.50, 20.00, 50.00, 'anthropic pricing 2026-09-25'),
     ('claude-fable-5',           '2000-01-01', 10.00, 1.00,  12.50, 20.00, 50.00, 'anthropic pricing 2026-09-25'),
     ('claude-haiku-5-5',         '2000-01-01',  0.10, 0.01,  0.125, 0.20,  0.50, 'anthropic pricing 2026-10-14 (prompts up to 100k tokens; longer prompts cost 5x)'),

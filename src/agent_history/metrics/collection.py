@@ -28,7 +28,10 @@ LABEL = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 # Never accept prefixes: a vendor-looking prefix can still contain private text.
 PUBLIC_MODELS = frozenset(
     {
+        "gpt-6.2-sol",
         "gpt-6.1-sol",
+        "gpt-6.1-terra",
+        "gpt-6.2-astra",
         "gpt-6-sol",
         "gpt-6-luna",
         "gpt-6-astra",
@@ -53,6 +56,7 @@ PUBLIC_MODELS = frozenset(
         "claude-sonnet-4-5-20250929",
         "claude-sonnet-4-20250514",
         "claude-3-7-sonnet-20250219",
+        "claude-fable-5-2",
         "claude-fable-5-1",
         "claude-fable-5",
         "claude-haiku-4-5",

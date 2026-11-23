@@ -10,7 +10,7 @@ from agent_history.metrics import Family, Sample
 from agent_history.metrics.archive import ArchiveCollector
 from agent_history.metrics.efficiency import EfficiencyCollector
 from agent_history.metrics.self import SelfCollector
-from agent_history.metrics.collection import Collection, State, exposition
+from agent_history.metrics.collection import Collection, State, exposition, public_model
 
 
 def test_trusted_labels_through_shared_and_mcp_loader(tmp_path, monkeypatch):
@@ -46,6 +46,12 @@ def test_trusted_labels_through_shared_and_mcp_loader(tmp_path, monkeypatch):
     ):
         with pytest.raises(ConfigError):
             parse_config({**invalid, "metrics_labels": {"machines": ["worker-a"]}})
+
+
+@pytest.mark.parametrize("model", ["gpt-6.2-sol", "gpt-6.1-terra", "gpt-6.2-astra", "claude-fable-5-2"])
+def test_priced_models_keep_their_public_label(model):
+    assert public_model(model) == model
+    assert public_model(f"{model}-private") == "other"
 
 
 @pytest.mark.parametrize(
