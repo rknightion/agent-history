@@ -87,6 +87,31 @@ def test_synthetic_records_are_not_model_calls(clean, tmp_path):
     assert row[10] == 1
 
 
+def test_synthetic_records_without_usage_leave_token_totals_known(clean, tmp_path):
+    root, child = populated(clean, tmp_path)
+    clean.execute(
+        "INSERT INTO ah.llm_call (agent,response_id,session_id,ts,model,source_id,byte_offset,is_api_error) "
+        "VALUES ('claude','synthetic-no-usage',%s,now(),'<synthetic>',0,0,true)",
+        (root,),
+    )
+    clean.execute("INSERT INTO ah.dirty_session (session_id) VALUES (%s)", (root,))
+    clean.commit()
+    load.post_passes(clean)
+    row = progress(clean)
+    # The two real calls' totals, as without the record; its API error still counts.
+    assert row[3:8] == (2, 22, 24, 54, 30) and row[10] == 1
+    # A real call with no usage still makes the totals unknown.
+    clean.execute(
+        "INSERT INTO ah.llm_call (agent,response_id,session_id,ts,model,source_id,byte_offset) "
+        "VALUES ('claude','synthetic-real-no-usage',%s,now(),'synthetic-unpriced',0,0)",
+        (child,),
+    )
+    clean.execute("INSERT INTO ah.dirty_session (session_id) VALUES (%s)", (child,))
+    clean.commit()
+    load.post_passes(clean)
+    assert progress(clean)[3:8] == (3, None, None, None, None)
+
+
 def test_synthetic_records_do_not_make_the_cost_unknown(clean, tmp_path):
     root, child = populated(clean, tmp_path)
     clean.execute(

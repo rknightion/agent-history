@@ -24,7 +24,7 @@ REPORT = "/synthetic/measure/codex/run-20310303-1/CLOSEOUT.md"
 def clean(conn):  # noqa: F811
     def wipe():
         conn.execute("TRUNCATE " + ", ".join(f"ah.{t}" for t in load.DATA_TABLES) + " RESTART IDENTITY CASCADE")
-        conn.execute("DELETE FROM ah.git_commit WHERE repo_slug = %s", (REPO,))
+        conn.execute("DELETE FROM ah.git_commit WHERE lower(repo_slug) = %s", (REPO,))
         conn.execute("DELETE FROM ah.loop_run_metadata WHERE path = %s", (REPORT,))
         conn.execute("DELETE FROM ah.model_pricing WHERE model = %s", (PRICED,))
         conn.commit()
@@ -279,3 +279,47 @@ def test_loop_health_window_is_not_ended_by_another_dialects_launch(clean):
     cur = db.execute(HEALTH_QUERY)
     names = [d.name for d in cur.description]
     assert [dict(zip(names, r))["root_model_calls"] for r in cur.fetchall()] == [2]
+
+
+def test_squash_resolution_matches_a_mixed_case_stored_slug(clean):
+    db = clean
+    sid = session(db, "measure-case", remote="https://github.com/Example-Org/Measure.git")
+    db.execute(
+        "INSERT INTO ah.git_event (agent,event_uid,session_id,ts,op,sha_short,pr_number,pr_url,evidence,source_id,"
+        "byte_offset) VALUES ('claude','k1',%s,%s,'commit','ddddddd1111',NULL,NULL,'gitOperation',0,0),"
+        "('claude','k2',%s,%s,'pr',NULL,7,'https://github.com/Example-Org/Measure/pull/7','gitOperation',0,0)",
+        (sid, AT, sid, AT + timedelta(minutes=1)),
+    )
+    # The sha path compares lower(repo_slug); the pull request path must too.
+    db.execute(
+        "INSERT INTO ah.git_commit (repo_slug,sha,context,committed_at,subject,on_default) "
+        "VALUES ('github.com/Example-Org/Measure',%s,'local',%s,'Fix (#7)',true)",
+        ("d" * 40, AT + timedelta(minutes=9)),
+    )
+    db.commit()
+    got = db.execute(
+        "SELECT resolved_by, pr_number, sha FROM ah.v_agent_commit_quality WHERE session_uid = 'measure-case'"
+    ).fetchall()
+    assert got == [("pr_number", 7, "d" * 40)]
+
+
+def test_migration_054_requeues_sessions_rolled_up_before_synthetic_calls(clean):
+    db = clean
+    sid = synthetic_session(db, "measure-stale")
+    plain = session(db, "measure-plain")
+    call(db, plain, "plain-a", AT)
+    # As a catalogue that applied 053 with the old rollup: marks consumed, counts inflated.
+    db.execute(
+        "INSERT INTO ah.session_rollup (session_id,computed_at,llm_calls) VALUES (%s,now(),5), (%s,now(),1)",
+        (sid, plain),
+    )
+    db.execute("DELETE FROM ah.dirty_session")
+    db.execute("DELETE FROM ah.meta WHERE key = 'migration:054_requeue_synthetic_rollups.sql'")
+    db.commit()
+    load.apply_schema(db, force=True)
+    db.commit()
+    queued = [r[0] for r in db.execute("SELECT session_id FROM ah.dirty_session ORDER BY 1")]
+    assert sid in queued and plain not in queued  # only sessions holding a synthetic record
+    rollup(db, sid)
+    r = one(db, "SELECT llm_calls, synthetic_calls FROM ah.session_rollup WHERE session_id = %s", (sid,))
+    assert r == {"llm_calls": 2, "synthetic_calls": 3}

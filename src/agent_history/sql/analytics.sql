@@ -1007,7 +1007,7 @@ LEFT JOIN LATERAL (
     LIMIT 1) pr ON true
 LEFT JOIN LATERAL (
     SELECT c.* FROM ah.git_commit c
-    WHERE pr.pr_number IS NOT NULL AND c.repo_slug = pr.repo_slug AND c.committed_at >= g.ts AND c.on_default
+    WHERE pr.pr_number IS NOT NULL AND lower(c.repo_slug) = lower(pr.repo_slug) AND c.committed_at >= g.ts AND c.on_default
       AND c.subject ~ ('\(#' || pr.pr_number || '\)[[:space:]]*$')
     ORDER BY c.committed_at, c.sha
     LIMIT 1) bypr ON true

@@ -571,6 +571,9 @@ The migration marks for one recomputation every session that holds a `<synthetic
 every root that wrote a run folder's `AUTHORITY.md`, so existing roots are recognised without a
 rebuild. `session_rollup.synthetic_calls` counts a session's `llm_call` rows whose model is Claude
 Code's `<synthetic>` marker; it is NULL until the session is rolled up by a rollup that writes it.
+Migration `054_requeue_synthetic_rollups.sql` marks those sessions once more with the same statement,
+so a catalogue that applied 053 before its rollup wrote `synthetic_calls` is recomputed without a
+manual step or a rebuild; on any other catalogue it only recomputes them again.
 
 ### Model calls, squash merges and run time in the read side
 
