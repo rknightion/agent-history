@@ -27,7 +27,7 @@ from typing import Any, Sequence
 import psycopg
 from psycopg.types.json import Jsonb
 
-from . import loop_v3_state
+from . import loop_identity_run, loop_v3_state
 from .loop_launch import REPORT_HEADER, identity_fields, parse_launch, report_lane_counts
 
 ACTIVATED_AT = "1970-01-01T00:00:00Z"  # launches before this instant are ignored
@@ -406,6 +406,9 @@ def refresh_live(conn: psycopg.Connection) -> dict[str, int]:
 
     v3_projected = projections(conn)
     finished = _refresh_completion_receipts(conn, v3_projected)
+    # Run-folder runs (protocol v5) are finished by their own closeout before lifecycle status.
+    run_projected = loop_identity_run.projections(conn)
+    loop_identity_run.refresh_completion(conn, run_projected)
     result = conn.execute("""
         INSERT INTO ah.loops (launch_uid, status, launch_ts, end_ts, observed_at)
         SELECT l.launch_uid,
@@ -435,6 +438,8 @@ def refresh_live(conn: psycopg.Connection) -> dict[str, int]:
 
     refresh_status(conn)
     _refresh_identity(conn, finished, v3_projected)
+    loop_identity_run.refresh_identity(conn, run_projected)
+    loop_identity_run.refresh_protocol(conn)
     _refresh_progress(conn, _refresh_lane_returns(conn))
     _refresh_state_counts(conn)
     conn.execute("UPDATE ah.loops SET waiting_until=NULL WHERE status='finished' AND waiting_until IS NOT NULL")
@@ -490,11 +495,12 @@ def _valid_completions(conn: psycopg.Connection, uid: str | None = None) -> dict
     """
     if uid is None:
         scope, params = (
-            "l.mode IS DISTINCT FROM 'v3' AND NOT COALESCE(l.end_evidence = ANY(%s), false)",
+            "l.mode IS DISTINCT FROM 'v3' AND l.mode IS DISTINCT FROM 'run' "
+            "AND NOT COALESCE(l.end_evidence = ANY(%s), false)",
             (list(FINISHED_EVIDENCE),),
         )
     else:
-        scope, params = "l.mode IS DISTINCT FROM 'v3' AND l.launch_uid = %s", (uid,)
+        scope, params = "l.mode IS DISTINCT FROM 'v3' AND l.mode IS DISTINCT FROM 'run' AND l.launch_uid = %s", (uid,)
     found: dict[str, list[tuple]] = {}
     for row in conn.execute(COMPLETION_SQL.format(scope=scope), params):
         uid_, number, naming, kind, when, content, exists, digest, line1, origin = row
@@ -723,7 +729,7 @@ def _refresh_identity(
         SELECT l.launch_uid, l.root_session_id, l.number, l.goal_path, l.report_path,
                l.launch_ts, l.text, l.following, l.window_known, l.tied_start
         FROM ordered_launches l JOIN ah.loops live ON live.launch_uid = l.launch_uid
-        WHERE l.mode IS DISTINCT FROM 'v3' AND (%s OR live.status IN ('running', 'waiting', 'paused') OR EXISTS (
+        WHERE l.mode IS DISTINCT FROM 'v3' AND l.mode IS DISTINCT FROM 'run' AND (%s OR live.status IN ('running', 'waiting', 'paused') OR EXISTS (
             SELECT 1 FROM dirty_now d JOIN ah.session changed ON changed.id = d.session_id
             WHERE COALESCE(changed.root_session_id, changed.id) = l.root_session_id
         ) OR EXISTS (
@@ -975,12 +981,12 @@ def _refresh_tasks_done(conn: psycopg.Connection) -> None:
         UPDATE ah.loops l SET tasks_done = c.n
         FROM counted c WHERE l.launch_uid = c.launch_uid AND l.tasks_done IS DISTINCT FROM c.n
     """)
-    # A v3 run whose identity is later withdrawn (for example a revoked closeout) has no repo to
+    # A v3 or run-folder run whose identity is later withdrawn (for example a revoked closeout) has no repo to
     # count in, so a count kept from a previous pass, including closeout counts, must not linger.
     # Historical runs keep their existing behaviour.
     conn.execute("""
         UPDATE ah.loops l SET tasks_done = NULL FROM ah.loop_run r
-        WHERE r.launch_uid = l.launch_uid AND r.mode = 'v3' AND l.repo IS NULL AND l.tasks_done IS NOT NULL
+        WHERE r.launch_uid = l.launch_uid AND r.mode IN ('v3', 'run') AND l.repo IS NULL AND l.tasks_done IS NOT NULL
     """)
 
 
@@ -1534,6 +1540,7 @@ def _refresh_state_counts(conn: psycopg.Connection) -> None:
             )
     _refresh_trailer_lands(conn, [uid for uid, cohorts in qualified.items() if _state_blocks_trailer_lands(cohorts)])
     _refresh_closeout_counts(conn)
+    loop_identity_run.refresh_counts(conn)
 
 
 def _refresh_closeout_counts(conn: psycopg.Connection) -> None:
@@ -1636,7 +1643,67 @@ def _tag_root(conn: psycopg.Connection, root_id: int) -> int:
             ),
         ).fetchone()[0]
         _tag_tree(conn, loop_id, root_id, ts, next_ts)
-    return len(launches)
+    return len(launches) + _tag_runs(conn, root_id, root_key, root_last)
+
+
+RUN_WRITES_SQL = """
+    SELECT i.io_uid, i.tool_name, i.input_text, s.cwd, i.ts, i.output_text
+    FROM ah.tool_io i JOIN ah.session s ON s.id = i.session_id
+    LEFT JOIN ah.tool_call t ON t.agent = i.agent AND t.call_uid = i.call_uid AND t.session_id = i.session_id
+    LEFT JOIN ah.tool_op o ON o.agent = i.agent AND o.item_uid = i.item_uid AND o.session_id = i.session_id
+    WHERE i.session_id = %s AND position('AUTHORITY.md' in i.input_text) > 0
+      AND lower(i.tool_name) ~ '(^|[.])(write|apply_patch|filechange)$'
+      AND NOT COALESCE(i.input_truncated, false) AND NOT COALESCE(i.output_truncated, false)
+      AND ((i.kind = 'call' AND t.outcome = 'ok' AND t.ended_at IS NOT NULL) OR
+           (i.kind = 'op' AND o.status = 'completed' AND o.completed_at IS NOT NULL
+            AND o.is_error IS FALSE AND (o.exit_code IS NULL OR o.exit_code = 0)))
+    ORDER BY i.ts, i.id
+"""
+
+
+def _tag_runs(conn: psycopg.Connection, root_id: int, root_key: str, root_last: Any) -> int:
+    """Runs of the run-folder dialect this root started by writing a run folder's AUTHORITY.md.
+
+    One run per folder: the root's first complete successful structured write of a qualified
+    AUTHORITY.md starts it, and its lanes are the root's sessions that start inside the window up to
+    the root's next such run. Only this top-level session counts as the root; launch text is not read.
+    """
+    starts: dict[str, tuple[str, Any]] = {}
+    for io_uid, tool, raw, cwd, ts, output in conn.execute(RUN_WRITES_SQL, (root_id,)):
+        if tool.rsplit(".", 1)[-1].lower() == "apply_patch" and re.match(
+            r"\s*(?:apply_patch verification failed|error|failed|invalid patch)", output or "", re.I
+        ):
+            continue
+        for authority in loop_identity_run.authority_targets(tool, raw, cwd):
+            starts.setdefault(authority, (io_uid, ts))
+    runs = sorted(starts.items(), key=lambda item: (item[1][1], item[0]))
+    for index, (authority, (io_uid, ts)) in enumerate(runs):
+        next_ts = runs[index + 1][1][1] if index + 1 < len(runs) else None
+        end_ts, evidence = (next_ts, "next_launch") if next_ts is not None else (root_last, "root_last_event")
+        row = conn.execute(
+            "INSERT INTO ah.loop_run (launch_uid, root_session_id, status, repo_slug, naming, mode, report_path, "
+            "goal_path, launch_ts, end_ts, end_evidence, protocol) VALUES (%s,%s,'resolved',%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+            "ON CONFLICT (launch_uid) DO UPDATE SET end_ts = EXCLUDED.end_ts, end_evidence = EXCLUDED.end_evidence, "
+            "repo_slug = EXCLUDED.repo_slug, report_path = EXCLUDED.report_path, goal_path = EXCLUDED.goal_path, "
+            "launch_ts = EXCLUDED.launch_ts, protocol = EXCLUDED.protocol "
+            "WHERE ah.loop_run.mode = EXCLUDED.mode RETURNING id",
+            (
+                f"{root_key}:{io_uid}",
+                root_id,
+                PurePosixPath(authority).parent.parent.parent.name,
+                loop_identity_run.MODE,
+                loop_identity_run.MODE,
+                loop_identity_run.closeout_path(authority),
+                authority,
+                ts,
+                end_ts,
+                evidence,
+                loop_identity_run.PROTOCOL,
+            ),
+        ).fetchone()
+        if row:
+            _tag_tree(conn, row[0], root_id, ts, next_ts)
+    return len(runs)
 
 
 def _tag_tree(conn: psycopg.Connection, loop_id: int, root_id: int, start: Any, end: Any) -> None:

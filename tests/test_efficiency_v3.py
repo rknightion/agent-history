@@ -30,6 +30,24 @@ def test_protocol_recognition_never_checks_local_launch_files(monkeypatch):
     assert efficiency_protocol("launch-You are the root.txt") == "none"
 
 
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("Contract: loop-v5", "v5"),
+        ("Contract: `loop-v4` for this run", "v4"),
+        ("Contract: loop-v2.1", "v2.1"),
+        ("Contract: loop-v3.1", "other"),
+        ("Contract: loop-v5.1", "other"),
+        ("Read codex/run-20261123-1/AUTHORITY.md and start.", "none"),
+    ],
+)
+def test_declared_contract_labels_include_v4_and_v5(text, expected):
+    from agent_history.efficiency.parser import EFFICIENCY_PROTOCOLS
+
+    assert efficiency_protocol(text) == expected
+    assert expected in EFFICIENCY_PROTOCOLS
+
+
 @pytest.fixture
 def eff(tmp_path, monkeypatch):
     return Harness(tmp_path, monkeypatch, time.time() - 2000)
