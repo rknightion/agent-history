@@ -757,7 +757,12 @@ stat(
         )
     ],
 )
-stat("ov_calls", "LLM calls", "API responses recorded (ah.llm_call).", [sql(f"SELECT count(*) {LLM}")])
+stat(
+    "ov_calls",
+    "LLM calls",
+    "API responses recorded (ah.llm_call), not counting Claude Code's client-written <synthetic> records.",
+    [sql(f"SELECT count(*) {LLM} AND l.model IS DISTINCT FROM '<synthetic>'")],
+)
 stat(
     "ov_tools",
     "Tool calls",
@@ -1634,7 +1639,7 @@ table(
     "Root sessions started in range with their whole subagent tree priced from ah.llm_call. Click a session to drill down.",
     [
         sql(
-            f"WITH t AS (SELECT r.id AS root, l.session_id, l.model, l.ts::date AS d, count(*) AS calls, sum(l.output) AS output, sum(l.input_uncached) AS i, sum(l.cache_read) AS cr, sum(l.cache_write_5m) AS w5, sum(l.cache_write_1h) AS w1, sum(l.output) AS o FROM ah.session r JOIN ah.session s ON coalesce(s.root_session_id, s.id) = r.id JOIN ah.llm_call l ON l.session_id = s.id WHERE $__timeFilter(r.first_event_at) AND NOT r.is_subagent AND {NSAG('r')} GROUP BY 1,2,3,4), c AS (SELECT root, count(DISTINCT session_id) AS sessions, sum(calls) AS llm_calls, sum(output) AS output, sum(ah.priced_usd(model, d, i, cr, w5, w1, o)) AS cost_usd FROM t GROUP BY 1 ORDER BY cost_usd DESC NULLS LAST LIMIT 30) SELECT r.namespace, r.agent, r.session_uid, {RP('ah.project_of(r.cwd)')} AS project, {TX('coalesce(r.custom_title, r.title)')} AS title, r.first_event_at AS started, c.sessions, c.llm_calls, c.output, c.cost_usd FROM c JOIN ah.session r ON r.id = c.root ORDER BY c.cost_usd DESC NULLS LAST"
+            f"WITH t AS (SELECT r.id AS root, l.session_id, l.model, l.ts::date AS d, count(*) FILTER (WHERE l.model IS DISTINCT FROM '<synthetic>') AS calls, sum(l.output) AS output, sum(l.input_uncached) AS i, sum(l.cache_read) AS cr, sum(l.cache_write_5m) AS w5, sum(l.cache_write_1h) AS w1, sum(l.output) AS o FROM ah.session r JOIN ah.session s ON coalesce(s.root_session_id, s.id) = r.id JOIN ah.llm_call l ON l.session_id = s.id WHERE $__timeFilter(r.first_event_at) AND NOT r.is_subagent AND {NSAG('r')} GROUP BY 1,2,3,4), c AS (SELECT root, count(DISTINCT session_id) AS sessions, sum(calls) AS llm_calls, sum(output) AS output, sum(ah.priced_usd(model, d, i, cr, w5, w1, o)) AS cost_usd FROM t GROUP BY 1 ORDER BY cost_usd DESC NULLS LAST LIMIT 30) SELECT r.namespace, r.agent, r.session_uid, {RP('ah.project_of(r.cwd)')} AS project, {TX('coalesce(r.custom_title, r.title)')} AS title, r.first_event_at AS started, c.sessions, c.llm_calls, c.output, c.cost_usd FROM c JOIN ah.session r ON r.id = c.root ORDER BY c.cost_usd DESC NULLS LAST"
         )
     ],
     cols=[
@@ -2364,7 +2369,7 @@ table(
     "ah.v_loop_summary launched in range. Click a loop id to load its lanes below.",
     [
         sql(
-            f"SELECT loop_run_id AS loop, launch_ts AS launched, {RP('repo_slug')} AS repo, {TX('campaign_slug')} AS campaign, loop_number AS n, mode, status, wall_s, budget_s, lanes, sessions, llm_calls, tool_calls, tool_errors, api_errors, compactions, commits, pushes, priced_cost_usd AS cost_usd {LS} ORDER BY launch_ts DESC LIMIT 100"
+            f"SELECT loop_run_id AS loop, launch_ts AS launched, {RP('repo_slug')} AS repo, {TX('campaign_slug')} AS campaign, loop_number AS n, mode, protocol, status, wall_s, budget_s, lanes, sessions, llm_calls, tool_calls, tool_errors, api_errors, compactions, commits, pushes, priced_cost_usd AS cost_usd {LS} ORDER BY launch_ts DESC LIMIT 100"
         )
     ],
     cols=[
@@ -3710,8 +3715,8 @@ stat(
 stat(
     "sd_calls",
     "Tree LLM calls",
-    "LLM calls across the selected session and its descendants.",
-    [sql(f"SELECT count(*) FROM ah.llm_call WHERE session_id IN {TREE}")],
+    "LLM calls across the selected session and its descendants, not counting <synthetic> records.",
+    [sql(f"SELECT count(*) FROM ah.llm_call WHERE session_id IN {TREE} AND model IS DISTINCT FROM '<synthetic>'")],
 )
 stat(
     "sd_tools",
@@ -4805,7 +4810,8 @@ for index, (metric, title, unit, desc) in enumerate(HEALTH_PANELS):
 timeseries(
     "health_coverage",
     "Root model-time coverage",
-    HEALTH_DESC + "Timed root assistant calls versus all root assistant calls, excluding compaction and usage records. "
+    HEALTH_DESC
+    + "Timed root assistant calls versus all root assistant calls, excluding compaction, usage and synthetic records. "
     "Only valid ended pi progress linked by response identity supplies timing; other harnesses remain unsupported.",
     [
         prom(

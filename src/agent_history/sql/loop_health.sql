@@ -2,7 +2,7 @@
 -- a newer unknown observation must never fall back to an older known loop.
 WITH latest AS MATERIALIZED (
     SELECT DISTINCT ON (ah.canonical_repo(l.repo), s.agent)
-           r.id, r.root_session_id, r.report_path, r.launch_ts, l.end_ts,
+           r.id, r.root_session_id, r.report_path, r.launch_ts, l.end_ts, r.mode,
            ah.canonical_repo(l.repo) AS repo, s.agent AS harness,
            l.tasks_done, l.priced_cost_usd
     FROM ah.loops l
@@ -16,6 +16,9 @@ WITH latest AS MATERIALIZED (
     SELECT l.*, LEAST(l.end_ts,
         (SELECT min(r.launch_ts) FROM ah.loop_run r
          WHERE r.id <> l.id AND r.launch_ts >= l.launch_ts
+           -- Only a run of the same dialect bounds the window: run-folder rows (mode 'run') and the
+           -- earlier dialects share ah.loop_run but never end each other's windows.
+           AND (r.mode IS NOT DISTINCT FROM 'run') = (l.mode IS NOT DISTINCT FROM 'run')
            AND (r.root_session_id = l.root_session_id OR r.report_path = l.report_path))) AS window_end
     FROM latest l
 ), roots AS MATERIALIZED (
@@ -53,6 +56,7 @@ LEFT JOIN LATERAL (
         HAVING count(*) = 1
     ) p ON true
     WHERE r.id = w.id AND c.ts >= w.launch_ts AND c.ts < w.window_end
+      AND c.model IS DISTINCT FROM '<synthetic>'
       AND (c.stop_reason IS NULL OR
            (c.stop_reason NOT LIKE 'usage:%' AND c.stop_reason NOT IN ('compaction', 'branch_summary')))
 ) c ON true

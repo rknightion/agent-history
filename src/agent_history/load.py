@@ -1316,7 +1316,7 @@ ROLLUP_SQL = """
 INSERT INTO ah.session_rollup AS r (session_id, computed_at, turns_human, turns_other, messages, llm_calls,
     input_uncached, cache_read, cache_write, output, reasoning, peak_context_tokens, tool_calls, tool_errors,
     tool_denials, tool_interrupts, subagents, compactions, commits, pushes, api_errors, interrupts, models,
-    cli_versions, duration_s, claude_cost_usd, snapshot_calls)
+    cli_versions, duration_s, claude_cost_usd, snapshot_calls, synthetic_calls)
 SELECT s.id, now(),
     (SELECT count(*) FROM ah.turn t WHERE t.session_id = s.id AND t.origin = 'human'),
     (SELECT count(*) FROM ah.turn t WHERE t.session_id = s.id AND t.origin IS DISTINCT FROM 'human'),
@@ -1335,16 +1335,23 @@ SELECT s.id, now(),
     ARRAY_REMOVE(ARRAY[s.cli_version_first, NULLIF(s.cli_version_last, s.cli_version_first)], NULL),
     EXTRACT(EPOCH FROM (s.last_event_at - s.first_event_at))::bigint,
     (SELECT c.total_cost_usd FROM ah.cost_state c WHERE c.session_id = s.id ORDER BY c.ts DESC LIMIT 1),
-    CASE WHEN s.agent = 'claude' THEN l.snapshot_calls END
+    CASE WHEN s.agent = 'claude' THEN l.snapshot_calls END,
+    l.synthetic_calls
 FROM ah.session s
 JOIN ah.dirty_now d ON d.session_id = s.id
+-- A row whose model is Claude Code's '<synthetic>' marker is written by the client, not returned by a
+-- model: it is counted in synthetic_calls, never in llm_calls, snapshot_calls or models. api_errors
+-- keeps it, because a synthetic row is the only record of some API errors.
 LEFT JOIN LATERAL (
-    SELECT count(*) AS calls, sum(input_uncached) AS input_uncached, sum(cache_read) AS cache_read,
+    SELECT count(*) FILTER (WHERE model IS DISTINCT FROM '<synthetic>') AS calls,
+           sum(input_uncached) AS input_uncached, sum(cache_read) AS cache_read,
            sum(COALESCE(cache_write_5m,0) + COALESCE(cache_write_1h,0)) AS cache_write, sum(output) AS output,
            sum(reasoning) AS reasoning, max(context_tokens) AS peak,
            count(*) FILTER (WHERE is_api_error) AS api_errors,
-           count(*) FILTER (WHERE stop_reason IS NULL AND NOT is_api_error) AS snapshot_calls,
-           array_agg(DISTINCT model) FILTER (WHERE model IS NOT NULL) AS models
+           count(*) FILTER (WHERE stop_reason IS NULL AND NOT is_api_error
+                              AND model IS DISTINCT FROM '<synthetic>') AS snapshot_calls,
+           count(*) FILTER (WHERE model = '<synthetic>') AS synthetic_calls,
+           array_agg(DISTINCT model) FILTER (WHERE model IS NOT NULL AND model <> '<synthetic>') AS models
     FROM ah.llm_call WHERE session_id = s.id) l ON true
 LEFT JOIN LATERAL (
     SELECT count(*) AS calls, count(*) FILTER (WHERE outcome = 'error') AS errors,
@@ -1360,7 +1367,7 @@ ON CONFLICT (session_id) DO UPDATE SET computed_at = EXCLUDED.computed_at, turns
     commits = EXCLUDED.commits, pushes = EXCLUDED.pushes, api_errors = EXCLUDED.api_errors,
     interrupts = EXCLUDED.interrupts, models = EXCLUDED.models, cli_versions = EXCLUDED.cli_versions,
     duration_s = EXCLUDED.duration_s, claude_cost_usd = EXCLUDED.claude_cost_usd,
-    snapshot_calls = EXCLUDED.snapshot_calls
+    snapshot_calls = EXCLUDED.snapshot_calls, synthetic_calls = EXCLUDED.synthetic_calls
 """
 
 

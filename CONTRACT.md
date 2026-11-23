@@ -572,6 +572,37 @@ every root that wrote a run folder's `AUTHORITY.md`, so existing roots are recog
 rebuild. `session_rollup.synthetic_calls` counts a session's `llm_call` rows whose model is Claude
 Code's `<synthetic>` marker; it is NULL until the session is rolled up by a rollup that writes it.
 
+### Model calls, squash merges and run time in the read side
+
+A `<synthetic>` row is never a model call on the read side. `session_rollup.llm_calls`,
+`snapshot_calls` and `models` leave it out and `synthetic_calls` counts it; `api_errors` keeps
+it, because a synthetic row is the only record of some API errors. The same split applies to
+`ah.v_session_cost` (`synthetic_calls`; the unpriced `<synthetic>` group adds no unpriced call),
+`ah.v_session_summary`, `ah.v_session_tree`, `ah.v_loop_summary`, `ah.loop_lanes` and
+`ah.v_daily_usage` (the `<synthetic>` model keeps its row with `llm_calls` 0). For every one of them
+`llm_calls + synthetic_calls` is the earlier `llm_calls`. `ah.efficiency_calls`, the
+fake-cell-wait views, `ah.v_notify_lag`, `ah.active_sessions` and the loop health query skip
+the row; `loop --usage` prints it as one "Synthetic records" line.
+
+`ah.v_agent_commit_quality` resolves a commit its sha does not resolve through the same session's
+nearest pull request event at or after it (else the latest before it): the earliest default-branch
+`git_commit` of that pull request's repository, at or after the commit, whose subject ends with
+`(#<number>)`, GitHub's squash subject. `resolved_by` is `sha`, `pr_number` or NULL and
+`pr_number` names the pull request used. Every commit squashed into one pull request resolves to
+the same merge commit, so `ah.v_agent_commit_quality_weekly` counts that commit's lines once per
+week and repository and adds `resolved_by_sha`, `resolved_by_pr` and `pr_merge_commits`. Limits:
+pull request events must be in the committing session (pi records none), the repository's
+default branch must be collected, and merge-commit or rebase subjects are not read.
+
+`ah.v_loop_summary` adds `protocol` beside `mode`; `closeout_ts`, the earliest collected
+modification time of the run's closeout document (kinds `closeout` and `run_closeout`) at or after
+launch, and `closeout_wall_s` from launch to it; `active_s`, the time inside `[launch_ts, end_ts]`
+covered by the run's sessions' model calls (points) and tool calls (spans), where activity less than
+15 minutes apart joins one span, so it never exceeds `wall_s`; and `ah.loops`'
+`tasks_admitted`, `tasks_landed`, `tasks_done` and `parks_total`. `end_ts`, `end_evidence` and
+`wall_s` keep their meaning. No view special-cases `mode = 'v3'`. The loop health window ends
+only at a later launch of the same dialect (`mode = 'run'` or not).
+
 ### HISTORICAL v2 identity and retained compatibility
 
 The following report/goal rules describe historical v2 and legacy launches, not v3 closeouts.

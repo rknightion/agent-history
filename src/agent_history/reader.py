@@ -555,13 +555,15 @@ USAGE_ROWS_SQL = (
     WHERE NOT m.windowed OR (c.ts >= m.launch_ts AND c.ts < COALESCE(m.end_ts, 'infinity'))
     ORDER BY c.id, m.role
 ), priced AS (
-    SELECT role, model, count(*) AS calls,
+    -- Claude Code's '<synthetic>' records are written by the client: never a call, counted apart.
+    SELECT role, model, count(*) FILTER (WHERE model IS DISTINCT FROM '<synthetic>') AS calls,
+           count(*) FILTER (WHERE model = '<synthetic>') AS synthetic,
            ah.priced_usd(model, ts::date, sum(input_uncached), sum(cache_read), sum(cache_write_5m),
                          sum(cache_write_1h), sum(output)) AS cost
     FROM calls GROUP BY role, model, ts::date
 )
 SELECT role, COALESCE(model, '(unknown)') AS model, sum(calls) AS calls, sum(cost) AS cost,
-       COALESCE(sum(calls) FILTER (WHERE cost IS NULL), 0) AS unpriced
+       COALESCE(sum(calls) FILTER (WHERE cost IS NULL), 0) AS unpriced, sum(synthetic) AS synthetic
 FROM priced GROUP BY 1, 2
 ORDER BY role <> 'root', role, sum(cost) DESC NULLS LAST, model;
 """
@@ -913,6 +915,9 @@ def usage_markdown(summary: dict[str, str], rows: list[dict[str, str]], runs: in
     table, with no prompt text or lane names."""
     from decimal import Decimal
 
+    # A row holding only '<synthetic>' records (no calls) is reported as one count, not a model row.
+    synthetic = sum(int(r.get("synthetic") or 0) for r in rows)
+    rows = [r for r in rows if int(r["calls"])]
     calls = sum(int(r["calls"]) for r in rows)
     unpriced = sum(int(r["unpriced"]) for r in rows)
     cost = sum((Decimal(r["cost"]) for r in rows if r["cost"]), Decimal(0))
@@ -927,6 +932,8 @@ def usage_markdown(summary: dict[str, str], rows: list[dict[str, str]], runs: in
         lines.append(f"- Launches: {runs} share this closeout and are counted as one run")
     if unpriced:
         lines.append(f"- Unpriced calls: {unpriced:,} (not in the cost total)")
+    if synthetic:
+        lines.append(f"- Synthetic records: {synthetic:,} (written by the client, not model calls)")
     heuristic = int(summary.get("heuristic_sessions") or 0)
     if heuristic:
         lines.append(f"- Heuristic-linked sessions: {heuristic:,} (attributed by timing, not by an explicit link)")
@@ -1161,7 +1168,7 @@ def execute(args) -> int:
     if args.cmd == "loops":
         repo = ":'repo'" if args.repo else "NULL"
         return run(
-            f"SELECT loop_run_id, status, repo_slug, campaign_slug, loop_number, launch_ts, wall_s, lanes, "
+            f"SELECT loop_run_id, status, repo_slug, campaign_slug, loop_number, mode, protocol, launch_ts, wall_s, lanes, "
             f"sessions, turns_human, output, tool_calls, tool_errors, commits "
             f"FROM ah.recent_loops({repo}, {int(args.limit)});",
             {"repo": args.repo or ""},
@@ -1225,19 +1232,25 @@ def execute(args) -> int:
         if args.quality and args.weekly:
             # weekly rows are per repo; the namespace filter applies through the per-commit view
             return run(
+                # as ah.v_agent_commit_quality_weekly: a squash merge commit's lines count once
                 f"SELECT date_trunc('week', ts)::date AS week, repo_slug, count(*) AS agent_commits, "
                 f"count(*) FILTER (WHERE resolved) AS resolved, "
+                f"count(*) FILTER (WHERE resolved_by = 'pr_number') AS resolved_by_pr, "
                 f"count(*) FILTER (WHERE ci_conclusion = 'success') AS ci_success, "
                 f"count(*) FILTER (WHERE ci_conclusion = 'failure') AS ci_failure, "
-                f"count(*) FILTER (WHERE reverted) AS reverted, sum(lines_changed) FILTER (WHERE resolved) "
-                f"AS lines_changed FROM ah.v_agent_commit_quality WHERE ts >= {since} {where} "
+                f"count(*) FILTER (WHERE reverted) AS reverted, sum(lines_changed) FILTER (WHERE resolved_by = 'sha' "
+                f"OR (resolved_by = 'pr_number' AND merge_ref = 1)) AS lines_changed "
+                f"FROM (SELECT q.*, row_number() OVER (PARTITION BY date_trunc('week', q.ts), q.repo_slug, q.sha, "
+                f"q.resolved_by ORDER BY q.ts, q.git_event_id) AS merge_ref FROM ah.v_agent_commit_quality q "
+                f"WHERE ts >= {since} {where}) q "
                 f"GROUP BY 1, 2 ORDER BY 1 DESC, 3 DESC LIMIT {int(args.limit)};",
                 {},
                 fmt,
             )
         if args.quality:
             return run(
-                f"SELECT ts, sha_short, repo_slug, agent, session_uid, resolved, on_default, lines_changed, "
+                f"SELECT ts, sha_short, repo_slug, agent, session_uid, resolved, resolved_by, pr_number, on_default, "
+                f"lines_changed, "
                 f"ci_runs, ci_conclusion, reverted, left(subject, 70) AS subject "
                 f"FROM ah.v_agent_commit_quality WHERE ts >= {since} {where} "
                 f"ORDER BY ts DESC LIMIT {int(args.limit)};",
