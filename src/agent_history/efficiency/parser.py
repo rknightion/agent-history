@@ -216,7 +216,7 @@ EFFICIENCY_SPAWN_OK_TEXT = re.compile(r'"(?:task_name|agent_id)"\s*:')
 EFFICIENCY_ROUTE_KEYS = ("model", "reasoning_effort", "agent_type", "fork_turns")
 # v1.3: the loop protocol a thread's first human prompt declares, and the stalled-loop windows.
 EFFICIENCY_PROTOCOL_RE = re.compile(r"Contract:\s*`?loop-v(\d+(?:\.\d+)*)")
-EFFICIENCY_PROTOCOLS = frozenset({"v3", "v2.1", "v2.0", "other", "none"})
+EFFICIENCY_PROTOCOLS = frozenset({"v5", "v4", "v3", "v2.1", "v2.0", "other", "none"})
 EFFICIENCY_PROTOCOL_SCAN_BYTES = 16 * 1024 * 1024
 EFFICIENCY_CHILD_FLIGHT_SECONDS = 3600
 EFFICIENCY_LIVE_ROOT_SECONDS = 1500
@@ -873,7 +873,7 @@ def efficiency_codex_human_item(content: Any) -> bool:
 
 
 def efficiency_protocol(text: str) -> str:
-    """Use launch shape for v3, retaining the legacy Contract declaration labels."""
+    """Use launch shape for v3; a `Contract: loop-v<N>` declaration labels v2.0, v2.1, v4 or v5, else other."""
     # Only inline root prompts are candidates here. Never resolve a path against the
     # collector's filesystem: retained transcript text is the only authority.
     launch = recognize_inline(text, legacy=True)
@@ -883,6 +883,8 @@ def efficiency_protocol(text: str) -> str:
     if not match:
         return "none"
     version = match.group(1)
+    if version in ("4", "5"):
+        return "v" + version
     return "v2.1" if version == "2.1" else "v2.0" if version in ("2", "2.0") else "other"
 
 

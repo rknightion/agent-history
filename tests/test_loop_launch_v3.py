@@ -31,6 +31,20 @@ def test_v3_recognition_is_shape_based_and_freezes_compatibility_paths(at):
     assert loops._report_meta(v2["report"])["goal_path"] == CWD + "/codex/goal-synthetic-loop14.md"
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Read codex/run-20261123-1/AUTHORITY.md and run it.",
+        "You are the root. Write codex/run-20261123-1/CLOSEOUT.md at the end.",
+        "codex/run-20261123-1/AUTHORITY.md",
+    ],
+)
+def test_run_folder_documents_are_not_launches(text):
+    # The run-folder dialect has no launch text: only its AUTHORITY.md write starts a run.
+    assert loops._launch(text, CWD, AT) is None
+    assert parse_launch(text, CWD, AT, loops.ACTIVATED_AT, read_file=loops._no_read) is None
+
+
 def test_v3_tokens_share_resolution_boundaries_and_ambiguity_rules():
     text = PROMPT + " Also write `" + CLOSEOUT + "`."
     hit = parse_launch(text, CWD + "/subdirectory", AT, None)

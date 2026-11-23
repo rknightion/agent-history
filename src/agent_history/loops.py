@@ -27,7 +27,7 @@ from typing import Any, Sequence
 import psycopg
 from psycopg.types.json import Jsonb
 
-from . import loop_v3_state
+from . import loop_identity_run, loop_v3_state
 from .loop_launch import REPORT_HEADER, identity_fields, parse_launch, report_lane_counts
 
 ACTIVATED_AT = "1970-01-01T00:00:00Z"  # launches before this instant are ignored
@@ -40,6 +40,8 @@ LANE_CLOSE = re.compile(r"\s*```")
 FENCE_LINE_END = re.compile(r"```[ \t]*\r?$", re.M)
 UNPARSED = object()
 LANE_STATUS_V2 = ("complete", "partial", "blocked", "failed")
+# The plain return a lane gives without a fenced block: its first non-empty line, exactly this.
+STATUS_LINE = re.compile(r"Status: (complete|partial|blocked|failed)[ \t]*")
 CAMPAIGN = re.compile(r"^(?:report|closeout)-(.*?)-(?:loop|wave)\d+\.md$")
 # wave-notify completion receipts by kind. `.notified` (no longer written): `sha256:<64 hex> request
 # <id>`, or the legacy `request <id>`. `.posted`, written once the receiver accepted the report:
@@ -404,6 +406,9 @@ def refresh_live(conn: psycopg.Connection) -> dict[str, int]:
 
     v3_projected = projections(conn)
     finished = _refresh_completion_receipts(conn, v3_projected)
+    # Run-folder runs (protocol v5) are finished by their own closeout before lifecycle status.
+    run_projected = loop_identity_run.projections(conn)
+    loop_identity_run.refresh_completion(conn, run_projected)
     result = conn.execute("""
         INSERT INTO ah.loops (launch_uid, status, launch_ts, end_ts, observed_at)
         SELECT l.launch_uid,
@@ -433,7 +438,9 @@ def refresh_live(conn: psycopg.Connection) -> dict[str, int]:
 
     refresh_status(conn)
     _refresh_identity(conn, finished, v3_projected)
-    _refresh_progress(conn)
+    loop_identity_run.refresh_identity(conn, run_projected)
+    loop_identity_run.refresh_protocol(conn)
+    _refresh_progress(conn, _refresh_lane_returns(conn))
     _refresh_state_counts(conn)
     conn.execute("UPDATE ah.loops SET waiting_until=NULL WHERE status='finished' AND waiting_until IS NOT NULL")
     from .loop_live import refresh as refresh_phase
@@ -488,11 +495,12 @@ def _valid_completions(conn: psycopg.Connection, uid: str | None = None) -> dict
     """
     if uid is None:
         scope, params = (
-            "l.mode IS DISTINCT FROM 'v3' AND NOT COALESCE(l.end_evidence = ANY(%s), false)",
+            "l.mode IS DISTINCT FROM 'v3' AND l.mode IS DISTINCT FROM 'run' "
+            "AND NOT COALESCE(l.end_evidence = ANY(%s), false)",
             (list(FINISHED_EVIDENCE),),
         )
     else:
-        scope, params = "l.mode IS DISTINCT FROM 'v3' AND l.launch_uid = %s", (uid,)
+        scope, params = "l.mode IS DISTINCT FROM 'v3' AND l.mode IS DISTINCT FROM 'run' AND l.launch_uid = %s", (uid,)
     found: dict[str, list[tuple]] = {}
     for row in conn.execute(COMPLETION_SQL.format(scope=scope), params):
         uid_, number, naming, kind, when, content, exists, digest, line1, origin = row
@@ -716,12 +724,12 @@ def _refresh_identity(
             FROM ah.loop_run l JOIN ah.session s ON s.id = l.root_session_id
             LEFT JOIN ah.message m ON m.session_id = s.id
                 AND l.launch_uid = s.agent || '/' || s.session_uid || '/' || s.agent_id || ':' || m.event_uid
-            WHERE l.launch_ts IS NOT NULL
+            WHERE l.launch_ts IS NOT NULL AND l.mode IS DISTINCT FROM 'run'
         )
         SELECT l.launch_uid, l.root_session_id, l.number, l.goal_path, l.report_path,
                l.launch_ts, l.text, l.following, l.window_known, l.tied_start
         FROM ordered_launches l JOIN ah.loops live ON live.launch_uid = l.launch_uid
-        WHERE l.mode IS DISTINCT FROM 'v3' AND (%s OR live.status IN ('running', 'waiting', 'paused') OR EXISTS (
+        WHERE l.mode IS DISTINCT FROM 'v3' AND l.mode IS DISTINCT FROM 'run' AND (%s OR live.status IN ('running', 'waiting', 'paused') OR EXISTS (
             SELECT 1 FROM dirty_now d JOIN ah.session changed ON changed.id = d.session_id
             WHERE COALESCE(changed.root_session_id, changed.id) = l.root_session_id
         ) OR EXISTS (
@@ -839,7 +847,7 @@ PROGRESS_SELECTION_SQL = """
 """
 
 
-def _refresh_progress(conn: psycopg.Connection) -> None:
+def _refresh_progress(conn: psycopg.Connection, also: Sequence[str] = ()) -> None:
     """Refresh active/dirty loops plus at most 128 historical rows per transaction.
 
     The cursor is transactional with the projection. Existing catalogues therefore backfill on
@@ -860,7 +868,7 @@ def _refresh_progress(conn: psycopg.Connection) -> None:
             )
         ]
     active = [r[0] for r in conn.execute(PROGRESS_SELECTION_SQL)]
-    for uid in dict.fromkeys(historical + active):
+    for uid in dict.fromkeys(historical + active + list(also)):
         conn.execute(
             """
             WITH target AS (
@@ -973,12 +981,12 @@ def _refresh_tasks_done(conn: psycopg.Connection) -> None:
         UPDATE ah.loops l SET tasks_done = c.n
         FROM counted c WHERE l.launch_uid = c.launch_uid AND l.tasks_done IS DISTINCT FROM c.n
     """)
-    # A v3 run whose identity is later withdrawn (for example a revoked closeout) has no repo to
+    # A v3 or run-folder run whose identity is later withdrawn (for example a revoked closeout) has no repo to
     # count in, so a count kept from a previous pass, including closeout counts, must not linger.
     # Historical runs keep their existing behaviour.
     conn.execute("""
         UPDATE ah.loops l SET tasks_done = NULL FROM ah.loop_run r
-        WHERE r.launch_uid = l.launch_uid AND r.mode = 'v3' AND l.repo IS NULL AND l.tasks_done IS NOT NULL
+        WHERE r.launch_uid = l.launch_uid AND r.mode IN ('v3', 'run') AND l.repo IS NULL AND l.tasks_done IS NOT NULL
     """)
 
 
@@ -1008,7 +1016,7 @@ def _refresh_trailer_lands(conn: psycopg.Connection, state_qualified: list[str])
             SELECT l.launch_uid, r.id, r.root_session_id, l.repo, l.launch_ts,
                    least(l.end_ts, (
                        SELECT min(n.launch_ts) FROM ah.loop_run n
-                       WHERE n.launch_ts > l.launch_ts
+                       WHERE n.launch_ts > l.launch_ts AND n.mode IS DISTINCT FROM 'run'
                          AND (n.root_session_id = r.root_session_id OR
                               (r.report_path IS NOT NULL AND n.report_path = r.report_path))
                    )) AS cutoff
@@ -1016,7 +1024,7 @@ def _refresh_trailer_lands(conn: psycopg.Connection, state_qualified: list[str])
             WHERE r.mode = 'v3' AND NOT (l.launch_uid = ANY(%s))
               AND NOT EXISTS (
                   SELECT 1 FROM ah.loop_run n WHERE n.id <> r.id AND n.launch_ts = l.launch_ts
-                    AND (n.root_session_id = r.root_session_id OR
+                    AND n.mode IS DISTINCT FROM 'run' AND (n.root_session_id = r.root_session_id OR
                          (r.report_path IS NOT NULL AND n.report_path = r.report_path))
               )
         ), repos AS (
@@ -1532,6 +1540,7 @@ def _refresh_state_counts(conn: psycopg.Connection) -> None:
             )
     _refresh_trailer_lands(conn, [uid for uid, cohorts in qualified.items() if _state_blocks_trailer_lands(cohorts)])
     _refresh_closeout_counts(conn)
+    loop_identity_run.refresh_counts(conn)
 
 
 def _refresh_closeout_counts(conn: psycopg.Connection) -> None:
@@ -1548,7 +1557,7 @@ def _refresh_closeout_counts(conn: psycopg.Connection) -> None:
         WITH target AS (
             SELECT l.launch_uid, r.report_path, r.launch_ts,
                    (SELECT min(n.launch_ts) FROM ah.loop_run n
-                    WHERE n.launch_ts > r.launch_ts
+                    WHERE n.launch_ts > r.launch_ts AND n.mode IS DISTINCT FROM 'run'
                       AND (n.report_path = r.report_path OR n.root_session_id = r.root_session_id)) AS following
             FROM ah.loops l JOIN ah.loop_run r USING (launch_uid)
             WHERE r.mode = 'v3' AND r.end_evidence = 'closeout' AND r.end_ts IS NOT NULL
@@ -1634,7 +1643,75 @@ def _tag_root(conn: psycopg.Connection, root_id: int) -> int:
             ),
         ).fetchone()[0]
         _tag_tree(conn, loop_id, root_id, ts, next_ts)
-    return len(launches)
+    return len(launches) + _tag_runs(conn, root_id, root_key, root_last)
+
+
+RUN_WRITES_SQL = """
+    SELECT i.io_uid, i.tool_name, i.input_text, s.cwd, i.ts, i.output_text
+    FROM ah.tool_io i JOIN ah.session s ON s.id = i.session_id
+    LEFT JOIN ah.tool_call t ON t.agent = i.agent AND t.call_uid = i.call_uid AND t.session_id = i.session_id
+    LEFT JOIN ah.tool_op o ON o.agent = i.agent AND o.item_uid = i.item_uid AND o.session_id = i.session_id
+    WHERE i.session_id = %s AND position('AUTHORITY.md' in i.input_text) > 0
+      AND lower(i.tool_name) ~ '(^|[.])(write|apply_patch|filechange)$'
+      AND NOT COALESCE(i.input_truncated, false) AND NOT COALESCE(i.output_truncated, false)
+      AND ((i.kind = 'call' AND t.outcome = 'ok' AND t.ended_at IS NOT NULL) OR
+           (i.kind = 'op' AND o.status = 'completed' AND o.completed_at IS NOT NULL
+            AND o.is_error IS FALSE AND (o.exit_code IS NULL OR o.exit_code = 0)))
+    ORDER BY i.ts, i.id
+"""
+
+
+def _tag_runs(conn: psycopg.Connection, root_id: int, root_key: str, root_last: Any) -> int:
+    """Runs of the run-folder dialect this root started by writing a run folder's AUTHORITY.md.
+
+    One run per folder: the root's first complete successful structured write of a qualified
+    AUTHORITY.md starts it, and its lanes are the root's sessions that start inside the window up to
+    the root's next such run. Only this top-level session counts as the root; launch text is not read.
+    """
+    top = conn.execute(
+        "SELECT NOT COALESCE(is_subagent, false) AND (root_session_id IS NULL OR root_session_id = id) "
+        "FROM ah.session WHERE id = %s",
+        (root_id,),
+    ).fetchone()
+    if not top or not top[0]:
+        # A child indexed before its parent has no root yet; it is never a run's root.
+        return 0
+    starts: dict[str, tuple[str, Any]] = {}
+    for io_uid, tool, raw, cwd, ts, output in conn.execute(RUN_WRITES_SQL, (root_id,)):
+        if tool.rsplit(".", 1)[-1].lower() == "apply_patch" and re.match(
+            r"\s*(?:apply_patch verification failed|error|failed|invalid patch)", output or "", re.I
+        ):
+            continue
+        for authority in loop_identity_run.authority_targets(tool, raw, cwd):
+            starts.setdefault(authority, (io_uid, ts))
+    runs = sorted(starts.items(), key=lambda item: (item[1][1], item[0]))
+    for index, (authority, (io_uid, ts)) in enumerate(runs):
+        next_ts = runs[index + 1][1][1] if index + 1 < len(runs) else None
+        end_ts, evidence = (next_ts, "next_launch") if next_ts is not None else (root_last, "root_last_event")
+        row = conn.execute(
+            "INSERT INTO ah.loop_run (launch_uid, root_session_id, status, repo_slug, naming, mode, report_path, "
+            "goal_path, launch_ts, end_ts, end_evidence, protocol) VALUES (%s,%s,'resolved',%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+            "ON CONFLICT (launch_uid) DO UPDATE SET end_ts = EXCLUDED.end_ts, end_evidence = EXCLUDED.end_evidence, "
+            "repo_slug = EXCLUDED.repo_slug, report_path = EXCLUDED.report_path, goal_path = EXCLUDED.goal_path, "
+            "launch_ts = EXCLUDED.launch_ts, protocol = EXCLUDED.protocol "
+            "WHERE ah.loop_run.mode = EXCLUDED.mode RETURNING id",
+            (
+                f"{root_key}:{io_uid}",
+                root_id,
+                PurePosixPath(authority).parent.parent.parent.name,
+                loop_identity_run.MODE,
+                loop_identity_run.MODE,
+                loop_identity_run.closeout_path(authority),
+                authority,
+                ts,
+                end_ts,
+                evidence,
+                loop_identity_run.PROTOCOL,
+            ),
+        ).fetchone()
+        if row:
+            _tag_tree(conn, row[0], root_id, ts, next_ts)
+    return len(runs)
 
 
 def _tag_tree(conn: psycopg.Connection, loop_id: int, root_id: int, start: Any, end: Any) -> None:
@@ -1714,6 +1791,19 @@ def parse_lane_returns(text: str) -> list[tuple[Any, str | None]]:
     return [_projected(value) for value in _lane_blocks(text)]
 
 
+def parse_status_line(text: str) -> tuple[dict[str, str], str] | None:
+    """The plain return: a message whose first non-empty line is exactly `Status: <status>`.
+
+    The status is one of complete|partial|blocked|failed. The stored return is only that stated
+    status, `{"status": ..., "form": "status_line"}`; nothing else of the message is projected.
+    """
+    for line in (text or "").splitlines():
+        if line.strip():
+            match = STATUS_LINE.fullmatch(line)
+            return ({"status": match[1], "form": "status_line"}, match[1]) if match else None
+    return None
+
+
 def parse_lane_return(text: str) -> tuple[Any, str | None]:
     """(lane_return, return_status) of the last ```lane-return block in a lane's final message.
 
@@ -1739,16 +1829,21 @@ def lane_returns(
 ) -> list[dict[str, Any]]:
     """Every lane-return of one lane session, oldest first.
 
-    Sources: the session's own final reports, then (Claude) subagent hand-backs addressed from its
-    agent id and relayed to a parent as an agent message or queued prompt, which is the only place a
-    lane resumed after a one-shot hand-back returns again. A relayed copy equal to a return already
-    held is the same return, not another.
+    Sources: the session's own final reports, then (Claude) the lane session's last assistant text,
+    which is where a Claude subagent writes its final message, then (Claude) subagent hand-backs
+    addressed from its agent id and relayed to a parent as an agent message or queued prompt, which
+    is the only place a lane resumed after a one-shot hand-back returns again. A copy equal to a
+    return already held is the same return, not another. A final report or final message without a
+    fenced block gives a return only when its first non-empty line states the status.
     """
     found: list[tuple[Any, int, int, dict[str, Any]]] = []
     seen: set[str] = set()
 
-    def add(source: str, ts: Any, uid: str, text: str, rank: int, keep_equal: bool) -> None:
-        for index, (value, status) in enumerate(parse_lane_returns(text)):
+    def add(source: str, ts: Any, uid: str, text: str, rank: int, keep_equal: bool, plain: bool = False) -> None:
+        values = parse_lane_returns(text)
+        if not values and plain and (stated := parse_status_line(text)):
+            values = [stated]
+        for index, (value, status) in enumerate(values):
             key = json.dumps(value, sort_keys=True)
             if not keep_equal and key in seen:
                 continue
@@ -1758,10 +1853,19 @@ def lane_returns(
 
     for uid, ts, text in conn.execute(
         "SELECT event_uid, ts, text FROM ah.message WHERE session_id = %s AND message_class = 'subagent_report' "
-        "AND position('```lane-return' in text) > 0 ORDER BY ts, byte_offset, id",
+        "AND (position('```lane-return' in text) > 0 OR ltrim(text, E' \\t\\r\\n') LIKE 'Status:%%') "
+        "ORDER BY ts, byte_offset, id",
         (session_id,),
     ):
-        add("report", ts, uid, text, 0, True)
+        add("report", ts, uid, text, 0, True, plain=True)
+    if agent == "claude":
+        final = conn.execute(
+            "SELECT event_uid, ts, text FROM ah.message WHERE session_id = %s AND message_class = 'assistant_text' "
+            "ORDER BY ts DESC, byte_offset DESC, id DESC LIMIT 1",
+            (session_id,),
+        ).fetchone()
+        if final:
+            add("final_message", final[1], final[0], final[2], 2, False, plain=True)
     if agent == "claude" and agent_id and parents:
         header = _hand_back_header(agent_id)
         for uid, ts, text in conn.execute(
@@ -1775,6 +1879,40 @@ def lane_returns(
                 add("hand_back", ts, uid, text[framed.end() :], 1, False)
     found.sort(key=lambda item: item[:3])
     return [entry for *_, entry in found]
+
+
+LANE_RETURNS_MARKER = "loops_lane_returns_final_message_v1"
+LANE_RETURNS_BATCH = 256
+
+
+def _refresh_lane_returns(conn: psycopg.Connection) -> list[str]:
+    """Re-read the returns of lanes indexed before the final-message and status-line sources, once.
+
+    A bounded batch of lanes without a return status per pass, in id order behind a transactional
+    cursor; new lanes are read when their sessions change. Returns the runs whose lanes gained a
+    return, so their progress counts are refreshed in the same pass.
+    """
+    saved = conn.execute("SELECT value FROM ah.meta WHERE key = %s", (LANE_RETURNS_MARKER,)).fetchone()
+    if saved and saved[0] == "complete":
+        return []
+    cursor = int(saved[0]) if saved else 0
+    lanes = conn.execute(
+        "SELECT l.id, l.loop_run_id, l.session_id, l.link_method, r.launch_uid FROM ah.lane l "
+        "JOIN ah.loop_run r ON r.id = l.loop_run_id WHERE l.id > %s AND l.return_status IS NULL "
+        "ORDER BY l.id LIMIT %s",
+        (cursor, LANE_RETURNS_BATCH),
+    ).fetchall()
+    changed = []
+    for lane_id, loop_id, session_id, method, uid in lanes:
+        _lane(conn, loop_id, session_id, method)
+        if conn.execute("SELECT return_status IS NOT NULL FROM ah.lane WHERE id = %s", (lane_id,)).fetchone()[0]:
+            changed.append(uid)
+    following = str(lanes[-1][0]) if len(lanes) == LANE_RETURNS_BATCH else "complete"
+    conn.execute(
+        "INSERT INTO ah.meta (key, value) VALUES (%s, %s) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+        (LANE_RETURNS_MARKER, following),
+    )
+    return list(dict.fromkeys(changed))
 
 
 def _return_lane(entries: Sequence[dict[str, Any]]) -> str | None:

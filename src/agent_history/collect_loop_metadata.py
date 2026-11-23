@@ -1,5 +1,9 @@
 """Collect charter/closeout identity metadata, never document bodies or receipt state.
 
+A run folder `codex/run-<YYYYMMDD>-<n>/` (the run-folder dialect) yields its `AUTHORITY.md` and
+`CLOSEOUT.md` the same way, as kinds `authority` and `run_closeout`. Every document also yields the
+one token of a `protocol: <token>` line that is the first non-empty line after its first line.
+
 A qualified closeout also yields two integers, the distinct task IDs or `#N` issue numbers under
 its `## Landed` and `## Parked` headings. A charter yields the ordered task IDs that open the rows under its
 `## First wave` heading. The body is read in memory while it is hashed and then discarded; only
@@ -18,6 +22,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from .collect_git import GIT_ENV, parse_remote
+from .loop_identity_run import AUTHORITY, CLOSEOUT, declared_protocol, qualified, run_name
 from .loop_identity_v3 import CLOSEOUT_HEADER
 
 COLS = [
@@ -31,6 +36,7 @@ COLS = [
     ("landed_count", "integer"),
     ("parked_count", "integer"),
     ("task_ids", "text[]"),
+    ("protocol", "text"),
 ]
 KEY = ["machine", "kind", "path"]
 SOURCE_NAME = re.compile(r"(charter|closeout)-[\w.-]*-loop[0-9]+\.md")
@@ -150,6 +156,15 @@ def _parents(repo: Path, repo_fd: int, codex_fd: int, root: tuple, parent: tuple
         raise Changed("source directory changed")
 
 
+def _folder(codex_fd: int, folder: tuple[str, int, tuple] | None) -> None:
+    """Check a run folder's anchored descriptor and its current binding below `codex/`."""
+    if folder is None:
+        return
+    name, fd, version = folder
+    if _version(os.fstat(fd)) != version or _version(os.stat(name, dir_fd=codex_fd, follow_symlinks=False)) != version:
+        raise Changed("run folder changed")
+
+
 def _snapshot(
     repo: Path,
     repo_fd: int,
@@ -160,14 +175,19 @@ def _snapshot(
     kind: str,
     machine: str,
     origin: str | None,
+    folder: tuple[str, int, tuple] | None = None,
 ) -> dict[str, Any]:
+    # A run-folder document is opened below its anchored folder; every other source directly below codex/.
+    dir_fd = codex_fd if folder is None else folder[1]
+    relative = Path(name) if folder is None else Path(folder[0]) / name
     _parents(repo, repo_fd, codex_fd, root, parent)
-    fd = os.open(name, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW, dir_fd=codex_fd)
+    _folder(codex_fd, folder)
+    fd = os.open(name, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW, dir_fd=dir_fd)
     try:
         before = os.fstat(fd)
         if not stat.S_ISREG(before.st_mode):
             raise OSError("not a regular metadata source")
-        if _version(os.stat(name, dir_fd=codex_fd, follow_symlinks=False)) != _version(before):
+        if _version(os.stat(name, dir_fd=dir_fd, follow_symlinks=False)) != _version(before):
             raise Changed(name)
         handle = os.fdopen(fd, "rb")
     except BaseException:
@@ -190,9 +210,10 @@ def _snapshot(
                 body += chunk
             remaining -= len(chunk)
         after = os.fstat(handle.fileno())
-        bound = os.stat(name, dir_fd=codex_fd, follow_symlinks=False)
-        public = os.stat(repo / "codex" / name, follow_symlinks=False)
+        bound = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+        public = os.stat(repo / "codex" / relative, follow_symlinks=False)
         _parents(repo, repo_fd, codex_fd, root, parent)
+        _folder(codex_fd, folder)
         if any(_version(info) != _version(before) for info in (after, bound, public)):
             raise Changed(name)
     line1 = None
@@ -204,13 +225,23 @@ def _snapshot(
         # A full-size prefix without a newline is incomplete, even if it resembles a header.
         if (len(first) < MAX_LINE1_BYTES or first.endswith(b"\n")) and CLOSEOUT_HEADER.fullmatch(candidate):
             line1 = candidate
-    landed = parked = task_ids = None
+    elif kind in ("authority", "run_closeout"):
+        try:
+            candidate = first.decode("utf-8").removesuffix("\n").removesuffix("\r")
+        except UnicodeDecodeError:
+            candidate = ""
+        # The header must name this run folder; the bounded prefix rule is the closeout's.
+        if (len(first) < MAX_LINE1_BYTES or first.endswith(b"\n")) and qualified(kind, folder[0], candidate):
+            line1 = candidate
+    landed = parked = task_ids = protocol = None
     if body is not None:
         try:
             text = (bytes(first) + bytes(body)).decode("utf-8")
         except UnicodeDecodeError:
             text = None
-        if text is not None and kind == "closeout" and line1 is not None:
+        if text is not None:
+            protocol = declared_protocol(text)
+        if text is not None and kind in ("closeout", "run_closeout") and line1 is not None:
             landed, parked = closeout_counts(text)
         elif text is not None and kind == "charter":
             task_ids = charter_task_ids(text)
@@ -218,7 +249,7 @@ def _snapshot(
     del body
     return {
         "machine": machine,
-        "path": str(repo / "codex" / name),
+        "path": str(repo / "codex" / relative),
         "kind": kind,
         "sha256": digest.hexdigest(),
         "line1": line1,
@@ -227,7 +258,29 @@ def _snapshot(
         "landed_count": landed,
         "parked_count": parked,
         "task_ids": task_ids,
+        "protocol": protocol,
     }
+
+
+def _run_folder(repo, repo_fd, codex_fd, root, parent, name, machine, origin, report) -> Iterator[dict[str, Any]]:
+    """AUTHORITY.md and CLOSEOUT.md of one run folder, through a no-follow folder descriptor."""
+    try:
+        folder_fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=codex_fd)
+    except OSError as error:
+        report(error)
+        return
+    try:
+        folder = (name, folder_fd, _version(os.fstat(folder_fd)))
+        present = set(os.listdir(folder_fd))
+        for document, kind in ((AUTHORITY, "authority"), (CLOSEOUT, "run_closeout")):
+            if document not in present:
+                continue
+            try:
+                yield _snapshot(repo, repo_fd, codex_fd, root, parent, document, kind, machine, origin, folder)
+            except OSError as error:
+                report(error)
+    finally:
+        os.close(folder_fd)
 
 
 def metadata(repo: Path, machine: str, errors: list[dict[str, str]] | None = None) -> Iterator[dict[str, Any]]:
@@ -254,6 +307,9 @@ def metadata(repo: Path, machine: str, errors: list[dict[str, str]] | None = Non
                 parent = _version(os.fstat(codex_fd))
                 origin = _origin(repo)
                 for name in sorted(os.listdir(codex_fd)):
+                    if run_name(name):
+                        yield from _run_folder(repo, repo_fd, codex_fd, root, parent, name, machine, origin, report)
+                        continue
                     match = SOURCE_NAME.fullmatch(name)
                     if not match:
                         continue

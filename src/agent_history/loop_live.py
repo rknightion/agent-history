@@ -1409,7 +1409,7 @@ def refresh(conn: psycopg.Connection) -> None:
         for row in conn.execute(
             "SELECT l.launch_uid FROM ah.loops l JOIN ah.loop_run r USING(launch_uid) "
             "WHERE l.status='finished' AND l.live_phase IS DISTINCT FROM 'closing' AND (r.end_evidence='state_close' "
-            "OR (r.mode='v3' AND r.end_evidence = ANY(%s)))",
+            "OR (r.mode IN ('v3','run') AND r.end_evidence = ANY(%s)))",
             (list(V3_TERMINAL),),
         )
     ]
@@ -1439,9 +1439,9 @@ def refresh(conn: psycopg.Connection) -> None:
         for field, value in zip(("tasks_admitted", "tasks_landed", "parks_total"), outcomes[:3]):
             state[field] = value
         state["phase_input"]["park_events_so_far"] = state["parks_total"]
-        # A v3 closeout (or completion receipt or report) is the run's terminal file: the loop is closed.
+        # A v3 or run-folder closeout (or completion receipt or report) is the run's terminal file: the loop is closed.
         if target[5] == "finished" and (
-            outcomes[3] == "state_close" or (outcomes[4] == "v3" and outcomes[3] in V3_TERMINAL)
+            outcomes[3] == "state_close" or (outcomes[4] in ("v3", "run") and outcomes[3] in V3_TERMINAL)
         ):
             state["close_recorded"] = state["phase_input"]["close_recorded"] = True
             state["live_phase"] = "closing"

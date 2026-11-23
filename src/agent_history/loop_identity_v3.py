@@ -133,10 +133,30 @@ def structured_closeout(
     """
     if not raw or ended < started:
         return None
+    touched, content = structured_content(tool, raw, target, cwd)
+    if not isinstance(content, str) or "\x00" in content:
+        return Write(started, ended, None, None) if touched else None
+    first = content.partition("\n")[0].removesuffix("\r")
+    if not CLOSEOUT_HEADER.fullmatch(first):
+        first = None
+    try:
+        digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    except UnicodeEncodeError:
+        return None
+    return Write(started, ended, first, digest)
+
+
+def structured_content(tool: str, raw: str | None, target: str, cwd: str | None) -> tuple[bool, str | None]:
+    """(touched, content) of one structured mutation of the exact target path.
+
+    `content` is the whole new file only for a complete `Write`/`write`, an `apply_patch` Add File
+    or an executed FileChange add; every other mutation of the target is touched without content.
+    """
+    if not raw:
+        return False, None
     tool = tool.rsplit(".", 1)[-1].lower()
     content = None
     touched = False
-    unknown_write = Write(started, ended, None, None)
     try:
         args = json.loads(raw, object_pairs_hook=_unique)
     except (ValueError, RecursionError):
@@ -158,18 +178,9 @@ def structured_closeout(
     elif tool == "apply_patch":
         patch = args.get("input", args.get("patch")) if isinstance(args, dict) else raw
         if not isinstance(patch, str):
-            return None
+            return False, None
         touched, content = _patch_content(patch, target, cwd)
-    if not isinstance(content, str) or "\x00" in content:
-        return unknown_write if touched else None
-    first = content.partition("\n")[0].removesuffix("\r")
-    if not CLOSEOUT_HEADER.fullmatch(first):
-        first = None
-    try:
-        digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
-    except UnicodeEncodeError:
-        return None
-    return Write(started, ended, first, digest)
+    return touched, content
 
 
 def project(
@@ -335,10 +346,11 @@ WINDOWS_SQL = """
     SELECT l.launch_uid,l.root_session_id,l.loop_number,l.launch_ts,l.goal_path,l.report_path,l.mode,
            s.cwd,s.git_remote_url,m.text,
            least((SELECT min(n.launch_ts) FROM ah.loop_run n
-                  WHERE n.report_path=l.report_path AND n.launch_ts>l.launch_ts),
+                  WHERE n.report_path=l.report_path AND n.launch_ts>l.launch_ts AND n.mode IS DISTINCT FROM 'run'),
                  (SELECT min(n.launch_ts) FROM ah.loop_run n
-                  WHERE n.root_session_id=l.root_session_id AND n.launch_ts>l.launch_ts)) AS following,
-           EXISTS(SELECT 1 FROM ah.loop_run n WHERE n.report_path=l.report_path
+                  WHERE n.root_session_id=l.root_session_id AND n.launch_ts>l.launch_ts
+                    AND n.mode IS DISTINCT FROM 'run')) AS following,
+           EXISTS(SELECT 1 FROM ah.loop_run n WHERE n.report_path=l.report_path AND n.mode IS DISTINCT FROM 'run'
                   AND n.launch_ts=l.launch_ts AND n.launch_uid<>l.launch_uid) AS tied,
            l.id
     FROM ah.loop_run l JOIN ah.session s ON s.id=l.root_session_id

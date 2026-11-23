@@ -539,6 +539,7 @@ def test_collector_upsert_keeps_null_and_empty_task_ids_apart(conn, tmp_path):
             "landed_count": None,
             "parked_count": None,
             "task_ids": ids,
+            "protocol": None,
         }
         for name, kind, ids in (
             ("charter-a-loop1.md", "charter", ["APP-0002", "APP-0001"]),
