@@ -900,6 +900,8 @@ def _refresh_progress(conn: psycopg.Connection, also: Sequence[str] = ()) -> Non
                                  AND output IS NOT NULL
                             THEN ah.priced_usd(model, ts::date, input_uncached, cache_read,
                                                cache_write_5m, cache_write_1h, output) END AS cost FROM calls
+                -- A '<synthetic>' record is no model call and has no price: it never makes the cost unknown.
+                WHERE model IS DISTINCT FROM '<synthetic>'
             ), costs AS (
                 SELECT CASE WHEN count(cost) = count(*) THEN sum(cost) END AS cost FROM priced
             ), tools AS (
