@@ -14,11 +14,16 @@ concurrency:
 
 jobs:
   ci:
-    name: just ci
+    name: just ci (${{ matrix.python }})
     runs-on: ubuntu-latest
     timeout-minutes: 25
     permissions:
       contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        # The requires-python floor and the newest supported release.
+        python: ['3.11', '3.15']
     steps:
       - name: Harden the runner (audit egress)
         uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c # v2.23.0
@@ -31,8 +36,21 @@ jobs:
           fetch-depth: 0
       - name: Set up just
         uses: rknightion/.github/.github/actions/setup-just@84486af028f18f4a2d93ee5c4eb954fdd541d800 # v1.31.10
+      - name: Set up Python (the bare python3 the justfile calls)
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ matrix.python }}
       - name: Set up uv
         uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Confirm both interpreters are the matrix version
+        env:
+          EXPECTED_PYTHON: ${{ matrix.python }}
+        run: |
+          check='import os, sys; v = "%d.%d" % sys.version_info[:2]; print(sys.executable, sys.version); sys.exit(v != os.environ["EXPECTED_PYTHON"])'
+          python3 -c "$check"
+          uv run --locked --group dev python -c "$check"
       - name: Install the leak-gate hooks (just check verifies them)
         run: just hooks
       - name: just ci
