@@ -282,7 +282,9 @@ indexed-content timestamps do not advance for availability updates.
   first), and a record with no such call waits for one. Nothing pairs, and so nothing links, when
   the REPL call was never seen in the session, when two records disagree on a slot's tool, when the
   records are malformed or absent, or when a `data-flow-incomplete` record arrives (calls and records
-  still waiting are dropped). A call linked later than it was written is updated, never duplicated.
+  still waiting are dropped). When more calls or records wait than the parser keeps, all of them are
+  dropped and every REPL call seen up to then is cut off from later records: overflow gives no link,
+  never a wrong one. A call linked later than it was written is updated, never duplicated.
   Calls recorded before this rule are not linked until their session is reparsed by a rebuild.
 - pi: children of a pi-subagents run are linked to their parent by path; archived
   `subagent-artifacts/*_transcript.jsonl` copies pair a run id with the child's response id and are

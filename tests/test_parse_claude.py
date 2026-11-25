@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 from test_common import MALFORMED_PEER_ATTRIBUTES
 
+from agent_history import parse_claude
 from agent_history.memstore import MemStore, run_file
 from agent_history.model import FileContext, LinePos, LlmCallRow, SessionKey
 from agent_history.parse_claude import ClaudeParser, RESPONSE_SEEN_BITS, STATE_KEYS_MAX
@@ -1545,6 +1546,25 @@ def test_code_mode_incomplete_capture_drops_unpaired_calls_and_records(tmp_path)
     nested = _cm_nested(_cm_load(tmp_path, records))
     # The call before the gap is forgotten, so the record after it cannot pair with it; it pairs the next call.
     assert nested[first_id] is None and nested[second_id] == "toolu_repl1"
+
+
+def test_code_mode_pending_overflow_never_links_a_wrong_call(tmp_path, monkeypatch):
+    monkeypatch.setattr(parse_claude, "FLOW_PENDING_MAX", 2)
+    calls, ids = [], []
+    for n in (10, 12, 14):
+        pair, cid = _cm_inner(n, "Read")
+        calls += pair
+        ids.append(cid)
+    flow = _cm_flow(*[("Read", "toolu_repl1", i) for i in range(3)])
+    # The calls land in one batch and overflow the pending window; their records arrive in a later one.
+    records = [_cm_real(5, "toolu_repl1"), *calls, flow]
+    nested = _cm_nested(_cm_load(tmp_path, records, batch_lines=len(calls) + 1))
+    assert {nested[c] for c in ids} == {None}
+    # A call that arrives after the overflow, with a fresh REPL call and records, still links.
+    later, later_id = _cm_inner(20, "Read")
+    records += [_cm_real(18, "toolu_repl2"), *later, _cm_flow(("Read", "toolu_repl2", 0))]
+    nested = _cm_nested(_cm_load(tmp_path, records, batch_lines=len(calls) + 1))
+    assert {nested[c] for c in ids} == {None} and nested[later_id] == "toolu_repl2"
 
 
 def test_code_mode_malformed_data_flow_records_are_ignored(tmp_path):
