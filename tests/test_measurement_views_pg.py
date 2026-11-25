@@ -323,3 +323,60 @@ def test_migration_054_requeues_sessions_rolled_up_before_synthetic_calls(clean)
     rollup(db, sid)
     r = one(db, "SELECT llm_calls, synthetic_calls FROM ah.session_rollup WHERE session_id = %s", (sid,))
     assert r == {"llm_calls": 2, "synthetic_calls": 3}
+
+
+def test_migration_055_drops_code_mode_model_calls_and_keeps_other_synthetic_records(clean):
+    db = clean
+    sid = session(db, "measure-codemode")
+    call(db, sid, "real-a", AT + timedelta(minutes=1))
+    call(db, sid, "inner-a", AT + timedelta(minutes=2), SYN, stop="stop_sequence")
+    call(db, sid, "inner-b", AT + timedelta(minutes=3), SYN, stop="stop_sequence")
+    call(db, sid, "syn-error", AT + timedelta(minutes=4), SYN, api_error=True)
+    call(db, sid, "syn-notice", AT + timedelta(minutes=5), SYN, stop="stop_sequence")  # no tool call: kept
+    for uid, response in (
+        ("repl_aaaaaaaa-0000-4000-8000-000000000001", "inner-a"),
+        ("repl_aaaaaaaa-0000-4000-8000-000000000002", "inner-b"),
+        ("toolu_real_repl", "real-a"),
+    ):
+        db.execute(
+            "INSERT INTO ah.tool_call (agent, call_uid, session_id, response_id, tool_name, started_at, source_id, "
+            "byte_offset) VALUES ('claude', %s, %s, %s, 'Read', %s, 0, 0)",
+            (uid, sid, response, AT),
+        )
+    call(db, sid, "inner-text", AT + timedelta(minutes=6), SYN, stop="stop_sequence")  # real text: kept
+    db.execute(
+        "INSERT INTO ah.tool_call (agent, call_uid, session_id, response_id, tool_name, started_at, source_id, "
+        "byte_offset) VALUES ('claude', 'repl_aaaaaaaa-0000-4000-8000-000000000003', %s, 'inner-text', 'Read', %s, 0, 0)",
+        (sid, AT),
+    )
+    offset = 77
+    db.execute(
+        "UPDATE ah.llm_call SET byte_offset = %s WHERE session_id = %s AND response_id = 'inner-text'", (offset, sid)
+    )
+    db.execute(
+        "INSERT INTO ah.message (agent, event_uid, session_id, namespace, profile, ts, role, message_class, text, "
+        "content_sha256, source_id, byte_offset, byte_length) "
+        "VALUES ('claude', 'u-text', %s, 'ns', 'p', %s, 'assistant', 'assistant_text', 'hello', 'x', 0, %s, 1)",
+        (sid, AT, offset),
+    )
+    db.execute("DELETE FROM ah.dirty_session")
+    db.execute("DELETE FROM ah.meta WHERE key = 'migration:055_drop_code_mode_model_calls.sql'")
+    db.commit()
+    load.apply_schema(db, force=True)
+    db.commit()
+    left = [r[0] for r in db.execute("SELECT response_id FROM ah.llm_call WHERE session_id = %s ORDER BY ts", (sid,))]
+    assert left == ["real-a", "syn-error", "syn-notice", "inner-text"]
+    kept = dict(db.execute("SELECT call_uid, response_id FROM ah.tool_call WHERE session_id = %s", (sid,)).fetchall())
+    assert kept == {
+        "repl_aaaaaaaa-0000-4000-8000-000000000001": None,
+        "repl_aaaaaaaa-0000-4000-8000-000000000002": None,
+        "repl_aaaaaaaa-0000-4000-8000-000000000003": None,
+        "toolu_real_repl": "real-a",
+    }
+    assert [r[0] for r in db.execute("SELECT session_id FROM ah.dirty_session")] == [sid]
+    # A second run finds nothing more to do.
+    db.execute("DELETE FROM ah.meta WHERE key = 'migration:055_drop_code_mode_model_calls.sql'")
+    db.commit()
+    load.apply_schema(db, force=True)
+    db.commit()
+    assert db.execute("SELECT count(*) FROM ah.llm_call WHERE session_id = %s", (sid,)).fetchone()[0] == 4

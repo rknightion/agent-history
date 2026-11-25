@@ -262,6 +262,28 @@ indexed-content timestamps do not advance for availability updates.
   window, `meta.nested_in` naming the parent, and the arguments exactly as recorded (a call whose
   arguments the source left out for size has an empty, truncated input). No file touch, artifact or
   git event is derived from a nested call.
+- Claude Code, Code Mode: a tool a REPL script ran is recorded as a client-written assistant message
+  (top-level `isVirtual`, model `<synthetic>`, zero usage, one `tool_use` whose id starts `repl_`) and
+  a virtual result. It is not a model call: no `llm_call` row, response line count, model switch or
+  turn change. The call is still a `tool_call` and `tool_io` row like any other, with an empty
+  `response_id`. Any text or thinking such a record holds is still indexed as messages. A `<synthetic>`
+  message without the flag is also left out when it holds nothing but `repl_` tool uses; a record with
+  text or thinking, and every other `<synthetic>` record (API errors, notices), stays an `llm_call` row.
+  Migration `055_drop_code_mode_model_calls.sql` removes the rows older parsers made (a `<synthetic>`
+  row that is no API error, whose response held a `repl_` tool call and whose record has no message
+  rows), empties that call's
+  `response_id` and queues the sessions for a new rollup. The parser version is not bumped: a Claude
+  parser upgrade stops every indexed source until a full rebuild.
+- Claude Code, Code Mode links: the inner call's record names no parent, so `meta.nested_in` (the REPL
+  call's id, as for pi) comes from the `data-flow-records` records, whose items hold `tool_use_id`
+  (the REPL call), `inner_call_index` and `tool_name`. Records repeat, can come before or after
+  their call and can be missing, so a call is paired with the oldest unpaired record of the same tool
+  whose REPL call the session had shown by the time the call arrived (lowest index of that REPL call
+  first), and a record with no such call waits for one. Nothing pairs, and so nothing links, when
+  the REPL call was never seen in the session, when two records disagree on a slot's tool, when the
+  records are malformed or absent, or when a `data-flow-incomplete` record arrives (calls and records
+  still waiting are dropped). A call linked later than it was written is updated, never duplicated.
+  Calls recorded before this rule are not linked until their session is reparsed by a rebuild.
 - pi: children of a pi-subagents run are linked to their parent by path; archived
   `subagent-artifacts/*_transcript.jsonl` copies pair a run id with the child's response id and are
   indexed as evidence only (no messages or model calls). Both direct run-id directories and

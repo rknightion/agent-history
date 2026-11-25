@@ -1321,3 +1321,239 @@ def test_zero_usage_with_a_stop_reason_stays_a_known_zero(tmp_path):
     store = _subagent_blocks(tmp_path, [("msg_c", "end_turn", None)])
     call = one(store, "llm_call", response_id="msg_c")
     assert (call["input_uncached"], call["output"]) == (0, 0)
+
+
+# -- Code Mode (REPL) inner calls ------------------------------------------------------------------
+
+CM_SID = "cm-session"
+
+
+def _cm_ts(n):
+    return f"2026-11-23T15:{n // 60:02d}:{n % 60:02d}.000Z"
+
+
+def _cm_real(n, call_id, name="REPL", msg="msg_real"):
+    return {"type": "assistant", "sessionId": CM_SID, "uuid": f"real-{n}", "timestamp": _cm_ts(n),
+            "message": {"id": f"{msg}_{n}", "role": "assistant", "model": "synthetic-model", "stop_reason": "tool_use",
+                        "usage": {"input_tokens": 5, "output_tokens": 7},
+                        "content": [{"type": "tool_use", "id": call_id, "name": name, "input": {"code": "x"}}]}}
+
+
+def _cm_result(n, call_id, virtual=False):
+    rec = {"type": "user", "sessionId": CM_SID, "uuid": f"res-{n}", "timestamp": _cm_ts(n),
+           "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": call_id,
+                                                      "content": "ok", "is_error": False}]}}
+    if virtual:
+        rec["isVirtual"] = True
+        rec["toolUseResult"] = {"type": "text"}
+    return rec
+
+
+def _cm_inner(n, name, call_id=None):
+    call_id = call_id or f"repl_00000000-0000-4000-8000-{n:012d}"
+    return [{"type": "assistant", "sessionId": CM_SID, "uuid": f"virt-{n}", "timestamp": _cm_ts(n), "isVirtual": True,
+             "message": {"id": f"virt-msg-{n}", "role": "assistant", "model": "<synthetic>", "stop_reason": "stop_sequence",
+                         "usage": {"input_tokens": 0, "output_tokens": 0, "cache_read_input_tokens": 0,
+                                   "cache_creation_input_tokens": 0},
+                         "content": [{"type": "tool_use", "id": call_id, "name": name, "input": {"x": n}}]}},
+            _cm_result(n, call_id, virtual=True)], call_id
+
+
+def _cm_flow(*records):
+    return {"type": "data-flow-records", "v": 1, "sessionId": CM_SID,
+            "records": [{"tool_name": n, "tool_use_id": p, "inner_call_index": i} for n, p, i in records]}
+
+
+def _cm_load(tmp_path, records, batch_lines=1):
+    path = tmp_path / "codemode.jsonl"
+    path.write_text("".join(json.dumps(r) + "\n" for r in records))
+    store = MemStore()
+    run_file(ClaudeParser, FileContext(str(path), "claude-test/codemode.jsonl", "claude-test", "claude", "test",
+                                       None, "main"), store, batch_lines=batch_lines)
+    return store
+
+
+def _cm_nested(store):
+    return {r["call_uid"]: (r["meta"] or {}).get("nested_in") for r in store.rows("tool_call")}
+
+
+def test_code_mode_inner_calls_are_not_model_calls(tmp_path):
+    a, a_id = _cm_inner(10, "Read")
+    b, b_id = _cm_inner(11, "Bash")
+    records = [_cm_real(5, "toolu_repl1"), _cm_result(6, "toolu_repl1"), *a, *b]
+    store = _cm_load(tmp_path, records)
+    # Only the model's own response is a call; the two client-written inner messages are not.
+    assert [r["response_id"] for r in store.rows("llm_call")] == ["msg_real_5"]
+    assert not [r for r in store.rows("llm_call") if r["model"] == "<synthetic>"]
+    # The calls and their results are recorded exactly as before.
+    calls = {r["call_uid"]: r for r in store.rows("tool_call")}
+    assert set(calls) == {"toolu_repl1", a_id, b_id}
+    assert (calls[a_id]["tool_name"], calls[a_id]["outcome"], calls[b_id]["tool_name"]) == ("Read", "ok", "Bash")
+    assert calls[a_id]["response_id"] is None and calls["toolu_repl1"]["response_id"] == "msg_real_5"
+    assert {r["io_uid"] for r in store.rows("tool_io") if r["kind"] == "call"} >= {a_id, b_id}
+    assert {r["io_uid"] for r in store.rows("tool_io") if r["output_text"] == "ok"} >= {a_id, b_id}
+
+
+def test_synthetic_api_error_record_stays_a_call_row(tmp_path):
+    error = {"type": "assistant", "sessionId": CM_SID, "uuid": "err-1", "timestamp": _cm_ts(3), "isApiErrorMessage": True,
+             "error": "rate_limit", "message": {"id": "err-msg", "role": "assistant", "model": "<synthetic>",
+                                                "usage": {"input_tokens": 0, "output_tokens": 0},
+                                                "content": [{"type": "text", "text": "API Error"}]}}
+    store = _cm_load(tmp_path, [error])
+    assert [(r["response_id"], r["model"], r["is_api_error"]) for r in store.rows("llm_call")] == [
+        ("err-msg", "<synthetic>", True)]
+
+
+def test_synthetic_repl_tool_use_without_the_virtual_flag_is_still_not_a_call(tmp_path):
+    inner, _ = _cm_inner(10, "Read")
+    del inner[0]["isVirtual"]
+    store = _cm_load(tmp_path, [_cm_real(5, "toolu_repl1"), *inner])
+    assert [r["response_id"] for r in store.rows("llm_call")] == ["msg_real_5"]
+
+
+def _cm_mixed(flagged):
+    inner, call_id = _cm_inner(10, "Read")
+    block = inner[0]["message"]["content"]
+    block[:0] = [{"type": "thinking", "thinking": "weigh it up", "signature": "sig"},
+                 {"type": "text", "text": "Reading the file now."}]
+    if not flagged:
+        del inner[0]["isVirtual"]
+    return inner, call_id
+
+
+def test_virtual_record_keeps_its_text_and_thinking_but_makes_no_call_row(tmp_path):
+    inner, call_id = _cm_mixed(flagged=True)
+    store = _cm_load(tmp_path, [_cm_real(5, "toolu_repl1"), *inner])
+    assert [r["response_id"] for r in store.rows("llm_call")] == ["msg_real_5"]
+    msgs = {(r["message_class"], r["text"]) for r in store.rows("message")}
+    assert ("assistant_text", "Reading the file now.") in msgs and ("reasoning", "weigh it up") in msgs
+    assert call_id in {r["call_uid"] for r in store.rows("tool_call")}
+
+
+def test_unflagged_synthetic_record_with_content_is_a_real_call_with_its_messages(tmp_path):
+    inner, call_id = _cm_mixed(flagged=False)
+    store = _cm_load(tmp_path, [_cm_real(5, "toolu_repl1"), *inner])
+    assert [r["response_id"] for r in store.rows("llm_call")] == ["msg_real_5", "virt-msg-10"]
+    msgs = {(r["message_class"], r["text"]) for r in store.rows("message")}
+    assert ("assistant_text", "Reading the file now.") in msgs and ("reasoning", "weigh it up") in msgs
+
+
+@pytest.mark.parametrize("batch", [1, 3, 5000])
+def test_code_mode_inner_calls_link_to_their_repl_call(tmp_path, batch):
+    ids = {}
+    records = [_cm_real(5, "toolu_repl1"), _cm_result(6, "toolu_repl1"), _cm_real(7, "toolu_repl2"),
+               _cm_result(8, "toolu_repl2")]
+    # Records repeat, arrive before and after their calls, and cover only some calls.
+    records.append(_cm_flow(("Read", "toolu_repl1", 0), ("Bash", "toolu_repl2", 0)))
+    for n, name in ((10, "Read"), (11, "Bash"), (12, "searchTools")):
+        pair, ids[n] = _cm_inner(n, name)
+        records.extend(pair)
+    records.append(_cm_flow(("Read", "toolu_repl1", 0), ("Read", "toolu_repl1", 1), ("Bash", "toolu_repl2", 0)))
+    pair, ids[13] = _cm_inner(13, "Read")
+    records.extend(pair)
+    store = _cm_load(tmp_path, records, batch)
+    nested = _cm_nested(store)
+    assert nested[ids[10]] == "toolu_repl1"
+    assert nested[ids[11]] == "toolu_repl2"
+    assert nested[ids[12]] is None            # no record names this tool
+    assert nested[ids[13]] == "toolu_repl1"
+    assert nested["toolu_repl1"] is None and nested["toolu_repl2"] is None
+    # The link is added to the call's own row, not a second row.
+    row = [r for r in store.rows("tool_call") if r["call_uid"] == ids[10]]
+    assert len(row) == 1 and row[0]["tool_name"] == "Read" and row[0]["outcome"] == "ok"
+
+
+def test_code_mode_oldest_repl_call_pairs_first_and_index_order_holds(tmp_path):
+    records = [_cm_real(5, "toolu_a"), _cm_real(6, "toolu_b"),
+               _cm_flow(("Read", "toolu_b", 0), ("Read", "toolu_a", 1), ("Read", "toolu_a", 0))]
+    ids = []
+    for n in (10, 11, 12):
+        pair, cid = _cm_inner(n, "Read")
+        ids.append(cid)
+        records.extend(pair)
+    nested = _cm_nested(_cm_load(tmp_path, records))
+    assert [nested[i] for i in ids] == ["toolu_a", "toolu_a", "toolu_b"]
+
+
+@pytest.mark.parametrize("batch", [1, 5000])
+def test_code_mode_late_records_pair_in_call_order_not_array_order(tmp_path, batch):
+    records = [_cm_real(5, "toolu_a"), _cm_real(6, "toolu_b")]
+    ids = []
+    for n in (10, 11):
+        pair, cid = _cm_inner(n, "Read")
+        ids.append(cid)
+        records.extend(pair)
+    records.append(_cm_flow(("Read", "toolu_b", 0), ("Read", "toolu_a", 0)))
+    nested = _cm_nested(_cm_load(tmp_path, records, batch))
+    assert [nested[i] for i in ids] == ["toolu_a", "toolu_b"]
+
+
+def test_code_mode_a_later_conflicting_record_retracts_an_existing_link(tmp_path):
+    pair, cid = _cm_inner(10, "Read")
+    records = [_cm_real(5, "toolu_repl1"), _cm_flow(("Read", "toolu_repl1", 0)), *pair]
+    assert _cm_nested(_cm_load(tmp_path, records))[cid] == "toolu_repl1"
+    records.append(_cm_flow(("Bash", "toolu_repl1", 0)))
+    for batch in (1, 5000):
+        store = _cm_load(tmp_path, records, batch)
+        assert _cm_nested(store)[cid] is None
+        assert len([r for r in store.rows("tool_call") if r["call_uid"] == cid]) == 1
+
+
+def test_code_mode_a_late_record_retracts_a_link_made_from_a_waiting_call(tmp_path):
+    pair, cid = _cm_inner(10, "Read")
+    records = [_cm_real(5, "toolu_repl1"), *pair, _cm_flow(("Read", "toolu_repl1", 0)),
+               _cm_flow(("Bash", "toolu_repl1", 0))]
+    assert _cm_nested(_cm_load(tmp_path, records))[cid] is None
+
+
+def test_code_mode_conflicting_records_in_one_array_link_nothing_to_a_waiting_call(tmp_path):
+    pair, cid = _cm_inner(10, "Read")
+    records = [_cm_real(5, "toolu_repl1"), *pair,
+               _cm_flow(("Read", "toolu_repl1", 0), ("Bash", "toolu_repl1", 0))]
+    assert _cm_nested(_cm_load(tmp_path, records))[cid] is None
+
+
+def test_code_mode_no_link_without_data_flow_records(tmp_path):
+    pair, cid = _cm_inner(10, "Read")
+    store = _cm_load(tmp_path, [_cm_real(5, "toolu_repl1"), *pair])
+    assert _cm_nested(store)[cid] is None
+
+
+def test_code_mode_no_link_to_a_repl_call_the_session_never_showed(tmp_path):
+    pair, cid = _cm_inner(10, "Read")
+    store = _cm_load(tmp_path, [_cm_real(5, "toolu_repl1"), _cm_flow(("Read", "toolu_elsewhere", 0)), *pair])
+    assert _cm_nested(store)[cid] is None
+
+
+def test_code_mode_no_link_before_the_repl_call_was_seen(tmp_path):
+    pair, cid = _cm_inner(10, "Read")
+    store = _cm_load(tmp_path, [*pair, _cm_real(12, "toolu_late"), _cm_flow(("Read", "toolu_late", 0))])
+    assert _cm_nested(store)[cid] is None
+
+
+def test_code_mode_contradicting_records_link_nothing(tmp_path):
+    pair, cid = _cm_inner(10, "Read")
+    records = [_cm_real(5, "toolu_repl1"), _cm_flow(("Read", "toolu_repl1", 0)), _cm_flow(("Bash", "toolu_repl1", 0)), *pair]
+    assert _cm_nested(_cm_load(tmp_path, records))[cid] is None
+
+
+def test_code_mode_incomplete_capture_drops_unpaired_calls_and_records(tmp_path):
+    first, first_id = _cm_inner(10, "Read")
+    second, second_id = _cm_inner(12, "Read")
+    incomplete = {"type": "data-flow-incomplete", "v": 1, "sessionId": CM_SID}
+    records = [_cm_real(5, "toolu_repl1"), *first, incomplete, _cm_flow(("Read", "toolu_repl1", 0)), *second]
+    nested = _cm_nested(_cm_load(tmp_path, records))
+    # The call before the gap is forgotten, so the record after it cannot pair with it; it pairs the next call.
+    assert nested[first_id] is None and nested[second_id] == "toolu_repl1"
+
+
+def test_code_mode_malformed_data_flow_records_are_ignored(tmp_path):
+    pair, cid = _cm_inner(10, "Read")
+    bad = {"type": "data-flow-records", "v": 1, "sessionId": CM_SID,
+           "records": [None, 3, {"tool_name": "Read"}, {"tool_name": "Read", "tool_use_id": "toolu_repl1",
+                                                        "inner_call_index": True},
+                       {"tool_name": "Read", "tool_use_id": "toolu_repl1", "inner_call_index": -1}]}
+    worse = {"type": "data-flow-records", "v": 1, "sessionId": CM_SID, "records": "nope"}
+    store = _cm_load(tmp_path, [_cm_real(5, "toolu_repl1"), bad, worse, *pair])
+    assert _cm_nested(store)[cid] is None
+    assert not [i for i in store.issues if i.kind == "unknown_type"]
