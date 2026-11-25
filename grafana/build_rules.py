@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3.15
 """Generate the agent-history Grafana-managed alert rules and their promtool fixtures.
 
 Edit this file, then run `just gen-alerts`; `just alerts-check` fails on drift.

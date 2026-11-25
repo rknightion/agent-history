@@ -1,5 +1,8 @@
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
+# The Python the repository's own scripts run on: 3.15, resolved by uv unless PYTHON names an interpreter. Never the bare python3, which can be older.
+python := env("PYTHON", "uv run --no-project --python 3.15 python")
+
 # renovate: datasource=docker depName=paradedb/paradedb
 paradedb_image := "paradedb/paradedb:18-v0.25.10@sha256:188591a0bc317beb2c6d6d3f9ef0cb3e859d09ecc15a71dda5e9a027876686cf"
 
@@ -62,9 +65,9 @@ pg-test:
     #!/usr/bin/env bash
     set -euo pipefail
     name="agent-history-test-$$"
-    admin="$(python3 -c 'import secrets; print(secrets.token_hex(16))')"
-    writer="$(python3 -c 'import secrets; print(secrets.token_hex(16))')"
-    reader="$(python3 -c 'import secrets; print(secrets.token_hex(16))')"
+    admin="$({{ python }} -c 'import secrets; print(secrets.token_hex(16))')"
+    writer="$({{ python }} -c 'import secrets; print(secrets.token_hex(16))')"
+    reader="$({{ python }} -c 'import secrets; print(secrets.token_hex(16))')"
     docker run -d --rm --name "$name" -e POSTGRES_PASSWORD="$admin" -e POSTGRES_DB=agent_history_test \
         -p 127.0.0.1::5432 "{{ paradedb_image }}" > /dev/null
     trap 'docker rm -f -v "$name" > /dev/null 2>&1 || true' EXIT
@@ -125,18 +128,18 @@ verify-request-progress-catalogue namespace session request expected_schema_hash
 # Verify the generated fresh-init migration ledger against the classified migrations
 [group('check')]
 baseline-ledger-check:
-    python3 bin/baseline-ledger.py
+    {{ python }} bin/baseline-ledger.py
 
 # Verify the generated Grafana alert rules and fixtures match grafana/build_rules.py
 [group('check')]
 alerts-check:
-    python3 grafana/build_rules.py --check
+    {{ python }} grafana/build_rules.py --check
 
 # Verify the generated dashboards match their generators in grafana/
 [group('check')]
 dashboards-check:
-    python3 grafana/build_catalogue_dashboard.py --check
-    python3 grafana/build_archive_dashboard.py --check
+    {{ python }} grafana/build_catalogue_dashboard.py --check
+    {{ python }} grafana/build_archive_dashboard.py --check
 
 # Needs a Docker daemon: run the alert rule fixtures through promtool
 [group('check')]
@@ -147,23 +150,23 @@ alerts-test:
 # Regenerate the Grafana alert rules and their promtool fixtures
 [group('gen')]
 gen-alerts:
-    python3 grafana/build_rules.py
+    {{ python }} grafana/build_rules.py
 
 # Regenerate the dashboards from their generators in grafana/
 [group('gen')]
 gen-dashboards:
-    python3 grafana/build_catalogue_dashboard.py
-    python3 grafana/build_archive_dashboard.py
+    {{ python }} grafana/build_catalogue_dashboard.py
+    {{ python }} grafana/build_archive_dashboard.py
 
 # Regenerate the baseline's seed-data trailer, retaining the schema-only dump
 [group('gen')]
 gen-baseline-ledger:
-    python3 bin/baseline-ledger.py --write
+    {{ python }} bin/baseline-ledger.py --write
 
 # Regenerate the synthetic pi session fixtures
 [group('gen')]
 gen-fixtures:
-    python3 tests/fixtures/pi/generate.py
+    {{ python }} tests/fixtures/pi/generate.py
 
 # Install the leak-gate git hooks from hooks/
 [group('dev')]
