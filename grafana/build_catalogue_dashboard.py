@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3.15
 """Generate dashboards/agent-history.json (dashboard uid agent-history).
 
 dashboard.grafana.app/v2, tabbed. Panel shapes follow

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3.15
 """Compare generated Grafana rule resources with their live semantic state."""
 
 from __future__ import annotations

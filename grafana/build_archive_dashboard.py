@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3.15
 """Generate the agent session archive Grafana dashboard (Dashboard v2, GitSync resource shape).
 
 Edit this file, then run `python3 grafana/build_archive_dashboard.py`; `--check` fails on drift.
