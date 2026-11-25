@@ -30,7 +30,7 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
       - name: Set up just
-        uses: rknightion/.github/.github/actions/setup-just@7ed87713176ccae972b0143071b0196ff370d804 # v1.32.3
+        uses: rknightion/.github/.github/actions/setup-just@20533b678728ec119e52401c1e48b31f3c8b83c4 # v1.32.5
       - name: Set up Python (the bare python3 the justfile calls)
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
@@ -109,7 +109,7 @@ jobs:
     name: actionlint
     permissions:
       contents: read
-    uses: rknightion/.github/.github/workflows/actionlint.yml@7ed87713176ccae972b0143071b0196ff370d804 # v1.32.3
+    uses: rknightion/.github/.github/workflows/actionlint.yml@20533b678728ec119e52401c1e48b31f3c8b83c4 # v1.32.5
 
   zizmor:
     name: zizmor
@@ -117,4 +117,4 @@ jobs:
       security-events: write
       contents: read
       actions: read
-    uses: rknightion/.github/.github/workflows/zizmor.yml@7ed87713176ccae972b0143071b0196ff370d804 # v1.32.3
+    uses: rknightion/.github/.github/workflows/zizmor.yml@20533b678728ec119e52401c1e48b31f3c8b83c4 # v1.32.5
