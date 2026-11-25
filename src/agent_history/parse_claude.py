@@ -158,6 +158,10 @@ TN_SUMMARY = re.compile(r"<summary>(.*?)</summary>", re.S)
 TN_RESULT = re.compile(r"<result>(.*?)</result>", re.S)
 SLASH = re.compile(r"<command-name>\s*(/?[\w:.\-]+)")
 STATE_KEYS_MAX = 512
+# Code Mode link state: REPL calls remembered, calls and records waiting for a partner, records seen.
+FLOW_PARENTS_MAX = 2048
+FLOW_PENDING_MAX = 1024
+FLOW_SEEN_MAX = 16384
 RESPONSE_SEEN_BITS = 65536  # Fixed-size identity filter; collisions only suppress unknown durations.
 
 # --- parser v4 -------------------------------------------------------------------------------
@@ -229,6 +233,8 @@ class ClaudeParser:
         # Never forget that a response was observed, even after its exact lineage is evicted.
         # An older snapshot lacks this history, so only its retained exact parents remain usable.
         s.setdefault("response_seen", "f" * (RESPONSE_SEEN_BITS // 4) if state else "0")
+        # Code Mode inner calls: id -> order of the REPL calls seen, calls and data-flow records not yet paired.
+        s.setdefault("flow", {"n": 0, "parents": {}, "calls": {}, "recs": {}, "seen": {}})
         s.setdefault("last", {})              # change detectors: perm, mode, model, effort, rl:<kind>
         s.setdefault("perm_pending", None)    # [value, byte_offset] seen before any timestamp
         s.setdefault("first_offset", None)
@@ -302,6 +308,21 @@ class ClaudeParser:
         if len(gc) > STATE_KEYS_MAX:
             for k in list(gc)[: len(gc) - STATE_KEYS_MAX]:
                 del gc[k]
+        flow = self.s["flow"]
+        for name, limit in (("parents", FLOW_PARENTS_MAX), ("seen", FLOW_SEEN_MAX)):
+            table = flow[name]
+            if len(table) > limit:
+                for k in list(table)[: len(table) - limit]:
+                    del table[k]
+        for name in ("calls", "recs"):
+            table = flow[name]
+            excess = sum(len(v) for v in table.values()) - FLOW_PENDING_MAX
+            for key in list(table):
+                while excess > 0 and table[key]:
+                    table[key].pop(0)
+                    excess -= 1
+                if not table[key]:
+                    del table[key]
         oc = self.s["open_calls"]
         if len(oc) > 4 * STATE_KEYS_MAX:
             for k in list(oc)[: len(oc) - 4 * STATE_KEYS_MAX]:
@@ -1477,6 +1498,11 @@ class ClaudeParser:
         uid = self._uid(rec, pos)
         if ts is None:
             return
+        if _is_virtual(rec, msg):
+            # Code Mode records each tool a REPL script ran as a client-written assistant message: not a
+            # model call, so no llm_call row, no response line count and no turn or model accounting.
+            self._virtual_assistant(rec, msg, ts, pos, out)
+            return
         self._close_pending(out)
         self.s["after_cmd"] = None
         turn = self.s["turn"]
@@ -1569,13 +1595,91 @@ class ClaudeParser:
                 if isinstance(block, dict) and block.get("type") == "tool_use":
                     self._tool_use(rec, block, mid, ts, pos, out)
 
-    def _tool_use(self, rec, block, mid, ts, pos, out):
+    def _virtual_assistant(self, rec, msg, ts, pos, out) -> None:
+        """A Code Mode inner call: its tool_use is a call like any other, linked to its REPL call."""
+        content = msg.get("content")
+        for block in content if isinstance(content, list) else []:
+            if isinstance(block, dict) and block.get("type") == "tool_use":
+                self._tool_use(rec, block, None, ts, pos, out, virtual=True)
+
+    # -- Code Mode links ----------------------------------------------------------------------
+    #
+    # The inner call's own record names no parent. Claude Code writes data-flow records that name,
+    # for each inner call, the REPL call (tool_use_id), its order in the script (inner_call_index) and
+    # the tool (tool_name). Both streams are in call order but unequal (a record can come before or
+    # after its call, a call may have no record, records repeat), so a call is paired with the oldest
+    # unpaired record of the same tool whose REPL call was already seen when the call arrived, and the
+    # lowest index of that REPL call first. A pair emits the call again with meta.nested_in; a call
+    # nothing pairs, a repeated record that disagrees with itself and anything left when the client
+    # reports its capture incomplete stay unlinked.
+
+    def _flow_parent(self, cid: str) -> None:
+        flow = self.s["flow"]
+        flow["n"] += 1
+        flow["parents"][cid] = flow["n"]
+
+    def _flow_link(self, out, cid, name, turn, offset, parent) -> None:
+        out.append(ToolCallRow(agent=AGENT, call_uid=cid, session=self.key, tool_name=name,
+                               byte_offset=offset, turn_key=turn, meta={"nested_in": parent}))
+
+    def _flow_call(self, out, cid, name, turn, offset) -> None:
+        flow = self.s["flow"]
+        best = None
+        for rec in flow["recs"].get(name, ()):
+            if rec[2] <= flow["n"] and (best is None or (rec[2], rec[1]) < (best[2], best[1])):
+                best = rec
+        if best is None:
+            flow["calls"].setdefault(name, []).append([cid, flow["n"], turn, offset])
+            return
+        flow["recs"][name].remove(best)
+        self._flow_link(out, cid, name, turn, offset, best[0])
+
+    def _t_data_flow_records(self, rec, pos, ts, sub, out):
+        records = rec.get("records")
+        if not isinstance(records, list):
+            return
+        flow = self.s["flow"]
+        for item in records:
+            if not isinstance(item, dict):
+                continue
+            parent, name, index = item.get("tool_use_id"), item.get("tool_name"), item.get("inner_call_index")
+            if not (isinstance(parent, str) and parent and isinstance(name, str) and name
+                    and isinstance(index, int) and not isinstance(index, bool) and index >= 0):
+                continue
+            key = f"{parent}#{index}"
+            known = flow["seen"].get(key)
+            if known == name:
+                continue            # the same record again
+            if known is not None:
+                flow["seen"][key] = ""   # two tools claim one slot: neither is trusted
+                flow["recs"][known] = [r for r in flow["recs"].get(known, []) if r[:2] != [parent, index]]
+                continue
+            flow["seen"][key] = name
+            order = flow["parents"].get(parent)
+            if order is None:
+                continue            # not a REPL call this parser saw: no link rather than a guess
+            waiting = [c for c in flow["calls"].get(name, ()) if c[1] >= order]
+            if not waiting:
+                flow["recs"].setdefault(name, []).append([parent, index, order])
+                continue
+            call = waiting[0]
+            flow["calls"][name].remove(call)
+            self._flow_link(out, call[0], name, call[2], call[3], parent)
+
+    def _t_data_flow_incomplete(self, rec, pos, ts, sub, out):
+        # Records were lost: what is still unpaired could pair with the wrong partner.
+        self.s["flow"]["calls"] = {}
+        self.s["flow"]["recs"] = {}
+
+    def _tool_use(self, rec, block, mid, ts, pos, out, virtual=False):
         cid = as_str(block.get("id"))
         name = as_str(block.get("name")) or "unknown"
         if not cid:
             out.append(ParseIssueRow(byte_offset=pos.byte_offset, kind="missing_field",
                                      line_number=pos.line_number, detail="tool_use.id"))
             return
+        if name == "REPL" and not virtual:
+            self._flow_parent(cid)
         inp = block.get("input") if isinstance(block.get("input"), dict) else {}
         turn = self.s["turn"]
         server, tool = mcp_split(name)
@@ -1613,6 +1717,8 @@ class ClaudeParser:
             duration_ms=_ms_between(ts, parse_ts(early[0])) if early and not early[1] else None,
             attribution_skill=as_str(rec.get("attributionSkill")),
             attribution_plugin=as_str(rec.get("attributionPlugin")), meta=meta or None))
+        if virtual:
+            self._flow_call(out, cid, name, turn, pos.byte_offset)
         if early is None:
             self.s["open_calls"][cid] = [name, ts.isoformat(), turn, pos.byte_offset]
         else:
@@ -1723,6 +1829,17 @@ PERMISSION_FIELDS = {"decision": "permission_decision", "source": "permission_so
                      "reasonType": "permission_reason", "reasonCode": "permission_code",
                      "ruleSource": "permission_rule_source", "grantScope": "permission_scope",
                      "classifierCategory": "permission_category", "circuitBreaker": "permission_breaker"}
+
+
+def _is_virtual(rec: dict[str, Any], msg: dict[str, Any]) -> bool:
+    """A Code Mode inner call: top-level isVirtual, or a synthetic message holding only repl_ tool uses."""
+    if rec.get("isVirtual") is True:
+        return True
+    content = msg.get("content")
+    if msg.get("model") != "<synthetic>" or not isinstance(content, list):
+        return False
+    ids = [b.get("id") for b in content if isinstance(b, dict) and b.get("type") == "tool_use"]
+    return bool(ids) and all(isinstance(i, str) and i.startswith("repl_") for i in ids)
 
 
 def _permission_meta(rec: dict[str, Any]) -> dict[str, Any] | None:
