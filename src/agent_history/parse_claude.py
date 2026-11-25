@@ -315,15 +315,12 @@ class ClaudeParser:
             if len(table) > limit:
                 for k in list(table)[: len(table) - limit]:
                     del table[k]
-        for name in ("calls", "recs"):
-            table = flow[name]
-            excess = sum(len(v) for v in table.values()) - FLOW_PENDING_MAX
-            for key in list(table):
-                while excess > 0 and table[key]:
-                    table[key].pop(0)
-                    excess -= 1
-                if not table[key]:
-                    del table[key]
+        # An overflow never evicts selectively: what stayed could pair with the wrong partner. The whole
+        # pending window goes, and every REPL call seen so far is cut off, so a later record for one of
+        # them stays unpaired instead of linking a newer call to the wrong parent.
+        if any(sum(len(v) for v in flow[name].values()) > FLOW_PENDING_MAX for name in ("calls", "recs")):
+            flow["calls"], flow["recs"] = {}, {}
+            flow["cut"] = flow["n"]
         oc = self.s["open_calls"]
         if len(oc) > 4 * STATE_KEYS_MAX:
             for k in list(oc)[: len(oc) - 4 * STATE_KEYS_MAX]:
@@ -1676,7 +1673,7 @@ class ClaudeParser:
         batch = []
         for parent, index, name, key in fresh:
             order = flow["parents"].get(parent)
-            if order is not None and flow["seen"].get(key) == name:   # unseen REPL call: no link rather than a guess
+            if order is not None and order > flow.get("cut", 0) and flow["seen"].get(key) == name:   # unseen REPL call: no link rather than a guess
                 batch.append((order, index, parent, name))
         for order, index, parent, name in sorted(batch):
             waiting = [c for c in flow["calls"].get(name, ()) if c[1] >= order]
