@@ -52,10 +52,10 @@ jobs:
           LEAK_SCAN_PUBLIC_ONLY: '1'
         run: just ci
 
-  leak-scan:
-    name: leak-scan
+  history-scans:
+    name: history-scans
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     permissions:
       contents: read
     steps:
@@ -63,7 +63,7 @@ jobs:
         uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c # v2.23.0
         with:
           egress-policy: audit
-      - name: Check out (full history)
+      - name: Check out (full history, shared by both scans)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -80,23 +80,6 @@ jobs:
         run: |
           python3 bin/leak-scan --history --public-only
           python3 bin/leak-scan --path . --public-only
-
-  trufflehog:
-    name: trufflehog
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    permissions:
-      contents: read
-    steps:
-      - name: Harden the runner (audit egress)
-        uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c # v2.23.0
-        with:
-          egress-policy: audit
-      - name: Check out (full history)
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-          fetch-depth: 0
       - name: Scan every commit for verified or unverifiable secrets
         env:
           # renovate: datasource=docker depName=ghcr.io/trufflesecurity/trufflehog
@@ -118,3 +101,25 @@ jobs:
       contents: read
       actions: read
     uses: rknightion/.github/.github/workflows/zizmor.yml@20533b678728ec119e52401c1e48b31f3c8b83c4 # v1.32.5
+
+  ci-success:
+    name: ci-success
+    # Aggregate gate: the one name a ruleset needs to require. It runs even when a
+    # leaf fails or is skipped, and fails unless every leaf succeeded.
+    if: ${{ always() }}
+    needs: [ci, history-scans, actionlint, zizmor]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Require every leaf job to have succeeded
+        env:
+          NEEDS_RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "leaf results: ${NEEDS_RESULTS}"
+          for result in ${NEEDS_RESULTS}; do
+            if [ "${result}" != "success" ]; then
+              echo "a required job finished as ${result}" >&2
+              exit 1
+            fi
+          done
