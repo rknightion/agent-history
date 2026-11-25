@@ -1411,6 +1411,33 @@ def test_synthetic_repl_tool_use_without_the_virtual_flag_is_still_not_a_call(tm
     assert [r["response_id"] for r in store.rows("llm_call")] == ["msg_real_5"]
 
 
+def _cm_mixed(flagged):
+    inner, call_id = _cm_inner(10, "Read")
+    block = inner[0]["message"]["content"]
+    block[:0] = [{"type": "thinking", "thinking": "weigh it up", "signature": "sig"},
+                 {"type": "text", "text": "Reading the file now."}]
+    if not flagged:
+        del inner[0]["isVirtual"]
+    return inner, call_id
+
+
+def test_virtual_record_keeps_its_text_and_thinking_but_makes_no_call_row(tmp_path):
+    inner, call_id = _cm_mixed(flagged=True)
+    store = _cm_load(tmp_path, [_cm_real(5, "toolu_repl1"), *inner])
+    assert [r["response_id"] for r in store.rows("llm_call")] == ["msg_real_5"]
+    msgs = {(r["message_class"], r["text"]) for r in store.rows("message")}
+    assert ("assistant_text", "Reading the file now.") in msgs and ("reasoning", "weigh it up") in msgs
+    assert call_id in {r["call_uid"] for r in store.rows("tool_call")}
+
+
+def test_unflagged_synthetic_record_with_content_is_a_real_call_with_its_messages(tmp_path):
+    inner, call_id = _cm_mixed(flagged=False)
+    store = _cm_load(tmp_path, [_cm_real(5, "toolu_repl1"), *inner])
+    assert [r["response_id"] for r in store.rows("llm_call")] == ["msg_real_5", "virt-msg-10"]
+    msgs = {(r["message_class"], r["text"]) for r in store.rows("message")}
+    assert ("assistant_text", "Reading the file now.") in msgs and ("reasoning", "weigh it up") in msgs
+
+
 @pytest.mark.parametrize("batch", [1, 3, 5000])
 def test_code_mode_inner_calls_link_to_their_repl_call(tmp_path, batch):
     ids = {}

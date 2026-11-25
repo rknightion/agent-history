@@ -1499,11 +1499,48 @@ class ClaudeParser:
         uid = self._uid(rec, pos)
         if ts is None:
             return
-        if _is_virtual(rec, msg):
+        virtual = _is_virtual(rec, msg)
+        turn = self.s["turn"]
+        model = as_str(msg.get("model"))
+        is_err = bool(rec.get("isApiErrorMessage"))
+        if virtual:
             # Code Mode records each tool a REPL script ran as a client-written assistant message: not a
             # model call, so no llm_call row, no response line count and no turn or model accounting.
-            self._virtual_assistant(rec, msg, ts, pos, out)
-            return
+            # Its content is still indexed like any assistant line's.
+            mid = None
+        else:
+            mid = self._assistant_call(rec, msg, ts, pos, uid, duration, out)
+        content = msg.get("content")
+        text = text_blocks(content, {"text"})
+        if text and not is_err:
+            out.append(self._msg(uid, ts, "assistant", "assistant_text", text, pos, rec, model=model))
+            for path in linked_paths(text):
+                out.append(ArtifactRow(agent=AGENT, event_uid=uid, session=self.key, ts=ts,
+                                       kind=artifact_kind(path), action="linked", path=path,
+                                       evidence_type="assistant-markdown", byte_offset=pos.byte_offset,
+                                       turn_key=turn, display_name=PurePosixPath(path).name or path))
+        if isinstance(content, list):
+            for index, block in enumerate(content):
+                if not isinstance(block, dict):
+                    continue
+                btype = block.get("type")
+                if btype == "thinking":
+                    body = block.get("thinking")
+                    if isinstance(body, str) and body:
+                        out.append(self._msg(f"{uid}:think:{index}", ts, "assistant", "reasoning", body, pos, rec,
+                                             model=model))
+                    elif block.get("signature"):
+                        out.append(self._msg(f"{uid}:think:{index}", ts, "assistant", "reasoning", "", pos, rec,
+                                             model=model, detail={"signature_only": True}))
+                elif btype == "redacted_thinking":
+                    out.append(self._msg(f"{uid}:think:{index}", ts, "assistant", "reasoning", "", pos, rec,
+                                         model=model, detail={"redacted": True}))
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "tool_use":
+                    self._tool_use(rec, block, mid, ts, pos, out, virtual=virtual)
+
+    def _assistant_call(self, rec, msg, ts, pos, uid, duration, out) -> str:
+        """The llm_call row and the turn, model, effort and error accounting of a real model response."""
         self._close_pending(out)
         self.s["after_cmd"] = None
         turn = self.s["turn"]
@@ -1567,41 +1604,7 @@ class ClaudeParser:
             if turn:
                 out.append(TurnRow(session=self.key, turn_key=turn, byte_offset=pos.byte_offset,
                                    status="aborted", abort_reason="aborted_mid_stream"))
-        content = msg.get("content")
-        text = text_blocks(content, {"text"})
-        if text and not is_err:
-            out.append(self._msg(uid, ts, "assistant", "assistant_text", text, pos, rec, model=model))
-            for path in linked_paths(text):
-                out.append(ArtifactRow(agent=AGENT, event_uid=uid, session=self.key, ts=ts,
-                                       kind=artifact_kind(path), action="linked", path=path,
-                                       evidence_type="assistant-markdown", byte_offset=pos.byte_offset,
-                                       turn_key=turn, display_name=PurePosixPath(path).name or path))
-        if isinstance(content, list):
-            for index, block in enumerate(content):
-                if not isinstance(block, dict):
-                    continue
-                btype = block.get("type")
-                if btype == "thinking":
-                    body = block.get("thinking")
-                    if isinstance(body, str) and body:
-                        out.append(self._msg(f"{uid}:think:{index}", ts, "assistant", "reasoning", body, pos, rec,
-                                             model=model))
-                    elif block.get("signature"):
-                        out.append(self._msg(f"{uid}:think:{index}", ts, "assistant", "reasoning", "", pos, rec,
-                                             model=model, detail={"signature_only": True}))
-                elif btype == "redacted_thinking":
-                    out.append(self._msg(f"{uid}:think:{index}", ts, "assistant", "reasoning", "", pos, rec,
-                                         model=model, detail={"redacted": True}))
-            for block in content:
-                if isinstance(block, dict) and block.get("type") == "tool_use":
-                    self._tool_use(rec, block, mid, ts, pos, out)
-
-    def _virtual_assistant(self, rec, msg, ts, pos, out) -> None:
-        """A Code Mode inner call: its tool_use is a call like any other, linked to its REPL call."""
-        content = msg.get("content")
-        for block in content if isinstance(content, list) else []:
-            if isinstance(block, dict) and block.get("type") == "tool_use":
-                self._tool_use(rec, block, None, ts, pos, out, virtual=True)
+        return mid
 
     # -- Code Mode links ----------------------------------------------------------------------
     #
@@ -1850,14 +1853,15 @@ PERMISSION_FIELDS = {"decision": "permission_decision", "source": "permission_so
 
 
 def _is_virtual(rec: dict[str, Any], msg: dict[str, Any]) -> bool:
-    """A Code Mode inner call: top-level isVirtual, or a synthetic message holding only repl_ tool uses."""
+    """A Code Mode inner call: top-level isVirtual, or a synthetic message holding nothing but repl_ tool
+    uses. A synthetic record that also carries text or thinking is not recognised without the flag."""
     if rec.get("isVirtual") is True:
         return True
     content = msg.get("content")
-    if msg.get("model") != "<synthetic>" or not isinstance(content, list):
+    if msg.get("model") != "<synthetic>" or not isinstance(content, list) or not content:
         return False
-    ids = [b.get("id") for b in content if isinstance(b, dict) and b.get("type") == "tool_use"]
-    return bool(ids) and all(isinstance(i, str) and i.startswith("repl_") for i in ids)
+    return all(isinstance(b, dict) and b.get("type") == "tool_use" and isinstance(b.get("id"), str)
+               and b["id"].startswith("repl_") for b in content)
 
 
 def _permission_meta(rec: dict[str, Any]) -> dict[str, Any] | None:

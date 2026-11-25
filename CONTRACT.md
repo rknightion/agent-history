@@ -266,10 +266,12 @@ indexed-content timestamps do not advance for availability updates.
   (top-level `isVirtual`, model `<synthetic>`, zero usage, one `tool_use` whose id starts `repl_`) and
   a virtual result. It is not a model call: no `llm_call` row, response line count, model switch or
   turn change. The call is still a `tool_call` and `tool_io` row like any other, with an empty
-  `response_id`. A `<synthetic>` message without the flag is also left out when every one of its tool
-  uses has a `repl_` id; every other `<synthetic>` record (API errors, notices) stays an `llm_call` row.
+  `response_id`. Any text or thinking such a record holds is still indexed as messages. A `<synthetic>`
+  message without the flag is also left out when it holds nothing but `repl_` tool uses; a record with
+  text or thinking, and every other `<synthetic>` record (API errors, notices), stays an `llm_call` row.
   Migration `055_drop_code_mode_model_calls.sql` removes the rows older parsers made (a `<synthetic>`
-  row that is no API error and whose response held a `repl_` tool call), empties that call's
+  row that is no API error, whose response held a `repl_` tool call and whose record has no message
+  rows), empties that call's
   `response_id` and queues the sessions for a new rollup. The parser version is not bumped: a Claude
   parser upgrade stops every indexed source until a full rebuild.
 - Claude Code, Code Mode links: the inner call's record names no parent, so `meta.nested_in` (the REPL
