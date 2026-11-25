@@ -878,6 +878,27 @@ def test_request_capture_tools_used_and_session_owner_records_are_known(tmp_path
     assert {"api-request", "api-request-blob", "api-request-shape", "tools-used", "session-owner"} <= types
 
 
+def test_repl_data_flow_and_derived_from_records_are_known(tmp_path):
+    sid = "meta-session"
+    records = [
+        {"type": "repl-mode", "replMode": True, "sessionId": sid},
+        {"type": "data-flow-records", "v": 1, "sessionId": sid,
+         "records": [{"tool_name": "Read", "tool_use_id": "toolu_1", "inner_call_index": 0}]},
+        {"type": "data-flow-incomplete", "v": 1, "sessionId": sid},
+        {"type": "derived-from", "v": 1, "sessionId": sid,
+         "sessions": [{"type": "claude_code_session", "via": "compact", "sessionId": "parent"}]},
+    ]
+    store = _load_telemetry_records(tmp_path, records)
+    assert not [i.detail for i in store.issues if i.kind == "unknown_type"]
+    types = {r["record_type"] for r in store.rows("record_type_seen")}
+    assert {"repl-mode", "data-flow-records", "data-flow-incomplete", "derived-from"} <= types
+
+
+def test_genuinely_unknown_record_type_still_raises_issue(tmp_path):
+    store = _load_telemetry_records(tmp_path, [{"type": "not-a-real-record", "sessionId": "s"}])
+    assert [i.detail for i in store.issues if i.kind == "unknown_type"] == ["not-a-real-record"]
+
+
 def test_drift_rows(main_store):
     assert [i.detail for i in main_store.issues if i.kind == "unknown_type"] == ["brand-new-record-type"]
     types = {(r["record_type"], r["subtype"]) for r in main_store.rows("record_type_seen")}
