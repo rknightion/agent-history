@@ -235,6 +235,7 @@ class ClaudeParser:
         s.setdefault("response_seen", "f" * (RESPONSE_SEEN_BITS // 4) if state else "0")
         # Code Mode inner calls: id -> order of the REPL calls seen, calls and data-flow records not yet paired.
         s.setdefault("flow", {"n": 0, "parents": {}, "calls": {}, "recs": {}, "seen": {}})
+        s["flow"].setdefault("linked", {})    # "<repl call>#<index>" -> the inner call paired through that slot
         s.setdefault("last", {})              # change detectors: perm, mode, model, effort, rl:<kind>
         s.setdefault("perm_pending", None)    # [value, byte_offset] seen before any timestamp
         s.setdefault("first_offset", None)
@@ -309,7 +310,7 @@ class ClaudeParser:
             for k in list(gc)[: len(gc) - STATE_KEYS_MAX]:
                 del gc[k]
         flow = self.s["flow"]
-        for name, limit in (("parents", FLOW_PARENTS_MAX), ("seen", FLOW_SEEN_MAX)):
+        for name, limit in (("parents", FLOW_PARENTS_MAX), ("seen", FLOW_SEEN_MAX), ("linked", FLOW_SEEN_MAX)):
             table = flow[name]
             if len(table) > limit:
                 for k in list(table)[: len(table) - limit]:
@@ -1611,16 +1612,26 @@ class ClaudeParser:
     # unpaired record of the same tool whose REPL call was already seen when the call arrived, and the
     # lowest index of that REPL call first. A pair emits the call again with meta.nested_in; a call
     # nothing pairs, a repeated record that disagrees with itself and anything left when the client
-    # reports its capture incomplete stay unlinked.
+    # reports its capture incomplete stay unlinked. Records that arrive together are paired in the same
+    # order a call would have taken them (REPL call seen-order, then index), so when they arrive does
+    # not change the parent. A slot that turns contradictory after its call was paired is retracted:
+    # the call is emitted again with a null nested_in, which the merge writes over the old value.
 
     def _flow_parent(self, cid: str) -> None:
         flow = self.s["flow"]
         flow["n"] += 1
         flow["parents"][cid] = flow["n"]
 
-    def _flow_link(self, out, cid, name, turn, offset, parent) -> None:
+    def _flow_link(self, out, cid, name, turn, offset, parent, index) -> None:
+        self.s["flow"]["linked"][f"{parent}#{index}"] = [cid, name, turn, offset]
         out.append(ToolCallRow(agent=AGENT, call_uid=cid, session=self.key, tool_name=name,
                                byte_offset=offset, turn_key=turn, meta={"nested_in": parent}))
+
+    def _flow_retract(self, out, key) -> None:
+        done = self.s["flow"]["linked"].pop(key, None)
+        if done:
+            out.append(ToolCallRow(agent=AGENT, call_uid=done[0], session=self.key, tool_name=done[1],
+                                   byte_offset=done[3], turn_key=done[2], meta={"nested_in": None}))
 
     def _flow_call(self, out, cid, name, turn, offset) -> None:
         flow = self.s["flow"]
@@ -1632,13 +1643,14 @@ class ClaudeParser:
             flow["calls"].setdefault(name, []).append([cid, flow["n"], turn, offset])
             return
         flow["recs"][name].remove(best)
-        self._flow_link(out, cid, name, turn, offset, best[0])
+        self._flow_link(out, cid, name, turn, offset, best[0], best[1])
 
     def _t_data_flow_records(self, rec, pos, ts, sub, out):
         records = rec.get("records")
         if not isinstance(records, list):
             return
         flow = self.s["flow"]
+        fresh = []
         for item in records:
             if not isinstance(item, dict):
                 continue
@@ -1653,18 +1665,24 @@ class ClaudeParser:
             if known is not None:
                 flow["seen"][key] = ""   # two tools claim one slot: neither is trusted
                 flow["recs"][known] = [r for r in flow["recs"].get(known, []) if r[:2] != [parent, index]]
+                self._flow_retract(out, key)
                 continue
             flow["seen"][key] = name
+            fresh.append((parent, index, name, key))
+        # Pair in the order a call arriving later would take them, whatever order the array lists them.
+        batch = []
+        for parent, index, name, key in fresh:
             order = flow["parents"].get(parent)
-            if order is None:
-                continue            # not a REPL call this parser saw: no link rather than a guess
+            if order is not None and flow["seen"].get(key) == name:   # unseen REPL call: no link rather than a guess
+                batch.append((order, index, parent, name))
+        for order, index, parent, name in sorted(batch):
             waiting = [c for c in flow["calls"].get(name, ()) if c[1] >= order]
             if not waiting:
                 flow["recs"].setdefault(name, []).append([parent, index, order])
                 continue
             call = waiting[0]
             flow["calls"][name].remove(call)
-            self._flow_link(out, call[0], name, call[2], call[3], parent)
+            self._flow_link(out, call[0], name, call[2], call[3], parent, index)
 
     def _t_data_flow_incomplete(self, rec, pos, ts, sub, out):
         # Records were lost: what is still unpaired could pair with the wrong partner.

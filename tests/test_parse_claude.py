@@ -1448,6 +1448,44 @@ def test_code_mode_oldest_repl_call_pairs_first_and_index_order_holds(tmp_path):
     assert [nested[i] for i in ids] == ["toolu_a", "toolu_a", "toolu_b"]
 
 
+@pytest.mark.parametrize("batch", [1, 5000])
+def test_code_mode_late_records_pair_in_call_order_not_array_order(tmp_path, batch):
+    records = [_cm_real(5, "toolu_a"), _cm_real(6, "toolu_b")]
+    ids = []
+    for n in (10, 11):
+        pair, cid = _cm_inner(n, "Read")
+        ids.append(cid)
+        records.extend(pair)
+    records.append(_cm_flow(("Read", "toolu_b", 0), ("Read", "toolu_a", 0)))
+    nested = _cm_nested(_cm_load(tmp_path, records, batch))
+    assert [nested[i] for i in ids] == ["toolu_a", "toolu_b"]
+
+
+def test_code_mode_a_later_conflicting_record_retracts_an_existing_link(tmp_path):
+    pair, cid = _cm_inner(10, "Read")
+    records = [_cm_real(5, "toolu_repl1"), _cm_flow(("Read", "toolu_repl1", 0)), *pair]
+    assert _cm_nested(_cm_load(tmp_path, records))[cid] == "toolu_repl1"
+    records.append(_cm_flow(("Bash", "toolu_repl1", 0)))
+    for batch in (1, 5000):
+        store = _cm_load(tmp_path, records, batch)
+        assert _cm_nested(store)[cid] is None
+        assert len([r for r in store.rows("tool_call") if r["call_uid"] == cid]) == 1
+
+
+def test_code_mode_a_late_record_retracts_a_link_made_from_a_waiting_call(tmp_path):
+    pair, cid = _cm_inner(10, "Read")
+    records = [_cm_real(5, "toolu_repl1"), *pair, _cm_flow(("Read", "toolu_repl1", 0)),
+               _cm_flow(("Bash", "toolu_repl1", 0))]
+    assert _cm_nested(_cm_load(tmp_path, records))[cid] is None
+
+
+def test_code_mode_conflicting_records_in_one_array_link_nothing_to_a_waiting_call(tmp_path):
+    pair, cid = _cm_inner(10, "Read")
+    records = [_cm_real(5, "toolu_repl1"), *pair,
+               _cm_flow(("Read", "toolu_repl1", 0), ("Bash", "toolu_repl1", 0))]
+    assert _cm_nested(_cm_load(tmp_path, records))[cid] is None
+
+
 def test_code_mode_no_link_without_data_flow_records(tmp_path):
     pair, cid = _cm_inner(10, "Read")
     store = _cm_load(tmp_path, [_cm_real(5, "toolu_repl1"), *pair])
