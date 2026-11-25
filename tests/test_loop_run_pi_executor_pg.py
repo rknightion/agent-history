@@ -72,9 +72,10 @@ def lane_file(source, stem, run_id, uid, at):
 
 
 def executor(source, *, reads=AUTHORITY, at=T0 + timedelta(minutes=10), lanes=3):
+    paths = [reads] if isinstance(reads, str) else list(reads)
     stem = f"2026-10-04T09-10-00Z_{EXECUTOR}"
     records = [stamp(header(EXECUTOR), at), stamp(message("ask", "user", "Run the plan."), at)]
-    records += codemode("rd", at + timedelta(seconds=5), [("read", {"path": reads})])
+    records += codemode("rd", at + timedelta(seconds=5), [("read", {"path": p}) for p in paths])
     records.append(
         stamp(assistant("idle", [{"type": "text", "text": "Waiting."}], stopReason="stop"), at + timedelta(hours=2))
     )
@@ -198,6 +199,25 @@ def test_lanes_that_arrive_after_the_handover_join_the_run(clean, tmp_path):
         r[0] for r in clean.execute("SELECT session_id FROM ah.lane WHERE loop_run_id = %s", (run_id,))
     ) == sorted(lanes)
     assert {r[0] for r in clean.execute("SELECT loop_run_id FROM ah.session WHERE id = ANY(%s)", (lanes,))} == {run_id}
+
+
+def test_one_executor_of_two_runs_splits_its_lanes_by_launch(clean, tmp_path):
+    other = "run-20261123-2"
+    second = AUTHORITY.replace(RUN, other)
+    run_root(
+        tmp_path,
+        tool_write("authority-two", T0 + timedelta(minutes=1), second, AUTHORITY_BODY.replace(RUN, other)),
+    )
+    executor(tmp_path, reads=[AUTHORITY, second], lanes=3)  # every lane starts after the second launch
+    refresh(clean, tmp_path)
+    pi = session_id(clean, EXECUTOR)
+    owners = dict(clean.execute("SELECT goal_path, root_session_id FROM ah.loop_run WHERE mode = 'run'"))
+    assert owners == {AUTHORITY: pi, second: pi}
+    first_id = clean.execute("SELECT id FROM ah.loop_run WHERE goal_path = %s", (AUTHORITY,)).fetchone()[0]
+    lanes = [r[0] for r in clean.execute("SELECT id FROM ah.session WHERE is_subagent AND root_session_id = %s", (pi,))]
+    assert len(lanes) == 3
+    tagged = {r[0] for r in clean.execute("SELECT loop_run_id FROM ah.session WHERE id = ANY(%s)", (lanes,))}
+    assert tagged and first_id not in tagged
 
 
 def test_a_handed_over_run_does_not_keep_the_planners_next_run_as_its_end(clean, tmp_path):

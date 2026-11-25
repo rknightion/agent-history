@@ -1776,6 +1776,9 @@ def _bind_run_executors(conn: psycopg.Connection) -> None:
     ).fetchall():
         if loop_id not in chosen and _read_path(raw, cwd) == authority:
             chosen[loop_id] = (started, session_id)
+    # Hand over every selected run before refreshing any: one executor may take several run folders,
+    # and each run's end and lanes depend on the others already being its own.
+    handed: list[tuple[int, int, Any, Any]] = []
     for loop_id, (started, session_id) in chosen.items():
         planner, report = conn.execute(
             "SELECT root_session_id, report_path FROM ah.loop_run WHERE id = %s", (loop_id,)
@@ -1784,6 +1787,8 @@ def _bind_run_executors(conn: psycopg.Connection) -> None:
         conn.execute(
             "UPDATE ah.session SET loop_link_method = 'plan' WHERE id = %s AND loop_run_id = %s", (planner, loop_id)
         )
+        handed.append((loop_id, session_id, started, report))
+    for loop_id, session_id, started, report in handed:
         _refresh_executor_run(conn, loop_id, session_id, started, report)
 
 
