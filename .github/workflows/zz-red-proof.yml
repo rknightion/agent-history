@@ -1,0 +1,8 @@
+name: red proof
+on: [pull_request]
+jobs:
+  x:
+    runs-on: ubuntu-latest
+    bogus-key: 1
+    steps:
+      - run: true
