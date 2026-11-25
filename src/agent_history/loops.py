@@ -392,6 +392,7 @@ def run(conn: psycopg.Connection) -> dict[str, int]:
     # A root and its continuation may arrive together with either source order.
     for root_id in roots:
         _link_relaunch(conn, root_id)
+    _refresh_executor_runs(conn, roots)
     _bind_run_executors(conn)
     return {"loop_roots": len(roots), "launches": found}
 
@@ -1783,12 +1784,55 @@ def _bind_run_executors(conn: psycopg.Connection) -> None:
         conn.execute(
             "UPDATE ah.session SET loop_link_method = 'plan' WHERE id = %s AND loop_run_id = %s", (planner, loop_id)
         )
-        following = conn.execute(
-            "SELECT min(n.launch_ts) FROM ah.loop_run n WHERE n.mode = %s AND n.launch_ts > %s AND n.id <> %s "
-            "AND (n.report_path = %s OR n.root_session_id = %s)",
-            (loop_identity_run.MODE, started, loop_id, report, session_id),
-        ).fetchone()[0]
-        _tag_tree(conn, loop_id, session_id, started, following)
+        _refresh_executor_run(conn, loop_id, session_id, started, report)
+
+
+def _refresh_executor_run(conn: psycopg.Connection, loop_id: int, owner_id: int, started: Any, report: Any) -> None:
+    """Recompute an executor-owned run's end and lane membership against its current owner.
+
+    The end the planner computed (the planner's next run, or its last event) says nothing about the
+    executor, so a run that still carries one of those is recomputed from the executor's own next
+    run or last event. Closeout and receipt evidence belongs to the passes that set it.
+    """
+    following = conn.execute(
+        "SELECT min(n.launch_ts) FROM ah.loop_run n WHERE n.mode = %s AND n.launch_ts > %s AND n.id <> %s "
+        "AND (n.report_path = %s OR n.root_session_id = %s)",
+        (loop_identity_run.MODE, started, loop_id, report, owner_id),
+    ).fetchone()[0]
+    if following is not None:
+        conn.execute(
+            "UPDATE ah.loop_run SET end_ts = %s, end_evidence = 'next_launch' WHERE id = %s "
+            "AND (end_evidence IS NULL OR end_evidence IN ('root_last_event', 'next_launch')) "
+            "AND (end_ts, end_evidence) IS DISTINCT FROM (%s::timestamptz, 'next_launch')",
+            (following, loop_id, following),
+        )
+    else:
+        conn.execute(
+            "UPDATE ah.loop_run l SET end_evidence = 'root_last_event', end_ts = ("
+            "SELECT greatest(max(s.last_event_at), l.launch_ts) FROM ah.session s "
+            "WHERE s.id = l.root_session_id OR (s.loop_run_id = l.id AND s.loop_link_method = 'relaunch')) "
+            "WHERE l.id = %s AND (l.end_evidence IS NULL OR l.end_evidence IN ('root_last_event', 'next_launch'))",
+            (loop_id,),
+        )
+    _tag_tree(conn, loop_id, owner_id, started, following)
+
+
+def _refresh_executor_runs(conn: psycopg.Connection, roots: list[int]) -> None:
+    """Re-tag the runs a pi root executes when that root or one of its lanes changed.
+
+    A handed-over run is no longer selectable as an executor candidate (its owner has lanes) and its
+    planner no longer rewrites it, so lanes whose transcripts arrive later are picked up here.
+    """
+    if not roots:
+        return
+    for loop_id, owner, started, report in conn.execute(
+        "SELECT l.id, l.root_session_id, l.launch_ts, l.report_path FROM ah.loop_run l "
+        "WHERE l.mode = %s AND l.launch_ts IS NOT NULL AND l.root_session_id = ANY(%s) "
+        "AND EXISTS (SELECT 1 FROM ah.session p WHERE p.loop_run_id = l.id AND p.loop_link_method = 'plan' "
+        "AND p.id <> l.root_session_id) ORDER BY l.id",
+        (loop_identity_run.MODE, roots),
+    ).fetchall():
+        _refresh_executor_run(conn, loop_id, owner, started, report)
 
 
 def _tag_tree(conn: psycopg.Connection, loop_id: int, root_id: int, start: Any, end: Any) -> None:

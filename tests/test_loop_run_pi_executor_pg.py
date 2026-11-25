@@ -17,6 +17,7 @@ from test_loop_run_dialect_pg import (
     refresh,
     run_root,
     stamp,
+    tool_write,
 )
 
 DSN = os.environ.get("AGENT_HISTORY_TEST_DSN", "")
@@ -174,3 +175,51 @@ def test_a_pi_root_that_writes_the_authority_file_in_codemode_starts_the_run(cle
         clean.execute("SELECT loop_run_id, loop_link_method FROM ah.session WHERE id = %s", (pi,)).fetchone()[1]
         == "launch"
     )
+
+
+def test_lanes_that_arrive_after_the_handover_join_the_run(clean, tmp_path):
+    run_root(tmp_path)
+    executor(tmp_path, lanes=1)
+    refresh(clean, tmp_path)
+    ((run_id, pi, _, _),) = run_state(clean)
+    assert pi == session_id(clean, EXECUTOR)
+    stem = f"2026-10-04T09-10-00Z_{EXECUTOR}"
+    lane_file(
+        tmp_path,
+        stem,
+        "5f000000-0000-4000-8000-0000000000bb",
+        "1a000000-0000-4000-8000-0000000000bb",
+        T0 + timedelta(minutes=40),
+    )
+    refresh(clean, tmp_path)
+    lanes = [r[0] for r in clean.execute("SELECT id FROM ah.session WHERE is_subagent AND root_session_id = %s", (pi,))]
+    assert len(lanes) == 2
+    assert sorted(
+        r[0] for r in clean.execute("SELECT session_id FROM ah.lane WHERE loop_run_id = %s", (run_id,))
+    ) == sorted(lanes)
+    assert {r[0] for r in clean.execute("SELECT loop_run_id FROM ah.session WHERE id = ANY(%s)", (lanes,))} == {run_id}
+
+
+def test_a_handed_over_run_does_not_keep_the_planners_next_run_as_its_end(clean, tmp_path):
+    other = "run-20261123-2"
+    run_root(
+        tmp_path,
+        tool_write(
+            "authority-two",
+            T0 + timedelta(minutes=1),
+            AUTHORITY.replace(RUN, other),
+            AUTHORITY_BODY.replace(RUN, other),
+        ),
+    )
+    executor(tmp_path)
+    refresh(clean, tmp_path)
+    first = clean.execute(
+        "SELECT root_session_id, end_evidence, end_ts FROM ah.loop_run WHERE goal_path = %s", (AUTHORITY,)
+    ).fetchone()
+    assert first[0] == session_id(clean, EXECUTOR)
+    assert first[1] == "root_last_event"
+    assert first[2] > T0 + timedelta(minutes=1)
+    status = clean.execute(
+        "SELECT l.status FROM ah.loops l JOIN ah.loop_run r USING (launch_uid) WHERE r.goal_path = %s", (AUTHORITY,)
+    ).fetchone()
+    assert status[0] != "finished"
