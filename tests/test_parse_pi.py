@@ -1193,3 +1193,44 @@ def test_all_zero_usage_without_stop_reason_also_forgets_the_zero_estimate_and_i
     billed = LlmCallRow("pi", "r2", key, at, 0, input_uncached=0, output=0, cost_usd=Decimal("0.01"),
                         cost_estimate_usd=Decimal(0), cost_from_provider=True).unknown_if_zero()
     assert (billed.cost_usd, billed.cost_estimate_usd, billed.cost_from_provider) == (Decimal("0.01"), None, True)
+
+
+def test_codemode_nested_calls_become_tool_rows(tmp_path):
+    # synthetic: the nestedCalls shape pi records on a codemode tool result
+    path = tmp_path / "sessions" / "--x--" / "2026-11-24T10-00-00-000Z_n1.jsonl"
+    path.parent.mkdir(parents=True)
+    parent = "call_1|ctc_1"
+    nested = [
+        {"id": parent + "/1", "name": "write", "status": "ok", "durationMs": 7,
+         "arguments": {"path": "/work/codex/run-20261124-1/AUTHORITY.md", "content": "# Authority: x run-20261124-1\n"}},
+        {"id": parent + "/2", "name": "read", "status": "error", "durationMs": 3, "error": "ENOENT",
+         "arguments": {"path": "/work/missing.md"}},
+        {"id": parent + "/3", "name": "write", "status": "ok", "durationMs": 9, "argumentsBytes": 99999},
+    ]
+    lines = [
+        {"type": "session", "version": 3, "id": "n1", "timestamp": "2026-11-24T10:00:00.000Z", "cwd": "/work"},
+        {"type": "message", "id": "a1", "parentId": None, "timestamp": "2026-11-24T10:00:01.000Z",
+         "message": {"role": "assistant", "content": [
+             {"type": "toolCall", "id": parent, "name": "codemode", "arguments": {"code": "await tools.write(...)"}}],
+          "stopReason": "toolUse", "timestamp": 1795537701000}},
+        {"type": "message", "id": "r1", "parentId": "a1", "timestamp": "2026-11-24T10:00:02.000Z",
+         "message": {"role": "toolResult", "toolCallId": parent, "toolName": "codemode", "isError": False,
+                     "content": [{"type": "text", "text": "Script completed"}], "details": {"calls": []},
+                     "nestedCalls": {"calls": nested, "complete": True}, "timestamp": 1795537702000}},
+    ]
+    path.write_text("".join(json.dumps(r) + "\n" for r in lines))
+    store = MemStore()
+    run_file(PiParser, FileContext(str(path), "pi-local/sessions/--x--/" + path.name, "pi-local", "pi",
+                                   "local", None, "main"), store)
+    write = one(store, "tool_io", io_uid=parent + "/1")
+    assert (write["tool_name"], write["call_uid"], json.loads(write["input_text"])["path"]) == \
+        ("write", parent + "/1", "/work/codex/run-20261124-1/AUTHORITY.md")
+    call = one(store, "tool_call", call_uid=parent + "/1")
+    assert (call["outcome"], call["ended_at"] is not None, call["meta"]) == ("ok", True, {"nested_in": parent})
+    failed = one(store, "tool_call", call_uid=parent + "/2")
+    assert (failed["outcome"], failed["is_error"]) == ("error", True)
+    assert one(store, "tool_io", io_uid=parent + "/2")["output_text"] == "ENOENT"
+    big = one(store, "tool_io", io_uid=parent + "/3")
+    assert (big["input_text"], big["input_truncated"]) == (None, True)
+    # the parent keeps its own rows
+    assert one(store, "tool_call", call_uid=parent)["tool_name"] == "codemode"

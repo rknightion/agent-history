@@ -113,7 +113,8 @@ AGENT = "pi"
 # historical sources remain without telemetry; no backfill or rebuild is implied. Lineage remains
 # independently repairable by the existing metadata-only post-pass.
 # Version 11 reclassifies the current pi-subagents parent wake text as a task notification.
-PARSER_VERSION = "11"
+# Version 12 records the tools a codemode script ran (`nestedCalls`) as their own tool_call and tool_io rows.
+PARSER_VERSION = "12"
 # The exact user-role wake texts pi-subagents sends after a pending subagent notice, oldest first.
 PARENT_WAKE_TEXTS = frozenset({
     "Subagent updates above.",
@@ -1081,6 +1082,8 @@ class PiParser:
             rows.append(AttachmentRow(AGENT, f"{call_id}:att:{img['index']}", key, ts, pos.byte_offset, "image",
                                       "tool_result", call_uid=call_id, turn_key=call.get("t"), mime=img["mime"],
                                       size_bytes=img["bytes"]))
+        if call["n"] == "codemode":
+            rows.extend(self._nested_calls(m.get("nestedCalls"), call_id, call, ts, pos))
         if call["n"] == "bash" and text and not is_error:
             commits, pushes = git_from_output(text)
             commit_op = "cherry_pick" if "cherry-pick" in (call.get("a") or {}).get("command", "") else "commit"
@@ -1096,6 +1099,42 @@ class PiParser:
             for op, n in git_event_extras(ops, len(commits), len(pushes)):
                 rows.append(GitEventRow(AGENT, f"{call_id}:{'push' if op == 'push' else 'commit'}:cmd{n}", key, ts, op,
                                         "command", pos.byte_offset, call.get("t"), call_id, self.s["cwd"]))
+        return rows
+
+    def _nested_calls(self, nested: Any, parent_id: str, call: dict[str, Any], ts: datetime,
+                      pos: LinePos) -> list[Row]:
+        """One tool_call and tool_io row for each tool a codemode script ran (`nestedCalls.calls`).
+
+        The script's own tool_io input is JavaScript, so a path it writes or reads appears only in the
+        nested call's recorded arguments. The id is the source's own (`<parent id>/<n>`), the call
+        runs inside the parent's window and the parent's turn, and `meta.nested_in` names the parent.
+        Arguments the source left out for size are not invented: the input stays empty and marked
+        truncated.
+        """
+        calls = nested.get("calls") if isinstance(nested, dict) else None
+        if not isinstance(calls, list):
+            return []
+        key = self._key()
+        started = datetime.fromtimestamp(call["e"], ts.tzinfo)
+        rows: list[Row] = []
+        for item in calls:
+            nid = as_str(item.get("id")) if isinstance(item, dict) else None
+            name = as_str(item.get("name")) if isinstance(item, dict) else None
+            if not nid or not name:
+                continue
+            args = item.get("arguments")
+            failed = as_str(item.get("status")) != "ok"
+            rows.append(ToolCallRow(
+                AGENT, nid, key, name, pos.byte_offset, turn_key=call.get("t"),
+                tool_family="builtin" if name in BUILTIN else "extension", started_at=started, ended_at=ts,
+                duration_ms=_recorded_int(item.get("durationMs")),
+                input_bytes=json_size(args) if isinstance(args, dict) else None,
+                outcome="error" if failed else "ok", is_error=failed, meta={"nested_in": parent_id}))
+            rows.append(ToolIoRow(
+                AGENT, nid, key, started, pos.byte_offset, "call", tool_name=name, call_uid=nid,
+                turn_key=call.get("t"), input_text=_dumps(args) if isinstance(args, dict) else None,
+                input_truncated=True if "argumentsBytes" in item and not isinstance(args, dict) else None,
+                output_text=as_str(item.get("error")), output_at=ts, output_byte_offset=pos.byte_offset))
         return rows
 
     # --- subagents ----------------------------------------------------------------------------
