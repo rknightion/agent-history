@@ -257,6 +257,11 @@ indexed-content timestamps do not advance for availability updates.
 - `session.agent_type` is the child's type with `agent_type_source` `explicit` (recorded in the
   child or its exact spawn request) or `default` (the request omitted it and the harness default is
   known). Display names never supply a type.
+- pi: a `codemode` tool result carries `nestedCalls`, the tools its script ran. Each nested call is its
+  own `tool_call` and `tool_io` row with the source's id (`<parent id>/<n>`), the parent's turn and
+  window, `meta.nested_in` naming the parent, and the arguments exactly as recorded (a call whose
+  arguments the source left out for size has an empty, truncated input). No file touch, artifact or
+  git event is derived from a nested call.
 - pi: children of a pi-subagents run are linked to their parent by path; archived
   `subagent-artifacts/*_transcript.jsonl` copies pair a run id with the child's response id and are
   indexed as evidence only (no messages or model calls). Both direct run-id directories and
@@ -554,6 +559,15 @@ the half-open window up to the root's next run. `ah.loops.loop` holds the run na
 captured remote of the root, else the checkout fallback below. No v3 or historical rule reads
 these rows, and no rule of this dialect reads rows of another dialect: on a shared root, a run of
 one dialect never bounds a window, tie or lifecycle line of the other.
+
+A run planned in one session and run by a pi root moves to the pi root. When the session that wrote
+`AUTHORITY.md` has no lane of its own, the earliest top-level pi session that started after the write,
+completed a `read` of that exact path (a direct call or a codemode nested call, relative paths
+resolved against the session's working directory) and has lanes becomes the run's
+`root_session_id`. Its lanes link as above, the planning session stays on the run with
+`ah.session.loop_link_method = 'plan'`, and the run keeps its `launch_uid` and `launch_ts`. A pi root
+that writes the file itself, including from a codemode script, is the root like any other. No schema
+change is involved.
 
 The run ends with `end_evidence = 'closeout'` when its `CLOSEOUT.md` qualifies in the half-open
 window bounded by the next run on the same root or exact path: every in-window collected

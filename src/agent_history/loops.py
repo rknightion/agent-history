@@ -147,7 +147,7 @@ def repair_pi_spawns(conn: psycopg.Connection) -> None:
     ):
         try:
             details = json.loads(raw)
-        except (ValueError, RecursionError):
+        except ValueError, RecursionError:
             continue
         results = details.get("results") if isinstance(details, dict) else None
         if not isinstance(results, list):
@@ -198,7 +198,7 @@ def _captured_launch(
         try:
             args = json.loads(raw or "")
             details = json.loads(result) if result else None
-        except (ValueError, RecursionError):
+        except ValueError, RecursionError:
             continue
         if source_output_truncated("read", output, details):
             continue
@@ -263,7 +263,7 @@ def _resume_targets(conn: psycopg.Connection, root_id: int, cwd: str | None) -> 
             lexer.whitespace += "\n"
             lexer.whitespace_split = True
             tokens = list(lexer)
-        except (ValueError, RecursionError):
+        except ValueError, RecursionError:
             continue
         for i in range(len(tokens) - 2):
             if i and tokens[i - 1] != ";":
@@ -392,6 +392,7 @@ def run(conn: psycopg.Connection) -> dict[str, int]:
     # A root and its continuation may arrive together with either source order.
     for root_id in roots:
         _link_relaunch(conn, root_id)
+    _bind_run_executors(conn)
     return {"loop_roots": len(roots), "launches": found}
 
 
@@ -766,7 +767,7 @@ def _refresh_identity(
                     continue
                 try:
                     args = json.loads(raw or "")
-                except (ValueError, RecursionError):
+                except ValueError, RecursionError:
                     continue
                 if not isinstance(args, dict):
                     continue
@@ -1258,7 +1259,7 @@ def _read_state_progress(content: str, *, identity_only: bool = False):
             continue
         try:
             event = json.loads(raw, object_pairs_hook=unique)
-        except (ValueError, RecursionError):
+        except ValueError, RecursionError:
             # A cut-short object is not an observed event. A complete malformed object is invalid.
             if raw.lstrip().startswith("{") and not raw.rstrip().endswith("}"):
                 continue
@@ -1702,7 +1703,9 @@ def _tag_runs(conn: psycopg.Connection, root_id: int, root_key: str, root_last: 
             "ON CONFLICT (launch_uid) DO UPDATE SET end_ts = EXCLUDED.end_ts, end_evidence = EXCLUDED.end_evidence, "
             "repo_slug = EXCLUDED.repo_slug, report_path = EXCLUDED.report_path, goal_path = EXCLUDED.goal_path, "
             "launch_ts = EXCLUDED.launch_ts, protocol = EXCLUDED.protocol "
-            "WHERE ah.loop_run.mode = EXCLUDED.mode RETURNING id",
+            # A run handed to another root (see _bind_run_executors) is that root's to refresh.
+            "WHERE ah.loop_run.mode = EXCLUDED.mode AND ah.loop_run.root_session_id = EXCLUDED.root_session_id "
+            "RETURNING id",
             (
                 f"{root_key}:{io_uid}",
                 root_id,
@@ -1720,6 +1723,72 @@ def _tag_runs(conn: psycopg.Connection, root_id: int, root_key: str, root_last: 
         if row:
             _tag_tree(conn, row[0], root_id, ts, next_ts)
     return len(runs)
+
+
+EXECUTOR_CANDIDATES_SQL = """
+    SELECT l.id, l.goal_path, l.launch_ts, x.id, x.cwd, i.input_text
+    FROM ah.loop_run l
+    JOIN ah.session p ON p.id = l.root_session_id
+         AND NOT EXISTS (SELECT 1 FROM ah.session k WHERE k.root_session_id = p.id AND k.id <> p.id AND k.is_subagent)
+    JOIN ah.session x ON x.agent = 'pi' AND NOT COALESCE(x.is_subagent, false)
+         AND (x.root_session_id IS NULL OR x.root_session_id = x.id) AND x.id <> p.id
+         AND x.first_event_at >= l.launch_ts
+         AND EXISTS (SELECT 1 FROM ah.session k WHERE k.root_session_id = x.id AND k.id <> x.id AND k.is_subagent)
+    JOIN ah.tool_io i ON i.session_id = x.id AND i.agent = 'pi' AND lower(i.tool_name) = 'read'
+         AND position(%s in i.input_text) > 0 AND NOT COALESCE(i.input_truncated, false)
+    JOIN ah.tool_call t ON t.agent = i.agent AND t.call_uid = i.call_uid AND t.session_id = i.session_id
+         AND t.outcome = 'ok' AND t.ended_at IS NOT NULL
+    WHERE l.mode = %s AND l.launch_ts IS NOT NULL AND l.goal_path IS NOT NULL
+    ORDER BY l.id, x.first_event_at, x.id, i.ts, i.id
+"""
+
+
+def _read_path(raw: str | None, cwd: str | None) -> str | None:
+    """The normalised absolute path a pi read call's recorded arguments name, else None."""
+    try:
+        args = json.loads(raw or "")
+    except ValueError, RecursionError:
+        return None
+    path = args.get("path") if isinstance(args, dict) else None
+    if not isinstance(path, str) or not path:
+        return None
+    if not path.startswith("/"):
+        if not cwd:
+            return None
+        path = os.path.join(cwd, path)
+    return os.path.normpath(path)
+
+
+def _bind_run_executors(conn: psycopg.Connection) -> None:
+    """Hand a run planned in one harness to the pi root that ran it.
+
+    A run-folder run starts at the AUTHORITY.md write, so its root is the session that wrote it. When
+    that session dispatched no lanes of its own and a pi top-level session that started after the
+    write read the same file and dispatched lanes, the pi session is the one that ran it: the run's root becomes
+    that session, so its lanes (the sessions under it) and its spend belong to the run. The earliest
+    such session wins. The planning session stays on the run with `loop_link_method = 'plan'`; the
+    run keeps its `launch_uid`, which still names the AUTHORITY.md write.
+    """
+    chosen: dict[int, tuple[Any, int]] = {}
+    for loop_id, authority, started, session_id, cwd, raw in conn.execute(
+        EXECUTOR_CANDIDATES_SQL, ("AUTHORITY.md", loop_identity_run.MODE)
+    ).fetchall():
+        if loop_id not in chosen and _read_path(raw, cwd) == authority:
+            chosen[loop_id] = (started, session_id)
+    for loop_id, (started, session_id) in chosen.items():
+        planner, report = conn.execute(
+            "SELECT root_session_id, report_path FROM ah.loop_run WHERE id = %s", (loop_id,)
+        ).fetchone()
+        conn.execute("UPDATE ah.loop_run SET root_session_id = %s WHERE id = %s", (session_id, loop_id))
+        conn.execute(
+            "UPDATE ah.session SET loop_link_method = 'plan' WHERE id = %s AND loop_run_id = %s", (planner, loop_id)
+        )
+        following = conn.execute(
+            "SELECT min(n.launch_ts) FROM ah.loop_run n WHERE n.mode = %s AND n.launch_ts > %s AND n.id <> %s "
+            "AND (n.report_path = %s OR n.root_session_id = %s)",
+            (loop_identity_run.MODE, started, loop_id, report, session_id),
+        ).fetchone()[0]
+        _tag_tree(conn, loop_id, session_id, started, following)
 
 
 def _tag_tree(conn: psycopg.Connection, loop_id: int, root_id: int, start: Any, end: Any) -> None:
@@ -1764,7 +1833,7 @@ def _lane_blocks(text: str) -> list[Any]:
         try:
             candidate, end = json.JSONDecoder().raw_decode(text, start)
             close = LANE_CLOSE.match(text, end)
-        except (ValueError, RecursionError):
+        except ValueError, RecursionError:
             close = None
         if close is None:
             # not one JSON value then a fence: the block runs to the next fence that ends a line
