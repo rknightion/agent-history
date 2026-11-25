@@ -138,6 +138,8 @@ KNOWN_TYPES = {
     "api-request", "api-request-blob", "api-request-shape", "tools-used",
     # Account ownership metadata has no catalogue identity field.
     "session-owner",
+    # REPL mode flag, tool data-flow capture and session lineage: metadata with no catalogue home yet.
+    "repl-mode", "data-flow-records", "data-flow-incomplete", "derived-from",
 }
 SPAWN_TOOLS = {"Agent", "Task"}
 COLLAB_TOOLS = {"Agent", "Task", "SendMessage", "SubagentHandback", "StructuredOutput", "Workflow",
