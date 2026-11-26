@@ -171,7 +171,24 @@ def test_a_planner_that_only_scouted_after_the_executor_finished_hands_over_its_
     planner_with_subagent(tmp_path, T0 + timedelta(hours=5))
     executor(tmp_path)
     refresh(clean, tmp_path)
-    assert run_state(clean)[0][1] == session_id(clean, EXECUTOR)
+    ((run_id, pi, _, _),) = run_state(clean)
+    assert pi == session_id(clean, EXECUTOR)
+    scout = session_id(clean, "1a000000-0000-4000-8000-0000000000cc")
+    lanes = sorted(
+        r[0] for r in clean.execute("SELECT id FROM ah.session WHERE is_subagent AND root_session_id = %s", (pi,))
+    )
+    assert len(lanes) == 3
+    # the planner's scout is not the run's lane, however many passes run
+    refresh(clean)
+    clean.execute("INSERT INTO ah.dirty_session VALUES (%s) ON CONFLICT DO NOTHING", (scout,))
+    refresh(clean)
+    assert clean.execute("SELECT loop_run_id FROM ah.session WHERE id = %s", (scout,)).fetchone() == (None,)
+    assert (
+        sorted(r[0] for r in clean.execute("SELECT session_id FROM ah.lane WHERE loop_run_id = %s", (run_id,))) == lanes
+    )
+    assert clean.execute("SELECT lanes_total FROM ah.loops").fetchone() == (3,)
+    members = {r[0] for r in clean.execute("SELECT id FROM ah.session WHERE loop_run_id = %s", (run_id,))}
+    assert scout not in members
 
 
 def test_a_planner_that_dispatched_a_lane_while_the_executor_ran_keeps_its_run(clean, tmp_path):

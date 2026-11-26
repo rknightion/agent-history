@@ -1788,6 +1788,19 @@ def _bind_run_executors(conn: psycopg.Connection) -> None:
         planner, report = conn.execute(
             "SELECT root_session_id, report_path FROM ah.loop_run WHERE id = %s", (loop_id,)
         ).fetchone()
+        # What the planner's own tree tagged onto the run (its scouts, heuristic matches) is not the
+        # executor's work: detach it, and the executor's tree is tagged on below.
+        detached = [
+            r[0]
+            for r in conn.execute(
+                "UPDATE ah.session SET loop_run_id = NULL, loop_link_method = NULL "
+                "WHERE loop_run_id = %s AND id <> %s AND loop_link_method IN ('lineage', 'heuristic') "
+                "AND COALESCE(root_session_id, 0) <> %s RETURNING id",
+                (loop_id, planner, session_id),
+            )
+        ]
+        if detached:
+            conn.execute("DELETE FROM ah.lane WHERE loop_run_id = %s AND session_id = ANY(%s)", (loop_id, detached))
         conn.execute("UPDATE ah.loop_run SET root_session_id = %s WHERE id = %s", (session_id, loop_id))
         conn.execute(
             "UPDATE ah.session SET loop_link_method = 'plan' WHERE id = %s AND loop_run_id = %s", (planner, loop_id)
