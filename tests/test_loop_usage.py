@@ -588,3 +588,73 @@ def test_a_slot_time_that_is_not_a_finite_number_is_not_shown(tmp_path):
     lines = detail_block(V4, ledger=ledger)
     slots = [line.strip("|").split("|")[-1].strip() for line in lines if line.startswith("| PR ")]
     assert slots == ["-"] * 7 + ["1m 30s"]
+
+
+SPEND_ROWS = [
+    {
+        "role": "root",
+        "sessions": "1",
+        "calls": "1200",
+        "input_uncached": "9000",
+        "output": "250000",
+        "cache_read": "40000000",
+        "cache_write": "800000",
+        "cost": "40.5",
+        "unpriced": "0",
+    },
+    {
+        "role": "worker",
+        "sessions": "3",
+        "calls": "34",
+        "input_uncached": "700",
+        "output": "21000",
+        "cache_read": "",
+        "cache_write": "",
+        "cost": "1.255",
+        "unpriced": "30",
+    },
+    {
+        "role": "unattributed",
+        "sessions": "1",
+        "calls": "2",
+        "input_uncached": "",
+        "output": "",
+        "cache_read": "",
+        "cache_write": "",
+        "cost": "",
+        "unpriced": "2",
+    },
+]
+
+
+def test_spend_by_role_table_is_a_closeout_section():
+    assert reader.spend_by_role_markdown(SPEND_ROWS).splitlines() == [
+        "## Spend by role",
+        "",
+        "| Role | Sessions | Calls | Input | Output | Cache read | Cache write | Cost |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| root | 1 | 1,200 | 9,000 | 250,000 | 40,000,000 | 800,000 | $40.50 |",
+        "| worker | 3 | 34 | 700 | 21,000 | - | - | $1.26 (partial) |",
+        "| unknown | 1 | 2 | - | - | - | - | unpriced |",
+        "| Total | 5 | 1,236 | 9,700 | 271,000 | 40,000,000 | 800,000 | $41.76 (partial) |",
+    ]
+
+
+def test_spend_by_role_with_no_rows_says_so():
+    assert reader.spend_by_role_markdown([]).splitlines() == ["## Spend by role", "", "No model calls are recorded."]
+
+
+def test_loop_spend_by_role_flag_prints_only_the_section(monkeypatch, capsys):
+    seen = []
+
+    def query(sql, variables):
+        seen.append(sql)
+        if sql.startswith("SELECT id FROM ah.loop_run WHERE id ="):
+            return [{"id": "4"}]
+        return SPEND_ROWS
+
+    monkeypatch.setattr(reader, "query", query)
+    assert reader.main(["loop", "4", "--spend-by-role"]) == 0
+    out = capsys.readouterr().out
+    assert out.startswith("## Spend by role\n") and "Usage as of" not in out
+    assert "ARRAY[4]::bigint[]" in seen[-1] and "ah.priced_usd" in seen[-1]

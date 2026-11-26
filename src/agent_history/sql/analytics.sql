@@ -214,7 +214,14 @@ SELECT l.id AS loop_run_id, COALESCE(live.status, l.status) AS status, l.repo_sl
        COALESCE(rw.tool_errors, 0) + COALESCE(m.tool_errors, 0) AS tool_errors,
        COALESCE(rw.tool_denials, 0) + COALESCE(m.tool_denials, 0) AS tool_denials,
        COALESCE(rw.tool_interrupts, 0) + COALESCE(m.tool_interrupts, 0) AS tool_interrupts,
-       COALESCE(rw.subagents, 0) + COALESCE(m.subagents, 0) AS subagents,
+       -- Distinct child sessions: a lane resumed after a hand-back has several spawn rows for one session.
+       -- A spawn whose child is not yet linked counts as its own.
+       (SELECT count(DISTINCT COALESCE(x.child_session_id::text, 'spawn:' || x.id))
+        FROM ah.subagent_spawn x
+        WHERE (x.parent_session_id = l.root_session_id
+               AND x.spawned_at >= l.launch_ts AND x.spawned_at < COALESCE(l.end_ts, 'infinity'))
+           OR x.parent_session_id IN (SELECT s.id FROM ah.session s
+                                      WHERE s.loop_run_id = l.id AND s.id <> l.root_session_id)) AS subagents,
        COALESCE(rw.compactions, 0) + COALESCE(m.compactions, 0) AS compactions,
        COALESCE(rw.commits, 0) + COALESCE(m.commits, 0) AS commits,
        COALESCE(rw.pushes, 0) + COALESCE(m.pushes, 0) AS pushes,
@@ -322,11 +329,17 @@ LANGUAGE sql STABLE AS $$
            (r.models)[1], s.first_event_at, s.last_event_at,
            EXTRACT(EPOCH FROM (s.last_event_at - s.first_event_at))::bigint,
            r.llm_calls, r.synthetic_calls, r.input_uncached, r.cache_read, r.output, r.tool_calls, r.tool_errors,
-           r.tool_denials, r.compactions, r.commits, ln.return_status, sp.completion_status, sc.priced_cost_usd
+           r.tool_denials, r.compactions, r.commits, ln.return_status,
+           COALESCE(sp.completion_status, CASE ln.return_status WHEN 'complete' THEN 'completed' ELSE ln.return_status END),
+           sc.priced_cost_usd
     FROM ah.lane ln
     JOIN ah.session s ON s.id = ln.session_id
     LEFT JOIN ah.session_rollup r ON r.session_id = s.id
-    LEFT JOIN ah.subagent_spawn sp ON sp.child_session_id = s.id
+    -- One row per lane: a lane resumed after its first hand-back has several spawn rows for one child
+    -- session, and its latest one stands. A spawn with no status takes it from the lane-return block.
+    LEFT JOIN LATERAL (
+        SELECT x.completion_status FROM ah.subagent_spawn x WHERE x.child_session_id = s.id
+        ORDER BY x.spawned_at DESC NULLS LAST, x.id DESC LIMIT 1) sp ON true
     LEFT JOIN LATERAL (SELECT ah.session_cost(s.id) AS priced_cost_usd) sc ON true
     WHERE ln.loop_run_id = loop_id
     ORDER BY s.first_event_at
@@ -1371,6 +1384,8 @@ $$;
 --   name text, description text, spawned_at timestamptz, completed_at timestamptz, duration_s bigint,
 --   completion_status text, lane_return_status text, priced_cost_usd numeric, child_commits bigint,
 --   child_ci_conclusion text, redo boolean
+-- completion_status is the spawn's own; a spawn that recorded none takes it from the child's lane-return
+-- block (complete reads as completed, any other status as written).
 -- redo: a LATER spawn from the same parent, same description or name, within 2 hours of this one.
 CREATE OR REPLACE VIEW ah.v_spawn_outcome AS
 SELECT sp.id AS spawn_id, sp.parent_session_id, ps.namespace AS parent_namespace, ps.agent AS parent_agent,
@@ -1379,7 +1394,9 @@ SELECT sp.id AS spawn_id, sp.parent_session_id, ps.namespace AS parent_namespace
        sp.name, sp.description, sp.spawned_at, sp.completed_at,
        COALESCE(EXTRACT(EPOCH FROM (cs.last_event_at - cs.first_event_at))::bigint,
                 sp.reported_duration_ms / 1000) AS duration_s,
-       sp.completion_status, ln.return_status AS lane_return_status, sc.priced_cost_usd,
+       COALESCE(sp.completion_status, CASE ln.return_status WHEN 'complete' THEN 'completed' ELSE ln.return_status END)
+           AS completion_status,
+       ln.return_status AS lane_return_status, sc.priced_cost_usd,
        COALESCE(cq.commits, 0) AS child_commits, cq.ci_conclusion AS child_ci_conclusion,
        EXISTS (SELECT 1 FROM ah.subagent_spawn sp2
                WHERE sp2.parent_session_id = sp.parent_session_id AND sp2.id <> sp.id
