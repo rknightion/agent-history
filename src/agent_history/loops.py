@@ -2027,7 +2027,7 @@ def lane_returns(
 
 
 # A new return form needs a new bounded pass over every lane, not a reset of the old cursor.
-LANE_RETURNS_MARKER = "loops_lane_returns_status_line_v2"
+LANE_RETURNS_MARKER = "loops_lane_returns_opencode_v3"
 LANE_RETURNS_BATCH = 256
 
 

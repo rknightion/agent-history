@@ -199,3 +199,24 @@ def test_hand_back_pairs_an_opencode_lane_only_with_an_opencode_parent(clean, tm
     # and a claude lane still takes only a claude parent's relay.
     found = loops.lane_returns(clean, 0, "claude", "o6", [claude_parent, opencode_parent])
     assert [r["event_uid"] for r in found] == ["relay-c"]
+
+
+def test_an_upgraded_catalogue_re_reads_existing_opencode_lanes(clean, tmp_path):
+    loop_id, root_id = launched(clean, tmp_path)
+    worker = lane(clean, root_id, "o9", AT + timedelta(minutes=5), agent="opencode")
+    say(clean, worker, "o9-final", "Status: complete\nOutcome: merged.", AT + timedelta(minutes=9), agent="opencode")
+    # Indexed before OpenCode returns were read, with no dirty root to re-tag it.
+    clean.execute("UPDATE ah.session SET loop_run_id=%s, loop_link_method='lineage' WHERE id=%s", (loop_id, worker))
+    clean.execute(
+        "INSERT INTO ah.lane (loop_run_id, session_id, link_method) VALUES (%s, %s, 'lineage')", (loop_id, worker)
+    )
+    # An upgraded catalogue: the earlier status-line backfill finished, and this pass has not run yet.
+    clean.execute("DELETE FROM ah.meta WHERE key=%s", (loops.LANE_RETURNS_MARKER,))
+    clean.execute(
+        "INSERT INTO ah.meta (key, value) VALUES ('loops_lane_returns_status_line_v2', 'complete') "
+        "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value"
+    )
+    clean.commit()
+    loops.refresh_live(clean)
+    clean.commit()
+    assert clean.execute("SELECT return_status FROM ah.lane WHERE session_id=%s", (worker,)).fetchone() == ("complete",)
