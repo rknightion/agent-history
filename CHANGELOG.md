@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.12.0](https://github.com/rknightion/agent-history/compare/v0.11.0...v0.12.0) (2026-11-26)
+
+
+### Features
+
+* **loop:** run protocol, run-folder runs and Claude lane returns ([#117](https://github.com/rknightion/agent-history/issues/117)) ([fa02683](https://github.com/rknightion/agent-history/commit/fa02683b6cd7b2fb9726c8e65623988212fb5d4b))
+* **loops:** lane completion from lane returns, distinct lane counts, spend by role ([#146](https://github.com/rknightion/agent-history/issues/146)) ([c3796b4](https://github.com/rknightion/agent-history/commit/c3796b45d9e6f09f315c9118bbceabb2d2c198fd))
+* **loop:** usage block reports root calls, context, roles and landings ([#88](https://github.com/rknightion/agent-history/issues/88)) ([92ccc45](https://github.com/rknightion/agent-history/commit/92ccc4597349b69da744b34337dfc36b26c6822b))
+
+
+### Bug Fixes
+
+* **embed:** the orphan failure prune waits for a drained backlog ([#90](https://github.com/rknightion/agent-history/issues/90)) ([4c6bb40](https://github.com/rknightion/agent-history/commit/4c6bb40f7872b522cdc136d37d42747afcbf099e))
+* **loops:** link runs launched from pi to the pi root and its lanes ([#134](https://github.com/rknightion/agent-history/issues/134)) ([764fe57](https://github.com/rknightion/agent-history/commit/764fe575e8de059dc1dfedd719ff57bbc30102ee))
+* **parse:** Code Mode inner calls are not model calls, and link to their REPL call ([#135](https://github.com/rknightion/agent-history/issues/135)) ([4582838](https://github.com/rknightion/agent-history/commit/4582838eb6d39379337c571120e8bbfb496bd7ac))
+* **parse:** treat repl-mode, data-flow and derived-from records as known ([#133](https://github.com/rknightion/agent-history/issues/133)) ([297011c](https://github.com/rknightion/agent-history/commit/297011c4078ba52cd972b8ac68514ebc9f09e32a))
+* **publish:** find the edge image by the 12-character short SHA ([#123](https://github.com/rknightion/agent-history/issues/123)) ([cbdbe91](https://github.com/rknightion/agent-history/commit/cbdbe91ce56d8cd2ac864079af622f59ba15493b))
+
 ## [0.11.0](https://github.com/rknightion/agent-history/compare/v0.10.1...v0.11.0) (2026-11-10)
 
 
