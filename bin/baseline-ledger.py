@@ -58,6 +58,8 @@ REPLAYED = (
     "053_loop_protocol.sql",
     "054_requeue_synthetic_rollups.sql",
     "055_drop_code_mode_model_calls.sql",
+    # The baseline dump keeps the three-agent checks; this widens them on fresh init as well.
+    "056_opencode_agent.sql",
 )
 
 

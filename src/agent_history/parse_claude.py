@@ -120,7 +120,7 @@ from typing import Any, Iterable
 from .common import (BOUNDED_STATE_SECONDS, as_bool, clean_text, as_int, as_str, artifact_kind, cmd_verb, ssh_target,
                      git_ops_from_command, git_event_extras, git_from_output, json_size, key_set, linked_paths, mcp_split, parse_ts,
                      prompt_origin, sha256_text, split_legacy_peer_injections, split_prompt_injections, text_blocks)
-from .model import (ArtifactRow, AttachmentRow, CompactionRow, ContinuationRow, CostStateRow,
+from .model import (CLAUDE_FAMILY, ArtifactRow, AttachmentRow, CompactionRow, ContinuationRow, CostStateRow,
                     FileContext, FileTouchRow, GitEventRow, HookEventRow, LinePos, LlmCallRow,
                     MessageRow, ParseIssueRow, RateLimitRow, RecordTypeRow, Row, SessionEventRow,
                     SessionKey, SessionRow, SubagentSpawnRow, ToolCallRow, ToolIoRow, TurnRow)
@@ -214,6 +214,8 @@ def _transform_types(value: Any) -> list[str] | None:
 class ClaudeParser:
     def __init__(self, ctx: FileContext, state: dict[str, Any]) -> None:
         self.ctx = ctx
+        # An opencode-* namespace carries Claude-shaped lines; only its agent label differs.
+        self.agent = ctx.agent if ctx.agent in CLAUDE_FAMILY else AGENT
         s = dict(state or {})
         self.s = s
         s.setdefault("last_ts", None)
@@ -246,7 +248,7 @@ class ClaudeParser:
         s.setdefault("brief_seen", False)     # v4: a subagent file's first non-meta user line was seen
         self.role = ctx.file_role
         self.sid, self.aid, self.wf_id = self._path_ids(ctx)
-        self.key = SessionKey(AGENT, self.sid, self.aid or "")
+        self.key = SessionKey(self.agent, self.sid, self.aid or "")
         self.kprefix = f"{self.sid}/{self.aid or ''}"
         self._reset_batch()
 
@@ -336,7 +338,7 @@ class ClaudeParser:
         for cid, (name, ts_iso, turn, off) in list(self.s["open_calls"].items()):
             t = parse_ts(ts_iso)
             if t is not None and t < cutoff:
-                rows.append(ToolCallRow(agent=AGENT, call_uid=cid, session=self.key, tool_name=name,
+                rows.append(ToolCallRow(agent=self.agent, call_uid=cid, session=self.key, tool_name=name,
                                         byte_offset=off, turn_key=turn, outcome="no_result"))
                 del self.s["open_calls"][cid]
         return rows
@@ -347,7 +349,7 @@ class ClaudeParser:
         if self.role != "workflow_journal" and self.b["seen"]:
             rows.append(self._session_row())
         for (rtype, sub), (count, ks, ver, ts) in self.types.items():
-            rows.append(RecordTypeRow(agent=AGENT, record_type=rtype, subtype=sub,
+            rows.append(RecordTypeRow(agent=self.agent, record_type=rtype, subtype=sub,
                                       ts=ts or datetime.fromtimestamp(0).astimezone(), count=count,
                                       key_set=ks, cli_version=ver))
         self._reset_batch()
@@ -392,7 +394,7 @@ class ClaudeParser:
                value: Any = None, detail: dict[str, Any] | None = None) -> None:
         if ts is None:
             return
-        out.append(SessionEventRow(agent=AGENT, event_uid=uid, session=self.key, ts=ts, kind=kind,
+        out.append(SessionEventRow(agent=self.agent, event_uid=uid, session=self.key, ts=ts, kind=kind,
                                    byte_offset=pos.byte_offset, turn_key=self.s["turn"],
                                    value=None if value is None else str(value)[:200],
                                    detail=detail or None))
@@ -532,7 +534,7 @@ class ClaudeParser:
                                      line_number=pos.line_number, detail="sessionId differs from path"))
             when = ts or parse_ts(self.s.get("last_ts"))
             if self.role == "main" and when is not None:
-                out.append(ContinuationRow(agent=AGENT, child_uid=self.sid, parent_uid=sid, kind="other",
+                out.append(ContinuationRow(agent=self.agent, child_uid=self.sid, parent_uid=sid, kind="other",
                                            session=self.key, ts=when, byte_offset=pos.byte_offset,
                                            evidence="sessionId_mismatch"))
         if rec.get("type") in ("user", "assistant", "attachment", "system") and not sid:
@@ -581,14 +583,14 @@ class ClaudeParser:
         if nxt:
             self._event(out, self._uid(rec, pos), ts, "continued_in", pos, nxt)
             if ts is not None and nxt != self.sid:
-                out.append(ContinuationRow(agent=AGENT, child_uid=nxt, parent_uid=self.sid, kind="resume",
+                out.append(ContinuationRow(agent=self.agent, child_uid=nxt, parent_uid=self.sid, kind="resume",
                                            session=self.key, ts=ts, byte_offset=pos.byte_offset,
                                            evidence="continued-in"))
 
     def _t_fork_context_ref(self, rec, pos, ts, sub, out):
         parent = as_str(rec.get("parentSessionId"))
         if parent and parent != self.sid and ts is not None:
-            out.append(ContinuationRow(agent=AGENT, child_uid=self.sid, parent_uid=parent, kind="fork",
+            out.append(ContinuationRow(agent=self.agent, child_uid=self.sid, parent_uid=parent, kind="fork",
                                        session=self.key, ts=ts, byte_offset=pos.byte_offset,
                                        evidence="fork-context-ref"))
 
@@ -630,7 +632,7 @@ class ClaudeParser:
         repo = as_str(rec.get("prRepository"))
         if ts is None or num is None:
             return
-        out.append(GitEventRow(agent=AGENT, event_uid=f"{self.kprefix}:pr_link:{repo}#{num}",
+        out.append(GitEventRow(agent=self.agent, event_uid=f"{self.kprefix}:pr_link:{repo}#{num}",
                                session=self.key, ts=ts, op="pr", evidence="pr_link",
                                byte_offset=pos.byte_offset, turn_key=self.s["turn"], pr_number=num,
                                pr_url=as_str(rec.get("prUrl")), pr_repo=repo, cwd=self.s.get("cwd")))
@@ -641,7 +643,7 @@ class ClaudeParser:
             return
         mid = as_str(rec.get("messageId"))
         uid = f"fhd:{mid}" if mid else f"{self.kprefix}@{pos.byte_offset}"
-        out.append(ArtifactRow(agent=AGENT, event_uid=uid, session=self.key, ts=ts,
+        out.append(ArtifactRow(agent=self.agent, event_uid=uid, session=self.key, ts=ts,
                                kind=artifact_kind(path), action="modified", path=path,
                                evidence_type="claude-file-history", byte_offset=pos.byte_offset,
                                turn_key=self.s["turn"], display_name=PurePosixPath(path).name or path))
@@ -652,7 +654,7 @@ class ClaudeParser:
             return
         mu = rec.get("modelUsage")
         out.append(CostStateRow(
-            agent=AGENT, event_uid=f"{self.kprefix}@{pos.byte_offset}", session=self.key, ts=when,
+            agent=self.agent, event_uid=f"{self.kprefix}@{pos.byte_offset}", session=self.key, ts=when,
             byte_offset=pos.byte_offset,
             total_cost_usd=rec.get("totalCostUSD") if isinstance(rec.get("totalCostUSD"), (int, float)) else None,
             api_duration_ms=as_int(rec.get("totalAPIDuration")),
@@ -682,7 +684,7 @@ class ClaudeParser:
         elif sub == "compact_boundary" and ts is not None:
             meta = rec.get("compactMetadata") if isinstance(rec.get("compactMetadata"), dict) else {}
             out.append(CompactionRow(
-                agent=AGENT, event_uid=uid, session=self.key, ts=ts, byte_offset=pos.byte_offset,
+                agent=self.agent, event_uid=uid, session=self.key, ts=ts, byte_offset=pos.byte_offset,
                 turn_key=self.s["turn"], trigger=as_str(meta.get("trigger")),
                 pre_tokens=as_int(meta.get("preTokens")), post_tokens=as_int(meta.get("postTokens")),
                 duration_ms=as_int(meta.get("durationMs")),
@@ -698,7 +700,7 @@ class ClaudeParser:
             for i, info in enumerate(infos):
                 cmd = info.get("command")
                 out.append(HookEventRow(
-                    agent=AGENT, event_uid=f"{uid}:{i}", session=self.key, ts=ts,
+                    agent=self.agent, event_uid=f"{uid}:{i}", session=self.key, ts=ts,
                     byte_offset=pos.byte_offset, turn_key=self.s["turn"], call_uid=call,
                     hook_event="SubagentStop" if self.aid else "Stop", outcome=outcome,
                     hook_name="stop_hook_summary",
@@ -753,7 +755,7 @@ class ClaudeParser:
         if not self._changed("rl:" + kind, sig):
             return
         util = q.get("utilization")
-        out.append(RateLimitRow(agent=AGENT, event_uid=uid, session=self.key, ts=ts,
+        out.append(RateLimitRow(agent=self.agent, event_uid=uid, session=self.key, ts=ts,
                                 window_kind=kind, byte_offset=pos.byte_offset, limit_id=rtype,
                                 used_percent=float(util) * (100 if util <= 1 else 1)
                                 if isinstance(util, (int, float)) else None,
@@ -772,7 +774,7 @@ class ClaudeParser:
                        if a.get(k) is not None)
             outcome = sub[5:] if sub.startswith("hook_") else "async_response"
             out.append(HookEventRow(
-                agent=AGENT, event_uid=uid, session=self.key, ts=ts, byte_offset=pos.byte_offset,
+                agent=self.agent, event_uid=uid, session=self.key, ts=ts, byte_offset=pos.byte_offset,
                 turn_key=self.s["turn"], call_uid=as_str(a.get("toolUseID")),
                 hook_event=as_str(a.get("hookEvent")), outcome=outcome,
                 hook_name=as_str(a.get("hookName")),
@@ -857,7 +859,7 @@ class ClaudeParser:
         if sub == "read_truncation_notice":
             call = as_str(a.get("toolUseID"))
             if call:
-                out.append(ToolIoRow(agent=AGENT, io_uid=call, session=self.key, ts=ts,
+                out.append(ToolIoRow(agent=self.agent, io_uid=call, session=self.key, ts=ts,
                                      byte_offset=pos.byte_offset, kind="call", call_uid=call,
                                      output_truncated=True, output_byte_offset=pos.byte_offset))
         if sub == "prompt_snapshot":
@@ -909,7 +911,7 @@ class ClaudeParser:
             name = as_str(a.get("filename")) or as_str(f.get("filePath"))
             if name:
                 detail["path"] = name[:300]
-            out.append(AttachmentRow(agent=AGENT, attachment_uid=f"{uid}:att:0", session=self.key, ts=ts,
+            out.append(AttachmentRow(agent=self.agent, attachment_uid=f"{uid}:att:0", session=self.key, ts=ts,
                                      byte_offset=pos.byte_offset, kind="file", source="attachment_record",
                                      event_uid=uid, turn_key=self.s["turn"], file_name=name,
                                      size_bytes=len(text.encode("utf-8", "surrogatepass")) if text else None,
@@ -936,7 +938,7 @@ class ClaudeParser:
 
     def _msg(self, uid, ts, role, cls, text, pos, rec, turn=None, model=None, origin=None,
              detail=None) -> MessageRow:
-        return MessageRow(agent=AGENT, event_uid=uid, session=self.key, ts=ts, role=role,
+        return MessageRow(agent=self.agent, event_uid=uid, session=self.key, ts=ts, role=role,
                           message_class=cls, text=text, byte_offset=pos.byte_offset,
                           byte_length=pos.byte_length, line_number=pos.line_number,
                           turn_key=turn if turn is not None else self.s["turn"], model=model,
@@ -964,7 +966,7 @@ class ClaudeParser:
             detail = {"paste_id": ids[n]} if n < len(ids) and len(ids) == sum(
                 1 for b in blocks if isinstance(b, dict) and b.get("type") == "image") else None
             if ts is not None:
-                out.append(AttachmentRow(agent=AGENT, attachment_uid=f"{prefix}:att:{n}", session=self.key,
+                out.append(AttachmentRow(agent=self.agent, attachment_uid=f"{prefix}:att:{n}", session=self.key,
                                          ts=ts, byte_offset=pos.byte_offset, kind=block["type"],
                                          source=source, event_uid=event_uid, call_uid=call_uid,
                                          turn_key=self.s["turn"], mime=mime, size_bytes=size,
@@ -972,7 +974,7 @@ class ClaudeParser:
             n += 1
         if n == 0 and ids and ts is not None:
             for pid in ids:
-                out.append(AttachmentRow(agent=AGENT, attachment_uid=f"{prefix}:att:{n}", session=self.key,
+                out.append(AttachmentRow(agent=self.agent, attachment_uid=f"{prefix}:att:{n}", session=self.key,
                                          ts=ts, byte_offset=pos.byte_offset, kind="image", source=source,
                                          event_uid=event_uid, call_uid=call_uid, turn_key=self.s["turn"],
                                          detail={"paste_id": pid}))
@@ -983,7 +985,7 @@ class ClaudeParser:
         n = start
         for m in PASTED_BLOCK.finditer(text):
             attr = PASTE_ID_ATTR.search(m.group(1) or "")
-            out.append(AttachmentRow(agent=AGENT, attachment_uid=f"{uid}:att:{n}", session=self.key, ts=ts,
+            out.append(AttachmentRow(agent=self.agent, attachment_uid=f"{uid}:att:{n}", session=self.key, ts=ts,
                                      byte_offset=pos.byte_offset, kind="pasted_text", source=source,
                                      event_uid=uid, turn_key=self.s["turn"], text=m.group(2),
                                      size_bytes=len(m.group(2).encode("utf-8", "surrogatepass")),
@@ -993,7 +995,7 @@ class ClaudeParser:
             detail: dict[str, Any] = {"placeholder": True, "paste_id": m.group(1)}
             if m.group(2):
                 detail["lines"] = int(m.group(2))
-            out.append(AttachmentRow(agent=AGENT, attachment_uid=f"{uid}:att:{n}", session=self.key, ts=ts,
+            out.append(AttachmentRow(agent=self.agent, attachment_uid=f"{uid}:att:{n}", session=self.key, ts=ts,
                                      byte_offset=pos.byte_offset, kind="pasted_text", source=source,
                                      event_uid=uid, turn_key=self.s["turn"], detail=detail))
             n += 1
@@ -1250,7 +1252,7 @@ class ClaudeParser:
         task_id = tags.get("task-id")
         call = tags.get("tool-use-id")
         base = f"tn:{task_id or '-'}:{sha256_text(text)[:16]}"
-        out.append(MessageRow(agent=AGENT, event_uid=base + ":text", session=self.key, ts=ts, role="user",
+        out.append(MessageRow(agent=self.agent, event_uid=base + ":text", session=self.key, ts=ts, role="user",
                               message_class="agent_message", text=text, byte_offset=pos.byte_offset,
                               byte_length=pos.byte_length, line_number=pos.line_number,
                               turn_key=self.s["turn"], is_sidechain=self.role != "main",
@@ -1260,7 +1262,7 @@ class ClaudeParser:
         if spawn:
             status = tags.get("status")
             out.append(SubagentSpawnRow(
-                agent=AGENT, spawn_uid=call, session=self.key, byte_offset=pos.byte_offset,
+                agent=self.agent, spawn_uid=call, session=self.key, byte_offset=pos.byte_offset,
                 child_session_uid=self.sid, child_agent_id=task_id if spawn[0] == "agent" else None,
                 completion_status=status[:40] if status else None, completed_at=ts,
                 reported_tokens=as_int(tags.get("subagent_tokens")),
@@ -1268,7 +1270,7 @@ class ClaudeParser:
                 reported_duration_ms=as_int(tags.get("duration_ms"))))
         sm = TN_SUMMARY.search(text)
         if sm and sm.group(1).strip():
-            out.append(MessageRow(agent=AGENT, event_uid=base + ":summary", session=self.key, ts=ts,
+            out.append(MessageRow(agent=self.agent, event_uid=base + ":summary", session=self.key, ts=ts,
                                   role="user", message_class="task_notification_summary",
                                   text=sm.group(1).strip(), byte_offset=pos.byte_offset,
                                   byte_length=pos.byte_length, line_number=pos.line_number,
@@ -1276,7 +1278,7 @@ class ClaudeParser:
                                   raw_record_origin=record_origin))
         rm = TN_RESULT.search(text)
         if rm and rm.group(1).strip():
-            out.append(MessageRow(agent=AGENT, event_uid=base + ":result", session=self.key, ts=ts,
+            out.append(MessageRow(agent=self.agent, event_uid=base + ":result", session=self.key, ts=ts,
                                   role="user", message_class="subagent_report",
                                   text=rm.group(1).strip(), byte_offset=pos.byte_offset,
                                   byte_length=pos.byte_length, line_number=pos.line_number,
@@ -1359,7 +1361,7 @@ class ClaudeParser:
         if early and ts is not None:
             self.s["early_results"][cid] = [ts.isoformat(), duration is not None]
         out.append(ToolCallRow(
-            agent=AGENT, call_uid=cid, session=self.key, tool_name=name, byte_offset=off,
+            agent=self.agent, call_uid=cid, session=self.key, tool_name=name, byte_offset=off,
             turn_key=turn, ended_at=ts,
             duration_ms=duration, output_bytes=out_bytes,
             persisted_output_bytes=as_int(tur_d.get("persistedOutputSize")), outcome=outcome,
@@ -1408,7 +1410,7 @@ class ClaudeParser:
                 truncated = True
         elif tur is not None:
             result = json.dumps(_scrub(tur), ensure_ascii=False)
-        out.append(ToolIoRow(agent=AGENT, io_uid=cid, session=self.key, ts=ts, byte_offset=off, kind="call",
+        out.append(ToolIoRow(agent=self.agent, io_uid=cid, session=self.key, ts=ts, byte_offset=off, kind="call",
                              tool_name=name, call_uid=cid, turn_key=turn, output_text=output,
                              output_truncated=truncated, stdout_text=stdout, stderr_text=stderr,
                              result_json=result, output_parts=parts or None, output_at=ts,
@@ -1420,12 +1422,12 @@ class ClaudeParser:
         status = as_str(tur.get("status"))
         if name == "Workflow":
             out.append(SubagentSpawnRow(
-                agent=AGENT, spawn_uid=cid, session=self.key, byte_offset=pos.byte_offset,
+                agent=self.agent, spawn_uid=cid, session=self.key, byte_offset=pos.byte_offset,
                 child_session_uid=self.sid, launch_status=status,
                 workflow_id=as_str(tur.get("runId")), child_task_name=as_str(tur.get("workflowName"))))
             return
         child = as_str(tur.get("agentId")) or as_str(tur.get("agent_id"))
-        row = SubagentSpawnRow(agent=AGENT, spawn_uid=cid, session=self.key,
+        row = SubagentSpawnRow(agent=self.agent, spawn_uid=cid, session=self.key,
                                byte_offset=pos.byte_offset, child_session_uid=self.sid,
                                child_agent_id=child, resolved_model=as_str(tur.get("resolvedModel"))
                                or as_str(tur.get("model")), launch_status=status)
@@ -1446,7 +1448,7 @@ class ClaudeParser:
         turn = self.s["turn"]
 
         def ev(op, suffix, evidence, **kw):
-            out.append(GitEventRow(agent=AGENT, event_uid=f"{cid}:{suffix}", session=self.key,
+            out.append(GitEventRow(agent=self.agent, event_uid=f"{cid}:{suffix}", session=self.key,
                                    ts=ts, op=op, evidence=evidence, byte_offset=pos.byte_offset,
                                    turn_key=turn, call_uid=cid, cwd=cwd, **kw))
 
@@ -1512,7 +1514,7 @@ class ClaudeParser:
         if text and not is_err:
             out.append(self._msg(uid, ts, "assistant", "assistant_text", text, pos, rec, model=model))
             for path in linked_paths(text):
-                out.append(ArtifactRow(agent=AGENT, event_uid=uid, session=self.key, ts=ts,
+                out.append(ArtifactRow(agent=self.agent, event_uid=uid, session=self.key, ts=ts,
                                        kind=artifact_kind(path), action="linked", path=path,
                                        evidence_type="assistant-markdown", byte_offset=pos.byte_offset,
                                        turn_key=turn, display_name=PurePosixPath(path).name or path))
@@ -1548,7 +1550,7 @@ class ClaudeParser:
         usage = msg.get("usage") if isinstance(msg.get("usage"), dict) else None
         effort = as_str(rec.get("effort")) or as_str(rec.get("perTurnEffort"))
         is_err = bool(rec.get("isApiErrorMessage"))
-        row = LlmCallRow(agent=AGENT, response_id=mid, session=self.key, ts=ts,
+        row = LlmCallRow(agent=self.agent, response_id=mid, session=self.key, ts=ts,
                          byte_offset=pos.byte_offset, turn_key=turn, model=model,
                          request_id=as_str(rec.get("requestId")),
                          stop_reason=as_str(msg.get("stop_reason")), effort=effort,
@@ -1624,13 +1626,13 @@ class ClaudeParser:
 
     def _flow_link(self, out, cid, name, turn, offset, parent, index) -> None:
         self.s["flow"]["linked"][f"{parent}#{index}"] = [cid, name, turn, offset]
-        out.append(ToolCallRow(agent=AGENT, call_uid=cid, session=self.key, tool_name=name,
+        out.append(ToolCallRow(agent=self.agent, call_uid=cid, session=self.key, tool_name=name,
                                byte_offset=offset, turn_key=turn, meta={"nested_in": parent}))
 
     def _flow_retract(self, out, key) -> None:
         done = self.s["flow"]["linked"].pop(key, None)
         if done:
-            out.append(ToolCallRow(agent=AGENT, call_uid=done[0], session=self.key, tool_name=done[1],
+            out.append(ToolCallRow(agent=self.agent, call_uid=done[0], session=self.key, tool_name=done[1],
                                    byte_offset=done[3], turn_key=done[2], meta={"nested_in": None}))
 
     def _flow_call(self, out, cid, name, turn, offset) -> None:
@@ -1727,7 +1729,7 @@ class ClaudeParser:
         background = _bg(inp.get("run_in_background"))
         early = self.s["early_results"].pop(cid, None)
         out.append(ToolCallRow(
-            agent=AGENT, call_uid=cid, session=self.key, tool_name=name, byte_offset=pos.byte_offset,
+            agent=self.agent, call_uid=cid, session=self.key, tool_name=name, byte_offset=pos.byte_offset,
             turn_key=turn, response_id=mid, tool_family=family,
             mcp_server=server if family == "mcp" else None, mcp_tool=tool if family == "mcp" else None,
             started_at=ts, input_bytes=json_size(block.get("input")), background=background,
@@ -1741,14 +1743,14 @@ class ClaudeParser:
             self.s["open_calls"][cid] = [name, ts.isoformat(), turn, pos.byte_offset]
         else:
             self.s["closed_calls"][cid] = [name, ts.isoformat(), turn, pos.byte_offset]
-        out.append(ToolIoRow(agent=AGENT, io_uid=cid, session=self.key, ts=ts, byte_offset=pos.byte_offset,
+        out.append(ToolIoRow(agent=self.agent, io_uid=cid, session=self.key, ts=ts, byte_offset=pos.byte_offset,
                              kind="call", tool_name=name, call_uid=cid, turn_key=turn,
                              input_text=json.dumps(_scrub(block["input"]), ensure_ascii=False)
                              if "input" in block else None))
         touch = _file_touch(name, inp)
         if touch:
             path, op, added, removed = touch
-            out.append(FileTouchRow(agent=AGENT, touch_uid=f"{cid}:0", session=self.key, ts=ts,
+            out.append(FileTouchRow(agent=self.agent, touch_uid=f"{cid}:0", session=self.key, ts=ts,
                                     byte_offset=pos.byte_offset, path=path, op=op, tool=name, call_uid=cid,
                                     turn_key=turn, lines_added=added, lines_removed=removed))
         # artifacts from file tools (v1 parity plus tool inputs)
@@ -1756,7 +1758,7 @@ class ClaudeParser:
         if action:
             path = inp.get("file_path") or inp.get("notebook_path") or inp.get("path")
             if isinstance(path, str) and path.startswith("/"):
-                out.append(ArtifactRow(agent=AGENT, event_uid=cid, session=self.key, ts=ts,
+                out.append(ArtifactRow(agent=self.agent, event_uid=cid, session=self.key, ts=ts,
                                        kind=artifact_kind(path), action=action, path=path,
                                        evidence_type="tool_input", byte_offset=pos.byte_offset,
                                        turn_key=turn, call_uid=cid,
@@ -1765,7 +1767,7 @@ class ClaudeParser:
             self.s["spawns"][cid] = ["agent", ts.isoformat()]
             desc = as_str(inp.get("description"))
             out.append(SubagentSpawnRow(
-                agent=AGENT, spawn_uid=cid, session=self.key, byte_offset=pos.byte_offset,
+                agent=self.agent, spawn_uid=cid, session=self.key, byte_offset=pos.byte_offset,
                 turn_key=turn, child_session_uid=self.sid, spawned_at=ts,
                 requested_type=as_str(inp.get("subagent_type")) or "general-purpose",
                 requested_type_source="explicit" if as_str(inp.get("subagent_type")) else "default",
@@ -1781,7 +1783,7 @@ class ClaudeParser:
             self.s["spawns"][cid] = ["workflow", ts.isoformat()]
             desc = as_str(inp.get("description"))
             out.append(SubagentSpawnRow(
-                agent=AGENT, spawn_uid=cid, session=self.key, byte_offset=pos.byte_offset,
+                agent=self.agent, spawn_uid=cid, session=self.key, byte_offset=pos.byte_offset,
                 turn_key=turn, child_session_uid=self.sid, spawned_at=ts, requested_type="workflow",
                 description=desc[:200] if desc else None))
         elif name in ("SubagentHandback", "StructuredOutput"):
@@ -1824,8 +1826,8 @@ class ClaudeParser:
             out.append(ParseIssueRow(byte_offset=pos.byte_offset, kind="missing_field",
                                      line_number=pos.line_number, detail="journal agentId"))
             return
-        row = SubagentSpawnRow(agent=AGENT, spawn_uid=f"wf:{self.wf_id}:{agent_id}",
-                               session=SessionKey(AGENT, self.sid, ""), byte_offset=pos.byte_offset,
+        row = SubagentSpawnRow(agent=self.agent, spawn_uid=f"wf:{self.wf_id}:{agent_id}",
+                               session=SessionKey(self.agent, self.sid, ""), byte_offset=pos.byte_offset,
                                child_session_uid=self.sid, child_agent_id=agent_id,
                                workflow_id=self.wf_id, requested_type="workflow_agent")
         if rtype == "started":

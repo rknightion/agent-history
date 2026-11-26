@@ -16,7 +16,11 @@ from typing import Any, Callable, Iterable
 
 from agent_history.loop_launch import recognize_inline
 
+from agent_history.model import claude_family
+
 from .context_windows import PI_CONTEXT_WINDOWS, claude_context_window
+
+CLAUDE_NAMESPACES = ("claude-", "opencode-")
 
 
 def pi_format():
@@ -485,14 +489,17 @@ class LoopMap:
 
 def efficiency_session_keys(relative: str, file_state: dict[str, Any]) -> tuple[str | None, str | None]:
     """Catalogue natural key of a transcript file, and of its parent thread when it is a worker."""
-    if relative.split("/", 1)[0].startswith("claude-"):
+    namespace = relative.split("/", 1)[0]
+    if namespace.startswith(CLAUDE_NAMESPACES):
+        # The catalogue keys rows by their real agent: opencode-* namespaces are 'opencode', not 'claude'.
+        agent = namespace.split("-", 1)[0]
         name = relative.rsplit("/", 1)[-1]
         stem = name[:-6] if name.endswith(".jsonl") else name
         if "/subagents/" in relative:
             session = relative.rsplit("/subagents/", 1)[0].rsplit("/", 1)[-1]
             agent_id = stem[6:] if stem.startswith("agent-") else stem
-            return loop_session_key("claude", session, agent_id), loop_session_key("claude", session, "")
-        return loop_session_key("claude", stem, ""), None
+            return loop_session_key(agent, session, agent_id), loop_session_key(agent, session, "")
+        return loop_session_key(agent, stem, ""), None
     if relative.startswith("pi-"):
         info = pi_format().lineage(relative)
         thread = file_state.get("tid")
@@ -1123,7 +1130,7 @@ EFFICIENCY_FILE_UPGRADE: dict[str, Any] = {
 
 def efficiency_file_state(relative: str, skip: float) -> dict[str, Any]:
     namespace = relative.split("/", 1)[0]
-    worker = namespace.startswith("claude-") and "/subagents/" in relative
+    worker = namespace.startswith(CLAUDE_NAMESPACES) and "/subagents/" in relative
     if namespace.startswith("pi-"):
         worker = bool(pi_format().lineage(relative).get("depth", 0))
     return {
@@ -1348,7 +1355,7 @@ class EfficiencyParser:
         if self.agent == "pi":
             model = self.s["model"]
             return PI_CONTEXT_WINDOWS.get(model) if isinstance(model, str) else None
-        if self.agent == "claude":
+        if claude_family(self.agent):
             return claude_context_window(self.s["model"])
         return None
 
@@ -2346,7 +2353,7 @@ def efficiency_recover_protocol(path: Path, agent: str, limit: int) -> str | Non
             if agent == "codex":
                 if b'"user_message"' not in raw[:160] and b'"role":"user"' not in raw[:200]:
                     continue
-            elif agent == "claude" and b'"type":"user"' not in raw:
+            elif claude_family(agent) and b'"type":"user"' not in raw:
                 continue
             try:
                 record = json.loads(raw)
@@ -2650,7 +2657,7 @@ def efficiency_emit(metrics: Any, state: dict[str, Any], now: float, run: Effici
     def root_key(relative: str, file_state: dict[str, Any]) -> str | None:
         if relative.startswith("pi-"):
             return pi_format().lineage(relative).get("root")
-        if relative.split("/", 1)[0].startswith("claude-"):
+        if relative.split("/", 1)[0].startswith(CLAUDE_NAMESPACES):
             if "/subagents/" in relative:
                 return relative.rsplit("/subagents/", 1)[0] + ".jsonl"
             return relative
@@ -2780,7 +2787,7 @@ def efficiency_emit_stalls(
         if file_state.get("role") != "worker":
             continue
         namespace = relative.split("/", 1)[0]
-        if namespace.startswith("claude-"):
+        if namespace.startswith(CLAUDE_NAMESPACES):
             parent = relative.rsplit("/subagents/", 1)[0] + ".jsonl" if "/subagents/" in relative else None
         elif namespace.startswith("pi-"):
             # A pi lane records no parent id; its path under the root's run directory names the root.
