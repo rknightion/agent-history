@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.13.0](https://github.com/rknightion/agent-history/compare/v0.12.1...v0.13.0) (2026-11-26)
+
+
+### Features
+
+* **load:** accept opencode-* namespaces with the Claude parser ([#147](https://github.com/rknightion/agent-history/issues/147)) ([5f39709](https://github.com/rknightion/agent-history/commit/5f39709039e62701325d31b6e6983af0a34ceea0))
+
+
+### Bug Fixes
+
+* **parse:** stop tokenising shell command text past 256 KiB ([#154](https://github.com/rknightion/agent-history/issues/154)) ([1f62b7a](https://github.com/rknightion/agent-history/commit/1f62b7a275db3c369d247568c51b679f189c83d8))
+
 ## [0.12.1](https://github.com/rknightion/agent-history/compare/v0.12.0...v0.12.1) (2026-11-26)
 
 
