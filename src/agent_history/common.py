@@ -412,7 +412,15 @@ SSH_ARG_OPTS = set("bcDEeFIiJLlmOopQRSWw")
 REMOTE_PATH = re.compile(r"^(?:[^@/\s]+@)?(\[[^\]]+\]|[A-Za-z0-9][A-Za-z0-9._-]*):")
 
 
+# shlex tokenising is superlinear in command length (about 0.7 s at 256 KiB, 17 s at 1 MiB), and a pass
+# runs it on every shell command it reads, so one multi-megabyte command stalls the whole indexer.
+# Longer command text is text this reader cannot follow: callers get None and derive nothing from it.
+MAX_SHELL_TEXT = 256 * 1024
+
+
 def _tokens(command: str) -> list[str] | None:
+    if len(command) > MAX_SHELL_TEXT:
+        return None
     lexer = shlex.shlex(command.replace("\n", "\n;"), posix=True, punctuation_chars=True)
     lexer.whitespace_split = True
     lexer.commenters = "#"
@@ -645,6 +653,8 @@ def _join_continuations(command: str) -> str:
 
 def _shell_tokens(command: str) -> list[str] | None:
     """Shell words with control operators as their own tokens; redirections stay words."""
+    if len(command) > MAX_SHELL_TEXT:
+        return None
     stripped = _strip_heredocs(_join_continuations(command))
     tokens = _tokens(stripped) if stripped is not None else None
     if tokens is None:

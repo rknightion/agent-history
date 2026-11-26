@@ -278,6 +278,13 @@ def test_git_ops_from_command(command, ops):
     assert git_ops_from_command(command) == ops
 
 
+def test_git_ops_ignore_command_text_too_long_to_tokenise():
+    # One multi-megabyte inline payload once held an indexer pass for most of an hour: tokenising is
+    # superlinear, so text past the bound (256 KiB) is text this reader cannot follow.
+    assert git_ops_from_command("git commit -m x && echo '" + "a" * (300 * 1024) + "'") == []
+    assert git_ops_from_command("git commit -m x && echo '" + "a" * (64 * 1024) + "'") == ["commit"]
+
+
 def test_git_event_extras_skip_what_output_already_showed():
     # one output-matched commit covers one command commit; the second is command-only
     assert git_event_extras(["commit", "commit", "push"], 1, 0) == [("commit", 1), ("push", 0)]
