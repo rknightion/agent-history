@@ -26,6 +26,13 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any, ClassVar, Iterable, Protocol
 
+# Agents whose transcripts use the Claude Code line shape. opencode-* namespaces reuse the Claude parser.
+CLAUDE_FAMILY = ("claude", "opencode")
+
+
+def claude_family(agent: str) -> bool:
+    return agent in CLAUDE_FAMILY
+
 # Merge policies for ON CONFLICT DO UPDATE, per non-key column.
 KEEP = "keep"        # COALESCE(existing, excluded): first non-null observation wins
 UPDATE = "update"    # COALESCE(excluded, existing): latest non-null observation wins

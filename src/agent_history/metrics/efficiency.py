@@ -14,6 +14,7 @@ from agent_history import telemetry
 from agent_history.config import Config
 from agent_history.efficiency import parser as rules
 from agent_history.metrics import Family, Sample
+from agent_history.model import claude_family
 from agent_history.metrics.archive import scan_jsonl
 
 
@@ -104,7 +105,7 @@ class EfficiencyCollector:
             for rel_path, stat in scan_jsonl(str(home), prune=frozenset({"subagent-artifacts"}), budget=budget):
                 parts = tuple(rel_path.split("/"))
                 agent = namespace.split("-", 1)[0]
-                if agent == "claude" and not self._claude_transcript(parts):
+                if claude_family(agent) and not self._claude_transcript(parts):
                     continue
                 # archived_sessions holds moved copies of rollouts already counted from sessions/.
                 if agent == "codex" and parts[0] != "sessions":

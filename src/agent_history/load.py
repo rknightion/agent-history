@@ -42,8 +42,11 @@ SQL_DIR = PACKAGE_DIR / "sql"
 # --- inventory ---------------------------------------------------------------------------------
 
 
+NAMESPACE_PREFIXES = ("claude-", "codex-", "pi-", "opencode-")
+
+
 def namespace_details(namespace: str) -> tuple[str, str, str | None]:
-    agent = "claude" if namespace.startswith("claude-") else ("pi" if namespace.startswith("pi-") else "codex")
+    agent = next((a for a in ("claude", "opencode", "pi") if namespace.startswith(a + "-")), "codex")
     rest = namespace.removeprefix(agent + "-")
     if rest.startswith("standalone-"):
         return agent, "standalone", rest.removeprefix("standalone-")
@@ -55,7 +58,7 @@ def file_role(agent: str, parts: tuple[str, ...]) -> str | None:
     if agent == "pi" and len(parts) == 2 and parts[0] == "progress" and parts[1].endswith(".json"):
         from .parse_pi import PROGRESS_SESSION
         return "pi_progress" if PROGRESS_SESSION.fullmatch(parts[1][:-5]) else None
-    if (agent == "claude" and len(parts) >= 4 and parts[0] == "projects" and "subagents" in parts
+    if (model.claude_family(agent) and len(parts) >= 4 and parts[0] == "projects" and "subagents" in parts
             and parts[-1].startswith("agent-") and parts[-1].endswith(".meta.json") and "_history" not in parts):
         return "claude_subagent_meta"
     if not parts or not parts[-1].endswith(".jsonl") or "_history" in parts:
@@ -133,7 +136,7 @@ def list_namespaces(*roots: Path | None) -> list[str]:
         if root is None or not root.is_dir():
             continue
         for child in root.iterdir():
-            if child.is_dir() and not child.is_symlink() and child.name.startswith(("claude-", "codex-", "pi-")):
+            if child.is_dir() and not child.is_symlink() and child.name.startswith(NAMESPACE_PREFIXES):
                 names.add(child.name)
     return sorted(names)
 
@@ -149,7 +152,7 @@ def inventory(hot: Path | None, cold: Path | None, namespaces: Iterable[str] | N
             try:
                 with os.scandir(root) as children:
                     mapped = {child.name: Path(child.path) for child in children
-                              if child.name.startswith(("claude-", "codex-", "pi-"))
+                              if child.name.startswith(NAMESPACE_PREFIXES)
                               and (selected is None or child.name in selected)
                               and not child.is_symlink() and child.is_dir()}
             except FileNotFoundError:
@@ -207,7 +210,7 @@ def inventory_map(sources: dict[str, Path], *, strict: bool = False) -> dict[str
         if not base.is_dir():
             continue
         agent, profile, machine = namespace_details(namespace)
-        tops = {"claude": ("projects",), "codex": ("sessions", "archived_sessions"),
+        tops = {"claude": ("projects",), "opencode": ("projects",), "codex": ("sessions", "archived_sessions"),
                 "pi": ("sessions", "progress")}[agent]
         for top in tops:
             start = base / top
@@ -590,7 +593,7 @@ class Writer:
 
 
 def parser_for(agent: str, role: str | None = None) -> tuple[type, str]:
-    if agent == "claude":
+    if model.claude_family(agent):
         from .parse_claude import ClaudeParser
         return ClaudeParser, model.PARSER_VERSION_CLAUDE
     if agent == "pi":

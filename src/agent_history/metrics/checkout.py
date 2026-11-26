@@ -19,6 +19,7 @@ from agent_history.collect_git import GIT_ENV, repo_admitted, repo_slug
 from agent_history.efficiency import parser
 from agent_history.loop_launch import recognize_inline
 from agent_history.metrics import Family, Sample
+from agent_history.model import claude_family
 
 WARNING = "unconfigured_allowlisted_checkout"
 MAX_BYTES = 4 * 1024 * 1024
@@ -81,7 +82,7 @@ def _record(entry, agent, record):
         entry["child"] = isinstance(source, dict) and bool(source.get("subagent"))
     elif agent == "codex" and kind == "turn_context":
         entry["cwd"] = payload.get("cwd", entry.get("cwd"))
-    elif agent == "claude":
+    elif claude_family(agent):
         entry["cwd"] = record.get("cwd", entry.get("cwd"))
         entry["child"] = bool(record.get("agentId")) or entry.get("child", False)
     text = None
@@ -95,7 +96,7 @@ def _record(entry, agent, record):
     elif agent == "codex" and kind == "response_item" and payload.get("role") == "user":
         if parser.efficiency_codex_human_item(payload.get("content")):
             text = parser.efficiency_codex_human_text(payload.get("content"))
-    elif agent == "claude" and kind == "user":
+    elif claude_family(agent) and kind == "user":
         content = message.get("content")
         results = isinstance(content, list) and any(
             isinstance(block, dict) and block.get("type") == "tool_result" for block in content

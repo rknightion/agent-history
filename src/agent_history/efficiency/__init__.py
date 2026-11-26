@@ -10,6 +10,8 @@ import json
 import re
 from typing import Any
 
+from agent_history.model import claude_family
+
 _WAIT = re.compile(
     r'write_stdin\(\{[^}]*chars:\s*""|"chars":\s*""|tools\.wait\(|\bsleep\s+\d|tools\.sleep|setTimeout|wait_agent'
     r"|gh run watch|--watch\b|\buntil\b[^\n]{0,200}\bdo\b|while [^\n]{0,200}sleep|timeout \d+ .*(tail -f|wait)",
@@ -125,7 +127,7 @@ def classify_tool_result(agent: str, name: str, arguments: Any, result: Any) -> 
                 )
             return kind
         return "work"
-    if agent == "claude":
+    if claude_family(agent):
         kind = _CLAUDE_TOOL.get(name)
         if kind == "wait":
             if name == "TaskOutput":
