@@ -588,6 +588,8 @@ def test_migration_grants_an_existing_role_and_survives_reapplication(conn, role
     conn.execute("DROP FUNCTION ah.live_loop_tasks(text)")
     conn.execute("DROP FUNCTION ah.lane_brief_task(text)")
     conn.execute("DELETE FROM ah.meta WHERE key = %s", ("migration:" + MIGRATION,))
+    # 057 redefines the function after 043; an upgrade replays it right behind 043.
+    conn.execute("DELETE FROM ah.meta WHERE key = 'migration:057_opencode_loop_tracking.sql'")
     conn.commit()
     with psycopg.connect(role_dsn) as narrow, pytest.raises(errors.UndefinedFunction):
         narrow.execute("SELECT ah.live_loop_tasks(%s)", (REPO,))
@@ -677,3 +679,18 @@ def test_scope_follows_the_login_role_not_set_role(conn, role_dsn, admin_dsn):
             member.rollback()
     with psycopg.connect(role_dsn) as narrow:
         assert narrow.execute("SELECT ah.live_loop_tasks(%s)", (REPO,)).fetchone()[0] == {"loops": []}
+
+
+def test_opencode_lane_stays_active_until_its_completion_is_recorded(conn, tmp_path):
+    loop = claude_loop(tmp_path, 7, datetime.now(timezone.utc) - timedelta(minutes=30))
+    loop.dispatch("toolu_w1", header("w1", "ABC-0123", "Fix the widget"))
+    loop.save()
+    refresh(conn, {"opencode-toy": tmp_path})
+    assert conn.execute("SELECT DISTINCT agent FROM ah.message").fetchall() == [("opencode",)]
+    identify(conn, 7, REPO)
+    assert simple(live(conn)) == [(7, "running", 1, [{"id": "ABC-0123", "title": "Fix the widget"}])]
+    loop.notify("toolu_w1")
+    loop.save()
+    refresh(conn, {"opencode-toy": tmp_path})
+    identify(conn, 7, REPO)
+    assert simple(live(conn)) == [(7, "running", 0, [])]

@@ -29,6 +29,7 @@ from psycopg.types.json import Jsonb
 
 from . import loop_identity_run, loop_v3_state
 from .loop_launch import REPORT_HEADER, identity_fields, parse_launch, report_lane_counts
+from .model import CLAUDE_FAMILY
 
 ACTIVATED_AT = "1970-01-01T00:00:00Z"  # launches before this instant are ignored
 BARE_LAUNCH = re.compile(r"^`?\s*(\S*launch-[^\s`/]*\.(?:txt|md))\s*`?$")
@@ -1973,8 +1974,8 @@ def lane_returns(
 ) -> list[dict[str, Any]]:
     """Every lane-return of one lane session, oldest first.
 
-    Sources: the session's own final reports, then (Claude) the lane session's last assistant text,
-    which is where a Claude subagent writes its final message, then (Claude) subagent hand-backs
+    Sources: the session's own final reports, then (Claude or OpenCode) the lane session's last assistant text,
+    which is where a Claude subagent writes its final message, then (Claude or OpenCode) subagent hand-backs
     addressed from its agent id and relayed to a parent as an agent message or queued prompt, which
     is the only place a lane resumed after a one-shot hand-back returns again. A copy equal to a
     return already held is the same return, not another. A final report or final message without a
@@ -2002,7 +2003,7 @@ def lane_returns(
         (session_id,),
     ):
         add("report", ts, uid, text, 0, True, plain=True)
-    if agent == "claude":
+    if agent in CLAUDE_FAMILY:
         final = conn.execute(
             "SELECT event_uid, ts, text FROM ah.message WHERE session_id = %s AND message_class = 'assistant_text' "
             "ORDER BY ts DESC, byte_offset DESC, id DESC LIMIT 1",
@@ -2010,13 +2011,13 @@ def lane_returns(
         ).fetchone()
         if final:
             add("final_message", final[1], final[0], final[2], 2, False, plain=True)
-    if agent == "claude" and agent_id and parents:
+    if agent in CLAUDE_FAMILY and agent_id and parents:
         header = _hand_back_header(agent_id)
         for uid, ts, text in conn.execute(
-            "SELECT event_uid, ts, text FROM ah.message WHERE session_id = ANY(%s) "
+            "SELECT event_uid, ts, text FROM ah.message WHERE session_id = ANY(%s) AND agent = %s "
             "AND message_class IN ('agent_message', 'queued_prompt') AND position(%s in text) > 0 "
             "AND position('```lane-return' in text) > 0 ORDER BY ts, byte_offset, id",
-            (list(parents), f'<agent-message from="{agent_id}">'),
+            (list(parents), agent, f'<agent-message from="{agent_id}">'),
         ):
             framed = header.match(text)
             if framed:
