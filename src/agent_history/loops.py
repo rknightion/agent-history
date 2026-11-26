@@ -1730,11 +1730,14 @@ EXECUTOR_CANDIDATES_SQL = """
     SELECT l.id, l.goal_path, l.launch_ts, x.id, x.cwd, i.input_text
     FROM ah.loop_run l
     JOIN ah.session p ON p.id = l.root_session_id
-         AND NOT EXISTS (SELECT 1 FROM ah.session k WHERE k.root_session_id = p.id AND k.id <> p.id AND k.is_subagent)
     JOIN ah.session x ON x.agent = 'pi' AND NOT COALESCE(x.is_subagent, false)
          AND (x.root_session_id IS NULL OR x.root_session_id = x.id) AND x.id <> p.id
          AND x.first_event_at >= l.launch_ts
          AND EXISTS (SELECT 1 FROM ah.session k WHERE k.root_session_id = x.id AND k.id <> x.id AND k.is_subagent)
+         AND NOT EXISTS (
+             SELECT 1 FROM ah.session k
+             WHERE k.root_session_id = p.id AND k.id <> p.id AND k.is_subagent
+               AND k.first_event_at >= l.launch_ts AND k.first_event_at <= x.last_event_at)
     JOIN ah.tool_io i ON i.session_id = x.id AND i.agent = 'pi' AND lower(i.tool_name) = 'read'
          AND position(%s in i.input_text) > 0 AND NOT COALESCE(i.input_truncated, false)
     JOIN ah.tool_call t ON t.agent = i.agent AND t.call_uid = i.call_uid AND t.session_id = i.session_id
@@ -1764,8 +1767,10 @@ def _bind_run_executors(conn: psycopg.Connection) -> None:
     """Hand a run planned in one harness to the pi root that ran it.
 
     A run-folder run starts at the AUTHORITY.md write, so its root is the session that wrote it. When
-    that session dispatched no lanes of its own and a pi top-level session that started after the
-    write read the same file and dispatched lanes, the pi session is the one that ran it: the run's root becomes
+    that session dispatched no subagents while the executor was running (none with a first event from the
+    run's launch to the executor's last event; subagents it dispatched before the launch or after the
+    executor's last event, for example scouts for its next run, do not count) and a pi top-level session that
+    started after the write read the same file and dispatched lanes, the pi session is the one that ran it: the run's root becomes
     that session, so its lanes (the sessions under it) and its spend belong to the run. The earliest
     such session wins. The planning session stays on the run with `loop_link_method = 'plan'`; the
     run keeps its `launch_uid`, which still names the AUTHORITY.md write.
