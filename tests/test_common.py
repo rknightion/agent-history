@@ -285,6 +285,23 @@ def test_git_ops_ignore_command_text_too_long_to_tokenise():
     assert git_ops_from_command("git commit -m x && echo '" + "a" * (64 * 1024) + "'") == ["commit"]
 
 
+def test_cmd_verb_tokenises_only_a_bounded_prefix(monkeypatch):
+    import shlex
+
+    from agent_history import common
+
+    seen: list[int] = []
+    real = shlex.shlex
+
+    def recording(text, *args, **kwargs):
+        seen.append(len(text))
+        return real(text, *args, **kwargs)
+
+    monkeypatch.setattr(common.shlex, "shlex", recording)
+    assert common.cmd_verb("pytest -q '" + "a" * (300 * 1024) + "'") == "pytest"
+    assert seen and max(seen) <= 256 * 1024 + 1024
+
+
 def test_git_event_extras_skip_what_output_already_showed():
     # one output-matched commit covers one command commit; the second is command-only
     assert git_event_extras(["commit", "commit", "push"], 1, 0) == [("commit", 1), ("push", 0)]

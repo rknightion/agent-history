@@ -28,6 +28,7 @@ import psycopg
 from psycopg.types.json import Jsonb
 
 from . import loop_identity_run, loop_v3_state
+from .common import MAX_SHELL_TEXT
 from .loop_launch import REPORT_HEADER, identity_fields, parse_launch, report_lane_counts
 
 ACTIVATED_AT = "1970-01-01T00:00:00Z"  # launches before this instant are ignored
@@ -257,7 +258,8 @@ def _resume_targets(conn: psycopg.Connection, root_id: int, cwd: str | None) -> 
         try:
             args = json.loads(raw[0] or "")
             command = args.get("command") if isinstance(args, dict) else None
-            if not isinstance(command, str) or any(c in command for c in ("$", "`", "|", "&", "(", ")", "<", ">")):
+            if (not isinstance(command, str) or "loop-state" not in command or len(command) > MAX_SHELL_TEXT
+                    or any(c in command for c in ("$", "`", "|", "&", "(", ")", "<", ">"))):
                 continue
             lexer = shlex.shlex(command.replace("\n", "\n;"), posix=True, punctuation_chars=";")
             lexer.whitespace += "\n"

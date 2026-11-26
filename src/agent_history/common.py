@@ -347,6 +347,12 @@ SKIP_VERBS = {"cd", "pushd", "popd", "export", "set", "source", ".", "unset", "l
 OPERATORS = {";", "&&", "||", "|", "&", "|&", ";;", "(", ")", "{", "}"}
 
 
+# shlex tokenising is superlinear in command length (about 0.7 s at 256 KiB, 17 s at 1 MiB), and a pass
+# runs it on every shell command it reads, so one multi-megabyte command stalls the whole indexer.
+# Longer command text is text this reader cannot follow: callers get None and derive nothing from it.
+MAX_SHELL_TEXT = 256 * 1024
+
+
 def cmd_verb(command: Any) -> str | None:
     """First executable word of a shell command, basename only; never arguments or values.
 
@@ -361,13 +367,18 @@ def cmd_verb(command: Any) -> str | None:
         command = shlex.join(words)
     if not isinstance(command, str) or not command.strip():
         return None
-    lexer = shlex.shlex(command.replace("\n", "\n;"), posix=True, punctuation_chars=True)
+    # Only the first executable word is wanted, and tokenising is superlinear (see MAX_SHELL_TEXT).
+    cut = len(command) > MAX_SHELL_TEXT
+    lexer = shlex.shlex(command[:MAX_SHELL_TEXT].replace("\n", "\n;"), posix=True, punctuation_chars=True)
     lexer.whitespace_split = True
     lexer.commenters = "#"
+    tokens: list[str] = []
     try:
-        tokens = list(lexer)
+        for token in lexer:
+            tokens.append(token)
     except ValueError:
-        return None
+        if not cut:
+            return None  # a quote left open where the cut fell; the words before it still stand
     segment: list[str] = []
     for token in tokens + [";"]:
         if token in OPERATORS or set(token) <= set(";&|()"):
@@ -410,12 +421,6 @@ def _segment_verb(words: list[str]) -> str | None:
 
 SSH_ARG_OPTS = set("bcDEeFIiJLlmOopQRSWw")
 REMOTE_PATH = re.compile(r"^(?:[^@/\s]+@)?(\[[^\]]+\]|[A-Za-z0-9][A-Za-z0-9._-]*):")
-
-
-# shlex tokenising is superlinear in command length (about 0.7 s at 256 KiB, 17 s at 1 MiB), and a pass
-# runs it on every shell command it reads, so one multi-megabyte command stalls the whole indexer.
-# Longer command text is text this reader cannot follow: callers get None and derive nothing from it.
-MAX_SHELL_TEXT = 256 * 1024
 
 
 def _tokens(command: str) -> list[str] | None:
