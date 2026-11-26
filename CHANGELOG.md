@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.13.1](https://github.com/rknightion/agent-history/compare/v0.13.0...v0.13.1) (2026-11-26)
+
+
+### Bug Fixes
+
+* **parse:** bound the other two shell tokenisers too ([#155](https://github.com/rknightion/agent-history/issues/155)) ([1b27ea2](https://github.com/rknightion/agent-history/commit/1b27ea2437389117aa7b2bd78518caef61226f0e))
+
 ## [0.13.0](https://github.com/rknightion/agent-history/compare/v0.12.1...v0.13.0) (2026-11-26)
 
 
