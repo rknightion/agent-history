@@ -509,6 +509,8 @@ def test_migration_grants_an_existing_role_and_survives_reapplication(conn, role
     # As on a catalogue whose narrow role was provisioned before the indexer applied 044.
     conn.execute("DROP FUNCTION ah.live_loop_detail(text)")
     conn.execute("DELETE FROM ah.meta WHERE key = 'migration:044_live_loop_detail.sql'")
+    # 057 redefines the function after 044; an upgrade replays it right behind 044.
+    conn.execute("DELETE FROM ah.meta WHERE key = 'migration:057_opencode_loop_tracking.sql'")
     conn.commit()
     with psycopg.connect(role_dsn) as narrow, pytest.raises(errors.UndefinedFunction):
         narrow.execute("SELECT ah.live_loop_detail(%s)", (REPO,))
@@ -557,3 +559,17 @@ def test_collector_upsert_keeps_null_and_empty_task_ids_apart(conn, tmp_path):
         ("closeout", None),
     ]
     conn.commit()
+
+
+def test_opencode_dispatch_links_its_call_and_returns(conn, tmp_path):
+    loop = lanes_loop(tmp_path, 7, datetime.now(timezone.utc) - timedelta(minutes=30))
+    loop.dispatch("toolu_w1", header("w1", "ABC-0123", "Fix the widget"))
+    loop.dispatch("toolu_w2", header("w2", "ABC-0124", "Still running"))
+    loop.hand_back("toolu_w1", header("w1", "ABC-0123", "Fix the widget"), "w1", "complete", "ABC-0123")
+    loop.save()
+    refresh(conn, {"opencode-toy": tmp_path})
+    identify(conn, 7, REPO)
+    document = conn.execute("SELECT ah.live_loop_detail(%s)", (REPO,)).fetchone()[0]
+    conn.commit()
+    (found,) = document["loops"]
+    assert found["lanes"] == {"total": 2, "running": 1, "returned": 1, "blocked": 0}

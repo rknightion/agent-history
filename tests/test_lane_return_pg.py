@@ -162,3 +162,61 @@ def test_existing_returned_lanes_are_re_read_once(clean, tmp_path):
     ).fetchone() == ("complete", 2)
     marker = clean.execute("SELECT value FROM ah.meta WHERE key=%s", (loops.LANE_RETURNS_MARKER,)).fetchone()
     assert marker == ("complete",)
+
+
+def test_opencode_lane_returns_come_from_its_final_message(clean, tmp_path):
+    loop_id, root_id = launched(clean, tmp_path)
+    worker = lane(clean, root_id, "o1", AT + timedelta(minutes=5), agent="opencode")
+    say(clean, worker, "o1-a", "Working on it.", AT + timedelta(minutes=6), agent="opencode")
+    say(clean, worker, "o1-b", "Status: blocked\n\nOutcome: waits.", AT + timedelta(minutes=9), agent="opencode")
+    fenced = lane(clean, root_id, "o2", AT + timedelta(minutes=5), agent="opencode")
+    block = 'Done.\n```lane-return\n{"v": 3, "lane": "L2", "status": "complete"}\n```'
+    say(clean, fenced, "o2-a", block, AT + timedelta(minutes=8), agent="opencode")
+    retag(clean, root_id)
+    rows = clean.execute(
+        "SELECT session_id, return_status, returns->-1->>'source' FROM ah.lane WHERE loop_run_id=%s ORDER BY session_id",
+        (loop_id,),
+    ).fetchall()
+    assert rows == [(worker, "blocked", "final_message"), (fenced, "complete", "final_message")]
+
+
+def test_hand_back_pairs_an_opencode_lane_only_with_an_opencode_parent(clean, tmp_path):
+    loop_id, root_id = launched(clean, tmp_path)
+    block = 'Done.\n```lane-return\n{"v": 3, "lane": "L6", "status": "partial"}\n```'
+    relayed = (
+        '<agent-message from="o6">\n[Subagent hand-back] The text below is the final report of a subagent. '
+        "The report follows:\n" + block + "\n</agent-message>"
+    )
+    claude_parent = lane(clean, root_id, "p-claude", AT + timedelta(minutes=2))
+    opencode_parent = lane(clean, root_id, "p-opencode", AT + timedelta(minutes=2), agent="opencode")
+    say(clean, claude_parent, "relay-c", relayed, AT + timedelta(minutes=9), cls="agent_message")
+    # A claude parent never supplies the hand-back of an opencode lane.
+    assert loops.lane_returns(clean, 0, "opencode", "o6", [claude_parent]) == []
+    say(clean, opencode_parent, "relay-o", relayed, AT + timedelta(minutes=10), agent="opencode", cls="agent_message")
+    found = loops.lane_returns(clean, 0, "opencode", "o6", [claude_parent, opencode_parent])
+    assert [(r["source"], r["status"]) for r in found] == [("hand_back", "partial")]
+    assert [r["event_uid"] for r in found] == ["relay-o"]
+    # and a claude lane still takes only a claude parent's relay.
+    found = loops.lane_returns(clean, 0, "claude", "o6", [claude_parent, opencode_parent])
+    assert [r["event_uid"] for r in found] == ["relay-c"]
+
+
+def test_an_upgraded_catalogue_re_reads_existing_opencode_lanes(clean, tmp_path):
+    loop_id, root_id = launched(clean, tmp_path)
+    worker = lane(clean, root_id, "o9", AT + timedelta(minutes=5), agent="opencode")
+    say(clean, worker, "o9-final", "Status: complete\nOutcome: merged.", AT + timedelta(minutes=9), agent="opencode")
+    # Indexed before OpenCode returns were read, with no dirty root to re-tag it.
+    clean.execute("UPDATE ah.session SET loop_run_id=%s, loop_link_method='lineage' WHERE id=%s", (loop_id, worker))
+    clean.execute(
+        "INSERT INTO ah.lane (loop_run_id, session_id, link_method) VALUES (%s, %s, 'lineage')", (loop_id, worker)
+    )
+    # An upgraded catalogue: the earlier status-line backfill finished, and this pass has not run yet.
+    clean.execute("DELETE FROM ah.meta WHERE key=%s", (loops.LANE_RETURNS_MARKER,))
+    clean.execute(
+        "INSERT INTO ah.meta (key, value) VALUES ('loops_lane_returns_status_line_v2', 'complete') "
+        "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value"
+    )
+    clean.commit()
+    loops.refresh_live(clean)
+    clean.commit()
+    assert clean.execute("SELECT return_status FROM ah.lane WHERE session_id=%s", (worker,)).fetchone() == ("complete",)

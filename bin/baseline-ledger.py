@@ -60,6 +60,8 @@ REPLAYED = (
     "055_drop_code_mode_model_calls.sql",
     # The baseline dump keeps the three-agent checks; this widens them on fresh init as well.
     "056_opencode_agent.sql",
+    # Redefines the live loop functions in place; the baseline dump has the older bodies.
+    "057_opencode_loop_tracking.sql",
 )
 
 
