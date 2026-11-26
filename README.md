@@ -382,7 +382,11 @@ read `AGENT_HISTORY_EMBED_ENV`; OpenAI/Cohere gateway routes require `EMBED_BASE
 
 `agent-history loop <id>` prints one run's summary and lanes. The argument may instead be the
 run's absolute closeout path; when several launches share that closeout (a relaunch), they are
-shown together and the output says so. `agent-history loop <id or closeout path> --usage` prints
+shown together and the output says so. `agent-history loop <id or closeout path> --spend-by-role` prints only the closeout's `## Spend by role` table:
+per role (the root first, then each lane role from `ah.lane.role`, `unknown` for none), sessions, model calls, tokens
+(input, output, cache read, cache write) and list-price cost, with a total row. A token figure no call recorded
+prints `-`, never 0; a role with an unpriced call is marked `(partial)` or `unpriced`.
+`agent-history loop <id or closeout path> --usage` prints
 a Markdown block for a root to paste into its closeout Notes: an `as of` UTC timestamp,
 wall time, LLM calls, the list-price cost total, then the numbers a v4 closeout carries (harness
 and version, landing mode, landed and parked tasks, root calls and root calls per landed task,

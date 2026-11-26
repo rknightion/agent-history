@@ -846,6 +846,14 @@ Migration `024_loop_progress.sql` adds nullable columns on the same grant-preser
   ranges under `To <url>`, or with no header, are read as pushes.
   No matching git event leaves the count NULL, rather than claiming none happened.
 
+Lane completion and counts. `ah.v_spawn_outcome.completion_status` and `ah.loop_lanes.spawn_completion` are the
+spawn row's own status; where the spawn recorded none they take the child session's lane-return status
+(`complete` reads as `completed`, any other status as written), and `lane_return_status` stays the raw value.
+A lane resumed after a hand-back has several spawn rows for one child session: `ah.loop_lanes` returns it once,
+with its latest spawn's status, and `ah.v_loop_summary.subagents` counts distinct child sessions (a spawn whose
+child is not linked yet counts as one). `ah.session_rollup.subagents` still counts spawn rows. These are view
+changes: no reparse, no migration.
+
 These project existing catalogue evidence, with the same membership convention as
 `ah.v_loop_summary`: root calls/actions inside the launch window and linked lane sessions whole.
 Running, waiting, paused and stale roots have no terminal cutoff for progress;

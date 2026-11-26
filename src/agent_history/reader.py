@@ -606,6 +606,42 @@ SELECT (SELECT peak_context FROM peak) AS peak_context,
 """
 )
 
+# Model calls and tokens by role, for the closeout's "Spend by role" section: the root, then each lane
+# role (the lane's agent type, else its agent role or requested type; no role is 'unattributed').
+# Priced as USAGE_ROWS_SQL. A token column no call recorded is NULL, never zero.
+SPEND_BY_ROLE_SQL = (
+    "WITH "
+    + USAGE_SCOPE
+    + """, calls AS (
+    SELECT DISTINCT ON (c.id) c.id, m.role, c.model, c.ts, c.input_uncached, c.cache_read, c.cache_write_5m,
+           c.cache_write_1h, c.output
+    FROM members m JOIN ah.llm_call c ON c.session_id = m.session_id
+    WHERE NOT m.windowed OR (c.ts >= m.launch_ts AND c.ts < COALESCE(m.end_ts, 'infinity'))
+    ORDER BY c.id, m.role
+), priced AS (
+    -- Claude Code's '<synthetic>' records are no model call: left out of every figure here.
+    SELECT role, count(*) AS calls, sum(input_uncached) AS input_uncached, sum(output) AS output,
+           sum(cache_read) AS cache_read,
+           sum(CASE WHEN cache_write_5m IS NULL AND cache_write_1h IS NULL THEN NULL
+                    ELSE COALESCE(cache_write_5m, 0) + COALESCE(cache_write_1h, 0) END) AS cache_write,
+           ah.priced_usd(model, ts::date, sum(input_uncached), sum(cache_read), sum(cache_write_5m),
+                         sum(cache_write_1h), sum(output)) AS cost
+    FROM calls WHERE model IS DISTINCT FROM '<synthetic>' GROUP BY role, model, ts::date
+), spend AS (
+    SELECT role, sum(calls) AS calls, sum(input_uncached) AS input_uncached, sum(output) AS output,
+           sum(cache_read) AS cache_read, sum(cache_write) AS cache_write, sum(cost) AS cost,
+           COALESCE(sum(calls) FILTER (WHERE cost IS NULL), 0) AS unpriced
+    FROM priced GROUP BY role
+), people AS (
+    SELECT role, count(DISTINCT session_id) AS sessions FROM members GROUP BY role
+)
+SELECT p.role, p.sessions, COALESCE(s.calls, 0) AS calls, s.input_uncached, s.output, s.cache_read,
+       s.cache_write, s.cost, COALESCE(s.unpriced, 0) AS unpriced
+FROM people p LEFT JOIN spend s USING (role)
+ORDER BY p.role <> 'root', s.cost DESC NULLS LAST, p.role;
+"""
+)
+
 # Lanes by role, and how many of them handed back a complete return.
 USAGE_LANES_SQL = """
 SELECT COALESCE(NULLIF(ln.role, ''), 'unattributed') AS role, count(*) AS lanes,
@@ -950,6 +986,56 @@ def usage_markdown(summary: dict[str, str], rows: list[dict[str, str]], runs: in
     return "\n".join(lines + more) + "\n"
 
 
+def spend_by_role_markdown(rows: list[dict[str, str]]) -> str:
+    """The closeout's "## Spend by role" section: model calls, tokens and list-price cost per role,
+    the root first. A figure the catalogue did not record prints as "-", a role with an unpriced call
+    carries a cost floor marked partial, and a role with no priced call says unpriced."""
+    from decimal import Decimal
+
+    lines = ["## Spend by role", ""]
+    if not rows:
+        return "\n".join(lines + ["No model calls are recorded."]) + "\n"
+    columns = ("input_uncached", "output", "cache_read", "cache_write")
+
+    def number(row: dict[str, str], key: str) -> str:
+        value = _count(row, key)
+        return "-" if value is None else f"{value:,}"
+
+    def money(value: Decimal | None, calls: int, unpriced: int) -> str:
+        if calls and unpriced == calls or value is None:
+            return "unpriced"
+        return f"${value:,.2f}" + (" (partial)" if unpriced else "")
+
+    lines += [
+        "| Role | Sessions | Calls | Input | Output | Cache read | Cache write | Cost |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+    ]
+    totals: dict[str, int | None] = {key: None for key in columns}
+    sessions = calls = unpriced = 0
+    cost: Decimal | None = None
+    for r in rows:
+        role = "unknown" if r["role"] in ("", "unattributed") else r["role"]
+        n_calls, n_unpriced = int(r["calls"]), int(r["unpriced"])
+        value = Decimal(r["cost"]) if r["cost"] not in (None, "") else None
+        sessions, calls, unpriced = sessions + int(r["sessions"]), calls + n_calls, unpriced + n_unpriced
+        if value is not None:
+            cost = (cost or Decimal(0)) + value
+        for key in columns:
+            if (known := _count(r, key)) is not None:
+                totals[key] = (totals[key] or 0) + known
+        figures = " | ".join(number(r, key) for key in columns)
+        lines.append(
+            f"| {_cell(role)} | {int(r['sessions']):,} | {n_calls:,} | {figures} | {money(value, n_calls, n_unpriced)} |"
+        )
+    figures = " | ".join("-" if totals[key] is None else f"{totals[key]:,}" for key in columns)
+    lines.append(f"| Total | {sessions:,} | {calls:,} | {figures} | {money(cost, calls, unpriced)} |")
+    return "\n".join(lines) + "\n"
+
+
+def loop_spend_by_role(ids: list[int]) -> str:
+    return spend_by_role_markdown(query(SPEND_BY_ROLE_SQL.format(ids=loop_id_array(ids)), {}))
+
+
 def loop_usage(ids: list[int]) -> str:
     array = loop_id_array(ids)
     (summary,) = query(USAGE_SUMMARY_SQL.format(ids=array), {})
@@ -1028,6 +1114,11 @@ def build_parser():
     p.add_argument("id", help="numeric loop_run_id, or the run's absolute closeout path")
     p.add_argument(
         "--usage", action="store_true", help="print a Markdown usage and list-price cost block for a closeout"
+    )
+    p.add_argument(
+        "--spend-by-role",
+        action="store_true",
+        help="print the closeout's '## Spend by role' Markdown table: calls, tokens and cost per role",
     )
     p = sub.add_parser("compare", help="loops side by side")
     p.add_argument("ids", type=int, nargs="+")
@@ -1175,7 +1266,7 @@ def execute(args) -> int:
             fmt,
         )
     if args.cmd == "loop":
-        if args.id.isdigit() and not args.usage:
+        if args.id.isdigit() and not (args.usage or args.spend_by_role):
             rc = run(
                 f"SELECT * FROM ah.v_loop_summary WHERE loop_run_id = {int(args.id)};",
                 {},
@@ -1185,6 +1276,9 @@ def execute(args) -> int:
         ids = resolve_loop(args.id)
         if args.usage:
             print(loop_usage(ids), end="")
+            return 0
+        if args.spend_by_role:
+            print(loop_spend_by_role(ids), end="")
             return 0
         if len(ids) > 1:
             print(f"{len(ids)} launches share this closeout; showing them together as one run.")
