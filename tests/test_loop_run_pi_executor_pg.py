@@ -157,6 +157,47 @@ def test_a_planner_that_dispatched_lanes_keeps_its_run(clean, tmp_path):
     assert run_state(clean)[0][1] == planner
 
 
+def planner_with_subagent(tmp_path, at):
+    run_root(tmp_path)
+    stem = "2026-10-04T09-00-00Z_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    (tmp_path / "sessions" / "synthetic" / "run-root.jsonl").rename(
+        tmp_path / "sessions" / "synthetic" / (stem + ".jsonl")
+    )
+    lane_file(tmp_path, stem, "5f000000-0000-4000-8000-0000000000cc", "1a000000-0000-4000-8000-0000000000cc", at)
+
+
+def test_a_planner_that_only_scouted_after_the_executor_finished_hands_over_its_run(clean, tmp_path):
+    # the executor's last event is T0 + 2h10m; the planner dispatches a scout at T0 + 5h
+    planner_with_subagent(tmp_path, T0 + timedelta(hours=5))
+    executor(tmp_path)
+    refresh(clean, tmp_path)
+    ((run_id, pi, _, _),) = run_state(clean)
+    assert pi == session_id(clean, EXECUTOR)
+    scout = session_id(clean, "1a000000-0000-4000-8000-0000000000cc")
+    lanes = sorted(
+        r[0] for r in clean.execute("SELECT id FROM ah.session WHERE is_subagent AND root_session_id = %s", (pi,))
+    )
+    assert len(lanes) == 3
+    # the planner's scout is not the run's lane, however many passes run
+    refresh(clean)
+    clean.execute("INSERT INTO ah.dirty_session VALUES (%s) ON CONFLICT DO NOTHING", (scout,))
+    refresh(clean)
+    assert clean.execute("SELECT loop_run_id FROM ah.session WHERE id = %s", (scout,)).fetchone() == (None,)
+    assert (
+        sorted(r[0] for r in clean.execute("SELECT session_id FROM ah.lane WHERE loop_run_id = %s", (run_id,))) == lanes
+    )
+    assert clean.execute("SELECT lanes_total FROM ah.loops").fetchone() == (3,)
+    members = {r[0] for r in clean.execute("SELECT id FROM ah.session WHERE loop_run_id = %s", (run_id,))}
+    assert scout not in members
+
+
+def test_a_planner_that_dispatched_a_lane_while_the_executor_ran_keeps_its_run(clean, tmp_path):
+    planner_with_subagent(tmp_path, T0 + timedelta(minutes=30))
+    executor(tmp_path)
+    refresh(clean, tmp_path)
+    assert run_state(clean)[0][1] == session_id(clean, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+
+
 def test_a_pi_root_that_writes_the_authority_file_in_codemode_starts_the_run(clean, tmp_path):
     records = [stamp(header(EXECUTOR), T0), stamp(message("ask", "user", "Plan and run."), T0)]
     records += codemode(
