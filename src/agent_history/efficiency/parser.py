@@ -489,14 +489,17 @@ class LoopMap:
 
 def efficiency_session_keys(relative: str, file_state: dict[str, Any]) -> tuple[str | None, str | None]:
     """Catalogue natural key of a transcript file, and of its parent thread when it is a worker."""
-    if relative.split("/", 1)[0].startswith(CLAUDE_NAMESPACES):
+    namespace = relative.split("/", 1)[0]
+    if namespace.startswith(CLAUDE_NAMESPACES):
+        # The catalogue keys rows by their real agent: opencode-* namespaces are 'opencode', not 'claude'.
+        agent = namespace.split("-", 1)[0]
         name = relative.rsplit("/", 1)[-1]
         stem = name[:-6] if name.endswith(".jsonl") else name
         if "/subagents/" in relative:
             session = relative.rsplit("/subagents/", 1)[0].rsplit("/", 1)[-1]
             agent_id = stem[6:] if stem.startswith("agent-") else stem
-            return loop_session_key("claude", session, agent_id), loop_session_key("claude", session, "")
-        return loop_session_key("claude", stem, ""), None
+            return loop_session_key(agent, session, agent_id), loop_session_key(agent, session, "")
+        return loop_session_key(agent, stem, ""), None
     if relative.startswith("pi-"):
         info = pi_format().lineage(relative)
         thread = file_state.get("tid")

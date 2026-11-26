@@ -143,3 +143,19 @@ def test_efficiency_session_keys_treat_both_as_claude_shaped(name):
 
     session, parent = efficiency_session_keys(f"{name}/projects/{PROJECT}/{SID}.jsonl", {})
     assert session is not None and parent is None and SID in session
+
+
+def test_efficiency_session_keys_use_the_namespace_agent():
+    from agent_history.efficiency.parser import build_loop_map, efficiency_session_keys, LoopMap
+
+    base = f"opencode-toy/projects/{PROJECT}/{SID}"
+    assert efficiency_session_keys(f"{base}.jsonl", {}) == (f"opencode\t{SID}\t", None)
+    assert efficiency_session_keys(f"{base}/subagents/agent-a1.jsonl", {}) == (
+        f"opencode\t{SID}\ta1",
+        f"opencode\t{SID}\t",
+    )
+    assert efficiency_session_keys(f"claude-toy/projects/{PROJECT}/{SID}.jsonl", {})[0] == f"claude\t{SID}\t"
+    # An opencode catalogue row resolves a loop label through its transcript key.
+    loops = LoopMap(build_loop_map([("opencode", SID, "", "r", "c", "n", 1, 100.0, 200.0, "closeout")], [], 1000.0))
+    key, parent = efficiency_session_keys(f"{base}.jsonl", {})
+    assert loops.label(key, parent, 150.0) != "none"
