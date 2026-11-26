@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.12.1](https://github.com/rknightion/agent-history/compare/v0.12.0...v0.12.1) (2026-11-26)
+
+
+### Bug Fixes
+
+* **loops:** hand a run to its pi executor when the planner only scouted outside the executor's window ([#148](https://github.com/rknightion/agent-history/issues/148)) ([08325cb](https://github.com/rknightion/agent-history/commit/08325cbaab6ad4f24f1f73170ace0d3ce7ffbd8d))
+
 ## [0.12.0](https://github.com/rknightion/agent-history/compare/v0.11.0...v0.12.0) (2026-11-26)
 
 
