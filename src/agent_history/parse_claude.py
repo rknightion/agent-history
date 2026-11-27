@@ -214,7 +214,7 @@ def _transform_types(value: Any) -> list[str] | None:
 class ClaudeParser:
     def __init__(self, ctx: FileContext, state: dict[str, Any]) -> None:
         self.ctx = ctx
-        # An opencode-* namespace carries Claude-shaped lines; only its agent label differs.
+        # An opencode-* or antigravity-* namespace carries Claude-shaped lines; only its agent label differs.
         self.agent = ctx.agent if ctx.agent in CLAUDE_FAMILY else AGENT
         s = dict(state or {})
         self.s = s

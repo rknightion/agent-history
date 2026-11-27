@@ -121,7 +121,7 @@ RETURNS text LANGUAGE sql IMMUTABLE AS $$
                 WHEN result_json ~ 'Process exited with code -?[0-9]+|"?exit_code"?[[:space:]]*:[[:space:]]*-?[0-9]+'
                      THEN 'event' ELSE 'wait' END
             ELSE 'work' END
-        WHEN agent IN ('claude', 'opencode') THEN CASE
+        WHEN agent IN ('claude', 'opencode', 'antigravity') THEN CASE
             WHEN tool IN ('TaskOutput', 'BashOutput', 'Monitor', 'ScheduleWakeup', 'Sleep') THEN
                 CASE WHEN tool = 'TaskOutput' THEN
                     CASE WHEN COALESCE(result -> 'task' ->> 'status', result ->> 'status') IN ('running', 'pending')
@@ -183,13 +183,13 @@ LANGUAGE sql STABLE AS $$
         FROM ah.message m JOIN sess s ON s.id = m.session_id
         WHERE (s.agent = 'pi' AND m.message_class IN ('human_prompt', 'queued_prompt', 'agent_message'))
            OR (s.agent = 'codex' AND m.message_class IN ('human_prompt', 'queued_prompt'))
-           OR (s.agent IN ('claude', 'opencode') AND m.raw_record_origin = 'user'
+           OR (s.agent IN ('claude', 'opencode', 'antigravity') AND m.raw_record_origin = 'user'
                AND (m.message_class IN ('human_prompt', 'queued_prompt')
                     OR (m.message_class = 'agent_message' AND m.detail ->> 'source' = 'peer')))
         UNION ALL
         SELECT m.session_id, m.source_id, m.byte_offset, 0, 0, 'event', NULL
         FROM ah.message m JOIN sess s ON s.id = m.session_id
-        WHERE s.agent IN ('claude', 'opencode') AND m.message_class = 'agent_message'
+        WHERE s.agent IN ('claude', 'opencode', 'antigravity') AND m.message_class = 'agent_message'
           AND m.detail ->> 'source' = 'task-notification' AND m.raw_record_origin = 'user'
         UNION ALL
         SELECT m.session_id, m.source_id, m.byte_offset, 0, 0, 'agent_msg', NULL

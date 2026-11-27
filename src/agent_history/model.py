@@ -26,8 +26,8 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any, ClassVar, Iterable, Protocol
 
-# Agents whose transcripts use the Claude Code line shape. opencode-* namespaces reuse the Claude parser.
-CLAUDE_FAMILY = ("claude", "opencode")
+# Agents whose transcripts use the Claude Code line shape. opencode-* and antigravity-* namespaces reuse the Claude parser.
+CLAUDE_FAMILY = ("claude", "opencode", "antigravity")
 
 
 def claude_family(agent: str) -> bool:

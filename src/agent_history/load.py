@@ -42,11 +42,11 @@ SQL_DIR = PACKAGE_DIR / "sql"
 # --- inventory ---------------------------------------------------------------------------------
 
 
-NAMESPACE_PREFIXES = ("claude-", "codex-", "pi-", "opencode-")
+NAMESPACE_PREFIXES = ("claude-", "codex-", "pi-", "opencode-", "antigravity-")
 
 
 def namespace_details(namespace: str) -> tuple[str, str, str | None]:
-    agent = next((a for a in ("claude", "opencode", "pi") if namespace.startswith(a + "-")), "codex")
+    agent = next((a for a in ("claude", "opencode", "antigravity", "pi") if namespace.startswith(a + "-")), "codex")
     rest = namespace.removeprefix(agent + "-")
     if rest.startswith("standalone-"):
         return agent, "standalone", rest.removeprefix("standalone-")
@@ -210,7 +210,7 @@ def inventory_map(sources: dict[str, Path], *, strict: bool = False) -> dict[str
         if not base.is_dir():
             continue
         agent, profile, machine = namespace_details(namespace)
-        tops = {"claude": ("projects",), "opencode": ("projects",), "codex": ("sessions", "archived_sessions"),
+        tops = {"claude": ("projects",), "opencode": ("projects",), "antigravity": ("projects",), "codex": ("sessions", "archived_sessions"),
                 "pi": ("sessions", "progress")}[agent]
         for top in tops:
             start = base / top
@@ -1016,13 +1016,13 @@ def _process_subagent_meta_source(conn: psycopg.Connection, writer: Writer, entr
 
 
 LINK_SQL = [
-    # Claude-family subagents (claude, opencode; parent and child share the agent): root = the main session with the same sessionId; parent = the session
+    # Claude-family subagents (claude, opencode, antigravity; parent and child share the agent): root = the main session with the same sessionId; parent = the session
     # that spawned it (nested agents), else the main session. Runs over every unresolved row so a
     # parent that arrives in a later run still links its children.
     """
     UPDATE ah.session c SET root_session_id = p.id, parent_session_id = COALESCE(c.parent_session_id, p.id)
     FROM ah.session p
-    WHERE c.agent IN ('claude', 'opencode') AND c.agent_id <> '' AND c.root_session_id IS NULL
+    WHERE c.agent IN ('claude', 'opencode', 'antigravity') AND c.agent_id <> '' AND c.root_session_id IS NULL
       AND p.agent = c.agent AND p.session_uid = c.session_uid AND p.agent_id = ''
     """,
     # Codex: parent by thread id, root by root session uid.
@@ -1051,7 +1051,7 @@ LINK_SQL = [
     """
     UPDATE ah.subagent_spawn s SET child_session_id = c.id
     FROM ah.session c
-    WHERE s.child_session_id IS NULL AND s.agent IN ('claude', 'opencode') AND s.child_agent_id IS NOT NULL
+    WHERE s.child_session_id IS NULL AND s.agent IN ('claude', 'opencode', 'antigravity') AND s.child_agent_id IS NOT NULL
       AND c.agent = s.agent AND c.session_uid = s.child_session_uid AND c.agent_id = s.child_agent_id
     """,
     """

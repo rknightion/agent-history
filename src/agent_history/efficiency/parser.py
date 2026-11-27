@@ -20,7 +20,7 @@ from agent_history.model import claude_family
 
 from .context_windows import PI_CONTEXT_WINDOWS, claude_context_window
 
-CLAUDE_NAMESPACES = ("claude-", "opencode-")
+CLAUDE_NAMESPACES = ("claude-", "opencode-", "antigravity-")
 
 
 def pi_format():
@@ -491,7 +491,7 @@ def efficiency_session_keys(relative: str, file_state: dict[str, Any]) -> tuple[
     """Catalogue natural key of a transcript file, and of its parent thread when it is a worker."""
     namespace = relative.split("/", 1)[0]
     if namespace.startswith(CLAUDE_NAMESPACES):
-        # The catalogue keys rows by their real agent: opencode-* namespaces are 'opencode', not 'claude'.
+        # The catalogue keys rows by their real agent: opencode-* and antigravity-* namespaces carry their own agent, not 'claude'.
         agent = namespace.split("-", 1)[0]
         name = relative.rsplit("/", 1)[-1]
         stem = name[:-6] if name.endswith(".jsonl") else name
