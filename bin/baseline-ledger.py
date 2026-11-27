@@ -62,6 +62,8 @@ REPLAYED = (
     "056_opencode_agent.sql",
     # Redefines the live loop functions in place; the baseline dump has the older bodies.
     "057_opencode_loop_tracking.sql",
+    # Widens the agent checks again; the baseline dump keeps the three-agent checks.
+    "058_antigravity_agent.sql",
 )
 
 

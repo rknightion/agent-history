@@ -95,7 +95,7 @@ def test_invalid_namespace_diagnostics_do_not_echo_configured_value(tmp_path, ca
         diagnostic = captured.out + captured.err
     assert marker not in diagnostic
     assert "sources" in diagnostic and "namespace" in diagnostic
-    assert "must look like claude-<name>, codex-<name>, pi-<name> or opencode-<name>" in diagnostic
+    assert "must look like claude-<name>, codex-<name>, pi-<name>, opencode-<name> or antigravity-<name>" in diagnostic
 
 
 def test_unknown_context_is_refused():

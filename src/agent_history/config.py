@@ -5,7 +5,7 @@ optional; see config.example.toml. Without a file the indexer reads the three de
 
     claude-local = ~/.claude      codex-local = ~/.codex      pi-local = ~/.pi/agent
 
-A namespace is `<agent>-<profile>`: the agent (claude, codex, pi or opencode) picks the parser (opencode reuses the Claude one), the profile is
+A namespace is `<agent>-<profile>`: the agent (claude, codex, pi, opencode or antigravity) picks the parser (opencode and antigravity reuse the Claude one), the profile is
 a free label. Contexts are named search scopes over namespaces, not access-control boundaries: a
 reader can query every row through the `sql` tool. Use separate databases for real separation;
 reader roles on shared tables do not isolate rows without row-level security.
@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any
 
 DEFAULT_SOURCES = {"claude-local": "~/.claude", "codex-local": "~/.codex", "pi-local": "~/.pi/agent"}
-NAMESPACE = re.compile(r"^(claude|codex|pi|opencode)-[a-z0-9][a-z0-9_-]{0,62}$")
+NAMESPACE = re.compile(r"^(claude|codex|pi|opencode|antigravity)-[a-z0-9][a-z0-9_-]{0,62}$")
 DIMENSIONS = 1024  # ah.embedding is halfvec(1024)
 
 
@@ -337,7 +337,7 @@ def parse_config(data: dict[str, Any], path: Path | None = None) -> Config:
     for namespace, directory in sources_raw.items():
         if not NAMESPACE.match(namespace):
             raise ConfigError(
-                "sources namespace key must look like claude-<name>, codex-<name>, pi-<name> or opencode-<name>",
+                "sources namespace key must look like claude-<name>, codex-<name>, pi-<name>, opencode-<name> or antigravity-<name>",
                 key="sources",
             )
         if not isinstance(directory, str):

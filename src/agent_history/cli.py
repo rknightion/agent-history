@@ -129,7 +129,7 @@ def _sources(config, overrides: list[str] | None) -> dict[str, Path]:
 
         if not NAMESPACE.match(namespace):
             raise SystemExit(
-                "--source namespace must look like claude-<name>, codex-<name>, pi-<name> or opencode-<name>"
+                "--source namespace must look like claude-<name>, codex-<name>, pi-<name>, opencode-<name> or antigravity-<name>"
             )
         out[namespace] = Path(directory).expanduser().resolve()
     return out
