@@ -396,9 +396,9 @@ def test_collection_spans_are_one_per_real_refresh_and_content_free(tmp_path, re
             raise OSError(marker)
 
     collection = make_collection(tmp_path, [Stub(), Failing()], otlp.Bridge.create(), refresh=3600)
+    receiver.requests.clear()
     for _ in range(3):  # one real refresh and two cache hits
         collection.metrics()
-    receiver.requests.clear()
     assert telemetry.force_flush()
     spans = receiver.spans()
     parents = [s for s in spans if s.name == "metrics.collect"]

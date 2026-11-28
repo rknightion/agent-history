@@ -14,6 +14,7 @@ import os
 import re
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 from agent_history import telemetry
@@ -132,6 +133,8 @@ class State:
         self.directory = directory
         self.file = directory / "counters.json"
         self.lock = threading.RLock()
+        self._batch_depth = 0
+        self._dirty = False
         try:
             self.counters = json.loads(self.file.read_text())
         except FileNotFoundError:
@@ -175,7 +178,7 @@ class State:
                 value = prev["value"] + raw
             if prev is None or prev["raw"] != raw:
                 self.counters[key] = {"raw": raw, "value": value}
-                self._save()
+                self._persist()
             return value
 
     def forget_ended_loops(self, names: set[str], loops: set[str]) -> None:
@@ -191,7 +194,27 @@ class State:
             for key in ended:
                 del self.counters[key]
             if ended:
-                self._save()
+                self._persist()
+
+    @contextmanager
+    def batch(self):
+        """Defer disk writes across multiple mutations until the outermost batch exits."""
+        with self.lock:
+            self._batch_depth += 1
+            try:
+                yield self
+            finally:
+                self._batch_depth -= 1
+                if self._batch_depth == 0 and self._dirty:
+                    self._save()
+                    self._dirty = False
+
+    def _persist(self) -> None:
+        if self._batch_depth > 0:
+            self._dirty = True
+        else:
+            self._save()
+            self._dirty = False
 
     def _save(self) -> None:
         self.directory.mkdir(parents=True, exist_ok=True)
@@ -215,70 +238,73 @@ def render(
     Counters pass through `State.observe` exactly once here; the snapshot is what the text renders, so
     any other consumer (the OTLP bridge) sees the same adjusted, label-mapped, aggregated values.
     """
-    # Retirement is independent of family presence: the last loop may retire too.
-    for name, loops in (retired_loops or {}).items():
-        state.forget_ended_loops({name}, loops)
     lines: list[str] = []
     snapshot: list[Family] = []
     seen: set[str] = set()
-    for family in families:
-        if not NAME.fullmatch(family.name) or family.type not in ("counter", "gauge", "histogram"):
-            raise ValueError("invalid metric name or type")
-        if family.name in seen:
-            raise ValueError("duplicate metric family")
-        seen.add(family.name)
-        lines.extend((f"# HELP {family.name} {_escape(family.help)}", f"# TYPE {family.name} {family.type}"))
+    with state.batch():
+        # Retirement is independent of family presence: the last loop may retire too.
+        for name, loops in (retired_loops or {}).items():
+            state.forget_ended_loops({name}, loops)
+        for family in families:
+            if not NAME.fullmatch(family.name) or family.type not in ("counter", "gauge", "histogram"):
+                raise ValueError("invalid metric name or type")
+            if family.name in seen:
+                raise ValueError("duplicate metric family")
+            seen.add(family.name)
+            lines.extend((f"# HELP {family.name} {_escape(family.help)}", f"# TYPE {family.name} {family.type}"))
 
-        def sample_order(sample):
-            if family.type != "histogram":
-                return (sample.labels, 0, 0.0)
-            labels = tuple((key, value) for key, value in sample.labels if key != "le")
-            name = sample.name or ""
-            suffix = next((suffix for suffix in ("_bucket", "_sum", "_count") if name.endswith(suffix)), "")
-            bound = dict(sample.labels).get("le", "0")
-            return (
-                labels,
-                {"_bucket": 0, "_sum": 1, "_count": 2}.get(suffix, 3),
-                float("inf") if bound == "+Inf" else float(bound),
-            )
+            def sample_order(sample):
+                if family.type != "histogram":
+                    return (sample.labels, 0, 0.0)
+                labels = tuple((key, value) for key, value in sample.labels if key != "le")
+                name = sample.name or ""
+                suffix = next((suffix for suffix in ("_bucket", "_sum", "_count") if name.endswith(suffix)), "")
+                bound = dict(sample.labels).get("le", "0")
+                return (
+                    labels,
+                    {"_bucket": 0, "_sum": 1, "_count": 2}.get(suffix, 3),
+                    float("inf") if bound == "+Inf" else float(bound),
+                )
 
-        sources = _source_samples(family)
-        if family.type == "gauge":
-            public = _public_samples(sources, state.labels)
-        else:
-            # Adjust each ORIGINAL source independently before public-label summation.
-            for sample in sources:
-                state.observe(sample.name, sample.labels, sample.value)
-            names = (
-                {family.name + suffix for suffix in ("_bucket", "_sum", "_count")}
-                if family.type == "histogram"
-                else {family.name}
+            sources = _source_samples(family)
+            if family.type == "gauge":
+                public = _public_samples(sources, state.labels)
+            else:
+                # Adjust each ORIGINAL source independently before public-label summation.
+                for sample in sources:
+                    state.observe(sample.name, sample.labels, sample.value)
+                names = (
+                    {family.name + suffix for suffix in ("_bucket", "_sum", "_count")}
+                    if family.type == "histogram"
+                    else {family.name}
+                )
+                public = state.public_samples(names)
+            ordered = sorted(public, key=sample_order)
+            snapshot.append(
+                Family(
+                    family.name,
+                    family.type,
+                    family.help,
+                    tuple(Sample(sample.labels, float(sample.value), sample.name or family.name) for sample in ordered),
+                )
             )
-            public = state.public_samples(names)
-        ordered = sorted(public, key=sample_order)
-        snapshot.append(
-            Family(
-                family.name,
-                family.type,
-                family.help,
-                tuple(Sample(sample.labels, float(sample.value), sample.name or family.name) for sample in ordered),
-            )
-        )
-        for sample in ordered:
-            name = sample.name or family.name
-            if family.type == "histogram":
-                if name not in (family.name + "_bucket", family.name + "_sum", family.name + "_count"):
-                    raise ValueError("invalid histogram sample name")
-            elif name != family.name:
-                raise ValueError("non-histogram sample name differs from family")
-            raw = float(sample.value)
-            if not math.isfinite(raw) or (family.type != "gauge" and raw < 0):
-                raise ValueError("invalid sample value")
-            value = raw
-            labels = "{" + ",".join(f'{key}="{_escape(v)}"' for key, v in sample.labels) + "}" if sample.labels else ""
-            # The legacy textfile format: integers exact, everything else to 12 significant digits.
-            rendered = str(int(value)) if value.is_integer() else format(value, ".12g")
-            lines.append(f"{name}{labels} {rendered}")
+            for sample in ordered:
+                name = sample.name or family.name
+                if family.type == "histogram":
+                    if name not in (family.name + "_bucket", family.name + "_sum", family.name + "_count"):
+                        raise ValueError("invalid histogram sample name")
+                elif name != family.name:
+                    raise ValueError("non-histogram sample name differs from family")
+                raw = float(sample.value)
+                if not math.isfinite(raw) or (family.type != "gauge" and raw < 0):
+                    raise ValueError("invalid sample value")
+                value = raw
+                labels = (
+                    "{" + ",".join(f'{key}="{_escape(v)}"' for key, v in sample.labels) + "}" if sample.labels else ""
+                )
+                # The legacy textfile format: integers exact, everything else to 12 significant digits.
+                rendered = str(int(value)) if value.is_integer() else format(value, ".12g")
+                lines.append(f"{name}{labels} {rendered}")
     return "\n".join(lines) + "\n", tuple(snapshot)
 
 
