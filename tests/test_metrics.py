@@ -379,3 +379,30 @@ def test_retirement_replays_after_collector_restart(tmp_path, monkeypatch):
     collection.metrics()
     assert {json.loads(key)[0] for key in offsets.counters} <= {"agent_efficiency_malformed_records_total"}
     assert json.loads(path.read_text())["retired_loops"] == {}
+
+
+def test_render_batches_counter_state_saves(tmp_path, monkeypatch):
+    state = State(tmp_path)
+    saves = 0
+    original = state._save
+
+    def counting_save():
+        nonlocal saves
+        saves += 1
+        original()
+
+    monkeypatch.setattr(state, "_save", counting_save)
+    families = [
+        Family(
+            "agent_example_total",
+            "counter",
+            "Example.",
+            tuple(Sample((("loop", f"loop{n}"),), n + 1) for n in range(10)),
+        )
+    ]
+    exposition(families, state)
+    assert saves == 1
+    exposition(families, state)
+    assert saves == 1
+    exposition([], state, retired_loops={"agent_example_total": {"loop0", "loop1"}})
+    assert saves == 2
