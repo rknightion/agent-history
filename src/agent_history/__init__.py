@@ -1,3 +1,3 @@
 """agent-history: a ParadeDB catalogue of Claude Code, Codex and pi agent transcripts."""
 
-__version__ = "0.13.1"
+__version__ = "0.14.0"
