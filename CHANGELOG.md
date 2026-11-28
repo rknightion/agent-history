@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.0](https://github.com/rknightion/agent-history/compare/v0.13.1...v0.14.0) (2026-11-28)
+
+
+### Features
+
+* **load:** accept antigravity-* namespaces with the Claude parser ([#160](https://github.com/rknightion/agent-history/issues/160)) ([5f7f2d6](https://github.com/rknightion/agent-history/commit/5f7f2d63c3560e69acfdce685f9d594981c29d6e))
+
 ## [0.13.1](https://github.com/rknightion/agent-history/compare/v0.13.0...v0.13.1) (2026-11-26)
 
 
